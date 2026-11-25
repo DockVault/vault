@@ -710,11 +710,26 @@ def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: O
     change of its factors takes the turn before it reads them. So the factor is written wholly before such a
     change, which then finds it (a reset retires it, a removal counts it), or not at all: without the turn, a
     change that fell between the check of the token and the write left a factor set up on a proof the change had
-    just ended."""
+    just ended.
+
+    The wait for the turn is the short one of a sign-in where it is written (:func:`with_a_short_wait`): the
+    routes that set a factor up run on the server's one loop, as a sign-in does. A change that settles many
+    accounts at once holds each account's turn until it commits; waited for with the connection's own wait, every
+    other request stood still meanwhile, and the wait ended in an error that said nothing. A turn still held is
+    answered as a sign-in is: busy, try again in a moment. Nothing was written, and the held sign-in stays."""
     if pending is None:
         return
+    from sqlalchemy.exc import OperationalError
     from app.api import api_server as api
-    api._sessions_turn(db, user.id)
+    try:
+        with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))
+    except OperationalError as waited:
+        if getattr(getattr(waited, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
+            raise
+        db.rollback()
+        from app.core import sign_in_lockout
+        raise HTTPException(status_code=503, detail=BUSY,
+                            headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}) from None
     on_record = db.query(PendingLogin.consumed_at).filter(PendingLogin.id == pending.id).first()
     if on_record is None or on_record[0] is not None:
         raise HTTPException(status_code=401, detail="This login attempt has expired; start again.")

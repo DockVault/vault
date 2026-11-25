@@ -193,6 +193,25 @@ elif pair in ("a passkey from a session", "a passkey from a session the reset en
     else:
         a_change(ada, alice, cc.SECOND_FACTOR)()
         out = together(writer=store)
+elif pair == "a set-up while the turn stays held":
+    hold = held_sign_in(alice)
+
+    def hold_the_turn():
+        with SessionLocal() as s:
+            _take(s, alice)
+            in_turn.set()
+            time.sleep(2.5)            # longer than a sign-in waits, shorter than the connection's own wait
+            s.rollback()
+            return "let go"
+
+    def store():
+        with SessionLocal() as s:
+            user, pending = s.get(User, alice), s.get(PendingLogin, hold)
+            sign_in.refuse_a_factor_the_sign_in_could_not_finish(s, user, pending, IP)
+            s.add(key_for(s, alice))
+            s.commit()
+            return "stored"
+    out = together(holder=hold_the_turn, writer=after_the_turn_is_held(store))
 out["after"], out["the turn was held"] = state(alice), in_turn.is_set()
 print(json.dumps(out))
 '''
@@ -230,3 +249,15 @@ def test_a_session_the_reset_ended_stores_no_passkey(db_name):
     out = run_in(db_name, SCENARIO, env={"PAIR": "a passkey from a session the reset ended"})
     assert out["writer"][:3] == ["error", "HTTPException", "401"], out
     assert out["after"]["keys retired"] == [], out
+
+
+def test_a_set_up_whose_turn_stays_held_is_answered_as_busy_in_a_sign_ins_wait_and_stores_nothing(db_name):
+    """A change that settles many accounts holds each account's turn until it commits. A factor's set-up at a
+    held sign-in runs on the server's one loop: it waits half a second for the turn, not the holder's time, is
+    answered as busy, stores nothing, and leaves the sign-in held for the next try."""
+    out = run_in(db_name, SCENARIO, env={"PAIR": "a set-up while the turn stays held"})
+    assert out["holder"] == ["ok", "let go"] and out["holder seconds"] >= 2.4, out
+    assert out["writer"] == ["error", "HTTPException", "503", "Signing in is busy right now. Try again in a moment."], out
+    assert out["writer seconds"] < 1.5, out
+    after = out["after"]
+    assert after["keys retired"] == [] and after["held open"] == 1, out

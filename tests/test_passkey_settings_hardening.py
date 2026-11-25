@@ -661,6 +661,106 @@ def test_a_held_sign_in_spent_while_it_waited_for_the_accounts_turn_writes_no_fa
     assert "active" not in [e.status for e in h.db.rows_of(SecondFactorEnrollment)]
 
 
+@pytest.mark.parametrize("factor", ["a passkey", "a passkey's options", "an authenticator"])
+def test_a_set_up_whose_turn_stays_held_is_answered_as_busy_and_writes_nothing(monkeypatch, factor):
+    """A change that settles many accounts at once holds each account's turn until it commits. The routes that
+    set a factor up at a held sign-in run on the server's one loop: they wait for the turn only as long as a
+    sign-in does where it is written, and a turn still held then is answered as busy, with nothing written and
+    the held sign-in left as it was, so that the person's next try goes through."""
+    registry, wss = _mod()
+    from sqlalchemy.exc import OperationalError
+    from app.core.models import SecondFactorEnrollment, SecondFactorRecoveryCode, WebAuthnCredential
+    from app.services import sign_in
+    overdue = datetime.utcnow() - timedelta(days=20)
+    alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None)
+    h = StepHarness(monkeypatch, [alice])
+    _required(monkeypatch, registry, wss, ["user"])
+    pending, headers = h.pending_for(alice)
+    pending.enrollment_required = True
+    begun = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, method="totp", status="unconfirmed",
+                                  confirmed_at=datetime.utcnow(), secret_enc="sealed")
+    h.db.rows_of(SecondFactorEnrollment).append(begun)
+    h.db.rows_of(SecondFactorRecoveryCode).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, consumed_at=None))
+    method, path, body = {
+        "a passkey": ("POST", "/users/me/passkeys/register/verify", {"challenge_id": "ab" * 16, "credential": {}}),
+        "a passkey's options": ("POST", "/users/me/passkeys/register/options", {}),
+        "an authenticator": ("POST", "/users/me/second-factor/recovery/acknowledge", None)}[factor]
+    asked, real = [], sign_in.with_a_short_wait
+
+    def the_short_wait(db, take):
+        asked.append("the short wait")
+        return real(db, take)
+
+    def still_held(db, user_id):
+        asked.append(("the turn", user_id))
+        raise OperationalError("SELECT 1 FOR UPDATE", {}, types.SimpleNamespace(pgcode="55P03"))
+    monkeypatch.setattr(sign_in, "with_a_short_wait", the_short_wait)
+    monkeypatch.setattr(h.S, "_sessions_turn", still_held)
+    rolled_back = len([entry for entry in h.db.log if entry == ("rollback",)])
+    status, answer = _call_h(h.S, method, path, body, headers)
+    assert status == 503 and answer["detail"] == "Signing in is busy right now. Try again in a moment.", answer
+    assert asked == ["the short wait", ("the turn", alice.id)]              # through the short wait, once
+    assert len([entry for entry in h.db.log if entry == ("rollback",)]) == rolled_back + 1
+    assert pending.consumed_at is None                                      # the held sign-in stays for the next try
+    assert h.db.rows_of(WebAuthnCredential) == []
+    assert "active" not in [e.status for e in h.db.rows_of(SecondFactorEnrollment)]
+    # Let go, the same request goes on to where it went before (the verify reaches its challenge).
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, user_id: None)
+    status, answer = _call_h(h.S, method, path, body, headers)
+    assert status != 503, answer
+
+
+def test_the_busy_answer_of_a_set_up_says_when_to_try_again_and_another_failure_is_not_taken_for_it():
+    from sqlalchemy.exc import OperationalError
+    from app.api import api_server as api
+    from app.core import sign_in_lockout
+    from app.services import sign_in
+
+    class Session:
+        def __init__(self):
+            self.said = []
+
+        def get_bind(self):
+            return types.SimpleNamespace(dialect=types.SimpleNamespace(name="postgresql"))
+
+        def execute(self, statement, params=None):
+            self.said.append(str(statement) if params is None else (str(statement), dict(params)))
+            return types.SimpleNamespace(scalar=lambda: "5s")
+
+        def rollback(self):
+            self.said.append("rolled back")
+
+    def raising(code):
+        def turn(db, user_id):
+            raise OperationalError("SELECT 1 FOR UPDATE", {}, types.SimpleNamespace(pgcode=code))
+        return turn
+    alice = types.SimpleNamespace(id=uuid.uuid4(), username="alice")
+    pending = types.SimpleNamespace(id=uuid.uuid4(), consumed_at=None)
+    real = api._sessions_turn
+    try:
+        api._sessions_turn = raising("55P03")
+        db = Session()
+        with pytest.raises(HTTPException) as busy:
+            sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, alice, pending, "203.0.113.9")
+        assert busy.value.status_code == 503 and busy.value.detail == sign_in.BUSY
+        assert busy.value.headers == {"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}
+        # The wait was the short one, and the transaction was given back before the answer.
+        assert db.said == ["SELECT current_setting('lock_timeout')",
+                           ("SELECT set_config('lock_timeout', :wait, true)", {"wait": f"{sign_in.WRITE_WAIT_MS}ms"}),
+                           "rolled back"]
+        # A deadlock, a lost connection: not a turn that is held. It is raised as it is.
+        api._sessions_turn = raising("40P01")
+        db = Session()
+        with pytest.raises(OperationalError):
+            sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, alice, pending, "203.0.113.9")
+        assert "rolled back" not in db.said
+        # With a session there is no held sign-in, and no turn is asked for here.
+        api._sessions_turn = raising("55P03")
+        assert sign_in.refuse_a_factor_the_sign_in_could_not_finish(Session(), alice, None, "203.0.113.9") is None
+    finally:
+        api._sessions_turn = real
+
+
 @pytest.mark.parametrize("change", ["a new password", "a second-factor reset", "the removal of a passkey"])
 def test_a_change_to_how_an_account_signs_in_takes_its_turn_before_it_reads_anything(monkeypatch, change):
     """A sign-in held for a set-up writes its factor in the account's turn at its sessions. An administrator's
