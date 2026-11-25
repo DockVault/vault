@@ -39,6 +39,7 @@ from app.core import sso_policy
 from app.services import oidc_client as oc
 from app.services import sso_freshness
 from app.services import sso_groups
+from app.services import sign_in as _sign_in
 from app.services import sso_sign_in as sso
 
 router = APIRouter(tags=["Single sign-on"])
@@ -61,6 +62,21 @@ _BACKCHANNEL_SLOTS = asyncio.Semaphore(BACKCHANNEL_CONCURRENCY)
 # (``logout_failed``): the token is not spent, and sent again it may end the sessions then.
 LOGOUT_REFUSED = 400
 TOKEN_REFUSALS = frozenset({oc.TOKEN_INVALID, oc.ISSUER_MISMATCH, oc.SIGNING_KEY_TOO_SHORT})
+
+
+STEP_BUSY = "The vault is busy with this right now. Start it again in a moment."
+
+
+def _start_the_step_again() -> HTTPException:
+    """The busy answer of a route that claims a finished provider step (a link, a test, a confirmation): its
+    one-time code is spent, so there is nothing to send again and no wait to count down."""
+    return HTTPException(status_code=503, detail={"reason": sso.BUSY, "message": STEP_BUSY})
+
+
+def _back_to_the_sign_in_page_as_busy():
+    """The busy answer where the browser has come back from the provider: a navigation, so the sign-in page with
+    the reason, never a page of JSON. The sign-in's state is spent: the person starts again there."""
+    return _redirect("sso-error=" + sso.BUSY)
 
 
 class _ProviderUnusable(Exception):
@@ -453,6 +469,7 @@ def _logged_error(error) -> str:
 
 
 @router.get("/auth/sso/{provider_id}/callback")
+@_sign_in.after_a_spent_code_busy_is(_back_to_the_sign_in_page_as_busy)
 async def sign_in_callback(
     provider_id: str,
     request: Request,
@@ -992,6 +1009,7 @@ async def start_reauth(
 
 
 @router.post("/users/me/identities/reauth/finish")
+@_sign_in.after_a_spent_code_busy_is(_start_the_step_again)
 async def finish_reauth(
     body: SsoHandoverFinishRequest,
     request: Request,
@@ -1128,6 +1146,7 @@ def _claim_handover(db, request, current_user, body: SsoHandoverFinishRequest, *
 
 
 @router.post("/users/me/identities/finish")
+@_sign_in.after_a_spent_code_busy_is(_start_the_step_again)
 async def finish_link(
     body: SsoHandoverFinishRequest,
     request: Request,
@@ -1239,6 +1258,7 @@ async def start_test(
 
 
 @router.post("/admin/sso/providers/{provider_id}/test/finish")
+@_sign_in.after_a_spent_code_busy_is(_start_the_step_again)
 async def finish_test(
     provider_id: str,
     body: SsoHandoverFinishRequest,

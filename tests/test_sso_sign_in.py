@@ -1670,3 +1670,26 @@ def test_what_a_failed_test_keeps_and_what_it_does_not():
     # An earlier test that established nothing gives nothing.
     assert sso.keeping_what_a_passing_test_established(failed, {"outcome": "token_invalid", "config": "c-1"}) == failed
     assert sso.ESTABLISHED_BY_A_PASSING_TEST == ("auth_time_present", "groups")
+
+
+def test_a_lock_wait_at_the_providers_return_goes_back_to_the_sign_in_page_as_busy(monkeypatch):
+    """The browser comes back from the provider, and a statement of the callback waits for a lock for longer than
+    a request waits (a demotion by a group mapping takes an account's turn). The application's answer for that is
+    JSON with a wait: the person looked at a page of JSON where the sign-in page should be, and a reload said the
+    sign-in is unknown, because its state was spent. A navigation goes back to the sign-in page with the reason."""
+    from sqlalchemy.exc import OperationalError
+    from app.services import sso_sign_in as sso
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+
+    class Waited(Exception):
+        pgcode = "55P03"
+
+    def waits_too_long(*a, **kw):
+        raise OperationalError("SELECT pg_advisory_xact_lock(1, 2)", {}, Waited())
+    monkeypatch.setattr(sso, "verified_answer", waits_too_long)
+    status, location, _ = h.callback(p, state)
+    assert status == 302 and location == "/#sso-error=busy", (status, location)
+    assert sso.reason_text("busy") == "Signing in is busy right now. Try again in a moment."

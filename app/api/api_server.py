@@ -8929,6 +8929,7 @@ class SignInFinishRequest(BaseModel):
 
 
 @app.post("/auth/finish")
+@sign_in.after_a_spent_code_busy_is(sign_in.start_again)
 async def finish_sign_in(
     body: SignInFinishRequest,
     request: Request,

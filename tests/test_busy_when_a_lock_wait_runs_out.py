@@ -160,3 +160,80 @@ def test_stay_signed_in_while_the_accounts_turn_is_held_is_busy_and_not_an_error
         assert headers["retry-after"] == "5"
     else:
         assert "retry-after" not in headers and "error_id" in body
+
+
+def test_a_route_that_spent_a_one_time_code_answers_a_lock_wait_in_its_own_words():
+    """The exchange of a sign-in code, the provider's answer coming back, the claim of a finished link or test:
+    each has spent what carried the request by the time it works. The application's answer for a lock wait says
+    "try again" with a wait; the try after the wait was told the code is not valid. Such a route gives its own
+    answer: rolled back first, the answer returned or raised as the route would give it, and the database's
+    error (which carries the statement) not shown with it. Anything else passes as it is."""
+    set_bare_api_env()
+    from fastapi import HTTPException
+    from app.services import sign_in
+    rolled = []
+
+    class DB:
+        def rollback(self):
+            rolled.append("rolled back")
+
+    def route_that(raises=None, returns="done"):
+        @sign_in.after_a_spent_code_busy_is(lambda: made[0])
+        async def route(body, db=None):
+            """Its own words."""
+            if raises is not None:
+                raise raises
+            return returns
+        return route
+    made = [sign_in.start_again()]
+    waited = _the_databases_error("55P03")
+    # Raised by the answer: the route's own refusal, with no wait to count down.
+    with pytest.raises(HTTPException) as busy:
+        run_coroutine(route_that(waited)("body", db=DB()), timeout=30)
+    assert (busy.value.status_code, busy.value.detail) == (503, sign_in.BUSY_START_AGAIN)
+    assert busy.value.headers is None and rolled == ["rolled back"] and busy.value.__suppress_context__ is True
+    # Returned by the answer: a navigation gets a page to go to.
+    made[0] = "a redirect"
+    assert run_coroutine(route_that(waited)("body", db=DB()), timeout=30) == "a redirect" and len(rolled) == 2
+    # No session among its arguments: answered all the same.
+    assert run_coroutine(route_that(waited)("body"), timeout=30) == "a redirect" and len(rolled) == 2
+    # Another error of the database, a refusal of the route's own, and an answer: each as it was.
+    for other in (_the_databases_error("40P01"), _the_databases_error(None)):
+        with pytest.raises(OperationalError) as raised:
+            run_coroutine(route_that(other)("body", db=DB()), timeout=30)
+        assert raised.value is other
+    refusal = HTTPException(status_code=401, detail="This sign-in code is not valid; start again.")
+    with pytest.raises(HTTPException) as raised:
+        run_coroutine(route_that(refusal)("body", db=DB()), timeout=30)
+    assert raised.value is refusal
+    assert run_coroutine(route_that()("body", db=DB()), timeout=30) == "done" and len(rolled) == 2
+    # The route is still read as itself (the framework reads its parameters from it).
+    wrapped = route_that()
+    assert wrapped.__name__ == "route" and wrapped.__doc__ == "Its own words." and hasattr(wrapped, "__wrapped__")
+
+
+def test_every_route_that_spends_a_one_time_code_gives_its_own_busy_answer():
+    """The five routes, and what each answers: the exchange of a sign-in code "start the sign-in again", the claim
+    of a finished link, test or confirmation "start it again" in the shape those routes refuse in, and the
+    browser's return from the provider the sign-in page with the reason. None gives a wait to count down."""
+    import inspect
+    S = _api()
+    from fastapi import HTTPException
+    from app.api import sso_router
+    from app.services import sign_in
+    for route in (S.finish_sign_in, sso_router.sign_in_callback, sso_router.finish_link, sso_router.finish_test,
+                  sso_router.finish_reauth):
+        assert hasattr(route, "__wrapped__"), route.__name__
+        parameters = inspect.signature(route).parameters
+        assert "db" in parameters, route.__name__                    # rolled back by name before the answer
+    source = inspect.getsource(sso_router)
+    assert source.count("@_sign_in.after_a_spent_code_busy_is(_start_the_step_again)\nasync def finish_") == 3
+    assert "@_sign_in.after_a_spent_code_busy_is(_back_to_the_sign_in_page_as_busy)\nasync def sign_in_callback(" in source
+    assert "@sign_in.after_a_spent_code_busy_is(sign_in.start_again)\nasync def finish_sign_in(" in inspect.getsource(S)
+    step = sso_router._start_the_step_again()
+    assert isinstance(step, HTTPException) and step.status_code == 503 and step.headers is None
+    assert step.detail == {"reason": "busy", "message": "The vault is busy with this right now. Start it again in a moment."}
+    back = sso_router._back_to_the_sign_in_page_as_busy()
+    assert back.status_code in (302, 303, 307) and back.headers["location"].endswith("/#sso-error=busy")
+    again = sign_in.start_again()
+    assert (again.status_code, again.detail, again.headers) == (503, sign_in.BUSY_START_AGAIN, None)

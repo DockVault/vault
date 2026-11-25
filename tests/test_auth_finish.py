@@ -396,3 +396,23 @@ def test_the_code_store_says_why_it_refused_a_real_code_to_whoever_asks(finish):
     # The right proof gives the record, and adds nothing.
     code, verifier = _code(f, f.alice)
     assert f.codes.take(code, verifier=verifier, redis=f.redis, refused=why).user_id == str(f.alice.id) and len(why) == 1
+
+
+def test_a_lock_wait_anywhere_in_the_exchange_of_a_code_says_to_start_again(finish, monkeypatch):
+    """The code is spent before anything else. A statement of the exchange outside the pipeline's judging step
+    (the account read back, an invitation accepted through a provider) waits for a lock for longer than a request
+    waits. The application's answer said "try again in a moment" with a wait, for a code that is no code any
+    more: the exchange says to start the sign-in again, and gives no wait."""
+    from sqlalchemy.exc import OperationalError
+    f = finish
+
+    class Waited(Exception):
+        pgcode = "55P03"
+
+    def waits_too_long(db, handover, **kw):
+        raise OperationalError("SELECT 1 FROM users WHERE id = %(id)s FOR UPDATE", {"id": "an-id"}, Waited())
+    monkeypatch.setattr(f.codes, "to_result", waits_too_long)
+    code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    status, headers, body = _post_with_headers(f.S, "/auth/finish", {"code": code, "verifier": verifier})
+    assert status == 503 and body == {"detail": "Signing in is busy right now. Start the sign-in again in a moment."}
+    assert "retry-after" not in headers and f.made["sessions"] == []

@@ -366,6 +366,42 @@ def busy() -> HTTPException:
                          headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)})
 
 
+def start_again() -> HTTPException:
+    """The busy answer of a route whose one-time code is spent: 503, the words that say to start again, and no
+    wait to count down (sent again, the code is no code)."""
+    return HTTPException(status_code=503, detail=BUSY_START_AGAIN)
+
+
+def after_a_spent_code_busy_is(answer):
+    """For an async route that has spent a one-time code or state by the time it works (the exchange of a sign-in
+    code, the provider's answer coming back, the claim of a finished link or test): a lock wait that ran out
+    anywhere in it is answered by ``answer()``, which returns the route's answer or raises it.
+
+    Left to the application's own answer for a lock wait, such a route said "Try again in a moment" with a wait
+    to count down. What carried the request was spent by the first try, so the try made after the wait was told
+    the code is not valid, and where the browser had come back from a provider, a page of JSON stood where the
+    sign-in page should. The transaction is rolled back before the answer is made. Any other error of the
+    database passes as it is."""
+    def wrap(route):
+        @functools.wraps(route)
+        async def guarded(*args, **kwargs):
+            from sqlalchemy.exc import OperationalError
+            try:
+                return await route(*args, **kwargs)
+            except OperationalError as waited:
+                if getattr(getattr(waited, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
+                    raise
+                db = kwargs.get("db")
+                if db is not None:
+                    db.rollback()
+                made = answer()
+                if isinstance(made, BaseException):
+                    raise made from None
+                return made
+        return guarded
+    return wrap
+
+
 def a_refusal_leaves_no_session(step):
     """For a step of the pipeline that takes ``(db, result, ...)``: a refusal it raises leaves no session of the
     sign-in's proof behind. The password door writes its session in its own turn and commits it before the
