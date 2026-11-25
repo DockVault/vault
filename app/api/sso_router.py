@@ -533,7 +533,11 @@ async def sign_in_callback(
                 found = sso.resolve_account(db, row, answer)
         except sso.Refusal as exc:
             db.rollback()          # nothing of a refused resolution may ride on the audit row's commit
-            _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure",
+            # A refusal that met an account of the vault (a linked identity whose account is turned off, an
+            # address that is an account's) is that account's failed sign-in, and is recorded under it, as a
+            # wrong password for it is: an administrator who looks for the person finds who tried to come in as
+            # them. One that met nobody (no account, an address nobody holds) names nobody.
+            _audit(db, "sso_sign_in_refused", user=exc.about, ip=client_ip, status_="failure",
                    details={**details, "reason": exc.code,
                             **({"refused_because": exc.detail} if exc.detail else {})})
             if invitation_id:
@@ -1008,7 +1012,9 @@ def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
         except Exception as exc:  # noqa: BLE001
             log.info("sso account-created notices skipped: %s", type(exc).__name__)
     _audit(db, "sso_identity_linked", user=user, ip=client_ip,
-           details={"provider_id": details.get("provider_id"), "linked_by": found.linked_by})
+           details={"provider_id": details.get("provider_id"), "linked_by": found.linked_by,
+                    "identity_id": str(getattr(found.identity, "id", "") or ""),
+                    "made_sso_only": bool(found.password_stopped)})
     if found.linked_by == sso.LINKED_BY_EMAIL:
         _tell_owner(db, user, row, "A sign-in method was added",
                     f"Single sign-on with {label} was linked to your account by a sign-in with your verified email address."
@@ -1139,7 +1145,8 @@ async def finish_link(
                                     "Your account is being changed right now. Start the link again in a moment.")})
         raise HTTPException(status_code=409, detail={"reason": code, "message": sso.reason_text(code)})
     _audit(db, "sso_identity_linked", user=current_user, ip=client_ip,
-           details={"provider_id": str(row.id), "purpose": sso_state.LINK, "identity_id": str(identity.id), "linked_by": "self"})
+           details={"provider_id": str(row.id), "purpose": sso_state.LINK, "identity_id": str(identity.id),
+                    "linked_by": "self", "made_sso_only": bool(password_stopped)})
     label = row.label or row.name
     who = sso.identity_shown(identity)
     _tell_owner(db, current_user, row, "A sign-in method was added to your account",
@@ -1523,7 +1530,8 @@ async def unlink_my_identity(
     db.commit()
     _audit(db, "sso_identity_unlinked", user=current_user, ip=api.get_client_ip(request),
            details={"provider_id": provider_id, "identity_id": str(identity_id), "linked_by": "self",
-                    "sessions": ended, "confirmed_at_provider": bool(asked)})
+                    "sessions": ended, "confirmed_at_provider": bool(asked),
+                    "restored": settled == sso_only.RESTORED})
     label = (row.label or row.name) if row is not None else "an organisation provider"
     may_set_password = settled == sso_only.RESTORED
     # Every unlink by its owner is told to the administrators: from now on the provider says nothing about the

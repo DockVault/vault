@@ -195,9 +195,19 @@ def store(handover: Handover, *, redis=None, ttl_seconds: int = CODE_TTL_SECONDS
     return code
 
 
+PROOF_MISMATCH = "sign-in code proof mismatch"
+ACCOUNT_UNUSABLE = "sign-in code for an account that cannot sign in"
+REFUSED_SINCE = "sign-in code after the provider refused the person"
+HELD_SIGN_IN_ENDED = "sign-in code after its held sign-in ended"
+
+
 def take(code: str, *, verifier: Optional[str] = None, code_verifier: Optional[str] = None,
-         redis=None) -> Optional[Handover]:
+         redis=None, refused: Optional[list] = None) -> Optional[Handover]:
     """Spend ``code`` and prove the caller is the tab or app that started the sign-in.
+
+    ``refused``: a list the caller gives to learn of a code that was a real one and was refused for its proof:
+    ``(the record, PROOF_MISMATCH)`` is added to it, so the refusal can be recorded for the account the code
+    named. An unknown, spent or expired code adds nothing: there is nobody to record it for.
 
     None when the code is unknown, spent, expired or not a code at all, when the record is not one this
     module wrote, and when the proof is missing or wrong: a wrong proof spends the code too (``GETDEL``
@@ -220,18 +230,17 @@ def take(code: str, *, verifier: Optional[str] = None, code_verifier: Optional[s
         return None
     if handover is None:
         return None
+    proved = False
     if handover.verifier_hash:
-        if not isinstance(verifier, str) or not verifier:
-            return None
-        if not hmac.compare_digest(digest(verifier), handover.verifier_hash):
-            return None
+        proved = (isinstance(verifier, str) and bool(verifier)
+                  and hmac.compare_digest(digest(verifier), handover.verifier_hash))
+    elif handover.code_challenge:
+        proved = (_is_pkce_verifier(code_verifier)
+                  and hmac.compare_digest(pkce_challenge(code_verifier), handover.code_challenge))
+    if proved:
         return handover
-    if handover.code_challenge:
-        if not _is_pkce_verifier(code_verifier):
-            return None
-        if not hmac.compare_digest(pkce_challenge(code_verifier), handover.code_challenge):
-            return None
-        return handover
+    if refused is not None:
+        refused.append((handover, PROOF_MISMATCH))
     return None
 
 
@@ -291,24 +300,29 @@ def _refused_since(db, provider_id, user_id, created_at: int) -> bool:
     return refused is not None and refused >= made
 
 
-def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
+def to_result(db, handover: Handover, *, client_ip: Optional[str] = None, refused: Optional[list] = None):
     """The pipeline result a record stands for, read back against the database: the account must still
     exist and be active, a pending login it names must still be live, and a provider's handover must not have been
     overtaken by that provider's refusal of the identity. None otherwise (the finisher then answers as for an
-    unknown code)."""
+    unknown code); why is added to ``refused``, when the caller gives one, as :func:`take` adds it."""
     import uuid
     from datetime import datetime, timezone
     from app.core.models import PendingLogin, User
     from app.services.sign_in import SignInResult
+
+    def no(why):
+        if refused is not None:
+            refused.append((handover, why))
+        return None
     try:
         user_id = uuid.UUID(handover.user_id)
     except ValueError:
         return None
     user = db.query(User).filter(User.id == user_id).first()
     if user is None or not getattr(user, "is_active", True):
-        return None
+        return no(ACCOUNT_UNUSABLE)
     if handover.provider_id and _refused_since(db, handover.provider_id, user_id, handover.created_at):
-        return None
+        return no(REFUSED_SINCE)
     pending = None
     if handover.pending_id:
         try:
@@ -321,7 +335,7 @@ def to_result(db, handover: Handover, *, client_ip: Optional[str] = None):
             exp = exp.replace(tzinfo=timezone.utc)
         if (pending is None or pending.consumed_at is not None
                 or (exp is not None and exp < datetime.now(timezone.utc))):
-            return None
+            return no(HELD_SIGN_IN_ENDED)
     result = SignInResult(
         user, list(handover.methods), client_ip if client_ip is not None else handover.client_ip,
         pending=pending, provider_id=handover.provider_id,

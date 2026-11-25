@@ -298,15 +298,23 @@ class AuditLogger:
         ip_address: str,
         is_temporary: bool = False,
         methods: Optional[list] = None,
+        provider_id: Optional[str] = None,
+        provider_mfa: bool = False,
     ):
         """Log successful login. ``methods`` names how the person proved who they are (the session's
-        ``amr`` values: ``pwd``, ``totp``, a passkey, ...), when the caller knows."""
+        ``amr`` values: ``pwd``, ``totp``, a passkey, ...), when the caller knows. ``provider_id``: the identity
+        provider the sign-in came through; its row says so, says what was proved here beside it (nothing, where
+        the provider's sign-in was the whole of it) and whether the provider's own second factor stood in for
+        the vault's (``provider_mfa``)."""
         details = {
             'is_temporary': is_temporary,
             'timestamp': datetime.now(timezone.utc).isoformat()
         }
-        if methods:
-            details['methods'] = list(methods)
+        if methods or provider_id:
+            details['methods'] = list(methods or [])
+        if provider_id:
+            details['provider_id'] = str(provider_id)
+            details['provider_mfa'] = bool(provider_mfa)
         self.log_action(
             action="login_success",
             status="success",

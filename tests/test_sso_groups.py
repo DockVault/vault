@@ -189,6 +189,9 @@ def test_the_mappings_move_the_person_between_departments_and_touch_nothing_else
     removed = [a for a in h.audits if a[0] == "group_member_removed"]
     assert len(added) == 1 and added[0][2]["via"] == "single_sign_on" and added[0][2]["user_ids"] == [str(alice.id)]
     assert len(removed) == 1 and removed[0][2]["user_id"] == str(alice.id) and removed[0][2]["provider_id"] == str(p.id)
+    # Recorded under the account whose sign-in moved it, so that whoever looks for the person finds the change.
+    assert [who for action, who in h.audit_who if action in ("group_members_added", "group_member_removed")] == [
+        "alice", "alice"]
     # The owners of what Finance reaches were told, as an administrator's add tells them.
     assert ("reach", "single sign-on") in h.watched and ("watch", "joined_department", "Finance", [str(alice.id)]) in h.watched
     assert ("tell",) in h.watched

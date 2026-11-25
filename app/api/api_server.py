@@ -8928,8 +8928,10 @@ async def finish_sign_in(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="Too many attempts; please wait a few minutes.",
                             headers={"Retry-After": str(retry_after_seconds(reset, 300))})
+    why_not = []
     try:
-        handover = sign_in_codes.take(body.code, verifier=body.verifier, code_verifier=body.code_verifier)
+        handover = sign_in_codes.take(body.code, verifier=body.verifier, code_verifier=body.code_verifier,
+                                      refused=why_not)
     except sign_in_codes.Unavailable:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="Sign-in is temporarily unavailable; try again in a moment.")
@@ -8938,8 +8940,10 @@ async def finish_sign_in(
         # the account is made now, and by nothing before (the provider's callback wrote nothing).
         from app.api import sso_router
         sso_router.finish_invitation(db, handover, client_ip=client_ip)
-    result = sign_in_codes.to_result(db, handover, client_ip=client_ip) if handover is not None else None
+    result = (sign_in_codes.to_result(db, handover, client_ip=client_ip, refused=why_not)
+              if handover is not None else None)
     if result is None:
+        _record_a_refused_sign_in_code(db, why_not, client_ip)
         raise HTTPException(status_code=401, detail="This sign-in code is not valid; start again.")
     try:
         outcome = sign_in.finish(db, result)
@@ -8955,6 +8959,30 @@ async def finish_sign_in(
         return JSONResponse(status_code=200, content=outcome.body)
     return LoginResponse(access_token=outcome.access_token, user=UserResponse.model_validate(result.user),
                          is_temporary=False, is_scoped_temp=False)
+
+
+def _record_a_refused_sign_in_code(db, why_not, client_ip) -> None:
+    """A one-time sign-in code that was a real one and was refused (a wrong proof from whoever redeemed it; the
+    account turned off, or refused by its provider, in the minute the code lives; its held sign-in ended): recorded
+    as a failed sign-in of the account the code named, as a wrong password for it is. A stolen code redeemed with
+    a wrong proof is spent, the person is told their code is not valid, and this row is what says somebody else
+    tried it. An unknown or expired code names nobody, and leaves no row. The answer is the same either way.
+    Best effort: the refusal stands without its record."""
+    for handover, why in why_not[:1]:
+        try:
+            account = None
+            if handover.user_id:
+                account = db.query(User).filter(User.id == uuid.UUID(handover.user_id)).first()
+            if account is not None:
+                AuditLogger(db).log_login_failure(account.username, client_ip, why, account=account)
+            elif not handover.user_id and handover.provider_id:
+                # An invitation accepted through a provider: no account yet, the provider is what is known.
+                AuditLogger(db).log_action(action="sso_sign_in_refused", status="failure", ip_address=client_ip,
+                                           details={"provider_id": str(handover.provider_id), "purpose": "sign_in",
+                                                    "reason": "verifier_mismatch"})
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            print(f"⚠ a refused sign-in code was not recorded: {type(exc).__name__}")
 
 
 class SecondFactorChallengeRequest(BaseModel):

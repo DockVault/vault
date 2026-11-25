@@ -129,7 +129,7 @@ class Harness:
             def __init__(_self, db):
                 pass
 
-            def log_login_success(_self, user, ip, is_temporary=False, methods=None):
+            def log_login_success(_self, user, ip, is_temporary=False, methods=None, **through):
                 self.audits.append(("success", user.username, list(methods or [])))
 
             def log_login_failure(_self, username, ip, reason, **kw):

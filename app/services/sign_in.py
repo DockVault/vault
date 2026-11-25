@@ -1214,8 +1214,11 @@ def _record(db, result: SignInResult, api) -> None:
     user = result.user
     client_ip = result.client_ip
     try:
+        # A sign-in through a provider names it, and whether its second factor counted for the vault's.
+        through = ({"provider_id": str(result.provider_id), "provider_mfa": bool(result.provider_mfa_trusted)}
+                   if result.provider_id else {})
         api.AuditLogger(db).log_login_success(user, client_ip, is_temporary=result.is_temporary,
-                                              methods=list(result.methods))
+                                              methods=list(result.methods), **through)
     except Exception:  # noqa: BLE001
         pass
     # The live monitor. A temporary credential's event is tagged with the owning account so its session

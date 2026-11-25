@@ -229,13 +229,16 @@ class Harness:
                                                                                 "required": False})
         monkeypatch.setattr(sign_in_lockout, "lock_in_force", lambda db, user_id, address, **kw: None)
         self.audits, self.notices, self.emails, self.step_ups = [], [], [], []
+        self.signed_in_through = []        # what each recorded sign-in says of the provider it came through
+        self.audit_who = []                # (action, the username a row is recorded under, or None)
 
         class _Audit:
             def __init__(_self, db):
                 pass
 
-            def log_login_success(_self, user, ip, is_temporary=False, methods=None):
+            def log_login_success(_self, user, ip, is_temporary=False, methods=None, **through):
                 self.audits.append(("login_success", user.username, list(methods or [])))
+                self.signed_in_through.append(through)
 
             def log_login_failure(_self, username, ip, reason, **kw):
                 self.audits.append(("login_failure", username, reason))
@@ -243,9 +246,11 @@ class Harness:
 
             def log_action(_self, **kw):
                 self.audits.append((kw.get("action"), kw.get("status"), dict(kw.get("details") or {})))
+                self.audit_who.append((kw.get("action"), getattr(kw.get("user"), "username", None)))
 
             def build_row(_self, **kw):
                 self.audits.append((kw.get("action"), kw.get("status"), dict(kw.get("details") or {})))
+                self.audit_who.append((kw.get("action"), getattr(kw.get("user"), "username", None)))
                 return types.SimpleNamespace(**kw)
         import app.services.audit_logger as al
         monkeypatch.setattr(al, "AuditLogger", _Audit)
@@ -384,6 +389,8 @@ def test_a_known_identity_signs_in_through_a_one_time_code(monkeypatch):
     assert claims["idp"] == str(p.id) and claims["amr"] == [] and "mfa_at" not in claims and claims["sub"] == str(alice.id)
     assert abs(int(claims["auth_time"]) - time.time()) <= 60 and "idp_auth_time" not in claims
     assert ("login_success", "alice", []) in h.audits and identity.last_sign_in_at is not None
+    # The record of the sign-in names the provider it came through, and that its second factor did not count.
+    assert h.signed_in_through == [{"provider_id": str(p.id), "provider_mfa": False}]
     # The code is spent too.
     assert h.finish(location)[0] == 401
 
@@ -1366,3 +1373,45 @@ def test_a_provider_sign_in_time_that_has_not_come_yet_is_refused_beyond_the_ske
     assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "provider_clock_ahead" for a in h.audits), h.audits
     from app.services import sso_sign_in as sso
     assert "clock" in sso.REASON_TEXTS["provider_clock_ahead"]
+
+
+def test_a_refusal_that_met_an_account_is_recorded_under_it(monkeypatch):
+    """A leaver's account is turned off and its identity stays linked. They sign in through the provider and are
+    refused. The record of that is the account's, as a wrong password for it is: an administrator who looks for
+    the person finds that they tried to come back. A refusal that met no account names nobody."""
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    alice.is_active = False
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location == "/#sso-error=account_disabled", location
+    assert ("sso_sign_in_refused", "alice") in h.audit_who
+    del h.audit_who[:]
+    h.claims_override = {"sub": "somebody-the-vault-does-not-know"}
+    status, out = h.start(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location == "/#sso-error=no_account", location
+    assert h.audit_who == [("sso_sign_in_refused", None)]
+
+
+def test_the_record_of_a_sign_in_says_which_provider_it_came_through():
+    """What the audit log keeps of a successful sign-in: through a provider, the provider, what was proved here
+    beside it (nothing, where the provider's sign-in was all of it) and whether the provider's own second factor
+    stood in for the vault's. A sign-in through no provider says nothing of one."""
+    from app.services.audit_logger import AuditLogger
+    logged = []
+    log = AuditLogger.__new__(AuditLogger)
+    log.log_action = lambda **kw: logged.append(kw)
+    user = types.SimpleNamespace(id=uuid.uuid4(), username="alice")
+    log.log_login_success(user, "203.0.113.9", methods=[], provider_id="p-1", provider_mfa=True)
+    log.log_login_success(user, "203.0.113.9", methods=["totp"], provider_id="p-1")
+    log.log_login_success(user, "203.0.113.9", methods=["pwd"])
+    log.log_login_success(user, "203.0.113.9")
+    shown = [{k: v for k, v in row["details"].items() if k != "timestamp"} for row in logged]
+    assert shown == [{"is_temporary": False, "methods": [], "provider_id": "p-1", "provider_mfa": True},
+                     {"is_temporary": False, "methods": ["totp"], "provider_id": "p-1", "provider_mfa": False},
+                     {"is_temporary": False, "methods": ["pwd"]},
+                     {"is_temporary": False}]
+    assert all(row["action"] == "login_success" and row["user"] is user for row in logged)

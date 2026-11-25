@@ -120,7 +120,9 @@ def test_an_invitation_is_accepted_through_the_provider(monkeypatch):
     assert ("account_invitation_accepted", "success",
             {"username": "newbie", "role": str(user.role), "token_prefix": inv.token_prefix, "method": "sso",
              "provider_id": str(p.id)}) in h.audits, h.audits
-    assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "invitation"}) in h.audits
+    (identity,) = h.identities()
+    assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "invitation",
+                                               "identity_id": str(identity.id), "made_sso_only": False}) in h.audits
     assert ("account_welcome", "alice@example.test", None) in h.emails
     assert h.notices == []                                        # an invitation is the owner's own doing: no notice
     # Made, linked and claimed in one commit, and the same call signs the account in.
@@ -764,7 +766,8 @@ def test_a_verified_email_links_an_existing_account_when_the_provider_allows_it_
     assert told == [[str(root.id), str(other.id)]], h.notices
     (identity,) = h.identities()
     assert identity.user_id == bob.id and identity.linked_by == "email" and identity.email_at_link == "bob@example.test"
-    assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "email"}) in h.audits
+    assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "email",
+                                               "identity_id": str(identity.id), "made_sso_only": False}) in h.audits
     assert ([str(bob.id)], "A sign-in method was added") in h.notices
     # The account keeps its password here: what to do if it was not them is to remove the link and change it.
     (said,) = [body for ids, title, body in h.notice_bodies if title == "A sign-in method was added"]
@@ -859,7 +862,9 @@ def test_a_restricted_provider_makes_an_account_at_the_first_sign_in(monkeypatch
     assert h.grants == [(str(user.id), str(user.role), False)]
     assert ("sso_account_created", "success",
             {"username": "Alice.Example", "role": str(user.role), "provider_id": str(p.id)}) in h.audits, h.audits
-    assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "jit"}) in h.audits
+    (identity,) = h.identities()
+    assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "jit",
+                                               "identity_id": str(identity.id), "made_sso_only": False}) in h.audits
     assert ([str(root.id)], "An account was created by single sign-on") in h.notices
     assert ("account_welcome", "alice@example.test", None) in h.emails
     status, body = h.finish(location)

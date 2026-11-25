@@ -289,11 +289,14 @@ def tell(db, row, user, applied: Applied, *, client_ip) -> None:
         except Exception as exc:  # noqa: BLE001
             log.info("sso groups-missing notice skipped: %s", type(exc).__name__)
         return
+    # Recorded under the account that signed in: its own sign-in moved it, by the provider's word (``via``,
+    # ``provider_id``). With nobody named the Activity page showed the change as made by nobody, and whoever
+    # looked for the person did not find it.
     for gid in applied.joined_ids:
-        api._audit_access_change(db, None, "group_members_added", "group", gid,
+        api._audit_access_change(db, user, "group_members_added", "group", gid,
                                  {"user_ids": [str(user.id)], "added": 1, "via": "single_sign_on", "provider_id": pid})
     for gid in applied.left_ids:
-        api._audit_access_change(db, None, "group_member_removed", "group", gid,
+        api._audit_access_change(db, user, "group_member_removed", "group", gid,
                                  {"user_id": str(user.id), "via": "single_sign_on", "provider_id": pid})
     if applied.role_change is not None:
         _audit(db, "sso_role_changed", user=user, ip=client_ip,

@@ -492,7 +492,7 @@ def resolve_account(db, row, answer: ProviderAnswer) -> Resolution:
         if user is None:
             raise Refusal(NO_ACCOUNT)
         if not account_usable(user):
-            raise Refusal(ACCOUNT_DISABLED)
+            raise Refusal(ACCOUNT_DISABLED, about=user)
         if identity.tenant_id is None and answer.tenant_id:
             identity.tenant_id = answer.tenant_id      # linked before the provider named a tenant: pinned from now on
         return Resolution(user, identity)

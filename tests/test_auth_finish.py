@@ -104,8 +104,11 @@ def finish(monkeypatch):
         def __init__(self, db):
             pass
 
-        def log_login_success(self, user, ip, is_temporary=False, methods=None):
+        def log_login_success(self, user, ip, is_temporary=False, methods=None, **through):
             made["audit"].append(("success", user.username, methods))
+
+        def log_login_failure(self, username, ip, reason, *, account=None, login_identifier="username"):
+            made["audit"].append(("failure", username, reason, getattr(account, "username", None)))
 
         def log_action(self, **kw):
             made["audit"].append(("action", kw.get("action")))
@@ -310,3 +313,74 @@ def test_a_busy_finish_says_to_start_again_because_its_code_is_spent(finish, mon
     code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
     status, _headers, body = _post_with_headers(f.S, "/auth/finish", {"code": code, "verifier": verifier})
     assert status == 403 and "locked" in body["detail"].lower()
+
+
+def test_a_real_code_that_is_refused_is_recorded_for_the_account_it_named(finish, monkeypatch):
+    """Somebody redeems a sign-in code with a proof that is not the tab's: the code is spent and the person is
+    told theirs is not valid. The account the code named is known, and the refusal is recorded as its failed
+    sign-in. The same for a code whose account was turned off, or whose held sign-in ended, in the minute it
+    lives. An unknown code names nobody and leaves nothing. The answer is the same in every case."""
+    f = finish
+    answers = []
+
+    def redeem(code, **proof):
+        status, body = _post(f.S, "/auth/finish", {"code": code, **proof})
+        answers.append((status, body.get("detail")))
+
+    def failures():
+        return [row for row in f.made["audit"] if row[0] == "failure"]
+    code, _verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    redeem(code, verifier="not-it")
+    assert failures() == [("failure", "alice", "sign-in code proof mismatch", "alice")]
+    code, _verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    redeem(code)                                                       # no proof at all
+    assert len(failures()) == 2 and failures()[-1][2] == "sign-in code proof mismatch"
+    # A held sign-in the code named that is no longer there.
+    code, verifier = _code(f, f.alice, pending_id=str(uuid.uuid4()))
+    redeem(code, verifier=verifier)
+    assert failures()[-1] == ("failure", "alice", "sign-in code after its held sign-in ended", "alice")
+    # The account turned off meanwhile.
+    f.alice.is_active = False
+    code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    redeem(code, verifier=verifier)
+    assert failures()[-1] == ("failure", "alice", "sign-in code for an account that cannot sign in", "alice")
+    f.alice.is_active = True
+    # Nobody to record it for: an unknown code, a spent one, a code for an account that is gone.
+    before = len(f.made["audit"])
+    redeem("unknown", verifier="v")
+    redeem(code, verifier=verifier)
+    code, verifier = _code(f, _user(username="ghost"), user_verified=True, passwordless_allowed=True)
+    redeem(code, verifier=verifier)
+    assert len(f.made["audit"]) == before
+    # A code that stands for an invitation accepted through a provider has no account yet: the provider is named.
+    record = f.codes.Handover(user_id="", methods=[], client_ip="10.0.0.1", verifier_hash=f.codes.digest("tab"),
+                              provider_id="p-1", ended=0,
+                              invitation={"invitation_id": "i-1", "answer": {"subject": "s-1", "issuer": "https://idp.example.org"}})
+    redeem(f.codes.store(record, redis=f.redis), verifier="not-it")
+    assert f.made["audit"][-1] == ("action", "sso_sign_in_refused") and len(failures()) == 4
+    # One answer for all of them, and no session.
+    assert set(answers) == {(401, "This sign-in code is not valid; start again.")} and f.made["sessions"] == []
+    # A record that cannot be written changes nothing of the answer.
+    class Broken:
+        def __init__(self, db):
+            raise RuntimeError("the audit log is down")
+    monkeypatch.setattr(f.S, "AuditLogger", Broken)
+    code, _verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    assert _post(f.S, "/auth/finish", {"code": code, "verifier": "not-it"})[0] == 401
+
+
+def test_the_code_store_says_why_it_refused_a_real_code_to_whoever_asks(finish):
+    f = finish
+    why = []
+    code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    assert f.codes.take(code, verifier="not-it", redis=f.redis, refused=why) is None
+    ((record, reason),) = why
+    assert record.user_id == str(f.alice.id) and reason == f.codes.PROOF_MISMATCH
+    assert f.codes.take(code, verifier=verifier, redis=f.redis, refused=why) is None and len(why) == 1      # spent
+    assert f.codes.take("unknown", verifier="v", redis=f.redis, refused=why) is None and len(why) == 1
+    # Nobody asks: refused the same, and nothing is kept.
+    code, _verifier = _code(f, f.alice)
+    assert f.codes.take(code, verifier="not-it", redis=f.redis) is None
+    # The right proof gives the record, and adds nothing.
+    code, verifier = _code(f, f.alice)
+    assert f.codes.take(code, verifier=verifier, redis=f.redis, refused=why).user_id == str(f.alice.id) and len(why) == 1
