@@ -1607,3 +1607,63 @@ def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, sta
     # What the sentence says is what holds: the keys are paused exactly where it says they stay paused.
     assert (F.lapsed(h.db, alice.id) is not None) is ("stay paused" in noticed[0])
     assert (F.held_to_a_provider(h.db, alice) is not None) is ("sign in to nothing" in noticed[0])
+
+
+def test_a_failed_test_on_a_provider_that_is_on_keeps_what_the_last_passing_test_established(monkeypatch):
+    """Contoso is on, and the accounts that sign in only through it depend on it. An administrator runs a test
+    sign-in to read a group's exact name, and cancels at the provider. The failure's summary replaced the passing
+    one, and with it went the fact that Contoso says when it signed a person in: it confirmed nobody any more,
+    and a link through it took a sign-in from a session the provider already had. Until someone ran a passing
+    test. The failed test is recorded and still keeps the provider from being turned on; what the passing test
+    established about the provider stays while the connection is the same."""
+    from datetime import timezone
+    from app.core import sso_state
+    from app.services import oidc_client as oc
+    from app.services import sso_providers
+    from app.services import sso_sign_in as sso
+    root, p = _user("root", role="admin"), _provider(state="enabled")
+    passed = {"outcome": "ok", "at": "2026-11-01T10:00:00Z", "tester": "root", "auth_time_present": True,
+              "groups": ["finance", "staff"], "config": sso_providers.fingerprint(p)}
+    p.last_test = dict(passed)
+    h = Harness(monkeypatch, [root], [p])
+    assert sso.reauth_offered(p) is True and sso_providers.tested(p) is True
+    url = sso.start(p, purpose=sso_state.TEST, source="s", client_ip="203.0.113.9", verifier_hash=_h("test-tab"),
+                    user_id=root.id, session_hash="sess-hash")
+    state, _ = h.state_of(url)
+    status, location, _ = h.callback(p, state, code=None, error="access_denied")      # cancelled at the provider
+    status, out = h.finish_test(p, location)
+    assert status == 200 and out["tested"] is False and out["summary"]["outcome"] == oc.PROVIDER_ERROR, out
+    # Recorded as failed, by its tester and its moment; a provider is still not turned on with it.
+    assert p.last_test["outcome"] == oc.PROVIDER_ERROR and p.last_test["at"] != passed["at"]
+    assert sso_providers.tested(p) is False
+    # What the passing test established stands: confirmations are offered, and a link's sign-in is judged.
+    assert p.last_test["auth_time_present"] is True and p.last_test["groups"] == ["finance", "staff"]
+    assert sso.reauth_offered(p) is True
+    stale = types.SimpleNamespace(auth_time=datetime.now(timezone.utc) - timedelta(days=3))
+    with pytest.raises(sso.Refusal):
+        sso.link_freshness_refusal(p, stale)
+    # A second failure in a row keeps it too.
+    again = sso.keeping_what_a_passing_test_established(sso.failed_test_summary(p, "root", oc.TOKEN_INVALID), p.last_test)
+    assert again["outcome"] == oc.TOKEN_INVALID and again["auth_time_present"] is True and again["groups"] == ["finance", "staff"]
+
+
+def test_what_a_failed_test_keeps_and_what_it_does_not():
+    from app.services import sso_sign_in as sso
+    failed = {"outcome": "provider_error", "at": "now", "tester": "root", "message": "m", "config": "c-1"}
+    passed = {"outcome": "ok", "at": "then", "tester": "ann", "auth_time_present": True, "groups": ["g"],
+              "mfa_trusted": True, "config": "c-1"}
+    kept = sso.keeping_what_a_passing_test_established(failed, passed)
+    assert kept == {**failed, "auth_time_present": True, "groups": ["g"]}        # nothing else of the earlier test
+    # Run with another connection: nothing is known of the provider as it is set up now.
+    assert sso.keeping_what_a_passing_test_established(failed, {**passed, "config": "c-0"}) == failed
+    assert sso.keeping_what_a_passing_test_established({**failed, "config": None}, {**passed, "config": None}) == {
+        **failed, "config": None}
+    # No test before, or a record that is no summary: the failure as it is.
+    for nothing in (None, {}, "ok", []):
+        assert sso.keeping_what_a_passing_test_established(failed, nothing) == failed
+    # A passing test is written as it is: it establishes these itself (here, that the provider sends no time).
+    fresh = {"outcome": "ok", "at": "now", "auth_time_present": False, "groups": [], "config": "c-1"}
+    assert sso.keeping_what_a_passing_test_established(fresh, passed) == fresh
+    # An earlier test that established nothing gives nothing.
+    assert sso.keeping_what_a_passing_test_established(failed, {"outcome": "token_invalid", "config": "c-1"}) == failed
+    assert sso.ESTABLISHED_BY_A_PASSING_TEST == ("auth_time_present", "groups")

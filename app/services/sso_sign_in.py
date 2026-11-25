@@ -1206,6 +1206,34 @@ def failed_test_summary(row, tester_name: str, code: str) -> dict:
             "message": test_failure_text(code), "config": sso_providers.fingerprint(row)}
 
 
+# What a test sign-in that passed establishes about the provider itself, which later checks read from the last
+# test: whether it says when it signed the person in (the confirmations it can give, and whether a link's fresh
+# sign-in is judged), and the groups it sent (what the Groups page offers to map).
+ESTABLISHED_BY_A_PASSING_TEST = ("auth_time_present", "groups")
+
+
+def keeping_what_a_passing_test_established(summary: dict, previous) -> dict:
+    """``summary`` of a test sign-in as it is written on the provider, given the one written there before.
+
+    A test that did not pass is recorded, so that a provider is not turned on with it. Its summary holds the
+    reason and no more, and it replaced the last one. For a provider that is on, one failed test (the
+    administrator cancelled at the provider, or tested with an account the application is not assigned to) then
+    turned off what the passing test had established: the provider could confirm nobody any more (no step-up
+    for an account that signs in only through it, no first passkey, an owner's unlink refused), and a link
+    through it accepted a sign-in from a session the provider already had. Nothing told anybody, and it lasted
+    until somebody ran a test that passed.
+
+    A failed test says nothing of what the provider sends. While the connection it was run with is the one the
+    earlier test was run with, what that test established is kept in the failure's summary. With another
+    connection, nothing is known and nothing is kept."""
+    if summary.get("outcome") == "ok" or not isinstance(previous, dict):
+        return summary
+    if not summary.get("config") or summary.get("config") != previous.get("config"):
+        return summary
+    kept = {key: previous[key] for key in ESTABLISHED_BY_A_PASSING_TEST if key in previous}
+    return {**summary, **kept}
+
+
 def _group_names(row, answer: ProviderAnswer) -> list:
     return sorted(answer.groups or [])[:200]
 

@@ -1254,7 +1254,7 @@ async def finish_test(
     row = _provider(db, provider_id)
     if row is None or str(row.id) != record["provider_id"]:
         raise HTTPException(status_code=404, detail="Unknown provider.")
-    row.last_test = record.get("summary") or {}
+    row.last_test = sso.keeping_what_a_passing_test_established(record.get("summary") or {}, row.last_test)
     db.commit()
     outcome = str((row.last_test or {}).get("outcome") or "")
     passed = outcome == "ok"
