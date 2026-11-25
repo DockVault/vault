@@ -7063,6 +7063,7 @@ async function loadUsers() {
         updateActionButtonPermissions();
         loadInvites();
         loadCredentialRequests();
+        loadSsoAdminRequests();
     } catch (error) {
         console.error('Failed to load users:', error);
         container.innerHTML = `<div class="alert alert-error">Failed to load users: ${escapeHtml(error.message)}</div>`;
@@ -7460,6 +7461,129 @@ async function decideCredentialRequest(req, action, btn) {
     } finally {
         if (btn) btn.disabled = false;
         loadUsers();
+    }
+}
+
+// ---- Administrator requests from single sign-on (admin) -------------------------------------
+// A provider that maps a group to the administrator role grants nothing at a sign-in: the sign-in raises a request
+// that waits seven days for an administrator's approval (GET /admin/sso/admin-requests; approving or denying one
+// asks for the step-up). The card shows the waiting ones and, folded away, the last fifty decided. Built with DOM
+// APIs (no innerHTML).
+async function loadSsoAdminRequests() {
+    const block = document.getElementById('sso-admin-requests');
+    if (!block) return;
+    if (!currentUser || currentUser.role !== 'admin' || isScopedTemp) {
+        block.style.display = 'none';
+        return;
+    }
+    try {
+        renderSsoAdminRequests((await apiRequest('/admin/sso/admin-requests', { silent: true })) || {});
+    } catch (_) {
+        block.style.display = 'none';
+    }
+}
+
+// What became of a decided request, in a sentence. An expired one ran out at the end of its seven days; one that
+// was approved and then ended was ended by a later sign-in that found the person outside the group.
+function _ssoAdminDecidedText(req) {
+    const by = req.decided_by || 'an administrator';
+    if (req.state === 'approved') return 'Approved by ' + by + ', ' + formatServerTime(req.decided_at) + '.';
+    if (req.state === 'denied') return 'Denied by ' + by + ', ' + formatServerTime(req.decided_at) + '.';
+    if (req.state === 'expired') return 'Expired ' + formatServerTime(req.expires_at) + ': nobody decided within 7 days.';
+    if (req.state === 'demoted') {
+        return 'Approved by ' + by + ', ' + formatServerTime(req.decided_at) + '. The role ended when a later sign-in '
+            + 'through ' + req.provider + ' no longer put them in the group.';
+    }
+    return String(req.state || '');
+}
+
+function renderSsoAdminRequests(data) {
+    const block = document.getElementById('sso-admin-requests');
+    const list = document.getElementById('sso-admin-requests-list');
+    const decidedBox = document.getElementById('sso-admin-requests-decided');
+    const decidedList = document.getElementById('sso-admin-requests-decided-list');
+    if (!block || !list) return;
+    const held = Array.isArray(data && data.held) ? data.held : [];
+    const decided = Array.isArray(data && data.decided) ? data.decided : [];
+    list.replaceChildren();
+    if (decidedList) decidedList.replaceChildren();
+    if (!held.length && !decided.length) {
+        block.style.display = 'none';
+        return;
+    }
+    block.style.display = '';
+    if (!held.length) list.appendChild(_el('p', 'text-sm text-tertiary', 'No request is waiting.'));
+    held.forEach(req => {
+        const name = req.username || 'An account that no longer exists';
+        const row = _el('div', 'credential-request-row');
+        row.setAttribute('data-request-id', req.id);
+        const text = _el('div', 'credential-request-text');
+        text.appendChild(_el('div', 'credential-request-title', name + ' signed in through ' + req.provider
+            + ' in the group ' + req.provider_group + ', which is mapped to the administrator role.'));
+        text.appendChild(_el('div', 'credential-request-meta', 'Requested ' + formatServerTime(req.requested_at)
+            + ' · expires ' + formatServerTime(req.expires_at)));
+        row.appendChild(text);
+        const actions = _el('div', 'credential-request-actions');
+        if (req.you_may_decide) {
+            const approve = _el('button', 'btn btn-sm btn-primary', 'Approve');
+            approve.type = 'button';
+            approve.setAttribute('aria-label', 'Approve ' + name);
+            approve.addEventListener('click', () => decideSsoAdminRequest(req, true, approve));
+            const deny = _el('button', 'btn btn-sm btn-secondary', 'Deny');
+            deny.type = 'button';
+            deny.setAttribute('aria-label', 'Deny ' + name);
+            deny.addEventListener('click', () => decideSsoAdminRequest(req, false, deny));
+            actions.append(approve, deny);
+        } else if (req.refusal) {
+            // Why this administrator may not decide it (their own account, a change they made, too new...).
+            actions.appendChild(_el('span', 'credential-request-waiting', req.refusal));
+        }
+        row.appendChild(actions);
+        list.appendChild(row);
+    });
+    if (decidedBox) decidedBox.style.display = decided.length ? '' : 'none';
+    if (decidedList) {
+        decided.forEach(req => {
+            const row = _el('div', 'credential-request-row');
+            row.setAttribute('data-request-id', req.id);
+            const text = _el('div', 'credential-request-text');
+            text.appendChild(_el('div', 'credential-request-title', (req.username || 'An account that no longer exists')
+                + ', through ' + req.provider + ' (group ' + req.provider_group + ')'));
+            text.appendChild(_el('div', 'credential-request-meta', _ssoAdminDecidedText(req)));
+            row.appendChild(text);
+            row.appendChild(_el('div', 'credential-request-actions'));
+            decidedList.appendChild(row);
+        });
+    }
+}
+
+async function decideSsoAdminRequest(req, approve, btn) {
+    const name = req.username || 'this account';
+    const asked = approve
+        ? ['Make ' + name + ' an administrator? Their sign-in through ' + req.provider + ' put them in a group mapped '
+            + 'to the administrator role. They and the other administrators are told.', 'Approve the administrator role?', 'Approve']
+        : [name + ' stays as they are, and is told the administrator role was not granted.', 'Deny the administrator role?', 'Deny'];
+    if (!await showConfirm(asked[0], asked[1], null, asked[2])) return;
+    if (btn) btn.disabled = true;
+    const path = '/admin/sso/admin-requests/' + encodeURIComponent(req.id) + (approve ? '/approve' : '/deny');
+    try {
+        const r = await apiRequest(path, { method: 'POST' });
+        if (approve) {
+            const who = (r && r.username) || name;
+            showSuccess(who + ' is now an administrator.');
+            // A password someone else had set was taken back at the promotion: its reset link, as any promotion's.
+            const handed = r && r.handed_over;
+            if (handed && handed.reset_link) _showResetLinkModal(handed.reset_link, who, handed.expires_in_minutes);
+            else if (handed && handed.emailed) showSuccess('Their password was reset: a link to choose a new one was emailed to them.');
+            else if (handed) showError('Their password was reset, and no reset link could be made: set a new password for them.');
+        } else {
+            showSuccess(name + ' was not made an administrator; they are told.');
+        }
+    } catch (e) {
+        showError(e.message || 'The request could not be decided.');
+    } finally {
+        if (btn) btn.disabled = false;
+        loadUsers();          // reads the card again too
     }
 }
 

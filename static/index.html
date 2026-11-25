@@ -1588,6 +1588,17 @@
                         <div id="credential-requests-list"></div>
                     </div>
 
+                    <!-- The administrator role a provider's group mapping asked for at a sign-in, waiting for an administrator's approval (static/js/app.js loadSsoAdminRequests) -->
+                    <div id="sso-admin-requests" class="credential-requests" style="display: none;">
+                        <h3 class="text-lg font-bold">Administrator requests from single sign-on</h3>
+                        <p class="text-sm text-tertiary">A sign-in through a provider put these people in a group mapped to the administrator role. The role is granted only when an administrator approves it within 7 days.</p>
+                        <div id="sso-admin-requests-list"></div>
+                        <details id="sso-admin-requests-decided" style="display: none;">
+                            <summary class="text-sm">Decided</summary>
+                            <div id="sso-admin-requests-decided-list"></div>
+                        </details>
+                    </div>
+
                     <div id="users-list"></div>
 
                     <!-- Pending invitations (only when invitations are enabled) -->
