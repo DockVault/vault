@@ -11276,6 +11276,20 @@ async def get_my_second_factor(
     }
 
 
+def _factor_before_another_from_a_session(db, user, request, pending) -> None:
+    """An account that holds a factor (a passkey) adds an authenticator from a session only behind that factor:
+    the ``account.second_factor`` step-up, as a passkey's registration asks (:func:`_passkey_first_proof`). With
+    the password alone, whoever knew the password of an account that holds only passkeys enrolled an
+    authenticator of their own, and with it met every step-up the passkey guards, the removal of the owner's
+    passkeys among them. At a held sign-in the account's factor is asked where the factor is stored
+    (app/services/sign_in.py, refuse_enrollment_before_the_accounts_factor), so nothing is asked here."""
+    if pending is not None:
+        return
+    from app.core.active_factors import active_factors
+    if active_factors(db, user.id).any:
+        _enforce_step_up(db, user, request, "account.second_factor")
+
+
 @app.post("/users/me/second-factor/totp/enroll")
 async def enroll_totp(
     body: TotpEnrollRequest,
@@ -11300,6 +11314,7 @@ async def enroll_totp(
         raise HTTPException(status_code=404, detail="User not found")
     if _sf_enrollment(db, user.id, status="active"):
         raise HTTPException(status_code=409, detail="A second factor is already active; disable it before enrolling a new one.")
+    _factor_before_another_from_a_session(db, user, request, _pending)
     if not user.password_hash or not verify_password(body.current_password, user.password_hash):
         raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
 
@@ -11383,6 +11398,7 @@ async def acknowledge_recovery_codes(
     current_user, pending = principal
     if getattr(current_user, "_is_temp_session", False):
         raise HTTPException(status_code=403, detail="Temporary credentials cannot manage the second factor.")
+    _factor_before_another_from_a_session(db, current_user, request, pending)
     enr = db.query(SecondFactorEnrollment).filter(
         SecondFactorEnrollment.user_id == current_user.id,
         SecondFactorEnrollment.status == "unconfirmed",
