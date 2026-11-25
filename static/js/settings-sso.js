@@ -522,8 +522,9 @@
             }
             return;
         }
-        // A later read, another provider or another page of the dialog: this answer draws nothing.
-        if (mine !== identityReads || !open || open.id !== providerId || page !== 'identities') return;
+        // A later read draws the list (another page of it, the list read again after a lift, the page shown again):
+        // this answer draws nothing. A list the dialog no longer shows is not in the page any more.
+        if (mine !== identityReads) return;
         const rows = Array.isArray(read.identities) ? read.identities : [];
         const total = Number(read.total) || 0;
         const from = Number(read.skip) || 0;

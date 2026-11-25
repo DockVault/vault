@@ -198,19 +198,30 @@ out({ first, second, empty: byId('sso-identities').textContent, pager: pager() =
     assert got["empty"] == "0 linked accountsNo account is linked to this provider." and got["pager"] is True
 
 
-def test_an_answer_for_a_page_no_longer_shown_draws_nothing():
+def test_an_answer_that_comes_after_a_later_one_draws_nothing():
+    """The person pages on, and back, faster than the server answers: the list shows the page asked for last, whatever
+    order the answers come in."""
     got = _node(r"""
-let release;
-answers[IDS] = () => new Promise((resolve) => { release = () => resolve(LIST); });
-await window.SsoSettings.load();
-document.querySelector('.sso-provider-row button').click();
-await tick(); await tick();
-byId('sso-tab-identities').click();
+const page = (skip, count, total) => ({ provider_id: 'p-1', total, skip, limit: 50, counts: { refused: 0, lapsed: 0, linked: total },
+    identities: Array.from({ length: count }, (_, i) => ({ id: 'i-' + (skip + i), user_id: 'u-' + (skip + i),
+        username: 'user' + (skip + i), linked_by: 'self', linked_at: null, last_sign_in_at: null, state: 'linked',
+        refused_at: null, due_at: null, holds_sign_in: false, own: false })) });
+answers[IDS] = page(0, 50, 70);
+await openIdentities();
+const pager = () => document.querySelector('.sso-identities-pager');
+let releaseSecond;
+answers['/admin/sso/providers/p-1/identities?skip=50&limit=50'] = () => new Promise((resolve) => {
+    releaseSecond = () => resolve(page(50, 20, 70)); });
+pager().children[2].click();                 // the second page is asked for, and is slow to come
 await tick();
-byId('sso-tab-connection').click();          // the person moved on before the list came
+let releaseFirst;
+answers[IDS] = () => new Promise((resolve) => { releaseFirst = () => resolve(page(0, 50, 70)); });
+pager().children[0].click();                 // and the first again, before it came
 await tick();
-release();
+releaseFirst();
 await tick(); await tick();
-out({ rows: rows().length, identities: byId('sso-identities') === null, connection: byId('sso-page-connection') !== null });
+releaseSecond();                             // the slow answer comes last
+await tick(); await tick();
+out({ first: rows()[0].name, count: rows().length, said: pager().children[1].textContent });
 """)
-    assert got == {"rows": 0, "identities": True, "connection": True}
+    assert got == {"first": "user0", "count": 50, "said": "1 to 50 of 70"}
