@@ -465,6 +465,27 @@ def test_a_sign_in_that_would_link_a_busy_account_says_that_signing_in_is_busy(m
     assert body["reasons"][oc.TEMPORARILY_UNAVAILABLE] == "The provider could not be reached. Try again in a moment."
 
 
+def test_a_held_account_with_a_factor_of_its_own_is_told_that_it_is_held_not_to_use_its_password(monkeypatch):
+    """An account with a second factor of its own is never linked by its address: it is told to sign in with its
+    password and link from its profile. For an account that is held, both are refused: it is told that it is
+    held, which is what it can act on. The hold is asked before the factor."""
+    from app.services import sso_sign_in as sso
+    bob = _user("bob")
+    holding = _provider(name="contoso")
+    other = _provider(name="fabrikam", label="Sign in with Fabrikam",
+                      policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    held_by = _identity(bob, holding, subject="bob-at-contoso", last_sign_in_at=datetime.utcnow() - LONG_AGO)
+    h = Resolving(monkeypatch, [bob], [holding, other], identities=[held_by])
+    monkeypatch.setattr(sso, "set_up_its_own_factor", lambda db, user: True)
+    assert F.held_to_a_provider(h.db, bob) is not None
+    location, _ = _sign_in(h, other, sub="bob-at-fabrikam", email="bob@example.test")
+    assert location == "/#sso-error=held_to_a_provider", location
+    # Not held, the same account is sent to its profile, as before.
+    held_by.last_sign_in_at = datetime.utcnow()
+    location, _ = _sign_in(h, other, sub="bob-at-fabrikam", email="bob@example.test")
+    assert location == "/#sso-error=" + sso.LINK_FROM_PROFILE, location
+
+
 def test_a_held_account_is_not_linked_by_its_verified_email_at_another_provider(monkeypatch):
     """A second provider that links by a verified address would give a held account a way back in: the sign-in
     that made the link would finish as a provider's own. Refused where the link is decided, as the link from Your
@@ -482,6 +503,17 @@ def test_a_held_account_is_not_linked_by_its_verified_email_at_another_provider(
     assert len(h.identities()) == 1
     assert [a for a in h.audits if a[0] == "sso_sign_in_refused"][-1][2]["reason"] == sso.HELD_TO_A_PROVIDER
     assert "signs in only through the sign-in it already uses" in sso.REASON_TEXTS[sso.HELD_TO_A_PROVIDER]
+    # The owner is told what works: the holding provider first, in the words its own doors use, and only then the
+    # link. Not "link it under Your account", which is refused for a held account, as its password is.
+    (ids, title, body), = [n for n in h.notice_bodies if n[1].endswith("with your address was kept out")]
+    assert ids == [str(bob.id)] and title == "A sign-in through Sign in with Fabrikam with your address was kept out"
+    assert F.way_in_text(h.db, F.held_to_a_provider(h.db, bob)) in body
+    assert "Once your account has signed in there, you can link Sign in with Fabrikam under Your account." in body
+    assert "If that was you, link it there" not in body
+    # The administrators are told: a person who can no longer sign in through one provider and tries another.
+    (ids, title, body), = [n for n in h.notice_bodies if "tried to reach bob's account" in n[1]]
+    assert ids == [str(root.id)] and "signs in only through contoso until it has signed in there again" in body
+    assert "Nobody was signed in and nothing was linked." in body
     # What a test sign-in at that provider says of the same person.
     told = sso.would_do(h.db, other, types.SimpleNamespace(
         issuer=other.issuer, subject="bob-at-fabrikam", tenant_id=None, email="bob@example.test", email_verified=True,

@@ -1266,6 +1266,37 @@ def _identity_public(identity: ExternalIdentity, row: Optional[SsoProvider]) -> 
             "last_sign_in_at": _t(identity.last_sign_in_at)}
 
 
+def _tell_of_a_held_account_kept_out(db, row, user, label: str, key: str) -> None:
+    """A sign-in at ``row`` carried the address of ``user``, whose account is held to another provider's sign-in:
+    the owner is told what works (the holding provider first, in the words its own doors use), and the
+    administrators are told once a day for the account. Called inside the caller's guard."""
+    from app.core import setting_changes
+    from app.core.models import RoleEnum
+    api = _api()
+    held = sso_freshness.held_to_a_provider(db, user)
+    holding = held.provider_name if held is not None else "the provider it already uses"
+    first = (sso_freshness.way_in_text(db, held) if held is not None else
+             "Your account signs in only through the sign-in it already uses, until it has signed in there again.")
+    api._notify_users([str(user.id)], "account_changed",
+                      title=f"A sign-in through {label} with your address was kept out",
+                      body=(f"Someone signed in through {label} with your email address. Nobody was signed in to your "
+                            f"account and nothing was linked. {first} Once your account has signed in there, you can "
+                            f"link {label} under Your account. If it was not you, your address at {label} may be in "
+                            "someone else's hands: tell an administrator."),
+                      target="#profile", dedup_prefix=key, once=True)
+    # (The held account is never one of them: an administrator is not held.)
+    admins = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN).all() if a.is_active]
+    if admins:
+        api._notify_users(admins, setting_changes.NOTICE_TYPE,
+                          title=f"A sign-in through {label} tried to reach {user.username}'s account",
+                          body=(f"A sign-in through {label} carried the email address of {user.username}, whose "
+                                f"account signs in only through {holding} until it has signed in there again (its "
+                                f"days there ran out, or {holding} did not admit the person). Nobody was signed in "
+                                f"and nothing was linked. A person who can no longer sign in through {holding} and "
+                                "tries another provider looks like this: check the account on the Users page."),
+                          target="#users", dedup_prefix=f"{key}:{user.id}:held", once=True)
+
+
 def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
     """A sign-in at the provider carried the verified address of an account that is never linked by its address
     (it set up a second factor of its own, or it is privileged). Whoever holds that address at the provider
@@ -1280,13 +1311,20 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
     label = (getattr(row, "label", None) or getattr(row, "name", None) or "a provider").strip()
     key = f"sso_kept_out:{row.id}:{datetime.utcnow():%Y-%m-%d}"
     try:
+        detail = getattr(refusal, "detail", "") or ""
+        if detail == sso.HELD_ACCOUNT:
+            # The account is held to the sign-in of a provider it is linked to. "Link it under Your account" is
+            # refused for it, and so is its password: what works is said instead, and the administrators are
+            # told, for a person who can no longer sign in through one provider trying another is what a leaver
+            # does.
+            _tell_of_a_held_account_kept_out(db, row, user, label, key)
+            return
         api._notify_users([str(user.id)], "account_changed", title=f"A sign-in through {label} with your address was kept out",
                           body=(f"Someone signed in through {label} with your email address. Nobody was signed in to your "
                                 f"account and nothing was linked: your account is linked to {label} only by you, under "
                                 f"Your account. If that was you, link it there. If it was not, your address at {label} "
                                 "may be in someone else's hands: tell an administrator."),
                           target="#profile", dedup_prefix=key, once=True)
-        detail = getattr(refusal, "detail", "") or ""
         if detail == sso.ADDRESS_ON_AN_UNCONFIRMED_ACCOUNT:
             # A first sign-in that made no account: its verified address is written on an account that never
             # confirmed it. Either that account is this person's, and they link the provider there; or the

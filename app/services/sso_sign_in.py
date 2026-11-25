@@ -707,6 +707,15 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
         raise Refusal(LINK_FROM_YOUR_ACCOUNT, f"{PRIVILEGED_ACCOUNT}:{kind}", about=user)
     if not email_confirmation.confirmed(user):
         raise Refusal(NO_ACCOUNT, ADDRESS_NOT_CONFIRMED)
+    from app.services import sso_freshness
+    if sso_freshness.held_to_a_provider(db, user) is not None:
+        # The account's sign-in through a provider it is linked to has lapsed, or that provider refused the
+        # person, and it closes the other ways in until the person has signed in there again
+        # (app/services/sso_freshness.py). A link made here would be another way in: the sign-in that made it
+        # would finish as a provider's own, which is let in. Refused as the link from Your account is. Asked
+        # before the account's own factor: an account that is held and has one was sent to sign in with its
+        # password and link from its profile, and both are refused for it while it is held.
+        raise Refusal(HELD_TO_A_PROVIDER, HELD_ACCOUNT, about=user)
     if set_up_its_own_factor(db, user):
         # The account set up a second factor of its own. A link made here would stand before that factor is given:
         # the identity is on the account from the moment the provider answered (and at a provider whose people hold
@@ -715,13 +724,6 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
         # be asked for nothing of the account's. Such an account links the provider from its own profile, where
         # its own sign-in and its own factor stand behind the link.
         raise Refusal(LINK_FROM_PROFILE, HOLDS_A_FACTOR, about=user)
-    from app.services import sso_freshness
-    if sso_freshness.held_to_a_provider(db, user) is not None:
-        # The account's sign-in through a provider it is linked to has lapsed, or that provider refused the
-        # person, and it closes the other ways in until the person has signed in there again
-        # (app/services/sso_freshness.py). A link made here would be another way in: the sign-in that made it
-        # would finish as a provider's own, which is let in. Refused as the link from Your account is.
-        raise Refusal(HELD_TO_A_PROVIDER, HELD_ACCOUNT, about=user)
     if db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == row.id,
                                             ExternalIdentity.user_id == user.id).first() is not None:
         return None          # the account's identity on this provider is another one: an administrator sorts it out
