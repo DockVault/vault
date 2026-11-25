@@ -9878,11 +9878,16 @@ def _count_the_end_of_the_accounts_sessions(db, user_id) -> None:
         {User.sessions_ended: int(counted[0] or 0) + 1}, synchronize_session=False)
 
 
-def _refuse_sftp_password_for_sso_only(db, user, wanted) -> None:
+def _refuse_sftp_password_for_sso_only(db, user, wanted, *, for_owner: bool = False) -> None:
     """An account that signs in only through its identity provider holds no password of its own (app/core/sso_only.py),
     so its SFTP password sign-in cannot be turned on, by the account or by an administrator: SSH keys remain its way
-    in over SFTP."""
+    in over SFTP. An administrator is told which provider setting lets it hold a password; the account's owner
+    (``for_owner``) cannot change that setting, and is told whom to ask."""
     if wanted and getattr(user, "sso_only", False):
+        if for_owner:
+            raise HTTPException(status_code=409, detail=(
+                "This account signs in only through its organisation's provider and has no password for SFTP "
+                "either; use an SSH key, or ask an administrator to let your account hold a password."))
         from app.core import sso_only
         raise HTTPException(status_code=409, detail=(
             "This account signs in only through its organisation's provider and has no password for SFTP either; "
@@ -11386,7 +11391,7 @@ async def update_own_account(
         user.sftp_enabled = body.sftp_enabled
         changes.append("sftp_enabled")
     if body.sftp_password_auth is not None and body.sftp_password_auth != user.sftp_password_auth:
-        _refuse_sftp_password_for_sso_only(db, user, body.sftp_password_auth)
+        _refuse_sftp_password_for_sso_only(db, user, body.sftp_password_auth, for_owner=True)
         user.sftp_password_auth = body.sftp_password_auth
         changes.append("sftp_password_auth")
 
@@ -13945,7 +13950,7 @@ async def update_user(
         changes['sftp_enabled'] = {'old': user.sftp_enabled, 'new': user_update.sftp_enabled}
         user.sftp_enabled = user_update.sftp_enabled
     if user_update.sftp_password_auth is not None:
-        _refuse_sftp_password_for_sso_only(db, user, user_update.sftp_password_auth)
+        _refuse_sftp_password_for_sso_only(db, user, user_update.sftp_password_auth, for_owner=is_self)
         changes['sftp_password_auth'] = {'old': user.sftp_password_auth, 'new': user_update.sftp_password_auth}
         user.sftp_password_auth = user_update.sftp_password_auth
 

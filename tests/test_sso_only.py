@@ -200,12 +200,19 @@ def test_no_reset_link_and_no_password_change_for_an_sso_only_account(monkeypatc
     alice.sftp_password_auth = False
     status, body, _ = _call(S, "PATCH", "/users/me", {"sftp_password_auth": True})
     assert status == 409 and "SSH key" in body["detail"], body
+    # The person is told whom to ask; the provider's setting is the administrators' to change, and named to them.
+    assert "ask an administrator to let your account hold a password" in body["detail"].lower(), body
+    assert "allow password sign-in on" not in body["detail"].lower(), body
     assert alice.sftp_password_auth is False
     import pytest as _pytest
     from fastapi import HTTPException
     with _pytest.raises(HTTPException) as refused:
         S._refuse_sftp_password_for_sso_only(h.db, alice, True)        # the administrator's update asks the same
     assert refused.value.status_code == 409
+    assert "let your account hold a password" not in refused.value.detail, refused.value.detail
+    with _pytest.raises(HTTPException) as refused:
+        S._refuse_sftp_password_for_sso_only(h.db, alice, True, for_owner=True)
+    assert "ask an administrator to let your account hold a password" in refused.value.detail.lower()
     S._refuse_sftp_password_for_sso_only(h.db, alice, False)            # turning it off is always allowed
     S._refuse_sftp_password_for_sso_only(h.db, root, True)              # an ordinary account may turn it on
 
@@ -521,6 +528,9 @@ def test_the_flag_follows_the_providers_an_account_is_still_linked_to(monkeypatc
     b.state = "disabled"
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{on_a.id}")
     assert status == 409 and "no other identity on a provider that is on can sign you in now" in out["detail"], out
+    # No administrator gives one account a password: they let it hold one, and the person then sets it.
+    assert "ask an administrator to let your account hold a password" in out["detail"].lower(), out
+    assert "allow password sign-in on" not in out["detail"].lower() and "for a password first" not in out["detail"]
     assert alice.sso_only is True and len(h.identities()) == 2
     # With it on, the unlink goes through and the account may hold a password again; it is told how to set one.
     b.state = "enabled"

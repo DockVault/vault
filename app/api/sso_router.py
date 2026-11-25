@@ -1468,7 +1468,8 @@ def owners_unlink_refusal(db, account, identity, row, *, now: Optional[datetime]
         if getattr(account, "sso_only", False):
             return (UNLINK_NO_WAY_IN, (
                 "Your account signs in only through single sign-on, and no other identity on a provider that is "
-                "on can sign you in now. Ask an administrator for a password first."))
+                "on can sign you in now. Ask an administrator to let your account hold a password, set one, then "
+                "unlink."))
         from app.api import sso_providers_router
         has_address = bool((getattr(account, "email", None) or "").strip())
         how = ("\"Forgot your password?\" on the sign-in page, or ask an administrator for a reset link"
