@@ -23,6 +23,7 @@ from playwright.sync_api import Page, expect
 
 from conftest import unique
 from test_account_passkeys_page import account_node
+from test_sso_identities_page_ui import _node as sso_dialog_node
 from test_users_page_sso_admin_requests import _node as users_page_node
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -164,6 +165,24 @@ out(list.querySelectorAll('.credential-request-row').map((row) => ({ classes: ro
     assert _declared(".credential-request-actions", rules).get("flex") == "1 1 100%"
     height = _declared(".credential-request-actions .btn", rules).get("min-height", "")
     assert re.fullmatch(r"\d+px", height) and int(height[:-2]) >= 40, height
+
+
+@pytest.mark.unit
+def test_the_provider_dialogs_tabs_wrap_onto_more_lines_on_a_phone():
+    """A provider's dialog in Settings, Sign-in (static/js/settings-sso.js, drawDialog) has six pages. Their tabs are
+    buttons that never break their own text, and on one line they need more than a phone's width: the row wraps, so
+    every tab stays on screen, none is squeezed, and the dialog does not scroll sideways."""
+    got = sso_dialog_node(r"""
+await window.SsoSettings.load();
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+const tabs = document.querySelector('[role="tablist"]');
+out({ classes: tabs.className.split(' '), tabs: tabs.children.map((t) => t.textContent) });
+""")
+    assert got["tabs"] == ["Connection", "Access", "Groups", "Second factor", "Sessions", "Identities"]
+    assert {"sso-tabs", "flex"} <= set(got["classes"]), got["classes"]
+    assert "flex-wrap" in got["classes"], got["classes"]
+    assert _declared(".flex-wrap", _skin_rules("utilities.css")).get("flex-wrap") == "wrap"
 
 
 # --------------------------------------------------------------------------- ui lane

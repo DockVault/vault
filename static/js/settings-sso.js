@@ -1429,7 +1429,8 @@
             left.id = 'sso-sessions-standing';
             body.appendChild(left);
         }
-        const tabs = _el('div', 'sso-tabs flex gap-sm mb-md');
+        // Six tabs need more than a phone's width on one line: the row wraps onto more lines.
+        const tabs = _el('div', 'sso-tabs flex flex-wrap gap-sm mb-md');
         tabs.setAttribute('role', 'tablist');
         PAGES.forEach(([key, text]) => {
             const tab = _el('button', 'btn btn-sm ' + (key === page ? 'btn-primary' : 'btn-secondary'), text);
