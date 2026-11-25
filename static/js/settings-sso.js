@@ -108,6 +108,9 @@
         row.appendChild(text);
         const edit = _el('button', 'btn btn-secondary btn-sm', 'Open');
         edit.type = 'button';
+        // Which provider it opens: its button text, and its name where they differ (a name is never shared).
+        edit.setAttribute('aria-label', 'Open ' + (provider.label || provider.name)
+            + (provider.label && provider.label !== provider.name ? ` (${provider.name})` : ''));
         edit.addEventListener('click', () => show(provider.id, 'connection'));
         row.appendChild(edit);
         return row;

@@ -5,7 +5,7 @@ dates the vault keeps; says on the page what a refusal and a hold are and how ea
 after a confirmation that says what lifting does; reads the list again afterwards; and pages through a long list.
 
 The card and the dialog under SETTINGS_LOCKED_KEYS: they say so in the server's words and offer nothing that would
-change a provider, while what only reads or tests stays.
+change a provider, while what only reads or tests stays. Each provider's Open button names the provider it opens.
 
 Driven in Node against the shipped module, on the small document of tests/js/mini_dom.js, by the clicks a person
 makes: open the provider, open its Identities page.
@@ -334,3 +334,16 @@ out({ card, dialog, patches, lift, wizardAdd: !!byId('sso-new-add').disabled });
         assert dialog["toggle"] is False and dialog["save"] is False and dialog["remove"] is False
         assert dialog["line"] is None and dialog["editable"] is False
         assert got["patches"] == 1 and got["wizardAdd"] is False
+
+
+def test_each_open_button_names_the_provider_it_opens():
+    """A screen reader hears which provider each "Open" opens: its button text, and its name where the two differ
+    (two providers may share a button text, never a name)."""
+    got = _node(r"""
+answers['/admin/sso/providers'].providers = [PROVIDER,
+    Object.assign({}, PROVIDER, { id: 'p-2', name: 'okta-prod', label: null }),
+    Object.assign({}, PROVIDER, { id: 'p-3', name: 'acme', label: 'acme' })];
+await window.SsoSettings.load();
+out(document.querySelectorAll('.sso-provider-row button').map((b) => [b.textContent, b.getAttribute('aria-label')]));
+""")
+    assert got == [["Open", "Open Contoso (contoso)"], ["Open", "Open okta-prod"], ["Open", "Open acme"]]
