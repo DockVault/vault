@@ -11324,6 +11324,43 @@ function collectAccountsPolicy(settings) {
     if (!Number.isNaN(prTtl)) settings.password_reset_ttl_minutes = prTtl;
 }
 
+// A single sign-on provider with "Also hold people to the sign-up domain list" ticked counts as saying who may sign
+// in only while that list is an allow-list with a domain on it (app/core/sso_policy.py, is_restricted). One with no
+// tenant, domain or required group of its own, that makes accounts at a first sign-in or links accounts by email,
+// stops doing that once the list is off, a deny-list or empty. Before a save that makes it so, the administrator is
+// asked, with those providers named. True when the save may go on: also when the providers cannot be read.
+async function _confirmSignUpListChange(next) {
+    const allowList = (s) => !!s && s.signup_email_domain_mode === 'allowlist'
+        && Array.isArray(s.signup_email_domains) && s.signup_email_domains.length > 0;
+    if (!allowList(currentSettings) || allowList(next)) return true;
+    let data = null;
+    try { data = await apiRequest('/admin/sso/providers', { silent: true }); } catch (_) { return true; }
+    const none = (v) => !Array.isArray(v) || !v.length;
+    const relying = ((data && data.providers) || []).filter((p) => {
+        const pol = (p && p.policy) || {};
+        return p.state === 'enabled' && pol.sso_use_signup_domains === true
+            && (pol.sso_account_creation === 'jit' || pol.sso_link_by_email === true)
+            && none(pol.sso_allowed_tenants) && none(pol.sso_allowed_domains) && none(pol.sso_required_groups);
+    });
+    if (!relying.length) return true;
+    const names = relying.map((p) => '“' + (p.name || p.label || 'Unnamed') + '”');
+    const named = names.length === 1 ? names[0] : names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
+    const one = relying.length === 1;
+    const makes = relying.some((p) => p.policy.sso_account_creation === 'jit');
+    const links = relying.some((p) => p.policy.sso_link_by_email === true);
+    const does = [makes ? (one ? 'makes' : 'make') + ' accounts at a first sign-in' : null,
+        links ? (one ? 'links' : 'link') + ' accounts by email' : null].filter(Boolean).join(one ? ' and ' : ' or ');
+    const doing = [makes ? 'making accounts at a first sign-in' : null, links ? 'linking accounts by email' : null]
+        .filter(Boolean).join(' and ');
+    const message = (one ? 'The single sign-on provider ' : 'The single sign-on providers ') + named + ' ' + does
+        + ' only because the sign-up allow-list on Accounts & Access says who may sign in through '
+        + (one ? 'it' : 'them') + '. Saved this way, '
+        + (one ? 'it stops ' : 'they stop ') + doing + ' until ' + (one ? 'it says' : 'they say') + ' who may sign in '
+        + 'another way: Tenants, Domains or Required groups on ' + (one ? 'its' : 'their') + ' Access page, under '
+        + 'Settings, Sign-in methods.';
+    return showConfirm(message, 'Single sign-on depends on the sign-up list', null, 'Save anyway');
+}
+
 // ============================================================================
 // ADMIN: MFA policy + step-up action matrix (Security settings tab)
 // ============================================================================
@@ -11923,6 +11960,8 @@ async function saveAllSettings() {
 
         // Accounts & Access: the org-onboarding policy block.
         collectAccountsPolicy(settings);
+        // A single sign-on provider may make or link accounts only because of the sign-up allow-list: asked first.
+        if (!(await _confirmSignUpListChange(settings))) return;
 
         // Save to API
         await apiRequest('/settings', {
