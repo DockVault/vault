@@ -406,3 +406,90 @@ def test_the_roots_file_is_said_to_hold_only_vendors_attestation_roots():
     assert "ONLY authenticator vendors' attestation roots" in help_text
     assert "never" in help_text and "general-purpose certificate authority" in help_text
     assert "within its validity period" in help_text
+
+
+def _anchored_direct(ws):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    import datetime as dt
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Root")])
+    now = dt.datetime.now(dt.timezone.utc)
+    ca = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(ca_key.public_key())
+          .serial_number(1).not_valid_before(now - dt.timedelta(days=1)).not_valid_after(now + dt.timedelta(days=365))
+          .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True).sign(ca_key, hashes.SHA256()))
+    return ws.PasskeyPolicy(attestation="direct", trust_anchors=(ca.public_bytes(serialization.Encoding.DER),))
+
+
+@pytest.mark.parametrize("spoil, error", [
+    ("nested too deep", "RecursionError"),          # arrays nested until the decoder's stack runs out
+    ("cut off", "error"),                           # a map whose key's length is cut off (struct.error)
+])
+def test_a_registration_answer_the_decoder_cannot_read_is_refused_not_a_server_error(spoil, error):
+    """The attestation object is the caller's bytes. Nested deep enough, or cut off inside a length, it made the
+    library's decoder raise an error that is no ValueError: it passed through the service and the route and was
+    answered as a server error, with no record of a refused registration."""
+    from fido2.utils import websafe_encode
+    ws = _svc()
+    rp, policy, challenge = _rp(), ws.PasskeyPolicy(), os.urandom(32)
+    options = ws.registration_options(rp, policy, challenge=challenge, user_id=USER_ID.bytes, username="alice",
+                                      display_name="Alice")
+    credential = SoftAuthenticator(ES256).make_credential(options, ORIGIN)
+    spoiled = b"\x81" * 50000 + b"\x00" if spoil == "nested too deep" else b"\xa3\x19"
+    credential["response"]["attestationObject"] = websafe_encode(spoiled)
+    with pytest.raises(ws.Refused) as refused:
+        ws.verify_registration(rp, policy, challenge=challenge, credential=credential)
+    assert refused.value.code == "malformed" and str(refused.value) == "malformed: " + error
+
+
+@pytest.mark.parametrize("spoil, error", [
+    ("extensions nested too deep", "RecursionError"),
+    ("extensions cut off", "error"),
+    ("client data nested too deep", "RecursionError"),
+])
+def test_a_sign_in_answer_the_decoder_cannot_read_is_refused_not_a_server_error(spoil, error):
+    """The same at a sign-in, a second step or a step-up: authenticator data that says it carries extensions and
+    then nests arrays, or stops inside a length; client data that is brackets all the way down. Each is refused
+    as malformed, where it was a server error that no failed attempt was counted for."""
+    import hashlib
+    from fido2.utils import websafe_encode
+    from fido2.webauthn import AuthenticatorData
+    ws = _svc()
+    auth = SoftAuthenticator(ES256)
+    registered, _, _ = _register(ws, auth)
+    key = _key(ws, registered)
+    rp, policy, challenge = _rp(), ws.PasskeyPolicy(), os.urandom(32)
+    options = ws.authentication_options(rp, policy, challenge=challenge, allow=[(key.credential_id, key.transports)])
+    credential = auth.get_assertion(options, ORIGIN)
+    head = hashlib.sha256(RP_ID.encode()).digest() + bytes([AuthenticatorData.FLAG.UP | AuthenticatorData.FLAG.UV
+                                                           | AuthenticatorData.FLAG.ED]) + (1).to_bytes(4, "big")
+    if spoil == "extensions nested too deep":
+        credential["response"]["authenticatorData"] = websafe_encode(head + b"\x81" * 50000 + b"\x00")
+    elif spoil == "extensions cut off":
+        credential["response"]["authenticatorData"] = websafe_encode(head + b"\xa1\x19")
+    else:
+        credential["response"]["clientDataJSON"] = websafe_encode(b"[" * 100000)
+    with pytest.raises(ws.Refused) as refused:
+        ws.verify_authentication(rp, policy, challenge=challenge, credential=credential, key=key,
+                                 allow_ids=[key.credential_id])
+    assert refused.value.code == "malformed" and str(refused.value) == "malformed: " + error
+
+
+def test_an_attestation_the_library_does_not_verify_is_an_attestation_refused(monkeypatch):
+    """Where the vault asks for an attestation it verifies: a statement of a kind the library does not verify
+    (ECDAA), or a certificate it cannot read, is not verified, and so refused as an attestation. It was a server
+    error, and no refused registration was recorded."""
+    ws = _svc()
+    with pytest.raises(ws.Refused) as refused:
+        _register(ws, SoftAuthenticator(ES256), _anchored_direct(ws), fmt="packed",
+                  att_stmt_override={"alg": -7, "sig": b"x", "ecdaaKeyId": b"k"})
+    assert refused.value.code == "attestation_refused"
+    assert str(refused.value) == "attestation_refused: NotImplementedError"
+    from cryptography.exceptions import UnsupportedAlgorithm
+    told = ws._refused_for(UnsupportedAlgorithm("a key type nothing here reads"))
+    assert (told.code, str(told)) == ("attestation_refused", "attestation_refused: UnsupportedAlgorithm")
+    # The record gets the error's class, never its text; and what is no such error is malformed.
+    told = ws._refused_for(RuntimeError("anything else, with words that must not be shown"))
+    assert (told.code, str(told)) == ("malformed", "malformed: RuntimeError")

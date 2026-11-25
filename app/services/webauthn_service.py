@@ -277,6 +277,8 @@ def verify_registration(rp: RelyingParty, policy: PasskeyPolicy, *, challenge: b
     except (KeyError, TypeError, IndexError, AttributeError, AssertionError) as exc:
         # The library asserts the shape it expects (an attestation without the credential flag, for one).
         raise Refused("malformed", type(exc).__name__) from exc
+    except Exception as exc:  # noqa: BLE001 -- see _refused_for
+        raise _refused_for(exc) from exc
     cred = auth_data.credential_data
     if cred is None:
         raise Refused("malformed", "no credential in the authenticator data")
@@ -368,7 +370,12 @@ def verify_authentication(rp: RelyingParty, policy: PasskeyPolicy, *, challenge:
         raise Refused("algorithm_not_allowed", str(exc)) from exc
     except (KeyError, TypeError, IndexError, AttributeError) as exc:
         raise Refused("malformed", type(exc).__name__) from exc
-    auth_data = AuthenticatorData(raw_auth_data)
+    except Exception as exc:  # noqa: BLE001 -- see _refused_for
+        raise _refused_for(exc) from exc
+    try:
+        auth_data = AuthenticatorData(raw_auth_data)
+    except Exception as exc:  # noqa: BLE001 -- the library read these bytes a moment ago; refused all the same
+        raise _refused_for(exc) from exc
     flags = AuthenticatorData.FLAG(auth_data.flags)
     up, uv = bool(flags & AuthenticatorData.FLAG.UP), bool(flags & AuthenticatorData.FLAG.UV)
     be, bs = bool(flags & AuthenticatorData.FLAG.BE), bool(flags & AuthenticatorData.FLAG.BS)
@@ -388,6 +395,23 @@ def verify_authentication(rp: RelyingParty, policy: PasskeyPolicy, *, challenge:
 
 
 # --------------------------------------------------------------------------- helpers
+
+def _refused_for(exc: Exception) -> Refused:
+    """The refusal for whatever else a browser's answer made the parser or the verifier raise. The answer is the
+    caller's bytes, so nothing in it is a failure of the server: arrays nested until the decoder's stack runs
+    out (RecursionError), a length cut off (struct.error), an attestation of a kind the library does not verify
+    (NotImplementedError) or a certificate it cannot read (cryptography's UnsupportedAlgorithm). Left to pass,
+    each was answered as a server error: the attempt was not recorded as a refused one and not counted against
+    the account or the address. An attestation that was not verified is refused as that; the rest is malformed.
+    The detail is the error's class, never its text."""
+    try:
+        from cryptography.exceptions import UnsupportedAlgorithm
+    except Exception:  # noqa: BLE001 -- without the library there is no such error to tell apart
+        UnsupportedAlgorithm = ()
+    not_verified = isinstance(exc, NotImplementedError) or (
+        bool(UnsupportedAlgorithm) and isinstance(exc, UnsupportedAlgorithm))
+    return Refused("attestation_refused" if not_verified else "malformed", type(exc).__name__)
+
 
 def _reason_of(exc: ValueError) -> str:
     text = str(exc).lower()
