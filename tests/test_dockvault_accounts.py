@@ -389,3 +389,28 @@ def test_an_account_that_signs_in_only_through_its_provider_is_shown_so_and_its_
     app.accounts(_args("--action", "unlock", *NAMED, "--non-interactive"))
     out = capsys.readouterr().out
     assert "providers:" not in out and "signs in:" not in out
+
+
+@pytest.mark.parametrize("answer, shown", [
+    ({"second_factor": True, "authenticator": False, "passkeys": 1}, "set up (1 passkey)"),
+    ({"second_factor": True, "authenticator": False, "passkeys": 3}, "set up (3 passkeys)"),
+    ({"second_factor": True, "authenticator": True, "passkeys": 0}, "set up (authenticator app)"),
+    ({"second_factor": True, "authenticator": True, "passkeys": 2}, "set up (authenticator app and 2 passkeys)"),
+    ({"second_factor": False, "authenticator": False, "passkeys": 0}, "not set up"),
+    # An earlier release's answer: second_factor is the authenticator alone, the passkeys counted beside it.
+    ({"second_factor": False, "passkeys": 2}, "set up (2 passkeys)"),
+    ({"second_factor": True, "passkeys": 0}, "set up (authenticator app)"),
+    ({"second_factor": True}, "set up (authenticator app)"),
+    ({"second_factor": False}, "not set up"),
+    # A count that is not one counts as none, and prints nothing of itself.
+    ({"second_factor": False, "passkeys": "2\x1b[H"}, "not set up"),
+    ({"second_factor": False, "passkeys": -4}, "not set up"),
+])
+def test_an_accounts_second_factor_counts_its_passkeys(answer, shown):
+    assert dv.second_factor_text(answer) == shown
+
+
+def test_a_passkey_only_account_is_shown_with_its_second_factor(app, capsys):
+    app._show_account({"username": "alice", "email": None, "role": "user", "active": True, "last_login": None,
+                       "second_factor": True, "authenticator": False, "passkeys": 1})
+    assert "  second factor: set up (1 passkey)\n" in capsys.readouterr().out

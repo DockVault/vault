@@ -103,7 +103,7 @@ def confirmation_problem(username, confirm_username):
 
 def _describe(db, user):
     from app.core.models import SecondFactorEnrollment
-    has_factor = db.query(SecondFactorEnrollment.id).filter(
+    has_authenticator = db.query(SecondFactorEnrollment.id).filter(
         SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first() is not None
     from app.core import webauthn_settings
     from app.core.models import WebAuthnCredential
@@ -116,7 +116,10 @@ def _describe(db, user):
         "active": bool(user.is_active),
         "locked_by_administrator": bool(user.is_locked) and user.locked_until is None,
         "last_login": user.last_login.isoformat() + "Z" if user.last_login else None,
-        "second_factor": has_factor,
+        # A second factor the account set up: an authenticator, or a passkey that was not retired, whether or not
+        # passkeys are switched on, as the web counts it (app/services/sso_sign_in.py accounts_that_set_up_a_factor).
+        "second_factor": has_authenticator or passkeys > 0,
+        "authenticator": has_authenticator,
         # The passkeys the account holds, and how many of them it can sign in with now: one made at another
         # address than the vault has, of an algorithm no longer accepted, or that never verified the person while
         # the vault asks for that is held in name only, and none is a factor while passkeys are turned off.

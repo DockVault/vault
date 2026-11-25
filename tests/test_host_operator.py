@@ -308,3 +308,40 @@ def test_the_host_tool_loads_the_settings_before_the_action_and_once(tmp_path, m
     assert host_operator.run(["lookup", "--username", "alice"]) == 0
     assert order == ["the settings", "the action"]
     capsys.readouterr()
+
+
+def test_the_host_tool_counts_a_passkey_as_a_second_factor_as_the_web_does():
+    # `dockvault.py accounts` showed the second factor from the authenticator alone, so an account that set up a
+    # passkey and nothing else was shown with none. A passkey that was not retired counts, whether or not passkeys are
+    # switched on (app/services/sso_sign_in.py accounts_that_set_up_a_factor); a retired one, and an authenticator
+    # that is not active, do not.
+    import types
+    import uuid
+    from datetime import datetime
+
+    from _memory_db import MemoryDB
+    from app.core.host_operator import _describe
+    from app.core.models import RoleEnum, SecondFactorEnrollment, User, WebAuthnCredential
+
+    def account(name):
+        return types.SimpleNamespace(id=uuid.uuid4(), username=name, email=None, role=RoleEnum.USER, is_active=True,
+                                     is_locked=False, locked_until=None, last_login=None)
+    keys_only, retired_only, code_only, both, nothing = (account(n) for n in ("keys", "retired", "code", "both", "none"))
+    now = datetime.utcnow()
+    db = MemoryDB({User: [keys_only, retired_only, code_only, both, nothing], WebAuthnCredential: [
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=keys_only.id, retired_at=None),
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=keys_only.id, retired_at=None),
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=retired_only.id, retired_at=now),
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=both.id, retired_at=None)],
+        SecondFactorEnrollment: [
+            types.SimpleNamespace(id=uuid.uuid4(), user_id=code_only.id, status="active"),
+            types.SimpleNamespace(id=uuid.uuid4(), user_id=both.id, status="active"),
+            types.SimpleNamespace(id=uuid.uuid4(), user_id=nothing.id, status="pending")]})
+    seen = {a.username: {k: _describe(db, a)[k] for k in ("second_factor", "authenticator", "passkeys")}
+            for a in (keys_only, retired_only, code_only, both, nothing)}
+    assert seen == {
+        "keys": {"second_factor": True, "authenticator": False, "passkeys": 2},
+        "retired": {"second_factor": False, "authenticator": False, "passkeys": 0},
+        "code": {"second_factor": True, "authenticator": True, "passkeys": 0},
+        "both": {"second_factor": True, "authenticator": True, "passkeys": 1},
+        "none": {"second_factor": False, "authenticator": False, "passkeys": 0}}

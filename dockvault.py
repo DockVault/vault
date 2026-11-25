@@ -4728,6 +4728,21 @@ def server_text(value, default=""):
     return clean_matrix_text(value if isinstance(value, str) else str(value))
 
 
+def second_factor_text(account):
+    """How `accounts` shows an account's second factor, from the account tool's answer: set up when the account holds
+    an authenticator or a passkey that was not retired, as the web counts it, with which; "not set up" otherwise. An
+    answer from an earlier release says ``second_factor`` of the authenticator alone and may count the passkeys
+    beside it; a value that is not a count counts as none."""
+    authenticator = account.get("authenticator") if "authenticator" in account else account.get("second_factor")
+    try:
+        passkeys = max(0, int(account.get("passkeys") or 0))
+    except (TypeError, ValueError):
+        passkeys = 0
+    held = (["authenticator app"] if authenticator is True else []) + (
+        ["1 passkey" if passkeys == 1 else "%d passkeys" % passkeys] if passkeys else [])
+    return "set up (%s)" % " and ".join(held) if held else "not set up"
+
+
 # --- cases (compliance access, from the host) ------------------------------------------------------
 CASE_ACTIONS = (
     ("list", "List the auditor rights and the cases that are open"),
@@ -9208,7 +9223,7 @@ class DockVault:
         print("  email:         %s" % (server_text(account.get("email")) or "(none)"))
         print("  role:          %s%s" % (server_text(account.get("role")), "" if account.get("active") else "  (deactivated)"))
         print("  last sign-in:  %s" % (server_text(account.get("last_login")) or "never"))
-        print("  second factor: %s" % ("set up" if account.get("second_factor") else "not set up"))
+        print("  second factor: %s" % second_factor_text(account))
         linked = ", ".join("%s (%s)" % (server_text(p.get("name")), "on" if p.get("on") else "off")
                            for p in (account.get("providers") or []) if isinstance(p, dict))
         if account.get("sso_only"):
