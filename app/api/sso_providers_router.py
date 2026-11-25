@@ -168,6 +168,34 @@ def _end_sessions_of(db, provider_id, *, by=None, ip=None, name=None) -> int:
         return 0
 
 
+def _sessions_standing(db, provider_id) -> Optional[int]:
+    """How many sessions that came through the provider still stand (in use, not ended), or None when that could
+    not be counted. Asked after a provider is turned off: its sessions are ended in a transaction of their own,
+    after the one that turned it off, and a failure there (an owner's turn held for longer than the wait) ended
+    none and was told to nobody. Turned off in an incident, the provider then signed nobody in while every
+    session through it stood until it ran out."""
+    from app.core.models import ActiveSession, SsoSession
+    try:
+        named = [s.session_id for s in db.query(SsoSession).filter(SsoSession.provider_id == provider_id).all()]
+        if not named:
+            return 0
+        rows = db.query(ActiveSession).filter(ActiveSession.id.in_(named)).all()
+        return sum(1 for row in rows if getattr(row, "is_active", True) and not getattr(row, "revoked", False))
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.warning("sso sessions of a provider turned off were not counted: %s", type(exc).__name__)
+        return None
+
+
+def _said_of_sessions_standing(standing: Optional[int]) -> str:
+    """The sentence of the administrators' notice for sessions that still stand after a turn-off, or ""."""
+    if standing == 0:
+        return ""
+    many = "Sessions" if standing is None else f"{standing} session(s)"
+    return (f" {many} that came through it could not be ended and stand until they run out: turn it off again "
+            "to end them, or sign those accounts out.")
+
+
 def _accounts_named(db, usernames) -> list:
     """(id, username, email) of the accounts ``usernames`` names, for a notice sent after the commit."""
     names = list(usernames or [])
@@ -313,8 +341,9 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         raise _refused(exc)
     ended = (_end_sessions_of(db, row.id, by=current_user, ip=api.get_client_ip(request), name=row.name)
              if turned_off else 0)
-    outcome = {**outcome, "turned_off": bool(turned_off), "sessions_ended": ended, "held": held,
-               "owners_told": len(owners)}
+    standing = _sessions_standing(db, row.id) if turned_off else 0
+    outcome = {**outcome, "turned_off": bool(turned_off), "sessions_ended": ended, "sessions_not_ended": standing,
+               "held": held, "owners_told": len(owners)}
     label = row.label or row.name
     _tell_accounts(owners, f"{label} was pointed somewhere else", (
         f"An administrator changed where this vault finds {label}, a sign-in your account is linked to. Nobody signs "
@@ -354,6 +383,7 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         if turned_off:
             said += (" Its connection changed, so it was turned off until a test sign-in passes again"
                      + (f", and {ended} session(s) that came through it were ended." if ended else "."))
+            said += _said_of_sessions_standing(standing)
         _tell_administrators(current_user.username, "A single sign-on provider was changed", said)
     return {"provider": providers.public(db, row), **outcome}
 
@@ -374,7 +404,19 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
                                                      "message": "One of: enabled, disabled."})
     row = _row_or_404(db, provider_id)
     if row.state == body.state:
-        return {"provider": providers.public(db, row), "changed": False}
+        # Off already. Where sessions that came through it still stand (they could not be ended when it was
+        # turned off), asking again ends them: behind the same proof as the turn-off, and nothing else changes.
+        left = _sessions_standing(db, row.id) if body.state == providers.DISABLED else 0
+        if left == 0:
+            return {"provider": providers.public(db, row), "changed": False}
+        _step_up(db, current_user, request)
+        ended = _end_sessions_of(db, row.id, by=current_user, ip=api.get_client_ip(request), name=row.name)
+        standing = _sessions_standing(db, row.id)
+        _tell_administrators(current_user.username, "Sessions of a single sign-on provider were ended", (
+            f"{current_user.username} asked again to end the sessions that came through the single sign-on provider "
+            f"{row.name}, which is turned off. {ended} session(s) were ended." + _said_of_sessions_standing(standing)))
+        return {"provider": providers.public(db, row), "changed": False, "sessions_ended": ended,
+                "sessions_not_ended": standing}
     if body.state == providers.ENABLED:
         refusal = providers.enable_refusal(db, row)
         if refusal is not None:
@@ -396,10 +438,12 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
     db.commit()
     ended = (_end_sessions_of(db, row.id, by=current_user, ip=api.get_client_ip(request), name=row.name)
              if off else 0)
+    standing = _sessions_standing(db, row.id) if off else 0
     turned = "on" if row.state == providers.ENABLED else "off"
     said = f"{current_user.username} turned the single sign-on provider {row.name} {turned}."
     if off and ended:
         said += f" {ended} session(s) that came through it were ended."
+    said += _said_of_sessions_standing(standing)
     if off and providers.sso_policy.effective(row.policy)["sso_lapse_ends_sign_in"]:
         said += (" While it is off, its days stop no password: only an account that was held before (a refusal, or "
                  "days already run out) stays held to this provider's sign-in, until it is lifted under Identities.")
@@ -417,7 +461,7 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
     _tell_administrators(current_user.username, f"A single sign-on provider was turned {turned}", said)
     answer = {"provider": providers.public(db, row), "changed": True}
     if off:
-        answer.update(sessions_ended=ended, held=held)
+        answer.update(sessions_ended=ended, sessions_not_ended=standing, held=held)
     else:
         answer.update(due=due)
     return answer

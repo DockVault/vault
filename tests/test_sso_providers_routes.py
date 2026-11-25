@@ -1152,3 +1152,122 @@ def test_a_providers_records_are_kept_with_the_other_settings_records():
     for name in ("sso_provider_created", "sso_provider_updated", "sso_provider_deleted", "sso_provider_tested"):
         category = by_name[name].category if by_name else audit_catalog.category_of(name)
         assert category == "administration" and category in audit_retention.PROTECTED_CATEGORIES, name
+
+
+def _sessions_through(h, row, *, standing=2, ended=1, others=1):
+    """Sessions recorded for ``row``: some in use, some ended already, and some of another provider."""
+    from app.core.models import ActiveSession, SsoSession
+    made = []
+
+    def add(provider_id, **state):
+        session = types.SimpleNamespace(id=uuid.uuid4(), user_id=uuid.uuid4(), **{"is_active": True, "revoked": False, **state})
+        h.db.tables.setdefault(ActiveSession, []).append(session)
+        h.db.tables.setdefault(SsoSession, []).append(types.SimpleNamespace(session_id=session.id, provider_id=provider_id))
+        made.append(session)
+        return session
+    for _ in range(standing):
+        add(row.id)
+    for index in range(ended):
+        add(row.id, **({"is_active": False} if index % 2 == 0 else {"revoked": True}))
+    for _ in range(others):
+        add(uuid.uuid4())
+    return made
+
+
+def test_the_sessions_of_a_provider_that_still_stand_are_counted(monkeypatch):
+    row = _provider(created_at=None, updated_at=None)
+    h = Admin(monkeypatch, [row])
+    assert h.R._sessions_standing(h.db, row.id) == 0                     # none recorded
+    _sessions_through(h, row, standing=2, ended=3, others=2)
+    assert h.R._sessions_standing(h.db, row.id) == 2                     # in use and not ended, of this provider
+    assert h.R._sessions_standing(h.db, uuid.uuid4()) == 0
+    # It could not be counted: said as that, never as "none".
+    rolled = []
+
+    class Down:
+        def query(self, *a):
+            raise RuntimeError("down")
+
+        def rollback(self):
+            rolled.append(1)
+    assert h.R._sessions_standing(Down(), row.id) is None and rolled == [1]
+    assert h.R._said_of_sessions_standing(0) == ""
+    assert h.R._said_of_sessions_standing(2) == (
+        " 2 session(s) that came through it could not be ended and stand until they run out: turn it off again to "
+        "end them, or sign those accounts out.")
+    assert h.R._said_of_sessions_standing(None).startswith(" Sessions that came through it could not be ended")
+
+
+def test_a_turn_off_that_could_not_end_the_sessions_says_so_and_asked_again_ends_them(monkeypatch):
+    """An administrator turns a provider off in an incident while a long save holds the turn of one of its
+    people. The sessions are ended in a transaction of their own, which failed and ended none: the provider was
+    off, every session through it stood until it ran out, and the answer and the notice said nothing. Both say
+    how many still stand. Turning it off again, which did nothing, ends them, behind the same proof."""
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
+    h = Admin(monkeypatch, [row])
+    sessions = _sessions_through(h, row, standing=2, ended=1, others=1)
+    path = f"/admin/sso/providers/{row.id}/state"
+    works = [False]
+
+    def end(db, provider_id, **record):
+        if not works[0]:
+            return 0                                  # the turn of an owner was held: none ended, none raised
+        for session in sessions[:2]:
+            session.is_active, session.revoked = False, True
+        return 2
+    monkeypatch.setattr(h.R, "_end_sessions_of", end)
+    status, out = h.call("POST", path, {"state": "disabled"})
+    assert status == 200 and out["changed"] is True and row.state == "disabled", out
+    assert out["sessions_ended"] == 0 and out["sessions_not_ended"] == 2
+    said = h.told[-1][2]
+    assert "2 session(s) that came through it could not be ended and stand until they run out" in said
+    assert "turn it off again to end them" in said
+    # Asked again: the same proof, the sessions ended, nothing else changed, and the administrators told.
+    del h.order[:], h.told[:]
+    works[0] = True
+    status, out = h.call("POST", path, {"state": "disabled"})
+    assert status == 200 and out["changed"] is False and out["sessions_ended"] == 2 and out["sessions_not_ended"] == 0
+    assert h.order == ["step_up"] and row.state == "disabled"
+    (by, title, body), = h.told
+    assert title == "Sessions of a single sign-on provider were ended" and "2 session(s) were ended." in body
+    assert "could not be ended" not in body
+    # None stands now: off again is nothing, and asks for no proof.
+    del h.order[:], h.told[:]
+    status, out = h.call("POST", path, {"state": "disabled"})
+    assert status == 200 and out == {"provider": out["provider"], "changed": False} and h.order == [] and h.told == []
+    # On when it is on is nothing either, whatever sessions there are.
+    row.state = "enabled"
+    sessions[0].is_active, sessions[0].revoked = True, False
+    status, out = h.call("POST", path, {"state": "enabled"})
+    assert status == 200 and out == {"provider": out["provider"], "changed": False} and h.order == []
+
+
+def test_a_turn_off_that_ended_every_session_says_nothing_of_sessions_left(monkeypatch):
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
+    h = Admin(monkeypatch, [row])
+    sessions = _sessions_through(h, row, standing=2, ended=0, others=1)
+
+    def end(db, provider_id, **record):
+        for session in sessions[:2]:
+            session.is_active = False
+        return 2
+    monkeypatch.setattr(h.R, "_end_sessions_of", end)
+    status, out = h.call("POST", f"/admin/sso/providers/{row.id}/state", {"state": "disabled"})
+    assert status == 200 and out["sessions_ended"] == 2 and out["sessions_not_ended"] == 0
+    assert "could not be ended" not in h.told[-1][2] and "2 session(s) that came through it were ended." in h.told[-1][2]
+
+
+def test_a_change_that_turns_a_provider_off_says_which_sessions_still_stand(monkeypatch):
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
+    h = Admin(monkeypatch, [row])
+    _sessions_through(h, row, standing=3, ended=0, others=0)
+    monkeypatch.setattr(h.R, "_end_sessions_of", lambda db, provider_id, **record: 0)
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"client_id": "another-client"})
+    assert status == 200 and out["turned_off"] is True and out["sessions_ended"] == 0, out
+    assert out["sessions_not_ended"] == 3
+    assert "3 session(s) that came through it could not be ended" in h.told[-1][2]
+    # A change that turns nothing off counts nothing and says nothing.
+    _tested(row)
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"label": "Staff"})
+    assert status == 200 and out["turned_off"] is False and out["sessions_not_ended"] == 0
+    assert "could not be ended" not in h.told[-1][2]
