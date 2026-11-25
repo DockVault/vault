@@ -685,11 +685,16 @@ def test_an_account_made_at_a_first_sign_in_is_promoted_and_then_chooses_a_passw
     alice, p, i, db = _world(linked_by="jit", sso_only=True, password_set_by=None, password_set_by_other_at=None)
     users = {alice.id: alice}
     monkeypatch.setattr(db, "add", lambda row: None)
+    from app.services import sign_in
+    spent = []
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda session, user_id: spent.append(user_id))
     S._record_admin_grant(db, alice, by=root)
     assert recorded == [alice.id] and alice.sso_only is False
-    assert turns == [(alice.id, True)]                  # the account's turn, before the account was changed
+    assert turns[0] == (alice.id, True)                 # the account's turn, before the account was changed
+    assert revoked == [alice.id] and spent == [alice.id]            # her sessions end with the promotion
     assert password_origin.nobody_knows(alice) and password_origin.is_set_by_other(alice)
-    assert S._take_back_password_at_promotion(db, alice, by=root) == {"user_id": alice.id} and revoked == [alice.id]
+    assert S._take_back_password_at_promotion(db, alice, by=root) == {"user_id": alice.id}
+    assert revoked == [alice.id, alice.id]
     # Held by a provider whose people hold no password: an administrator needs one, so the setting changes first.
     bob, q, j, db2 = _world(policy={"sso_password_login": "disabled"}, username="bob", sso_only=True)
     users[bob.id] = bob

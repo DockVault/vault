@@ -242,6 +242,9 @@ def test_no_administrator_sets_a_password_on_or_promotes_an_sso_only_account(mon
     assert alice.sso_only is True
     alice.sso_only = False
     monkeypatch.setattr(S, "_revoke_reset_links_outranked_by", lambda db, user, actor: None)
+    from app.services import sign_in
+    monkeypatch.setattr(S, "_revoke_sessions", lambda db, **kw: 0)          # a promotion ends the account's sessions
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db, user_id: None)
     S._record_admin_grant(types.SimpleNamespace(), alice, by=_user("root", role="admin"))
     assert recorded == [alice.id]
     alice.sso_only = True

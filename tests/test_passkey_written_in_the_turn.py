@@ -247,6 +247,9 @@ def test_a_passkey_alone_taken_before_a_promotion_is_refused_in_the_accounts_tur
     monkeypatch.setattr(sign_in, "drop_the_session_the_proof_made", lambda db, result: dropped.append(result))
     monkeypatch.setattr(sign_in, "refuse_unless_the_account_may_sign_in", lambda db, user, ip: None)
     monkeypatch.setattr(sign_in, "write_the_passkey_grace", lambda result: None)
+    # What else the turn asks where a sign-in can come through a provider is not this test's.
+    for asked in ("hold_the_providers_row", "refuse_without_the_provider", "refuse_unless_the_provider_stands"):
+        monkeypatch.setattr(sign_in, asked, lambda db, result: None, raising=False)
 
     def taken(methods, **more):
         return sign_in.SignInResult(alice, list(methods), "192.0.2.1", sessions_ended=0, **more)
