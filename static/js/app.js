@@ -2739,6 +2739,29 @@ function renderEnrollmentWizard(box, opts) {
         back.addEventListener('click', (ev) => { ev.preventDefault(); _sfCancel(preAuthToken); });
         return back;
     };
+    // Under Your account, an account that holds a factor (a passkey) gives it before an authenticator app is added:
+    // the set-up and the acknowledgement each answer 403 second_factor_required, and each spends a confirmation of
+    // its own. The person is asked, and the same request goes once more with the receipt; declined, the refusal
+    // comes back as it was. At a sign-in held for the set-up the factor is asked where the sign-in is held.
+    async function send(url, init) {
+        const resp = await fetch(url, init);
+        if (preAuthToken || resp.status !== 403) return resp;
+        const detail = await resp.clone().json().then((d) => d && d.detail, () => null);
+        if (!detail || typeof detail !== 'object' || !detail.second_factor_required) return resp;
+        const receipt = await requestStepUpReceipt(detail.action, detail.methods || []);
+        if (!receipt) return resp;
+        return fetch(url, { ...init, headers: { ...(init.headers || {}), 'X-Second-Factor': receipt } });
+    }
+    // The sentence of a refusal: its detail when that is the sentence, a structured refusal's message, else `fallback`.
+    const said = (e, fallback) => {
+        const detail = e && e.detail;
+        if (typeof detail === 'string' && detail) return detail;
+        if (detail && typeof detail === 'object') {
+            if (typeof detail.message === 'string' && detail.message) return detail.message;
+            if (detail.second_factor_required) return 'This needs your second factor first.';
+        }
+        return fallback;
+    };
 
     async function start() {
         clear();
@@ -2749,14 +2772,14 @@ function renderEnrollmentWizard(box, opts) {
         const status = _el('div', 'alert alert-info mt-sm', 'Preparing…'); status.setAttribute('role', 'status');
         box.appendChild(status);
         try {
-            const resp = await fetch(`${API_BASE}/users/me/second-factor/totp/enroll`, {
+            const resp = await send(`${API_BASE}/users/me/second-factor/totp/enroll`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json', ...auth },
                 body: JSON.stringify({ current_password: password })
             });
             if (!resp.ok) {
                 const e = await resp.json().catch(() => ({}));
                 status.className = 'alert alert-error mt-sm';
-                status.textContent = (e && e.detail) || 'Could not start enrollment.';
+                status.textContent = said(e, 'Could not start enrollment.');
                 // The way back: the sign-in form for a held sign-in, the two-factor block under Your account.
                 const back = _el('a', 'mt-md', preAuthToken ? '← Back to sign in' : '← Back'); back.href = '#';
                 back.setAttribute('role', 'button'); back.style.display = 'block';
@@ -2816,7 +2839,7 @@ function renderEnrollmentWizard(box, opts) {
                 });
                 if (!resp.ok) {
                     const e = await resp.json().catch(() => ({}));
-                    _sfError(e2, (e && e.detail) || 'That code is not valid.'); next.disabled = false; return;
+                    _sfError(e2, said(e, 'That code is not valid.')); next.disabled = false; return;
                 }
                 const dd = await resp.json();
                 recoveryCodes = dd.recovery_codes || [];
@@ -2849,12 +2872,12 @@ function renderEnrollmentWizard(box, opts) {
             if (!cb.checked) { _sfError(e3, 'Please confirm you saved your recovery codes.'); return; }
             done.disabled = true;
             try {
-                const resp = await fetch(`${API_BASE}/users/me/second-factor/recovery/acknowledge`, {
+                const resp = await send(`${API_BASE}/users/me/second-factor/recovery/acknowledge`, {
                     method: 'POST', headers: { ...auth }
                 });
                 if (!resp.ok) {
                     const e = await resp.json().catch(() => ({}));
-                    _sfError(e3, (e && e.detail) || 'Could not finish enrollment.'); done.disabled = false; return;
+                    _sfError(e3, said(e, 'Could not finish enrollment.')); done.disabled = false; return;
                 }
                 const dd = await resp.json();
                 if (dd.access_token || dd.second_factor_required) await _signInStepAnswer(dd);   // signed in, or one more step

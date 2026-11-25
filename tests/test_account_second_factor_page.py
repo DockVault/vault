@@ -6,6 +6,11 @@ holds (``passkeys``). A passkey is a second factor: the sign-in asks for it. An 
 must not read that two-factor authentication is off, and turning the authenticator app off must not promise a sign-in
 with the password only while passkeys still confirm it is the person.
 
+Under Your account, an account that holds a factor (a passkey) gives it before it adds an authenticator app: the
+set-up (POST /users/me/second-factor/totp/enroll) and the acknowledgement of the recovery codes each answer 403
+second_factor_required, and each spends a confirmation of its own. The set-up asks for it and sends the request once
+more, and never shows a refusal's object as "[object Object]".
+
 The page's own functions run in Node on the small document of tests/js/mini_dom.js, against a stand-in for the
 server (the server's side has its own tests).
 """
@@ -24,7 +29,8 @@ ROOT = Path(__file__).resolve().parent.parent
 APP_JS = ROOT / "static" / "js" / "app.js"
 # Your account's two-factor section, as shipped; a name that is not in app.js is left out (and its test fails on what
 # the page does, not on a missing name).
-_SHIPPED = ("_el", "_sfError", "renderAccount2FA", "account2FASetup", "_account2FAPasskeys", "account2FADisable")
+_SHIPPED = ("_el", "_sfError", "renderAccount2FA", "account2FASetup", "_account2FAPasskeys", "account2FADisable",
+            "renderEnrollmentWizard")
 
 
 def _function(js, name):
@@ -63,6 +69,30 @@ const said = () => body.querySelectorAll('p').map((p) => p.textContent);
 const buttons = () => body.querySelectorAll('button').map((b) => b.textContent);
 const button = (text) => body.querySelectorAll('button').find((b) => b.textContent === text);
 const out = (value) => console.log(JSON.stringify(value));
+// The server, at the set-up's own requests: each request in order, and the answers given to them in order.
+const sent = [];
+let replies = [];
+const reply = (status, data) => ({ ok: status >= 200 && status < 300, status,
+    json: async () => JSON.parse(JSON.stringify(data)), clone: () => reply(status, data) });
+global.fetch = async (url, init) => {
+    init = init || {};
+    sent.push({ url: String(url).replace(API_BASE, ''), headers: Object.assign({}, init.headers),
+                body: init.body ? JSON.parse(init.body) : null });
+    const next = replies.shift();
+    if (!next) throw new Error('Not arranged: ' + url);
+    return reply(next[0], next[1]);
+};
+// The step-up dialog: what it was asked for, and the receipts the person's answers give (null: declined).
+const stepUps = [];
+let receipts = [];
+async function requestStepUpReceipt(action, methods) {
+    stepUps.push({ action, methods });
+    return receipts.shift() || null;
+}
+const settle = async () => { for (let i = 0; i < 20; i++) await tick(); };
+const STEP_UP = { detail: { second_factor_required: true, action: 'account.second_factor', reason: 'step_up_required',
+                            methods: ['passkey'] } };
+const ENROLL = { secret: 'JBSWY3DPEHPK3PXP', otpauth_uri: 'otpauth://totp/x', qr_svg: '' };
 """
 
 
@@ -157,3 +187,121 @@ out({ seen, deleted: asked.filter((a) => a.method === 'DELETE').length });
     assert seen["password"] == ["Turn off two-factor authentication? You will sign in with your password only."]
     assert not any("password only" in m for m in seen["passkeys"] + seen["provider"])
     assert got["deleted"] == 0            # every question was answered No
+
+
+ENROLL_URL = "/users/me/second-factor/totp/enroll"
+CONFIRM_URL = "/users/me/second-factor/totp/confirm"
+ACK_URL = "/users/me/second-factor/recovery/acknowledge"
+
+
+def test_an_account_that_holds_a_passkey_adds_an_authenticator_app_after_its_second_factor_each_time_asked():
+    got = page_node(r"""
+replies = [[403, STEP_UP], [200, ENROLL], [200, { recovery_codes: ['aaaa-bbbb', 'cccc-dddd'] }], [403, STEP_UP],
+           [200, { enrolled: true, method: 'totp' }]];
+receipts = ['receipt-1', 'receipt-2'];
+let completed = 0;
+const box = document.createElement('div'); body.appendChild(box);
+const texts = [];
+renderEnrollmentWizard(box, { token: authToken, password: 'pw', onComplete: () => { completed++; } });
+await settle();
+texts.push(box.textContent);
+box.querySelector('#sf-enroll-code').value = '123456';
+box.querySelectorAll('button').find((b) => b.textContent === 'Continue').click();
+await settle();
+texts.push(box.textContent);
+box.querySelector('#sf-ack-cb').checked = true;
+box.querySelectorAll('button').find((b) => b.textContent === 'Finish').click();
+await settle();
+texts.push(box.textContent);
+out({ sent, stepUps, completed, texts });
+""")
+    assert [s["url"] for s in got["sent"]] == [ENROLL_URL, ENROLL_URL, CONFIRM_URL, ACK_URL, ACK_URL], got["sent"]
+    assert [s["headers"].get("X-Second-Factor") for s in got["sent"]] == [None, "receipt-1", None, None, "receipt-2"]
+    # The request sent again is the same request: its token, and the password typed for the set-up.
+    assert all(s["headers"]["Authorization"] == "Bearer token-of-alice" for s in got["sent"]), got["sent"]
+    assert got["sent"][0]["body"] == got["sent"][1]["body"] == {"current_password": "pw"}
+    # Asked twice: each route spends a confirmation of its own.
+    assert got["stepUps"] == [{"action": "account.second_factor", "methods": ["passkey"]}] * 2
+    assert "Scan this QR code" in got["texts"][0] and "Save your recovery codes" in got["texts"][1], got["texts"]
+    assert got["completed"] == 1
+    assert not any("[object Object]" in text for text in got["texts"]), got["texts"]
+
+
+def test_a_declined_second_factor_says_what_the_set_up_needs_and_sends_nothing_more():
+    got = page_node(r"""
+const seen = {};
+// Declined at the start.
+replies = [[403, STEP_UP]];
+receipts = [null];
+let box = document.createElement('div'); body.replaceChildren(box);
+renderEnrollmentWizard(box, { token: authToken, password: 'pw', onComplete: () => {} });
+await settle();
+seen.start = { sent: sent.length, said: box.querySelectorAll('.alert').map((a) => a.textContent),
+               back: box.querySelectorAll('a').map((a) => a.textContent) };
+// Declined at the recovery codes: the button can be pressed again.
+sent.length = 0;
+replies = [[200, ENROLL], [200, { recovery_codes: ['aaaa-bbbb'] }], [403, STEP_UP]];
+receipts = [null];
+box = document.createElement('div'); body.replaceChildren(box);
+renderEnrollmentWizard(box, { token: authToken, password: 'pw', onComplete: () => {} });
+await settle();
+box.querySelector('#sf-enroll-code').value = '123456';
+box.querySelectorAll('button').find((b) => b.textContent === 'Continue').click();
+await settle();
+box.querySelector('#sf-ack-cb').checked = true;
+const finish = box.querySelectorAll('button').find((b) => b.textContent === 'Finish');
+finish.click();
+await settle();
+seen.ack = { sent: sent.map((s) => s.url), said: box.querySelectorAll('.alert').map((a) => a.textContent),
+             disabled: !!finish.disabled };
+out({ seen, stepUps: stepUps.length, text: body.textContent });
+""")
+    start, ack = got["seen"]["start"], got["seen"]["ack"]
+    assert start["sent"] == 1 and start["said"] == ["This needs your second factor first."], start
+    assert start["back"] == ["\u2190 Back"], start
+    assert ack["sent"] == [ENROLL_URL, CONFIRM_URL, ACK_URL], ack
+    assert ack["said"] == ["This needs your second factor first."] and ack["disabled"] is False, ack
+    assert got["stepUps"] == 2
+    assert "[object Object]" not in got["text"]
+
+
+@pytest.mark.parametrize("where", ["start", "code", "codes"])
+def test_a_structured_refusal_shows_its_sentence(where):
+    """A refusal whose detail is {reason, message} shows the message, at every step of the set-up."""
+    got = page_node(r"""
+const refusal = [409, { detail: { reason: 'something', message: 'The words of the refusal.' } }];
+replies = WHERE === 'start' ? [refusal]
+    : WHERE === 'code' ? [[200, ENROLL], refusal]
+    : [[200, ENROLL], [200, { recovery_codes: ['aaaa-bbbb'] }], refusal];
+const box = document.createElement('div'); body.replaceChildren(box);
+renderEnrollmentWizard(box, { token: authToken, password: 'pw', onComplete: () => {} });
+await settle();
+if (WHERE !== 'start') {
+    box.querySelector('#sf-enroll-code').value = '123456';
+    box.querySelectorAll('button').find((b) => b.textContent === 'Continue').click();
+    await settle();
+}
+if (WHERE === 'codes') {
+    box.querySelector('#sf-ack-cb').checked = true;
+    box.querySelectorAll('button').find((b) => b.textContent === 'Finish').click();
+    await settle();
+}
+out({ said: box.querySelectorAll('.alert').filter((a) => a.style.display !== 'none').map((a) => a.textContent),
+      stepUps: stepUps.length });
+""".replace("WHERE", json.dumps(where)))
+    assert got == {"said": ["The words of the refusal."], "stepUps": 0}, got
+
+
+def test_a_sign_in_held_for_the_set_up_asks_for_no_second_factor_here():
+    """At a sign-in held for the set-up the account's factor is asked where the sign-in is held, never here: an
+    answer that asks for one is shown, and nothing is sent again."""
+    got = page_node(r"""
+replies = [[403, STEP_UP]];
+const box = document.createElement('div'); body.replaceChildren(box);
+renderEnrollmentWizard(box, { preAuthToken: 'held-1', password: 'pw' });
+await settle();
+out({ sent: sent.map((s) => [s.url, s.headers.Authorization, s.headers['X-Second-Factor'] || null]),
+      stepUps: stepUps.length, text: box.textContent });
+""")
+    assert got["sent"] == [[ENROLL_URL, "Bearer held-1", None]] and got["stepUps"] == 0, got
+    assert "[object Object]" not in got["text"]
