@@ -492,6 +492,14 @@ def test_the_start_fills_the_addresses_in_a_step_of_its_own_after_the_column_is_
     column = source.index('"ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS rp_id VARCHAR(253)"')
     filled = source.index("_passkey_settings.fill_the_addresses_not_recorded(db)")
     assert column < source.index("for stmt in statements:") < filled
+    # The call is the whole of its line, so it is made: a line that only names it (after "0 and", in a comment,
+    # under a condition) is not this one. Then it is committed, and said when it wrote something.
+    step = source[filled - 200:filled + 500].splitlines()
+    assert "                filled = _passkey_settings.fill_the_addresses_not_recorded(db)" in step
+    called = step.index("                filled = _passkey_settings.fill_the_addresses_not_recorded(db)")
+    assert step[called + 1] == "                db.commit()"
+    assert step[called - 1] == '                db.execute(text("SET LOCAL lock_timeout = 0"))'
+    assert step[called + 3] == "                if filled:"
     # Then, the addresses filled in, it says how many keys were made at another one: after the fill, so that a
     # key with no address on record is not said to be elsewhere, and in a step that stops nothing.
     said = source.index("_passkey_settings.made_at_another_address_line(_passkey_settings.made_at_another_address(db))")

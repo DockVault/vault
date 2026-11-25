@@ -563,6 +563,19 @@ def test_an_administrators_removal_of_the_last_factor_an_account_set_up_counts_a
     assert own["left_without_a_factor"] is False and other.second_factor_reset_at is None
     assert own["signed_out"] is False and ended == [target.id] and spent == [target.id]
     assert "signed out" not in S._credential_change_notice(cc.PASSKEY, own)[1]
+    # The one place the two-person rule is applied passes it on so: whoever acts on their own account there has
+    # the change applied as their own, for a passkey as for every other kind. (No route brings an account's own
+    # passkey here today; this holds what the function promises a route that would.)
+    once_more = types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, uv_initialized=True, retired_at=None,
+                                      label="own again", cose_alg=-7)
+    db.rows_of(WebAuthnCredential).append(once_more)
+    outcome = S._credential_change(db, other, other, cc.PASSKEY, summary="their own passkey",
+                                   payload={"passkey_id": str(once_more.id)})
+    assert outcome.held is False and outcome.change is None        # applied now, and not recorded as a request
+    applied = outcome.result
+    assert applied["passkey_id"] == str(once_more.id) and once_more.retired_at is not None
+    assert applied["signed_out"] is False and applied["left_without_a_factor"] is False
+    assert ended == [target.id] and spent == [target.id] and other.second_factor_reset_at is None
 
 
 def test_a_second_factor_reset_retires_every_passkey_and_a_gone_key_is_reported(monkeypatch):
