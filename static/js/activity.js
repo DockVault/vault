@@ -3190,7 +3190,8 @@
         group.setAttribute('aria-label', 'Sign-ins');
         const rows = [
             ['succeeded', 'Signed in', si.succeeded, null, null],
-            ['failed', 'Failed', si.failed, 'act-mark-bad', null],
+            ['failed', 'Failed', si.failed, 'act-mark-bad', `Failed: ${nf(si.failed || 0)}. Wrong passwords and codes, refused passkeys, `
+                + 'refused sign-ins through a provider, and any other refused sign-in. Click to filter.'],
             ['locked', 'Locked out', si.locked, 'act-mark-warn', 'Automatic lockouts after failed sign-ins, from one address or for the whole account.'],
         ];
         const anyChosen = rows.some(([k]) => outcomeChosen(k));

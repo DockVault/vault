@@ -53,11 +53,16 @@ LEGACY = "legacy"
 FAILED_STATUSES = ("failure", "failed", "error", "refused")
 
 # Sign-in outcomes, by catalog name (a stored alias counts as its entry). A sign-in with a recovery code
-# writes login_success as well, so second_factor_recovery_used is not counted a second time.
+# writes login_success as well, so second_factor_recovery_used is not counted a second time. A sign-in through a
+# provider that its callback refused writes only sso_sign_in_refused, and gets no code to finish with; one the
+# callback let through and /auth/finish refused writes one row there (login_failure, app/services/sign_in.py, or
+# sso_sign_in_refused for an invitation with no account yet). Either way one attempt is counted once. A refused
+# link, test or confirmation (sso_flow_refused) is somebody already signed in, and is no sign-in attempt.
 SIGN_IN_OUTCOMES = {
     "login_success": "succeeded",
     "login_failure": "failed",
     "second_factor_failed": "failed",
+    "sso_sign_in_refused": "failed",
     "account_auto_locked": "locked",
 }
 

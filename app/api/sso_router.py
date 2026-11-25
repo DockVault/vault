@@ -279,6 +279,10 @@ def _refused_start(exc) -> HTTPException:
 
 def _audit(db, action: str, *, user=None, ip, details: dict, status_: str = "success", resource_type=None,
            resource_id=None) -> None:
+    # A refusal of a link, a test or a confirmation is somebody already signed in: recorded apart from the refused
+    # sign-ins, which the Activity page counts as failed sign-ins.
+    if action == "sso_sign_in_refused" and (details or {}).get("purpose") not in (sso_state.SIGN_IN, sso_state.APP):
+        action = "sso_flow_refused"
     try:
         from app.services.audit_logger import AuditLogger
         AuditLogger(db).log_action(action=action, status=status_, user=user, ip_address=ip, details=details,

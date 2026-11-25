@@ -788,7 +788,7 @@ def test_a_provider_that_cannot_confirm_this_person_says_who_can_unlink_for_them
     h.claims_override = {"auth_time": int(time.time()) - 5, **claims}
     status, location, _ = h.callback(p, state)
     assert (status, location) == (302, "/#sso-error=" + shown), location
-    assert [a[2]["reason"] for a in h.audits if a[0] == "sso_sign_in_refused"][-1] == recorded
+    assert [a[2]["reason"] for a in h.audits if a[0] == "sso_flow_refused"][-1] == recorded
     said = _call(h.S, "GET", "/auth/sso/reasons")[1]["reasons"][shown]
     assert said.endswith("ask an administrator to unlink it for you.") and "does not confirm the unlink" in said
     assert not _staged(h) and h.identities() == [identity]

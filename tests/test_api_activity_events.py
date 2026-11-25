@@ -30,7 +30,7 @@ def test_the_catalog_offers_every_category_channel_and_status(admin):
     assert body["statuses"] == ["success", "authorized", "failed"]
     # The events the summary counts as each sign-in outcome, so a click on one filters the list to them.
     assert body["sign_in_outcomes"] == {"succeeded": ["login_success"],
-                                        "failed": ["login_failure", "second_factor_failed"],
+                                        "failed": ["login_failure", "second_factor_failed", "sso_sign_in_refused"],
                                         "locked": ["account_auto_locked"]}
 
 

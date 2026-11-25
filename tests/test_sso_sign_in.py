@@ -654,7 +654,8 @@ def test_a_link_met_by_a_change_of_the_account_is_answered_as_busy_and_links_not
     assert body["detail"] == {"reason": "busy",
                               "message": "Your account is being changed right now. Start the link again in a moment."}
     assert len(h.identities()) == 0
-    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "busy" for a in h.audits), h.audits
+    assert any(a[0] == "sso_flow_refused" and a[2].get("reason") == "busy" and a[2].get("purpose") == "link"
+               for a in h.audits), h.audits
     # The same code spent: the request sent again finds nothing to finish.
     assert _call(h.S, "POST", "/users/me/identities/finish", {"code": code, "verifier": "link-tab"})[0] != 200
     assert oc.TEMPORARILY_UNAVAILABLE != sso.BUSY
@@ -1418,6 +1419,42 @@ def test_a_refusal_that_met_an_account_is_recorded_under_it(monkeypatch):
     status, location, _ = h.callback(p, state)
     assert location == "/#sso-error=no_account", location
     assert h.audit_who == [("sso_sign_in_refused", None)]
+
+
+REFUSALS = ("login_failure", "sso_sign_in_refused", "sso_flow_refused")
+
+
+def test_a_sign_in_refused_at_the_callback_is_counted_as_a_failed_sign_in(monkeypatch):
+    """A sign-in through a provider that the callback refused leaves one row, and it is the attempt's failure: the
+    Activity page counts it among the failed sign-ins, with the wrong passwords."""
+    from app.services.activity_summary import SIGN_IN_OUTCOMES
+    h, alice, root, p, identity, callback_with = _refusal_world(monkeypatch)
+    assert callback_with(groups=["sales"]) == "/#sso-error=restricted"
+    refused = [(a[0], a[2].get("purpose"), a[2].get("reason")) for a in h.audits if a[0] in REFUSALS]
+    assert refused == [("sso_sign_in_refused", "sign_in", "restricted")], h.audits
+    assert SIGN_IN_OUTCOMES.get("sso_sign_in_refused") == "failed"
+
+
+def test_a_link_refused_at_the_callback_is_recorded_apart_from_the_failed_sign_ins(monkeypatch):
+    """A link is asked for by somebody already signed in. Refused at the callback (here the provider's answer told
+    of a sign-in three days old, not a fresh one), its row names the link and is recorded under an action of its
+    own, which the count of failed sign-ins leaves out."""
+    from app.core import audit_catalog
+    from app.services.activity_summary import SIGN_IN_OUTCOMES
+    alice = _user()
+    p = _provider(last_test={"outcome": "ok", "auth_time_present": True})
+    h = Harness(monkeypatch, [alice], [p])
+    status, out = h.start_link(p)
+    assert status == 200, out
+    state, _ = h.state_of(out["authorization_url"])
+    h.claims_override = {"auth_time": int(time.time()) - 3 * 86400}
+    status, location, _ = h.callback(p, state)
+    assert location == "/#sso-error=reauth_stale", location
+    refused = [(a[0], a[2].get("purpose"), a[2].get("reason")) for a in h.audits if a[0] in REFUSALS]
+    assert refused == [("sso_flow_refused", "link", "reauth_stale")], h.audits
+    assert ("sso_flow_refused", "alice") in h.audit_who and h.identities() == []
+    assert "sso_flow_refused" not in SIGN_IN_OUTCOMES
+    assert audit_catalog.lookup("sso_flow_refused").category == "sign_in"
 
 
 def test_the_record_of_a_sign_in_says_which_provider_it_came_through():

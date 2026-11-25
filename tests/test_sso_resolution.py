@@ -354,7 +354,8 @@ def test_a_link_asks_the_provider_for_a_fresh_sign_in_and_says_who_was_linked(mo
     h.claims_override = {"sub": "somebody-else", "email": "other@corp.example", "auth_time": int(time.time()) - 3 * 86400}
     assert h.callback(p, state)[1] == "/#sso-error=reauth_stale"
     assert h.codes() == [] and h.identities() == []
-    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "reauth_stale" for a in h.audits)
+    assert any(a[0] == "sso_flow_refused" and a[2].get("reason") == "reauth_stale" and a[2].get("purpose") == "link"
+               for a in h.audits), h.audits
     # A token that does not say when is no fresh sign-in either.
     status, out = h.start_link(p)
     state, _ = h.state_of(out["authorization_url"])
@@ -1572,7 +1573,8 @@ def test_a_privileged_account_never_links_itself_to_a_password_less_provider(mon
     status, location, _ = h.callback(p, state)
     assert location == "/#sso-error=privileged_on_password_less", location
     assert h.identities() == [] and h.codes() == []
-    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "privileged_on_password_less" for a in h.audits), h.audits
+    assert any(a[0] == "sso_flow_refused" and a[2].get("reason") == "privileged_on_password_less"
+               and a[2].get("purpose") == "link" for a in h.audits), h.audits
     # The same provider with password sign-in allowed takes the link.
     p.policy = {"sso_password_login": "allowed"}
     status, out = h.start_link(p)

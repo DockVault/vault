@@ -274,10 +274,10 @@ def test_the_callback_accepts_only_a_fresh_sign_in_of_the_accounts_own_identity(
     assert not [k for k in h.redis.rows if k.startswith("sso:handover:") or k.startswith("sso:reauth:")]
     if arrange == "future":
         # Refused where the provider's answer is read, before the re-authentication's own rule: for every purpose.
-        assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == reason and a[2].get("purpose") == "step_up"
+        assert any(a[0] == "sso_flow_refused" and a[2].get("reason") == reason and a[2].get("purpose") == "step_up"
                    for a in h.audits), h.audits
         return
-    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == reason and a[2].get("step_up") == "admin.retention.write"
+    assert any(a[0] == "sso_flow_refused" and a[2].get("reason") == reason and a[2].get("step_up") == "admin.retention.write"
                for a in h.audits), h.audits
     # With the provider's MFA trusted and present, the sign-in is accepted.
     if arrange == "no_mfa_when_trusted":

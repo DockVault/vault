@@ -230,6 +230,21 @@ def test_grouped_counts_become_buckets_categories_and_sign_in_outcomes():
     assert band["top_addresses"] == [{"ip_address": "203.0.113.9", "count": 6, "failed": 2}]
 
 
+def test_a_sign_in_refused_through_a_provider_is_a_failed_sign_in_and_a_refused_link_is_not():
+    # A sign-in refused at the provider's callback writes one row, sso_sign_in_refused, and nothing else: it is
+    # the attempt's failure. A link, a test or a confirmation refused there is somebody already signed in, and
+    # writes sso_flow_refused: a refused event of the sign-in category, never a failed sign-in.
+    w = s.window("24h", NOW)
+    rows = [(23, "login_success", 4, 0, 0, 0), (23, "login_failure", 2, 2, 2, 2)]
+    before = s.shape(w, _grouped(*rows), [], [])
+    after = s.shape(w, _grouped(*rows, (23, "sso_sign_in_refused", 2, 2, 2, 2), (23, "sso_flow_refused", 1, 1, 0, 0)),
+                    [], [])
+    assert before["sign_ins"] == {"succeeded": 4, "failed": 2, "locked": 0}
+    assert after["sign_ins"] == {"succeeded": 4, "failed": 4, "locked": 0}
+    assert after["buckets"][23]["counts"] == {"sign_in": 9} and (after["total"], after["failed"]) == (9, 5)
+    assert after["categories"] == [{"key": "sign_in", "label": "Sign-in and sessions", "count": 9, "failed": 5}]
+
+
 def test_a_block_under_other_filters_is_counted_from_its_own_rows():
     # A category filter narrowed the Events block to files; the category mix, the sign-ins and the
     # people were counted without it (their rows carry no bucket).

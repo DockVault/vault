@@ -71,7 +71,10 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("passkey_requirement_restored", "sign_in", "Passkey requirement put back for an account", "info"),
     # By an administrator (through the two-person rule) or by an approved request.
     AuditAction("passkey_admin_removed", "sign_in", "Passkey removed for another user", "warning"),
-    AuditAction("sso_sign_in_refused", "sign_in", "Single sign-on refused", "warning"),
+    # A sign-in through a provider, refused: counted as a failed sign-in. A link, a test or a confirmation refused
+    # at the provider is asked for by somebody already signed in, and is recorded apart (app/api/sso_router.py).
+    AuditAction("sso_sign_in_refused", "sign_in", "Sign-in through a provider refused", "warning"),
+    AuditAction("sso_flow_refused", "sign_in", "Provider link, test or confirmation refused", "warning"),
     AuditAction("sso_identity_linked", "sign_in", "Organisation identity linked", "notice"),
     AuditAction("sso_identity_unlinked", "sign_in", "Organisation identity unlinked", "notice"),
     # Who may sign in through whom is an administrator's setting: kept with the other settings' records, which
