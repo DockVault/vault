@@ -126,8 +126,9 @@ class SignInResult:
     # the ID token (plain here, encrypted at rest) when the provider logout option wants it.
     provider_sid: Optional[str] = None
     provider_sub: Optional[str] = None
-    # When the vault took the provider's answer (seconds since the epoch): a logout the provider sends later ends
-    # the sign-ins under way that it answered before, and not one it answers after.
+    # The moment this sign-in counts from for the provider's logouts (seconds since the epoch): when the vault
+    # began it, before the person was sent to the provider (app/core/sso_state.began_at). A logout the vault
+    # takes later ends the sign-ins under way that were begun before it, and not one begun after.
     provider_answered_at: Optional[float] = None
     # The ID token, for the provider's own logout; only when wanted. Never in the result's text form.
     provider_logout_hint: Optional[str] = field(default=None, repr=False)
@@ -762,12 +763,12 @@ def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
 
 
 def logged_out_at_the_provider(row, result: SignInResult) -> bool:
-    """Whether the provider has said, by a back-channel logout made after it answered this sign-in, that the
-    session the sign-in came through, or the person, is logged out (app/api/sso_router.py backchannel_logout).
+    """Whether the provider has said, by a back-channel logout the vault took after this sign-in was begun, that
+    the session the sign-in came through, or the person, is logged out (app/api/sso_router.py backchannel_logout).
     Finished all the same, the sign-in would record the provider's session on a new vault session, and no later
-    logout would name it. A sign-in the provider answered after its logout is a new one, whatever session id it
-    carries (a provider may keep one): it is not refused. One that does not say when it was answered is taken as
-    answered before. Asked only where the provider's logouts are taken. A store that cannot be reached refuses
+    logout would name it. A sign-in begun after the logout is a new one, whatever session id it carries (a
+    provider may keep one): it is not refused. One that does not say when it was begun is taken as begun
+    before. Asked only where the provider's logouts are taken. A store that cannot be reached refuses
     the sign-in as busy: whether the person was logged out cannot be told."""
     pending = result.pending
     sid = result.provider_sid or getattr(pending, "_provider_sid", None)

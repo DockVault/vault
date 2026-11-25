@@ -106,6 +106,9 @@ class LoginState:
     client_ip: Optional[str] = None
     source: Optional[str] = None                 # the address's source key, for the abandoned count
     started_at: int = field(default_factory=lambda: int(time.time()))
+    # When the vault began this sign-in, to the fraction of a second (:func:`began_at`): the moment a sign-in
+    # through the provider counts from when the provider's logouts are judged.
+    asked_at: Optional[float] = None
     extras: dict = field(default_factory=dict)   # small, purpose-specific additions (an invitation token)
 
     @classmethod
@@ -128,6 +131,9 @@ class LoginState:
             if value is not None and not isinstance(value, str):
                 return None
         if not isinstance(record.extras, dict):
+            return None
+        if record.asked_at is not None and (isinstance(record.asked_at, bool)
+                                            or not isinstance(record.asked_at, (int, float))):
             return None
         if record.return_to not in RETURN_TO:
             return None
@@ -166,7 +172,7 @@ def begin(*, provider_id: str, purpose: str, source: str, client_ip: Optional[st
         return_to=return_to_or_default(return_to), verifier_hash=verifier_hash, code_challenge=code_challenge,
         user_id=str(user_id) if user_id is not None else None, session_hash=session_hash,
         step_up_action=step_up_action, client_ip=client_ip, source=source, started_at=int(now),
-        extras=dict(extras or {}))
+        asked_at=float(now), extras=dict(extras or {}))
     try:
         written = r.set(_key(record.state), json.dumps(asdict(record), separators=(",", ":")),
                              ex=STATE_TTL_SECONDS, nx=True)
@@ -178,6 +184,17 @@ def begin(*, provider_id: str, purpose: str, source: str, client_ip: Optional[st
     if not written:
         raise Unavailable("the sign-in state could not be written")
     return record
+
+
+def began_at(login) -> float:
+    """When the vault began the sign-in ``login`` stands for (seconds since the epoch). Every code the provider
+    hands back for this state was issued after it, however long the provider or the browser took: a logout the
+    vault takes after this moment is a logout made while the sign-in was under way. A state written without the
+    exact moment gives its whole second, which is not later."""
+    asked = getattr(login, "asked_at", None)
+    if isinstance(asked, (int, float)) and not isinstance(asked, bool):
+        return float(asked)
+    return float(login.started_at)
 
 
 def take(state, *, redis=None) -> Optional[LoginState]:
@@ -338,9 +355,10 @@ def forget_logout_jti(jti, *, scope: str, redis=None) -> None:
 
 
 LOGGED_OUT_PREFIX = "sso:logged-out:"
-# Longer than a sign-in under way can go without being judged again: the handover code lives a minute and a held
-# step five, and each step that follows another is judged where it is written.
-LOGGED_OUT_TTL_SECONDS = 900
+# Longer than a sign-in can last from the moment it counts from, its start at the vault (:func:`began_at`), to
+# the end of a held step: the state's ten minutes, the handover code's one and a held step's five (960 seconds).
+# Each step that follows another is judged where it is written.
+LOGGED_OUT_TTL_SECONDS = 1200
 
 
 def _logged_out_key(kind: str, value: str, scope: str) -> str:
@@ -350,7 +368,7 @@ def _logged_out_key(kind: str, value: str, scope: str) -> str:
 
 def note_logged_out(*, scope: str, sid=None, sub=None, at: Optional[float] = None, redis=None) -> None:
     """Remember when the provider ``scope`` logged out what its token named (its session ``sid``, or the person
-    ``sub``), for as long as a sign-in under way that the provider answered before that moment could still be
+    ``sub``), for as long as a sign-in under way that was begun before that moment could still be
     finished. Raises :class:`Unavailable` without the store: the logout is then answered as failed, and the
     provider's retry notes it."""
     moment = repr(float(time.time() if at is None else at))

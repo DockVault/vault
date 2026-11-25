@@ -111,7 +111,7 @@ class Handover:
     provider_sub: Optional[str] = None
     provider_logout_hint_enc: Optional[str] = None
     provider_auth_time: Optional[int] = None          # when the provider said the person authenticated; None if it did not say
-    provider_answered_at: Optional[float] = None      # when the vault took the provider's answer
+    provider_answered_at: Optional[float] = None      # when the vault began the sign-in at the provider
     created_at: int = field(default_factory=lambda: int(time.time()))
     # How many times the account's sessions had been ended when the proof read the account
     # (app/services/sign_in.py, in_the_accounts_turn). A record without it matches no account.

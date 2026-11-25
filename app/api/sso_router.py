@@ -498,7 +498,7 @@ async def sign_in_callback(
         sso_groups.tell(db, row, user, applied, client_ip=client_ip)
         from app.core import sign_in_codes
         result = sso.pipeline_result(db, row, user, answer, provider_id=login.provider_id, client_ip=client_ip,
-                                     identity=found.identity)
+                                     identity=found.identity, began_at=sso_state.began_at(login))
         try:
             handover_code = sign_in_codes.store(sign_in_codes.from_result(
                 result, verifier_hash=login.verifier_hash, code_challenge=login.code_challenge,
@@ -735,7 +735,7 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         # A sign-in held for a further step, or waiting in its handover code, carries the provider's session
         # and the person, and would record them on a new vault session that no later logout names. What the
         # token names (the session, else the person) is remembered as logged out now, for as long as such a
-        # sign-in can last: one the provider answered before this moment is refused where it is written, and
+        # sign-in can last: one begun before this moment is refused where it is written, and
         # one it answers after is a new sign-in.
         if by == "sid":
             sso_state.note_logged_out(scope=scope, sid=sid)

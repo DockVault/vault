@@ -757,9 +757,86 @@ def test_a_logout_by_session_id_ends_the_sign_in_under_way_that_came_through_tha
     assert sso_state.logged_out_since(scope=str(uuid.uuid4()), sid="s-held") is None
     assert sso_state.logged_out_since(scope=str(p.id), sid="", sub=None) is None
     assert sso_state.logged_out_since(scope=str(p.id), sub="s-held") is None           # a session id is no subject
-    # Kept for longer than a sign-in under way lives: the handover code's minute and a held step's five.
+    # Kept for longer than a sign-in lasts from its start: the state's ten minutes, the handover code's one and a
+    # held step's five.
     assert h.redis.ttl[sso_state._logged_out_key("sid", "s-held", str(p.id))] == sso_state.LOGGED_OUT_TTL_SECONDS
-    assert sso_state.LOGGED_OUT_TTL_SECONDS > sso_state.HANDOVER_TTL_SECONDS + sign_in.PRE_AUTH_TTL_MINUTES * 60
+    assert sso_state.LOGGED_OUT_TTL_SECONDS > (sso_state.STATE_TTL_SECONDS + sso_state.HANDOVER_TTL_SECONDS
+                                               + sign_in.PRE_AUTH_TTL_MINUTES * 60)
+
+
+def test_a_logout_taken_while_the_provider_is_asked_for_its_answer_ends_that_sign_in(monkeypatch):
+    """The vault exchanges the code and resolves the account, and that takes its time. A logout taken meanwhile
+    finds no session of the sign-in to end. The sign-in counts from when the vault began it, so it is refused
+    where it is written; counted from when the answer was taken, it finished with the session the provider had
+    just logged out, and no later logout named it."""
+    from app.services import sso_sign_in as sso
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    answered = sso.verified_answer
+
+    def logged_out_while_the_provider_answers(*args, **kwargs):
+        answer = answered(*args, **kwargs)
+        assert h.logout(p, h.logout_token(sid="s-held", sub=...))[0] == 200
+        return answer
+    monkeypatch.setattr(sso, "verified_answer", logged_out_while_the_provider_answers)
+    waiting, _ = _sign_in(h, p, sid="s-held")
+    assert waiting.startswith("/#sso="), waiting
+    status, body = h.finish(waiting)
+    assert status == 401 and body == {"detail": "This sign-in cannot be completed; start again."}, body
+    assert not h.active_sessions()
+    # The same logout, and a sign-in begun after it: a new one, finished as ever.
+    monkeypatch.setattr(sso, "verified_answer", answered)
+    again, _ = _sign_in(h, p, sid="s-held")
+    assert h.finish(again)[0] == 200 and len(h.active_sessions()) == 1
+
+
+def test_a_redirect_held_across_a_logout_is_not_finished_into_a_session(monkeypatch):
+    """A browser holds the provider's redirect, whose code was issued while the provider's session was live, and
+    sends it after the provider logged that session out. The sign-in counts from its start at the vault, which
+    is before the logout: refused."""
+    from app.core import sso_state
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    status, out = h.start(p)
+    assert status == 200, out
+    state, record = h.state_of(out["authorization_url"])
+    assert isinstance(record["asked_at"], float) and int(record["asked_at"]) == record["started_at"]
+    assert h.logout(p, h.logout_token(sid="s-held", sub=...))[0] == 200
+    since = sso_state.logged_out_since(scope=str(p.id), sid="s-held")
+    assert since is not None and record["asked_at"] <= since
+    h.claims_override = {"sid": "s-held"}
+    status, location, _ = h.callback(p, state)
+    assert status == 302 and location.startswith("/#sso="), location
+    status, body = h.finish(location)
+    assert status == 401 and body == {"detail": "This sign-in cannot be completed; start again."}, body
+    assert not h.active_sessions()
+
+
+def test_a_sign_in_counts_from_when_the_vault_began_it(monkeypatch):
+    from app.core import sso_state
+    from app.services import sso_sign_in as sso
+    # The state's own moment, exact; a state without it gives its whole second, which is not later.
+    assert sso_state.began_at(types.SimpleNamespace(asked_at=1000.75, started_at=1000)) == 1000.75
+    assert sso_state.began_at(types.SimpleNamespace(asked_at=None, started_at=1000)) == 1000.0
+    assert sso_state.began_at(types.SimpleNamespace(asked_at=True, started_at=1000)) == 1000.0
+    assert sso_state.began_at(types.SimpleNamespace(started_at=1000)) == 1000.0
+    # A state whose moment is not a number is no state.
+    whole = {"state": "s", "provider_id": "p", "purpose": sso_state.SIGN_IN, "nonce": "n", "code_verifier": "v",
+             "verifier_hash": "h"}
+    assert sso_state.LoginState.from_payload({**whole, "asked_at": 12.5}).asked_at == 12.5
+    assert sso_state.LoginState.from_payload(whole).asked_at is None
+    for odd in ("12.5", True, [1]):
+        assert sso_state.LoginState.from_payload({**whole, "asked_at": odd}) is None, odd
+    # The result carries the moment it is given, and now for a caller that began nothing.
+    alice, p = _user(), _provider()
+    answer = types.SimpleNamespace(auth_time=None, sid="s-1", subject="subject-1", id_token="t", amr=[], acr=None)
+    monkeypatch.setattr(sso, "linked_on_the_providers_word", lambda db, user, identity: False)
+    monkeypatch.setattr(sso, "mfa_trusted", lambda row, answer: False)
+    given = sso.pipeline_result(None, p, alice, answer, provider_id=str(p.id), client_ip=None, began_at=1000.75)
+    assert given.provider_answered_at == 1000.75
+    for nothing in (None, True, "1000"):
+        result = sso.pipeline_result(None, p, alice, answer, provider_id=str(p.id), client_ip=None, began_at=nothing)
+        assert abs(result.provider_answered_at - time.time()) < 5, nothing
 
 
 def test_a_logout_by_the_subject_ends_the_persons_sign_ins_under_way_through_the_provider_and_no_others(monkeypatch):

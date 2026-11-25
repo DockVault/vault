@@ -953,7 +953,7 @@ def _group_names(row, answer: ProviderAnswer) -> list:
 
 
 def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, client_ip: Optional[str],
-                    identity=None):
+                    identity=None, began_at=None):
     """The pipeline's result for a provider sign-in: the provider is the first proof (``amr`` carries what the
     vault proved itself, nothing from the provider); the provider's MFA counts as the second factor only when the
     provider's policy trusts the values the token carried, and never for an identity that stands on the provider's
@@ -968,14 +968,23 @@ def pipeline_result(db, row, user, answer: ProviderAnswer, *, provider_id: str, 
     The rule is :func:`linked_on_the_providers_word`: a factor it can give now, or one it is to set up again
     (after a reset, a removed last passkey, a key that can no longer be used: the sign-in is then held for that
     set-up). It is less than :func:`set_up_its_own_factor`: passkeys kept while they are switched off are no
-    factor and nothing is owed for them, so such an account goes on as one without a factor does."""
+    factor and nothing is owed for them, so such an account goes on as one without a factor does.
+
+    ``began_at``: when the vault began this sign-in (app/core/sso_state.began_at), which is the moment the
+    sign-in counts from for the provider's logouts. Not the moment the provider's answer was taken: the exchange
+    of the code and the account's resolution take their time, and a browser may hold the provider's redirect for
+    as long as the state lives. A logout the vault took in between found no session to end, and a moment stamped
+    here, after it, let the sign-in finish with the session the provider had logged out. Without it (a caller
+    that began nothing), now."""
     from app.services.sign_in import SignInResult
+    counted_from = (float(began_at) if isinstance(began_at, (int, float)) and not isinstance(began_at, bool)
+                    else time.time())
     policy = policy_of(row)
     on_the_providers_word = linked_on_the_providers_word(db, user, identity)
     return SignInResult(user, [], client_ip, provider_id=provider_id, sessions_ended=sign_in_as_read(user),
                         provider_mfa_trusted=mfa_trusted(row, answer) and not on_the_providers_word,
                         provider_auth_time=answer.auth_time,
-                        provider_sid=answer.sid, provider_sub=answer.subject, provider_answered_at=time.time(),
+                        provider_sid=answer.sid, provider_sub=answer.subject, provider_answered_at=counted_from,
                         provider_logout_hint=answer.id_token if policy["sso_idp_logout"] else None)
 
 
