@@ -1685,7 +1685,8 @@ async def list_my_identities(
                                   and not getattr(current_user, "sso_only", False)),
                 "link_refusal": link_refusal(p),
                 "reauth": may_confirm and str(p.id) in linked and sso.reauth_offered(p)}
-    return {"identities": [shown(i) for i in rows],
+    identities = [shown(i) for i in rows]
+    return {"identities": identities,
             "providers": [offered_one(p) for p in offered],
             # The account's address, when confirming it would let a provider's sign-in find the account: the
             # page then offers the code (or says who can confirm it, where the vault sends no email).
@@ -1693,7 +1694,19 @@ async def list_my_identities(
                        # Whether the account can set a second factor up under Your account: an authenticator
                        # asks for the password again, and one with none it can type is left the passkey.
                        "factor_here": _a_factor_can_be_set_up_here(current_user)}
-                      if sso.confirmed_address_wanted(db, current_user) else None)}
+                      if sso.confirmed_address_wanted(db, current_user) else None),
+            # Where an unlink lets the account hold a password again: whether "Forgot your password?" on the
+            # sign-in page sends this account a reset link, so the page names it only then (else an administrator's
+            # reset link), as the owner's notice of the unlink does.
+            "self_service_reset": (any(i["restores_password"] for i in identities)
+                                   and _self_service_reset_for(db, current_user))}
+
+
+def _self_service_reset_for(db, user) -> bool:
+    """Whether "Forgot your password?" on the sign-in page sends ``user`` a reset link (sso_providers_router
+    .self_service_reset), by the address the account has."""
+    from app.api import sso_providers_router
+    return sso_providers_router.self_service_reset(db, has_address=bool((getattr(user, "email", None) or "").strip()))
 
 
 def _a_factor_can_be_set_up_here(user) -> bool:
@@ -1946,5 +1959,7 @@ async def unlink_my_identity(
     answer = {"removed": True, "sessions_ended": ended}
     if may_set_password:
         answer["may_set_password"] = True
+        # How the page says it gets one, as the owner's notice does (_how_to_set_a_password).
+        answer["self_service_reset"] = _self_service_reset_for(db, current_user)
     answer["ended_this_session"] = bool(this_session)
     return answer

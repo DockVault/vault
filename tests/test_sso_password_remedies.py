@@ -185,3 +185,29 @@ def test_an_account_held_before_a_removal_is_told_its_password_signs_it_in_only_
                                      "before.")
     assert told[("bob",)].endswith("stay paused until an administrator lifts that.")
     assert "password" not in told[("bob",)]
+
+
+@pytest.mark.parametrize("vault, address, sends", [
+    ({}, "alice@example.test", True),
+    ({"smtp": False}, "alice@example.test", False),
+    ({"enabled": False}, "alice@example.test", False),
+    ({}, None, False),
+])
+def test_your_account_says_whether_forgot_your_password_sends_a_link_before_and_after_an_unlink(monkeypatch, vault,
+                                                                                                address, sends):
+    """An unlink that lets the account hold a password again leaves it with none anybody can type. Your account
+    says how to get one before the unlink and after it, and names "Forgot your password?" only where that link
+    sends this account a reset link: the self-service switch on, email configured, the vault's public address
+    set, and an address on the account. The list and the unlink's answer say which, as the owner's notice does."""
+    alice = _user(sso_only=True, email=address)
+    holds = _provider(name="holds", label="Holds", policy={"sso_password_login": "disabled", **ONE_STEP})
+    keeps = _provider(name="keeps", label="Keeps", policy=ONE_STEP)
+    on_holds, on_keeps = _identity(alice, holds, subject="s-holds"), _identity(alice, keeps, subject="s-keeps")
+    h = Harness(monkeypatch, [alice], [holds, keeps], identities=[on_holds, on_keeps])
+    h.session_claims = {"amr": []}
+    _self_service(monkeypatch, h.S, **vault)
+    status, out, _ = _call(h.S, "GET", "/users/me/identities")
+    assert status == 200 and out["self_service_reset"] is sends, out
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: None)
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{on_holds.id}")
+    assert status == 200 and out["may_set_password"] is True and out["self_service_reset"] is sends, out

@@ -262,6 +262,15 @@
     // The name a fresh sign-in is staged under to confirm an unlink (app/services/sso_sign_in.py).
     const UNLINK_CONFIRMATION = 'sso.identity.unlink';
 
+    // How an account that may hold a password again, and has none, gets one. "Forgot your password?" sends a reset
+    // link only where the vault offers it, sends email and has its public address, and the account has an address:
+    // the server says whether it does (self_service_reset). An administrator's reset link works everywhere.
+    function howToSetAPassword(selfServiceReset) {
+        return selfServiceReset === true
+            ? 'set one with "Forgot your password?" on the sign-in page, or ask an administrator for a reset link.'
+            : 'ask an administrator for a reset link.';
+    }
+
     // What the page does once an unlink went through. An unlink ends every session made through the identity, so
     // when this session came through it (the answer's ended_this_session) the page signs out with a sentence: the
     // list read again would meet a session that has ended. Another way in is left, or the unlink was refused.
@@ -273,8 +282,8 @@
         }
         // The provider that held the account to no password is gone: the account may hold one again, and has none.
         showSuccess(answer && answer.may_set_password === true
-            ? 'Unlinked. Your account may hold a password again and has none yet: ask an administrator for a reset '
-                + 'link, or use "Forgot your password?" on the sign-in page where it is shown.'
+            ? 'Unlinked. Your account may hold a password again and has none yet: '
+                + howToSetAPassword(answer.self_service_reset)
             : 'Unlinked.');
         renderAccount();
     }
@@ -369,8 +378,7 @@
                 // hold one again, and has none yet), and it ends every session made through the identity, this one
                 // too when it came through it.
                 const alsoSaid = (identity.restores_password === true ? ' Your account may then hold a password '
-                    + 'again, but has none yet: ask an administrator for a reset link, or use "Forgot your password?" '
-                    + 'on the sign-in page where it is shown.' : '')
+                    + 'again, but has none yet: ' + howToSetAPassword(data && data.self_service_reset) : '')
                     + (identity.this_session === true ? ' You signed in this time through ' + name
                         + ', so unlinking it also signs you out here and wherever you signed in through it.' : '');
                 if (identity.unlink_asks_provider) {

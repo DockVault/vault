@@ -539,7 +539,7 @@ def test_the_flag_follows_the_providers_an_account_is_still_linked_to(monkeypatc
     b.state = "enabled"
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{on_a.id}")
     assert status == 200 and out == {"removed": True, "sessions_ended": 0, "may_set_password": True,
-                                     "ended_this_session": False}, out
+                                     "self_service_reset": False, "ended_this_session": False}, out
     assert alice.sso_only is False and h.identities() == [on_b]
     said = [body for ids, title, body in h.notice_bodies if ids == [str(alice.id)]]
     assert "may hold a password again" in said[-1] and "ask an administrator for a reset link." in said[-1]

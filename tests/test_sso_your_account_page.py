@@ -229,17 +229,24 @@ def test_the_page_back_from_the_provider_hands_the_providers_name_to_the_unlink(
     assert "await Sso.unlinkConfirmed(out.then.slice('unlink:'.length), out.label);" in source
 
 
-MAY_HOLD_A_PASSWORD = (' Your account may then hold a password again, but has none yet: ask an administrator for a reset '
-                       'link, or use "Forgot your password?" on the sign-in page where it is shown.')
-UNLINKED_PASSWORD_BACK = ('Unlinked. Your account may hold a password again and has none yet: ask an administrator for a '
-                          'reset link, or use "Forgot your password?" on the sign-in page where it is shown.')
+# How the account gets a password, as the server says it: "Forgot your password?" sends a link only where the vault
+# offers it, sends email, has its public address and the account has an address (self_service_reset).
+FROM_AN_ADMINISTRATOR = 'ask an administrator for a reset link.'
+SELF_SERVICE = 'set one with "Forgot your password?" on the sign-in page, or ask an administrator for a reset link.'
+MAY_HOLD_A_PASSWORD = ' Your account may then hold a password again, but has none yet: ' + FROM_AN_ADMINISTRATOR
 
 
-def test_an_unlink_that_gives_the_account_its_password_back_says_so_before_and_after():
+@pytest.mark.parametrize("sends", [False, True, None])
+def test_an_unlink_that_gives_the_account_its_password_back_says_so_before_and_after(sends):
+    """Before the unlink and after it, the page says how the account gets a password: "Forgot your password?" only
+    where the server says that link sends it one, and an administrator's reset link everywhere."""
+    listed = {"identities": [_identity(restores_password=True)], "providers": [], "email": None}
+    unlinked = {"removed": True, "sessions_ended": 0, "may_set_password": True, "ended_this_session": False}
+    if sends is not None:
+        listed["self_service_reset"] = unlinked["self_service_reset"] = sends
     got = _node(r"""
 answers['GET ' + LIST] = LISTED;
-answers['DELETE /users/me/identities/i-1'] = { removed: true, sessions_ended: 0, may_set_password: true,
-                                               ended_this_session: false };
+answers['DELETE /users/me/identities/i-1'] = UNLINKED;
 await window.Sso.renderAccount();
 button('Unlink').click();
 await settle();
@@ -248,11 +255,14 @@ confirms.length = 0; successes.length = 0;
 await window.Sso.unlinkConfirmed('i-1', 'Contoso');
 await settle();
 out({ direct, confirmed: { successes }, logouts });
-""".replace("LISTED", _list(_identity(restores_password=True))))
-    assert got["direct"]["confirms"][0]["message"] == ("Unlink Contoso? You will no longer sign in through it."
-                                                       + MAY_HOLD_A_PASSWORD)
-    assert got["direct"]["successes"] == [UNLINKED_PASSWORD_BACK]
-    assert got["confirmed"]["successes"] == [UNLINKED_PASSWORD_BACK]
+""".replace("LISTED", json.dumps(listed)).replace("UNLINKED", json.dumps(unlinked)))
+    how = SELF_SERVICE if sends else FROM_AN_ADMINISTRATOR
+    assert got["direct"]["confirms"][0]["message"] == ("Unlink Contoso? You will no longer sign in through it. Your "
+                                                       "account may then hold a password again, but has none yet: "
+                                                       + how)
+    done = "Unlinked. Your account may hold a password again and has none yet: " + how
+    assert got["direct"]["successes"] == [done]
+    assert got["confirmed"]["successes"] == [done]
     assert got["logouts"] == []
 
 
