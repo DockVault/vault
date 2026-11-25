@@ -560,15 +560,48 @@ def seed_email_actions(db: Session) -> int:
     return created
 
 
+# A default body an earlier release seeded, by action key, where the current default says something it did not. The
+# emails are sent from the stored row, so a vault upgraded from such a release would go on sending the old words: a
+# default row whose body is still one of these was never edited, and the boot gives it the current default body.
+EARLIER_DEFAULT_BODIES = {
+    # 0.16.0 to 0.35.2: no word for an account that signs in only through its organisation, which has no password to
+    # change.
+    "login_alert": (
+        "<h2>New sign-in to your account</h2>"
+        "<p>Hi {{user.username}},</p>"
+        "<p>Your <strong>{{vault.name}}</strong> account was signed in to on {{current_datetime}} (UTC).</p>"
+        "<p>If this was you, no action is needed. If you don't recognize this sign-in, change your "
+        "password right away.</p>"
+        "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
+        "<hr>"
+        "<p><small>Sent by {{vault.name}}.</small></p>",
+    ),
+}
+
+
+def _an_earlier_default(key: str, body) -> bool:
+    """Whether ``body`` (a stored default row's) is a default body an earlier release seeded for ``key``, as that
+    release's sanitizer stored it or as this one would: compared through the current sanitizer."""
+    from app.core import email_sanitize
+    earlier = EARLIER_DEFAULT_BODIES.get(key, ())
+    if not earlier or not isinstance(body, str):
+        return False
+    stored = email_sanitize.sanitize_email_html(body)
+    return any(stored == email_sanitize.sanitize_email_html(old) for old in earlier)
+
+
 def seed_default_templates(db: Session) -> int:
     """Idempotently materialize each action's built-in default template as an EmailTemplate row
     (identified by ``default_key``) and PRE-BIND the action to it when the action has no template yet.
 
     Runs after :func:`seed_email_actions` (the action rows must exist to bind). A default row is created
     only if one doesn't already exist for that key — so an admin's later customization of the default is
-    never overwritten (the pristine code body stays available via "Load From"). Binding happens only at
-    first creation and only when the action is currently unbound, so an admin's own template choice (or
-    an explicit "none") is respected on every subsequent boot. Returns the number of templates created."""
+    never overwritten (the pristine code body stays available via "Load From"). An existing default row
+    whose body is still a default an earlier release seeded (:data:`EARLIER_DEFAULT_BODIES`) was never
+    edited: it is given the current default body, so an upgrade sends the current words. Binding happens
+    only at first creation and only when the action is currently unbound, so an admin's own template
+    choice (or an explicit "none") is respected on every subsequent boot. Returns the number of templates
+    created."""
     from sqlalchemy.exc import IntegrityError
     from app.core.models import EmailAction, EmailTemplate
     from app.core import email_sanitize
@@ -579,7 +612,8 @@ def seed_default_templates(db: Session) -> int:
         if SPEC_BY_KEY.get(key, {}).get("category") == LOCKED:
             continue   # a locked action's wording is fixed: no template is made for it, none is bound
         # A default row already exists (this boot or a prior one) -> leave the ROW alone (never revive an
-        # admin's customization), but SELF-HEAL a SYSTEM action that is still unbound: bind it to its
+        # admin's customization; only a body still an earlier release's default is brought to the current
+        # one), but SELF-HEAL a SYSTEM action that is still unbound: bind it to its
         # existing default so editing that template actually changes the sent email. Without this, a boot
         # that created the default row before the action row existed leaves the action unbound forever,
         # and editing the "Default" template is a silent no-op (the send path reads action.template, and
@@ -589,6 +623,9 @@ def seed_default_templates(db: Session) -> int:
         # admin's explicit "none" (and stay off until explicitly configured).
         existing = db.query(EmailTemplate).filter(EmailTemplate.default_key == key).first()
         if existing is not None:
+            if _an_earlier_default(key, getattr(existing, "body_html", None)):
+                existing.body_html = email_sanitize.sanitize_email_html(spec["body_html"])
+                healed += 1
             action = db.get(EmailAction, key)
             if action is not None and action.template_id is None and action.category == SYSTEM:
                 action.template_id = existing.id

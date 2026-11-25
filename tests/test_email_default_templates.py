@@ -342,10 +342,55 @@ def test_seed_skips_a_conflicting_default_without_double_binding():
 
 
 class _FakeTemplate:
-    def __init__(self, default_key=None):
+    def __init__(self, default_key=None, body_html=None):
         import uuid
         self.id = uuid.uuid4()
         self.default_key = default_key
+        if body_html is not None:
+            self.body_html = body_html
+
+
+# The sign-in alert's default body as every release from 0.16.0 to 0.35.2 seeded it: no word for an account that signs
+# in only through its organisation, which has no password to change.
+_SIGN_IN_ALERT_BEFORE = (
+    "<h2>New sign-in to your account</h2>"
+    "<p>Hi {{user.username}},</p>"
+    "<p>Your <strong>{{vault.name}}</strong> account was signed in to on {{current_datetime}} (UTC).</p>"
+    "<p>If this was you, no action is needed. If you don't recognize this sign-in, change your "
+    "password right away.</p>"
+    "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
+    "<hr>"
+    "<p><small>Sent by {{vault.name}}.</small></p>"
+)
+
+
+@pytest.mark.parametrize("stored", ["as written", "sanitized"])
+def test_seed_brings_a_sign_in_alert_an_earlier_release_seeded_and_nobody_edited_to_the_current_default(stored):
+    """A vault upgraded from an earlier release keeps the default rows it seeded then, and the alert is sent from the
+    row. A row whose body is still that release's default was never edited: the boot gives it the current default,
+    whose advice fits an account that signs in only through its organisation. Whatever the sanitizer of the release
+    that stored it made of the body, it is the same default."""
+    body = _SIGN_IN_ALERT_BEFORE if stored == "as written" else es.sanitize_email_html(_SIGN_IN_ALERT_BEFORE)
+    existing = {k: _FakeTemplate(default_key=k) for k in ea.DEFAULT_TEMPLATES}
+    existing["login_alert"] = _FakeTemplate(default_key="login_alert", body_html=body)
+    sess = _FakeSession(existing_templates=existing, actions=_all_actions_unbound())
+    assert ea.seed_default_templates(sess) == 0                       # no row is made
+    healed = existing["login_alert"].body_html
+    assert healed == es.sanitize_email_html(ea.DEFAULT_TEMPLATES["login_alert"]["body_html"])
+    assert "tell your administrator at once if you sign in only through your organisation" in healed
+    assert sess.commits == 1
+    # A second boot finds the current default and changes nothing more.
+    ea.seed_default_templates(sess)
+    assert existing["login_alert"].body_html == healed
+
+
+def test_seed_leaves_a_sign_in_alert_an_administrator_edited_as_it_is():
+    edited = es.sanitize_email_html(_SIGN_IN_ALERT_BEFORE.replace("right away", "and call the help desk"))
+    existing = {k: _FakeTemplate(default_key=k) for k in ea.DEFAULT_TEMPLATES}
+    existing["login_alert"] = _FakeTemplate(default_key="login_alert", body_html=edited)
+    sess = _FakeSession(existing_templates=existing, actions=_all_actions_unbound())
+    ea.seed_default_templates(sess)
+    assert existing["login_alert"].body_html == edited
 
 
 def test_the_sign_in_method_email_is_described_by_everything_it_is_sent_for():
