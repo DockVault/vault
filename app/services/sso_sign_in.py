@@ -962,11 +962,29 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
         if said is not None:
             return said
     if policy["sso_account_creation"] == "jit":
-        if sso_policy.is_restricted(policy, _api()._account_policy(db), issuer=getattr(row, "issuer", None)):
+        account_policy = _api()._account_policy(db)
+        if sso_policy.is_restricted(policy, account_policy, issuer=getattr(row, "issuer", None)):
+            # What the sign-in itself refuses before it makes an account (_create_account), in its order: said
+            # here too, so the summary of a test is what a first sign-in would meet. A provider that sends no
+            # verified address was reported as "create the account", turned on, and then refused everybody.
+            if subject_owner(db, row, answer) is not None:
+                return {"restriction": "passes", "would": (
+                    "refuse: this identity is linked to an account already, under another tenant of the provider")}
             if address_holder(db, answer) is not None:
                 return {"restriction": "passes", "would": (
                     "refuse: an account here already holds this verified address, and no second one is made; its "
                     "owner signs in to it and links this provider under Your account")}
+            if (_admitted_address(db, answer, policy, account_policy) is None
+                    and account_policy.get("email_requirement") == "required"):
+                return {"restriction": "passes", "would": (
+                    "refuse: accounts here need an email address, and the provider's answer carries none a new "
+                    "account may have (none, one it does not mark as verified, one outside the allowed domains, "
+                    "or one already in use)")}
+            try:
+                _api()._enforce_user_cap(db)
+            except Exception:  # noqa: BLE001 -- the plan's refusal, whatever its words
+                return {"restriction": "passes", "would": (
+                    "refuse: this vault has reached the number of accounts it may hold")}
             name = username_for(db, row, answer)
             return {"restriction": "passes",
                     "would": (f"create the account {name} at the first sign-in and sign it in"

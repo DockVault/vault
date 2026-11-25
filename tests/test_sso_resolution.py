@@ -1627,6 +1627,51 @@ def test_a_test_sign_in_reports_the_restriction_and_what_the_vault_would_do(monk
         "refuse: an account here already holds this verified address, and no second one is made; its owner signs in "
         "to it and links this provider under Your account")
     assert would("nobody@example.test").startswith("create the account nobody at the first sign-in")
+    # What the sign-in itself refuses before it makes an account is said by the test too. (A provider that sends
+    # no verified address was reported as "create the account", turned on, and then refused everybody.)
+    from fastapi import HTTPException
+    account_policy = dict(h.S._account_policy(h.db))
+
+    def unverified(email="nobody@example.test"):
+        answer = sso.ProviderAnswer(claims={"preferred_username": "nobody"}, subject="s-new",
+                                    issuer="https://login.example.org", tenant_id=None, email=email,
+                                    email_verified=False, display_name=None, auth_time=None)
+        return answer, sso.would_do(h.db, made, answer, None)["would"]
+
+    def the_sign_in_refuses(answer):
+        with pytest.raises(sso.Refusal) as real:
+            sso._create_account(h.db, made, answer, sso.policy_of(made))
+        return real.value.code
+
+    def full(db):
+        raise HTTPException(status_code=400, detail="User limit reached")
+    with monkeypatch.context() as m:
+        m.setattr(h.S, "_account_policy", lambda db: account_policy)
+        m.setattr(sso, "restriction_of", lambda db, row, answer: None)
+        m.setattr(sso.sso_policy, "is_restricted", lambda policy, account, issuer=None: True)
+        account_policy["email_requirement"] = "required"
+        written = len(h.db.log)
+        answer, said = unverified()
+        assert said.startswith("refuse: accounts here need an email address, and the provider's answer carries "
+                               "none a new account may have"), said
+        assert not [step for step in h.db.log[written:] if step[0] in ("add", "commit", "flush")]   # a test writes nothing
+        assert the_sign_in_refuses(answer) == sso.EMAIL_REQUIRED          # the sign-in refuses for the same reason
+        account_policy["email_requirement"] = "optional"
+        assert unverified()[1].startswith("create the account nobody at the first sign-in")
+        # The vault at its number of accounts.
+        m.setattr(h.S, "_enforce_user_cap", full)
+        answer, said = unverified()
+        assert said == "refuse: this vault has reached the number of accounts it may hold"
+        assert the_sign_in_refuses(answer) == sso.ACCOUNT_LIMIT
+        m.setattr(h.S, "_enforce_user_cap", lambda db: None)
+        # The same subject pinned to an account already, under another tenant of the provider.
+        m.setattr(sso, "subject_owner", lambda db, row, answer: bob)
+        answer, said = unverified()
+        assert said == "refuse: this identity is linked to an account already, under another tenant of the provider"
+        assert the_sign_in_refuses(answer) == sso.ALREADY_LINKED
+        m.setattr(sso, "subject_owner", lambda db, row, answer: None)
+        assert unverified()[1].startswith("create the account nobody at the first sign-in")
+    assert h.users_named("nobody") == []
     h.db.rows_of(type(h.identities()[0]) if h.identities() else __import__("app.core.models", fromlist=["ExternalIdentity"]).ExternalIdentity).append(_identity(root, p))
     summary = run()
     assert summary["would"] == "sign in the linked account"
