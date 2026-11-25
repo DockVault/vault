@@ -11700,6 +11700,15 @@ async def update_user(
         from app.api.user_management_api import _blacklist_user_vault_keys
         n_bl = _blacklist_user_vault_keys(db, user.id, current_user.id)
 
+    # The account's turn at its sessions, once, for a request that changes somebody else's account, before
+    # anything below locks or writes that account's row (the order of the locks, app/services/sign_in.py).
+    # Several of the changes below end the account's sessions and take this turn themselves, some of them
+    # after an earlier field of the same request has written the row: the row before the turn, which a sign-in
+    # of the account that holds the turn and goes on to write the row meets as a ring of waiters. Held from
+    # here, each of them finds the turn taken. After the vault rows above, which are always locked first.
+    if not is_self:
+        _sessions_turn(db, user.id)
+
     # Nor may any change leave the deployment without an administrator who can act. Checked before
     # anything below touches the row, because the check reloads it under a lock.
     if is_admin and user.role == RoleEnum.ADMIN and (

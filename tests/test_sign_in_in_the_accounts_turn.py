@@ -503,3 +503,21 @@ def test_a_promotion_takes_the_accounts_turn_before_it_reads_or_writes_the_accou
     with pytest.raises(HTTPException) as refused:
         api._record_admin_grant(types.SimpleNamespace(), alice, by=None)
     assert refused.value.status_code == 409 and order == [("the turn", alice.id), "asked"]
+
+
+def test_a_change_of_somebody_elses_account_takes_that_accounts_turn_before_it_touches_the_row():
+    """Inside the request that changes an account: the vault rows a deactivation locks come first, then the
+    account's turn (for somebody else's account), then the administrators' rows, then every field. A request
+    that changes the caller's own account takes none here."""
+    import inspect
+    from app.api import api_server as api
+    source = inspect.getsource(api.update_user)
+    steps = ("n_bl = _blacklist_user_vault_keys(db, user.id, current_user.id)",
+             "    if not is_self:\n        _sessions_turn(db, user.id)",
+             "if removes_last_admin(db, user):", "outcome = _credential_change(",
+             "user.sftp_enabled = user_update.sftp_enabled", "_record_admin_grant(db, user, by=current_user)",
+             "user.is_active = user_update.is_active")
+    assert all(step in source for step in steps), [step for step in steps if step not in source]
+    order = [source.index(step) for step in steps]
+    assert order == sorted(order), order
+    assert source.count("_sessions_turn(db, user.id)") == 1
