@@ -97,7 +97,9 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("sso_password_sign_in_restored", "sign_in",
                 "A privileged account that signed in only through a provider may hold a password again", "warning",
                 automatic=True),
-    AuditAction("step_up_idp_reauth", "sign_in", "Step-up confirmed by a fresh provider sign-in", "notice"),
+    # Written when the tab stages the provider's answer, for a step-up, an unlink or a first passkey: what spends it
+    # may still refuse it, so the label says only what was given. The row's step_up names the action it was for.
+    AuditAction("step_up_idp_reauth", "sign_in", "Fresh provider sign-in given to confirm an action", "notice"),
     AuditAction("second_factor_action_updated", "sign_in", "Step-up requirement changed for an action", "notice"),
     AuditAction("second_factor_actions_bulk_updated", "sign_in", "Step-up requirements changed for several actions", "notice"),
     # By an administrator or by the server's operator on the host: the label names neither.

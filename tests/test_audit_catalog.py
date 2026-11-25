@@ -245,3 +245,11 @@ def test_a_category_filter_includes_every_spelling():
     assert "login_success" not in files
     assert catalog.label_for("USER_UPDATED") == catalog.label_for("user_updated")
     assert catalog.label_for("written_by_an_old_release") == catalog.LEGACY_LABEL
+
+
+def test_a_fresh_provider_sign_in_is_not_called_a_confirmed_step_up():
+    # The row is written when the tab stages the provider's answer. The step-up, the unlink or the first passkey
+    # that spends it may still refuse it, so the label says what was given, not that anything was confirmed.
+    label = catalog.lookup("step_up_idp_reauth").label
+    assert "confirmed" not in label.lower(), label
+    assert label == "Fresh provider sign-in given to confirm an action"
