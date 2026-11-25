@@ -149,6 +149,31 @@ def test_password_is_write_only_in_the_modal(admin_page: Page, admin):
     expect(page.locator("#ep-password-hint")).to_contain_text("leave blank to keep")
 
 
+def test_a_new_server_asks_for_the_smtp_password_beside_its_field(admin_page: Page, admin):
+    """The stored password goes only to the server it was entered for: saving the profile with another server
+    is refused before any step-up, with the sentence beside the password field; with the password it is saved."""
+    admin.post("/email/profiles", json={"name": "Moving", "smtp_server": "s.example.com", "smtp_port": 587,
+                                        "from_email": "a@example.com", "smtp_password": "secret-pw"})
+    page = admin_page
+    _open_email_tab(page)
+    page.locator('.email-profile-card:has-text("Moving") .epc-edit').click()
+    page.fill("#ep-server", "elsewhere.example.com")
+    page.click("#ep-save")
+    said = page.locator("#ep-password-error")
+    expect(said).to_be_visible(timeout=10000)
+    expect(said).to_contain_text("Re-enter the SMTP password")
+    expect(page.locator("#ep-password")).to_have_attribute("aria-invalid", "true")
+    expect(page.locator("#ep-password")).to_be_focused()
+    expect(page.locator("#stepup-modal.active")).to_have_count(0)
+    assert admin.get("/email/profiles").json()["profiles"][0]["smtp_server"] == "s.example.com"
+
+    page.fill("#ep-password", "secret-pw-2")
+    expect(said).to_be_hidden()
+    _save(page)
+    expect(page.locator("#email-profile-modal")).not_to_have_class(re.compile(r"\bactive\b"), timeout=10000)
+    assert admin.get("/email/profiles").json()["profiles"][0]["smtp_server"] == "elsewhere.example.com"
+
+
 def test_profile_saves_individually_not_central(admin_page: Page):
     page = admin_page
     _open_email_tab(page)

@@ -2251,8 +2251,11 @@
                                         </div>
                                         <div class="form-group">
                                             <label for="ep-password">Password</label>
-                                            <input type="password" id="ep-password" class="form-control" placeholder="••••••••" autocomplete="new-password">
+                                            <input type="password" id="ep-password" class="form-control" placeholder="••••••••" autocomplete="new-password" aria-describedby="ep-password-hint ep-password-error">
                                             <small class="text-secondary" id="ep-password-hint">Leave blank to keep the stored password</small>
+                                            <!-- Filled by app.js when the server asks for the SMTP password again: a new server, port or
+                                                 username, or the certificate check turned off, over a stored password. -->
+                                            <small class="text-error" id="ep-password-error" role="alert" hidden></small>
                                         </div>
                                     </div>
                                     <div class="form-group">

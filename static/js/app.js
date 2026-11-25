@@ -12293,8 +12293,48 @@ function openEmailProfileModal(profile) {
                                           : 'Enter a password if your server requires authentication';
     const result = document.getElementById('email-profile-result');
     result.textContent = '';
+    _emailProfilePasswordRefusal('');
+    const password = document.getElementById('ep-password');
+    if (password && !password.dataset.refusalWired) {
+        password.dataset.refusalWired = '1';
+        password.addEventListener('input', () => _emailProfilePasswordRefusal(''));
+    }
     document.getElementById('email-profile-modal').classList.add('active');
     document.getElementById('ep-name').focus();
+}
+
+// The server refuses a save or a test send that would send the stored SMTP password to another server, port or
+// username, or with the certificate check turned off, unless the request carries the password (reason
+// smtp_password_required). Its sentence goes beside the password field, which is marked and focused; an empty
+// sentence takes it away. Built with textContent only.
+const _SMTP_PASSWORD_REQUIRED = 'smtp_password_required';
+
+function _emailProfilePasswordRefusal(sentence) {
+    const said = document.getElementById('ep-password-error');
+    const field = document.getElementById('ep-password');
+    if (!said || !field) return;
+    said.textContent = sentence || '';
+    said.hidden = !sentence;
+    if (sentence) {
+        field.setAttribute('aria-invalid', 'true');
+        field.focus();
+    } else {
+        field.removeAttribute('aria-invalid');
+    }
+}
+
+// What a failed save or test send shows: the password refusal beside the password field, anything else on the
+// form's result line.
+function _emailProfileFailed(e, fallback) {
+    const result = document.getElementById('email-profile-result');
+    if (e && e.reason === _SMTP_PASSWORD_REQUIRED) {
+        result.textContent = '';
+        _emailProfilePasswordRefusal(e.message || fallback);
+        return;
+    }
+    _emailProfilePasswordRefusal('');
+    result.textContent = '✗ ' + ((e && e.message) || fallback);
+    result.style.color = 'var(--error)';
 }
 
 function closeEmailProfileModal() {
@@ -12336,8 +12376,7 @@ async function saveEmailProfile() {
         await loadEmailProfiles();
         showSuccess('Sending profile saved');
     } catch (e) {
-        result.textContent = '✗ ' + (e.message || 'Save failed');
-        result.style.color = 'var(--error)';
+        _emailProfileFailed(e, 'Save failed');
     } finally {
         btn.disabled = false;
     }
@@ -12352,6 +12391,8 @@ async function sendEmailProfileTest() {
         smtp_server: body.smtp_server, smtp_port: body.smtp_port,
         smtp_username: body.smtp_username || '', from_email: body.from_email,
         from_name: body.from_name || '',
+        // Tested as the form shows it: turning the check off over a stored password asks for the password.
+        smtp_allow_insecure_tls: body.smtp_allow_insecure_tls,
     };
     if (body.smtp_password) payload.smtp_password = body.smtp_password;
     try {
@@ -12359,11 +12400,11 @@ async function sendEmailProfileTest() {
         result.textContent = 'Sending test…';
         result.style.color = 'var(--text-secondary)';
         const r = await apiRequest('/email/profiles/test', { method: 'POST', body: JSON.stringify(payload) });
+        _emailProfilePasswordRefusal('');
         result.textContent = '✓ ' + ((r && r.message) || 'Test email sent');
         result.style.color = 'var(--success)';
     } catch (e) {
-        result.textContent = '✗ ' + (e.message || 'Test failed');
-        result.style.color = 'var(--error)';
+        _emailProfileFailed(e, 'Test failed');
     } finally {
         btn.disabled = false;
     }
