@@ -505,7 +505,8 @@ def test_the_warning_and_the_notices_say_that_the_password_stops_too_where_it_do
     assert told.emails[0][2]["change"] == F.warning_text(F.deadlines(db, alice.id)[0], due, sign_in_too=True)
     assert "your password and passkeys stop signing you in then" in told.emails[0][2]["change"]
     assert paused[2] == "Sign in through contoso: nothing else signs you in now"
-    assert paused[3] == F.LAPSE_MESSAGE_ALL.format(provider="contoso") and "your password" in paused[3]
+    how = F.how_to_sign_in(F.deadlines(db, carol.id)[0])
+    assert paused[3] == F.LAPSE_MESSAGE_ALL.format(provider="contoso") + " " + how and "your password" in paused[3]
     assert "For 1 of them the password and passkeys no longer sign in either" in wave[3]
     assert [details["ends_sign_in"] for _, _, details in told.audits] == [True, True]
     # The two texts differ, so a person is never told the wrong one.

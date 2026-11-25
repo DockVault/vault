@@ -23,6 +23,14 @@ NOW = datetime(2026, 11, 9, 12, 0, 0)
 DAY = timedelta(days=1)
 
 
+@pytest.fixture(autouse=True)
+def _an_address_single_sign_on_can_use(monkeypatch):
+    """The vault's address can carry single sign-on, so the sign-in page shows the providers' buttons, and the
+    sentences here name them. A test of an address that cannot sets its own."""
+    from app.services import sso_sign_in
+    monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: None)
+
+
 def _user(name="alice", **extra):
     fields = dict(id=uuid.uuid4(), username=name, email=f"{name}@example.test", is_active=True)
     fields.update(extra)
@@ -197,8 +205,12 @@ def test_the_sweep_warns_five_days_before_once_and_tells_once_when_keys_pause(to
     assert told.emails == [("sso_freshness_warning", "alice@example.test",
                             {"change": F.warning_text(F.deadlines(db, alice.id)[0], due_a), "when": due_a})]
     assert told.emails[0][2]["change"].startswith(f"Sign in through contoso by {due_a}.")
+    # How: the button, and to sign out first, since only a sign-in through the provider counts.
+    how = " Use the “contoso” button on the sign-in page (sign out first if you are signed in)."
+    assert told.emails[0][2]["change"].endswith(how) and told.notices[0][3].endswith(how)
     assert (str(carol.id), F.EXPIRED, "Your SSH keys and temporary credentials are paused") == told.notices[1][:3]
     assert told.notices[1][3].startswith("Sign in through contoso again")
+    assert told.notices[1][3] == F.refusal_text(F.deadlines(db, carol.id)[0]) + how
     wave = told.notices[2]
     assert wave[0] == str(admin.id) and wave[2].startswith("1 account") and "carol" in wave[3] and wave[4] == "#users"
     assert len(told.notices) == 3
@@ -277,6 +289,36 @@ def test_a_vault_address_single_sign_on_cannot_use_sends_nobody_to_a_button(monk
                         "is not available on this vault right now. Ask your administrator."), said
         assert "button" not in said
     assert F.another_way_in(db, refused) is None
+
+
+def test_the_warning_says_how_to_sign_in_through_the_provider(told, monkeypatch):
+    """Only a sign-in through the provider counts, and a person signed in with a password must sign out to make one:
+    the warning, in the app and by email, and the notice of the pause say how. Where the provider is not on the
+    sign-in page, the link the organisation hands out. The door's own answer says nothing of signing out: nobody
+    is signed in there."""
+    alice, bob = _user(), _user("bob")
+    p = _provider(30, name="entra-prod", label="Contoso", sso_lapse_ends_sign_in=False)
+    p.show_on_sign_in = False
+    ia = _identity(alice, p, signed_in=NOW - 27 * DAY)                 # due in 3 days: warned
+    ib = _identity(bob, p, signed_in=NOW - 31 * DAY)                   # lapsed a day ago
+    db = _db([alice, bob], [p], [ia, ib])
+    assert F.sweep(db, NOW) == {"warned": 1, "lapsed": 1}
+    link = " Use the sign-in link your organisation gave you (sign out first if you are signed in)."
+    warned, expired = told.notices
+    assert told.emails[0][2]["change"].endswith(link) and warned[3].endswith(link) and expired[3].endswith(link)
+    for found in F.deadlines(db, alice.id) + F.deadlines(db, bob.id):
+        assert "sign out" not in F.refusal_text(found) and "sign out" not in F.refusal_text(found, sign_in_too=True)
+    # On the sign-in page: its button, as it says it.
+    p.show_on_sign_in = True
+    found = F.deadlines(db, alice.id)[0]
+    assert F.how_to_sign_in(found) == ("Use the “Contoso” button on the sign-in page (sign out first if you are "
+                                       "signed in).")
+    assert F.warning_text(found, "x", sign_in_too=True).endswith(" " + F.how_to_sign_in(found))
+    # An address single sign-on cannot use: no button, no link that would work; the administrator.
+    from app.services import sso_sign_in
+    monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: "Single sign-on needs the vault's public address.")
+    said = F.how_to_sign_in(found)
+    assert "button" not in said and "link" not in said and "administrator" in said
 
 
 def test_the_sweep_sends_no_email_to_an_account_without_an_address(told):

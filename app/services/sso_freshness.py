@@ -63,6 +63,7 @@ class Deadline:
     # What the sign-in page's button says (its label, else the name): the person knows the provider by it, so every
     # sentence for the person names it so. The name is the administrators', and the person may never see it.
     provider_label: str = ""
+    on_sign_in_page: bool = True  # the sign-in page shows its button (else the organisation hands out a link)
 
     def __post_init__(self):
         if not self.provider_label:
@@ -115,7 +116,8 @@ def deadline_of(identity, provider) -> Optional[Deadline]:
                     window_days=days, ends_sign_in=bool(policy["sso_lapse_ends_sign_in"]),
                     provider_on=getattr(provider, "state", None) == "enabled",
                     keys_only_hold=bool(refused and keys_only is not None and keys_only == refused_at),
-                    provider_label=label or name or "your identity provider")
+                    provider_label=label or name or "your identity provider",
+                    on_sign_in_page=bool(getattr(provider, "show_on_sign_in", True)))
 
 
 def deadlines(db, user_id) -> List[Deadline]:
@@ -379,15 +381,31 @@ def refusal_text(found: Deadline, *, sign_in_too: bool = False) -> str:
     return (LAPSE_MESSAGE_ALL if sign_in_too else LAPSE_MESSAGE).format(provider=found.provider_label)
 
 
+def how_to_sign_in(found: Deadline) -> str:
+    """How a person makes the sign-in ``found`` asks for, said wherever they are told of it before they reach the
+    door: the provider's button, or the link the organisation hands out when the provider is not on the sign-in
+    page. Only a sign-in through the provider counts, so a person signed in some other way signs out first. Not
+    said at the door itself (:func:`refusal_text` is its answer too), where nobody is signed in. While the vault's
+    address cannot carry single sign-on no provider can be reached here: the administrator then."""
+    from app.services import sso_sign_in
+    if sso_sign_in.address_refusal():
+        return (f"This vault's sign-in page cannot offer {found.provider_label} right now: ask your "
+                "administrator.")
+    if found.on_sign_in_page:
+        return (f"Use the “{found.provider_label}” button on the sign-in page (sign out first if you are signed "
+                "in).")
+    return "Use the sign-in link your organisation gave you (sign out first if you are signed in)."
+
+
 def warning_text(found: Deadline, when: str, *, sign_in_too: bool = False) -> str:
-    """What the warning email tells the person: the provider as its button names it, and the date."""
+    """What the warning email tells the person: the provider as its button names it, the date, and how."""
     name = found.provider_label
     if sign_in_too:
         return (f"Sign in through {name} by {when}. If you do not, your password and passkeys stop "
                 "signing you in then, your SSH keys, temporary credentials and devices pause, and a sign-in "
-                f"through {name} restores them.")
+                f"through {name} restores them. {how_to_sign_in(found)}")
     return (f"Sign in through {name} by {when}. If you do not, your SSH keys, temporary credentials "
-            f"and devices pause then, and a sign-in through {name} restores them.")
+            f"and devices pause then, and a sign-in through {name} restores them. {how_to_sign_in(found)}")
 
 
 def _identities_with_deadlines(db) -> list:
@@ -473,14 +491,15 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
         details = {"provider_id": found.provider_id, "identity_id": found.identity_id,
                    "expires_at": found.due.isoformat() + "Z", "ends_sign_in": too}
         name = found.provider_label         # the person knows the provider by its button
+        how = how_to_sign_in(found)
         if found.due > now:
             told = api._notify_users(
                 [found.user_id], WARNED, title=f"Sign in through {name} by {when}",
                 body=((f"Your password and passkeys stop signing you in on {when}, and your SSH keys, temporary "
                        f"credentials and devices pause, unless you sign in through {name} before "
-                       "then. Signing in there restores them at any time.") if too else
+                       f"then. Signing in there restores them at any time. {how}") if too else
                       (f"Your SSH keys, temporary credentials and devices pause on {when} unless you sign in through "
-                       f"{name} before then. Signing in restores them at any time.")),
+                       f"{name} before then. Signing in restores them at any time. {how}")),
                 target=NOTICE_TARGET, dedup_prefix=f"{WARNED}:{found.identity_id}:{due_day}")
             warned += 1
             identity.freshness_warned_for = found.due
@@ -494,7 +513,7 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
                 [found.user_id], EXPIRED,
                 title=(f"Sign in through {name}: nothing else signs you in now" if too
                        else "Your SSH keys and temporary credentials are paused"),
-                body=refusal_text(found, sign_in_too=too), target=NOTICE_TARGET,
+                body=refusal_text(found, sign_in_too=too) + " " + how, target=NOTICE_TARGET,
                 dedup_prefix=f"{EXPIRED}:{found.identity_id}:{due_day}")
             paused.append(user.username)
             held += 1 if too else 0
