@@ -250,11 +250,15 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         return {"provider": providers.public(db, row), "changed": [], "connection_changed": False,
                 "made_sso_only": [], "restored": []}
     _step_up(db, current_user, request)        # may commit (a receipt is used once)
+    # A change of the policy may replace the password of every linked account. The one hash for them is made
+    # here, before the row is taken: sign-ins through the provider wait for that row, and hashing is slow.
+    from app.core import sso_only
+    unknown_hash = sso_only.a_password_nobody_knows() if "policy" in changes else None
     row = _row_or_404(db, provider_id, lock=True)
     try:
         changes = providers.clean(body, row=row)
         stored_policy = providers.check(db, row, changes, account_policy=api._account_policy(db))
-        outcome = providers.apply(db, row, changes, stored_policy)
+        outcome = providers.apply(db, row, changes, stored_policy, unknown_hash=unknown_hash)
         made, restored = _accounts_named(db, outcome["made_sso_only"]), _accounts_named(db, outcome["restored"])
         turned_off = outcome["connection_changed"] and row.state == providers.ENABLED
         # Where the provider is found says who a linked account's sign-in is vouched for by. A change of it is one
@@ -398,13 +402,15 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     if refusal is not None:
         raise _refused(refusal)
     _step_up(db, current_user, request)        # may commit (a receipt is used once)
+    from app.core import sso_only
+    from app.core.models import ExternalIdentity
+    # Made before the row is taken, as at a save: the linked accounts are settled while it is held.
+    unknown_hash = sso_only.a_password_nobody_knows()
     row = _row_or_404(db, provider_id, lock=True)
     refusal = providers.remove_refusal(db, row)
     if refusal is not None:
         db.rollback()
         raise _refused(refusal)
-    from app.core import sso_only
-    from app.core.models import ExternalIdentity
     gone = {"provider_id": str(row.id), "name": row.name, "identities": providers.public(db, row)["identities"]}
     label = row.label or row.name
     # Each account linked to it loses a way to sign in, and its flag follows the providers it is still linked to
@@ -416,7 +422,7 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
         user = db.query(User).filter(User.id == identity.user_id).first()
         if user is None:
             continue
-        settled = sso_only.settle(db, user, without=identity)
+        settled = sso_only.settle(db, user, without=identity, unknown_hash=unknown_hash)
         # Told how to get a password: an account that may hold one again, and one that has none it can type and
         # no other provider that is on (its passkey signs in after a provider only: nothing else would sign it in).
         # Not one that another provider still holds to no password, though that provider is off: a reset link is

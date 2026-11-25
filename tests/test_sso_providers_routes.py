@@ -888,3 +888,76 @@ def test_the_accounts_a_change_settles_are_taken_by_their_id_however_they_were_l
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
     assert status == 200, out
     assert settled == [u.username for u in by_id]
+
+
+def test_a_save_and_a_removal_hash_one_unknown_password_before_they_take_the_providers_row(monkeypatch):
+    """Sign-ins through the provider wait for its row, and hashing is slow on purpose: what settles the linked
+    accounts while it holds the row makes its one unknown password before, and writes that to each."""
+    from app.core import password_origin, security, sso_only
+    row = _provider(created_at=None, updated_at=None)
+    people = [_user(name) for name in ("alice", "bob", "carol")]
+    h = Admin(monkeypatch, [row], users=people,
+              identities=[_identity(person, row, subject="s-" + person.username) for person in people])
+    made = []
+
+    def hash_password(secret):
+        h.order.append("hash")
+        made.append("argon2:" + secret)
+        return made[-1]
+    monkeypatch.setattr(security, "hash_password", hash_password)
+    find = h.R._row_or_404
+    monkeypatch.setattr(h.R, "_row_or_404", lambda db, provider_id, *, lock=False: (
+        h.order.append("the row, taken" if lock else "the row, read"), find(db, provider_id, lock=lock))[1])
+    path = f"/admin/sso/providers/{row.id}"
+    # Off for all three: one hashing, before the row is taken, and the three accounts hold what it made.
+    status, out = h.call("PATCH", path, {"policy": {"sso_password_login": "disabled"}})
+    assert status == 200 and out["made_sso_only"] == ["alice", "bob", "carol"], out
+    assert h.order == ["the row, read", "step_up", "hash", "the row, taken"], h.order
+    assert [person.password_hash for person in people] == made * 3 and len(made) == 1
+    assert all(password_origin.nobody_knows(person) for person in people)
+    # Allowed again: the same.
+    del h.order[:]
+    status, out = h.call("PATCH", path, {"policy": {"sso_password_login": "allowed"}})
+    assert status == 200 and out["restored"] == ["alice", "bob", "carol"], out
+    assert h.order == ["the row, read", "step_up", "hash", "the row, taken"], h.order
+    assert [person.password_hash for person in people] == made[1:] * 3 and len(made) == 2
+    assert all(password_origin.nobody_knows(person) for person in people)
+    # A change that settles nobody (a name) hashes nothing.
+    del h.order[:]
+    assert h.call("PATCH", path, {"label": "Contoso 2"})[0] == 200
+    assert h.order == ["the row, read", "step_up", "the row, taken"], h.order
+    # A removal: made before the row is taken, and handed to every account it settles.
+    row.state = "disabled"
+    del h.order[:]
+    handed = []
+    settle = sso_only.settle
+    monkeypatch.setattr(sso_only, "settle", lambda db, user, **kw: (handed.append(kw.get("unknown_hash")),
+                                                                    settle(db, user, **kw))[1])
+    status, out = h.call("DELETE", path)
+    assert status == 200, out
+    assert h.order[:4] == ["the row, read", "step_up", "hash", "the row, taken"] and h.order.count("hash") == 1, h.order
+    assert handed == [made[-1]] * 3 and len(made) == 3
+
+
+def test_an_unknown_password_made_beforehand_is_what_is_written_and_one_is_made_without_it(monkeypatch):
+    from app.core import password_origin, security, sso_only
+    made = []
+    monkeypatch.setattr(security, "hash_password", lambda secret: (made.append("argon2:" + secret), made[-1])[1])
+    monkeypatch.setattr(sso_only, "end_sessions_no_provider_made", lambda db, user, keep=None: 0)
+    monkeypatch.setattr(sso_only.privileged_accounts, "kind", lambda db, user: None)
+    ready = sso_only.a_password_nobody_knows()
+    assert made == [ready] and len(ready) > 40
+    alice, bob = _user("alice"), _user("bob")
+    sso_only.make_sso_only(None, alice, unknown_hash=ready)
+    assert alice.password_hash == ready and alice.sso_only is True and password_origin.nobody_knows(alice)
+    sso_only.allow_password_sign_in(None, alice, unknown_hash=ready)
+    assert alice.password_hash == ready and alice.sso_only is False and len(made) == 1
+    # Without one, each makes its own (one account settled by itself, in its own turn).
+    sso_only.make_sso_only(None, bob)
+    assert bob.password_hash == made[1] != ready and password_origin.nobody_knows(bob)
+    sso_only.allow_password_sign_in(None, bob)
+    assert bob.password_hash == made[2] and len(made) == 3
+    # A privileged account met flagged keeps its password: nothing is written, with or without one.
+    before = bob.password_hash
+    sso_only.allow_password_sign_in(None, bob, keep_password=True, unknown_hash=ready)
+    assert bob.password_hash == before

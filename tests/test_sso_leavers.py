@@ -539,7 +539,7 @@ def test_a_save_of_the_setting_settles_the_linked_accounts(monkeypatch):
     made, own, linked, p, db = _made_and_linked(monkeypatch)
     settled = []
     monkeypatch.setattr(sso_only, "apply_password_login",
-                        lambda db, row: settled.append(dict(row.policy)) or {"made_sso_only": [], "restored": ["made"]})
+                        lambda db, row, **kw: settled.append(dict(row.policy)) or {"made_sso_only": [], "restored": ["made"]})
     monkeypatch.setattr(providers, "fingerprint", lambda row: "same")
     changes = {"policy": {"sso_jit_password": True}}
     outcome = providers.apply(db, p, changes, providers.check(db, p, changes, account_policy={}))

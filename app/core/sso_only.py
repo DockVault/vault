@@ -48,16 +48,27 @@ def _password_is_nobodys(user) -> None:
     password_origin.mark_nobody_knows(user)
 
 
-def make_sso_only(db, user, *, keep_session=None) -> None:
+def a_password_nobody_knows() -> str:
+    """The hash of random bytes that are thrown away: a password nobody, the account's owner included, can type.
+
+    Hashing is slow on purpose. What settles many accounts under a lock (a provider's save, its removal) makes
+    one before it takes the lock and hands it to each (``unknown_hash``): the lock is then held for what is
+    written, not for one hashing per account. One hash on several accounts tells nothing: the bytes behind it are
+    gone, and each account's mark (app/core/password_origin.py) is of its own row."""
+    from app.core.security import hash_password
+    return hash_password(secrets.token_urlsafe(32))
+
+
+def make_sso_only(db, user, *, keep_session=None, unknown_hash=None) -> None:
     """Make ``user`` sign in only through its provider, in the caller's transaction. The sessions a password made
     end with the password (:func:`end_sessions_no_provider_made`); ``keep_session`` is the id of the session the
-    request itself came through, where the person has just proved themselves at the provider in it."""
-    from app.core.security import hash_password
+    request itself came through, where the person has just proved themselves at the provider in it.
+    ``unknown_hash``: a hash from :func:`a_password_nobody_knows` made beforehand; one is made here without it."""
     kind = privileged_accounts.kind(db, user)
     if kind is not None:
         raise Privileged(f"{user.username} is {privileged_accounts.TEXTS[kind]} and keeps a local password")
     user.sso_only = True
-    user.password_hash = hash_password(secrets.token_urlsafe(32))     # nobody knows it; a reset sets a real one
+    user.password_hash = unknown_hash or a_password_nobody_knows()     # a reset sets a real one
     user.sftp_password_auth = False
     _password_is_nobodys(user)
     end_sessions_no_provider_made(db, user, keep=keep_session)
@@ -103,7 +114,7 @@ def end_sessions_no_provider_made(db, user, *, keep=None) -> int:
     return int(api._revoke_sessions(db, session_ids=ending, actor_username="system", durable=True) or 0)
 
 
-def allow_password_sign_in(db, user, *, keep_password: bool = False) -> None:
+def allow_password_sign_in(db, user, *, keep_password: bool = False, unknown_hash=None) -> None:
     """Let ``user`` hold a password again, in the caller's transaction: the flag cleared, so a reset link can be made
     for the account and it may set a password. The hash stays one nobody knows until such a link is used (whatever
     was written to it meanwhile is not a password), and nothing is minted here.
@@ -111,12 +122,13 @@ def allow_password_sign_in(db, user, *, keep_password: bool = False) -> None:
     ``keep_password``: for a privileged account met flagged. The flag on such an account comes from a release that
     knew nothing of it, run for a while after going back to it, and that release may also have given the account a
     real password (it had to, for the account to act as an administrator there): the hash is left as it is. Where
-    it is still the one nobody knows, its mark still says so."""
-    from app.core.security import hash_password
+    it is still the one nobody knows, its mark still says so.
+
+    ``unknown_hash``: as for :func:`make_sso_only`."""
     user.sso_only = False
     if keep_password:
         return
-    user.password_hash = hash_password(secrets.token_urlsafe(32))
+    user.password_hash = unknown_hash or a_password_nobody_knows()
     _password_is_nobodys(user)
 
 
@@ -187,12 +199,14 @@ def should_be_sso_only(db, user, *, also=None, also_by=None, without=None) -> bo
 MADE, RESTORED = "made_sso_only", "restored"
 
 
-def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None) -> Optional[str]:
+def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None,
+           unknown_hash=None) -> Optional[str]:
     """Bring ``user``'s flag in line with the providers it is linked to, in the caller's transaction: ``MADE`` when
     the account now signs in only through its providers (its password replaced, SFTP password sign-in off),
     ``RESTORED`` when it may hold a password again (nothing is minted), None when nothing changed. An account
     that must keep a password of its own is never made provider-only and is given its password back when it is
-    met flagged (:func:`should_be_sso_only`); nothing is raised for it."""
+    met flagged (:func:`should_be_sso_only`); nothing is raised for it. ``unknown_hash``: the hash to write where
+    a password is replaced, made beforehand by a caller that settles many accounts under a lock."""
     should = should_be_sso_only(db, user, also=also, also_by=also_by, without=without)
     flagged = bool(getattr(user, "sso_only", False))
     if should == flagged:
@@ -213,10 +227,11 @@ def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None
         should = should_be_sso_only(db, user, also=also, also_by=also_by, without=without)
         flagged = bool(getattr(user, "sso_only", False))
     if should and not flagged:
-        make_sso_only(db, user, keep_session=keep_session)
+        make_sso_only(db, user, keep_session=keep_session, unknown_hash=unknown_hash)
         return MADE
     if flagged and not should:
-        allow_password_sign_in(db, user, keep_password=privileged_accounts.kind(db, user) is not None)
+        allow_password_sign_in(db, user, keep_password=privileged_accounts.kind(db, user) is not None,
+                               unknown_hash=unknown_hash)
         return RESTORED
     return None
 
@@ -349,16 +364,17 @@ def disabled_refusal(db, provider) -> Optional[str]:
             f"linked to it: {', '.join(sorted(named))}. Unlink them, or leave password sign-in allowed.")
 
 
-def apply_password_login(db, provider) -> dict:
+def apply_password_login(db, provider, *, unknown_hash=None) -> dict:
     """After ``provider``'s ``sso_password_login`` or ``sso_jit_password`` was written: settle each account linked
     to it. ``disabled`` makes each SSO-only; ``allowed`` lets each hold a password again unless a provider it is
     linked to still holds it to none (no link is minted); the second setting does the same for the accounts made
     at a first sign-in through the provider that have no password of their own. Returns the usernames changed:
     ``{"made_sso_only": [...], "restored": [...]}``, each sorted. Call :func:`disabled_refusal` first for
-    ``disabled``."""
+    ``disabled``. ``unknown_hash``: made by the caller before it took the provider's row, and written to each
+    account whose password is replaced."""
     changed = {MADE: [], RESTORED: []}
     for user in linked_accounts(db, provider):
-        outcome = settle(db, user)
+        outcome = settle(db, user, unknown_hash=unknown_hash)
         if outcome is not None:
             changed[outcome].append(user.username)
     return {MADE: sorted(changed[MADE]), RESTORED: sorted(changed[RESTORED])}

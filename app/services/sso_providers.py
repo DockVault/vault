@@ -434,11 +434,12 @@ def check(db, row, changes: dict, *, account_policy=None) -> dict:
     return stored
 
 
-def apply(db, row, changes: dict, stored_policy) -> dict:
+def apply(db, row, changes: dict, stored_policy, *, unknown_hash=None) -> dict:
     """Write ``changes`` to ``row`` (already judged by :func:`check`). Returns what happened beside the row itself:
     the fields that changed, whether the connection did (the last test no longer speaks for it), whether the stored
     secret was dropped because the provider was pointed somewhere else without a new one, and the accounts whose
-    password sign-in was turned off or allowed again."""
+    password sign-in was turned off or allowed again. ``unknown_hash``: what the caller hashed before it took the
+    row (app/core/sso_only.a_password_nobody_knows), for the accounts whose password is replaced."""
     from app.core import sso_only
     from app.core.security import encrypt_secret
     changed = []
@@ -467,7 +468,7 @@ def apply(db, row, changes: dict, stored_policy) -> dict:
             changed.extend("policy." + key for key in keys)
         if (now["sso_password_login"] != was["sso_password_login"]
                 or now["sso_jit_password"] != was["sso_jit_password"]):
-            accounts = sso_only.apply_password_login(db, row)       # the row holds the new settings
+            accounts = sso_only.apply_password_login(db, row, unknown_hash=unknown_hash)    # the new settings
     return {"changed": changed, "connection_changed": fingerprint(row) != before, "secret_cleared": secret_cleared,
             **accounts}
 
