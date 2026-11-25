@@ -11815,6 +11815,23 @@ def _passkey_last_factor_refusal(db, user, row) -> Optional[str]:
     return None
 
 
+def _passkeys_against_the_limit(db, existing, pending) -> int:
+    """How many of the account's passkeys (``existing``: the ones not retired) count against PASSKEY_LIMIT when it
+    registers one more. From a session, every one: the owner removes a key to make room. At a held sign-in
+    (``pending``) there is no session to remove a key from, so only the keys that are a factor now count
+    (webauthn_settings.why_a_key_is_no_factor). An account in a role that must hold a passkey, whose twenty keys
+    were all made at an address the vault has left, was sent to add a passkey at every sign-in and refused each
+    time for holding too many, until an administrator removed some. A held sign-in is one the account reaches
+    only while it has no passkey it can use, so it adds one key above the limit at most each time its keys stop
+    working; back in a session the limit counts them all again, and the owner removes the ones it cannot use."""
+    if pending is None:
+        return len(existing)
+    from app.core import webauthn_settings
+    now, here, accepted = datetime.utcnow(), webauthn_settings.address_now(), {}
+    return sum(1 for key in existing
+               if webauthn_settings.why_a_key_is_no_factor(db, key, now=now, here=here, accepted=accepted) is None)
+
+
 def _passkey_audit(db, user, request, action: str, details: dict, status: str = "success") -> None:
     try:
         AuditLogger(db).log_action(action=action, status=status, user=user, ip_address=get_client_ip(request),
@@ -11863,7 +11880,7 @@ async def passkey_register_options(
         sign_in.refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, get_client_ip(request))
         sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
     existing = _passkeys_of(db, user.id)
-    if len(existing) >= PASSKEY_LIMIT:
+    if _passkeys_against_the_limit(db, existing, pending) >= PASSKEY_LIMIT:
         raise HTTPException(status_code=409, detail=f"An account can hold {PASSKEY_LIMIT} passkeys. Remove one first.")
     rp = _passkey_relying_party(db)
     policy = _passkey_policy(db)
@@ -11926,7 +11943,7 @@ async def passkey_register_verify(
         raise HTTPException(status_code=400, detail={
             "reason": "challenge_unknown", "message": "That registration request is unknown or has expired. Start again."})
     existing = _passkeys_of(db, user.id)
-    if len(existing) >= PASSKEY_LIMIT:
+    if _passkeys_against_the_limit(db, existing, pending) >= PASSKEY_LIMIT:
         raise HTTPException(status_code=409, detail=f"An account can hold {PASSKEY_LIMIT} passkeys. Remove one first.")
     rp = _passkey_relying_party(db)
     policy = _passkey_policy(db)

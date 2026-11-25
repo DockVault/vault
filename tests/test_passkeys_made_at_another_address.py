@@ -16,9 +16,10 @@ import pytest
 
 from _bare_api_env import set_bare_api_env
 # The route harness sets the application's overrides itself: cleared after every test here, as in its own file.
-from test_passkey_routes import Harness as RouteHarness, _clean_overrides  # noqa: F401
+from _webauthn_softauth import SoftAuthenticator
+from test_passkey_routes import Harness as RouteHarness, _call as _rcall, _clean_overrides  # noqa: F401
 from test_passkey_settings import _mod, _resolving
-from test_passkey_sign_in import ORIGIN, RP_ID, Harness as SignInHarness, _api, _user
+from test_passkey_sign_in import ORIGIN, RP_ID, Harness as SignInHarness, _api, _claims, _user
 
 pytestmark = pytest.mark.unit
 
@@ -502,3 +503,75 @@ def test_the_lookup_says_how_many_of_an_accounts_passkeys_it_can_sign_in_with(mo
     assert notes == {"moved": " (it can sign in with 1 of them now)", "stranded": " (it cannot sign in with it now)",
                      "fine": "", "none": ""}
     assert tool.passkeys_usable_note(off) == " (it can sign in with none of them now)"
+
+
+def _twenty(owner, made_at):
+    now = datetime.utcnow()
+    return [_key(owner, made_at, credential_id=bytes([index + 1]) * 8, provisional_until=None, created_at=now,
+                 transports=None, backup_eligible=False, last_used_at=None, label=f"k{index}") for index in range(20)]
+
+
+def test_twenty_keys_made_at_another_address_do_not_keep_a_held_sign_in_from_adding_the_one_it_owes(monkeypatch):
+    """A role that must hold a passkey, past its grace, with twenty keys made at the address the vault has left:
+    every sign-in was sent to add a passkey and refused for holding too many, and a held sign-in has no session
+    to remove one with. There the limit counts the keys that are a factor; from a session it counts them all, and
+    the owner removes the ones it cannot use."""
+    from datetime import timedelta
+    registry, wss = _mod()
+    alice = _user(passkey_required_since=datetime.utcnow() - timedelta(days=20), passkey_requirement_cleared_at=None)
+    h = RouteHarness(monkeypatch, alice)
+    S = h.S
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["user"], wss.GRACE_DAYS: 14})
+    monkeypatch.setattr(S, "_login_second_factor_in_effect", lambda db, user: False)
+    monkeypatch.setattr(S, "_second_factor_effective", lambda db, user: {"state": "not_setup", "in_effect": False, "required": False})
+    from app.core.models import ActiveSession, PendingLogin
+    from app.services import sign_in
+    h.db.tables.setdefault(PendingLogin, [])
+    h.db.tables.setdefault(ActiveSession, [])
+    h.rows().extend(_twenty(alice, ELSEWHERE))
+    assert wss.usable_passkeys(h.db, alice.id) == 0 and len(h.rows()) == 20
+    # From a session the account is at its limit: the owner removes a key first.
+    status, body = _rcall(S, "POST", "/users/me/passkeys/register/options", {"current_password": "pw"})
+    assert status == 409 and "20 passkeys" in body["detail"] and "Remove one first" in body["detail"], body
+    # The sign-in is held for the passkey the role owes.
+    outcome = sign_in.finish(h.db, sign_in.SignInResult(alice, ["pwd"], IP, session_token="s1"))
+    assert isinstance(outcome, sign_in.PendingStep) and outcome.body["enrollment_methods"] == ["passkey"], outcome
+    pending = h.db.rows_of(PendingLogin)[-1]
+    sign_in.read_pre_auth(_claims(outcome.body["pre_auth_token"]), pending)
+    monkeypatch.setitem(S.app.dependency_overrides, S.get_enrolling_principal, lambda: (alice, pending))
+    status, body = _rcall(S, "POST", "/users/me/passkeys/register/options", {})
+    assert status == 200, body
+    status, body = _rcall(S, "POST", "/users/me/passkeys/register/verify", {
+        "challenge_id": body["challenge_id"], "credential": SoftAuthenticator().make_credential(body["options"], ORIGIN),
+        "label": "the new one"})
+    assert status == 201 and "access_token" in body and pending.consumed_at is not None, body
+    assert body["passkey"]["usable"] is True and len(h.rows()) == 21 and wss.usable_passkeys(h.db, alice.id) == 1
+    # Back in a session, the limit counts every key again.
+    monkeypatch.setitem(S.app.dependency_overrides, S.get_enrolling_principal, lambda: (alice, None))
+    status, body = _rcall(S, "POST", "/users/me/passkeys/register/options", {}, {"X-Second-Factor": "ok"})
+    assert status == 409 and "Remove one first" in body["detail"], body
+
+
+def test_at_a_held_sign_in_the_limit_counts_the_keys_that_are_a_factor_and_from_a_session_every_key(monkeypatch):
+    registry, wss = _mod()
+    S = _api()
+    alice = _user()
+    _resolving(monkeypatch, registry, {wss.MODE: "optional"})
+    _address(monkeypatch, RP_ID)
+    held = types.SimpleNamespace(id=uuid.uuid4())
+    here, elsewhere = _twenty(alice, RP_ID), _twenty(alice, ELSEWHERE)
+    lapsed = [_key(alice, RP_ID, cose_alg=-999), _key(alice, RP_ID, uv_initialized=False), _key(alice, None)]
+    counted = S._passkeys_against_the_limit
+    assert counted(None, here + elsewhere + lapsed, None) == 43
+    assert counted(None, here + elsewhere + lapsed, held) == 21         # the twenty made here, and the one with no address
+    assert counted(None, elsewhere, held) == 0 and counted(None, elsewhere, None) == 20
+    assert counted(None, [], held) == 0 == counted(None, [], None)
+    # At an address no passkey can be made at, none is a factor.
+    _address(monkeypatch, None)
+    assert counted(None, here + elsewhere + lapsed, held) == 0 and counted(None, here, None) == 20
+    # Both steps of a registration ask the one rule: a key is not stored above the limit by skipping the first.
+    import inspect
+    for route in (S.passkey_register_options, S.passkey_register_verify):
+        source = inspect.getsource(route)
+        assert source.count("if _passkeys_against_the_limit(db, existing, pending) >= PASSKEY_LIMIT:") == 1, route
+        assert "len(existing) >= PASSKEY_LIMIT" not in source
