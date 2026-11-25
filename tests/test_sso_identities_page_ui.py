@@ -356,6 +356,77 @@ out({ first, second, empty: byId('sso-identities').textContent, pager: pager() =
     assert got["empty"] == "0 linked accountsNo account is linked to this provider." and got["pager"] is True
 
 
+FOCUSED = r"""
+// Where the keyboard is: the control a person last used, as a browser puts it there when they click or press it.
+const press = (button) => { button.focus(); button.click(); };
+const at = () => { const el = document.activeElement; const list = byId('sso-identities');
+    return { inList: !!list && list.contains(el), text: el.textContent, label: el.getAttribute('aria-label'),
+             id: el.id || null, tabindex: el.getAttribute('tabindex') }; };
+"""
+
+
+def test_paging_keeps_the_keyboard_on_the_pager():
+    """Previous and Next draw the list anew, their own buttons with it: the keyboard goes to the new button of the same
+    name, or to the other one where that one is at its end, so it stays in the dialog and on the pager."""
+    got = _node(FOCUSED + r"""
+const page = (skip, count, total) => ({ provider_id: 'p-1', total, skip, limit: 50, counts: { refused: 0, lapsed: 0, linked: total },
+    identities: Array.from({ length: count }, (_, i) => ({ id: 'i-' + (skip + i), user_id: 'u-' + (skip + i),
+        username: 'user' + (skip + i), linked_by: 'self', linked_at: null, last_sign_in_at: null, state: 'linked',
+        refused_at: null, due_at: null, holds_sign_in: false, own: false })) });
+answers[IDS] = page(0, 50, 120);
+answers['/admin/sso/providers/p-1/identities?skip=50&limit=50'] = page(50, 50, 120);
+answers['/admin/sso/providers/p-1/identities?skip=100&limit=50'] = page(100, 20, 120);
+await openIdentities();
+const pager = () => document.querySelector('.sso-identities-pager');
+press(pager().children[2]);
+await tick(); await tick();
+const middle = at();
+press(pager().children[2]);
+await tick(); await tick();
+const last = at();
+press(pager().children[0]);
+await tick(); await tick();
+const back = at();
+out({ middle, last, back, said: pager().children[1].textContent });
+""")
+    assert got["middle"]["inList"] is True and got["middle"]["text"] == "Next"
+    assert got["last"]["inList"] is True and got["last"]["text"] == "Previous"     # Next is at its end
+    assert got["back"]["inList"] is True and got["back"]["text"] == "Previous"
+    assert got["said"] == "51 to 100 of 120"
+
+
+def test_lifting_or_unlinking_keeps_the_keyboard_on_the_list():
+    """A lift or an unlink draws the list anew: the keyboard goes to the account's own row where it is still listed,
+    else to the next account listed with a button (not the administrator's own, which has none), else to the line
+    that counts the accounts."""
+    got = _node(FOCUSED + r"""
+answers[IDS] = LIST;
+answers['/admin/sso/identities/i-carol/clear-refusal'] = { cleared: true };
+answers['/admin/sso/identities/i-carol'] = { removed: true, sessions_ended: 0, held: false, keys_paused: false };
+answers['/admin/sso/identities/i-bob'] = { removed: true, sessions_ended: 0, held: false, keys_paused: false };
+await openIdentities();
+const carolLinked = Object.assign({}, LIST.identities[0], { state: 'linked', refused_at: null, holds_sign_in: false });
+answers[IDS] = Object.assign({}, LIST, { identities: [carolLinked, LIST.identities[1], LIST.identities[2]] });
+press(document.querySelector('.sso-identity-row[data-identity="i-carol"] button'));     // Lift refusal
+await tick(); await tick(); await tick();
+const lifted = at();
+answers[IDS] = Object.assign({}, LIST, { total: 2, identities: [LIST.identities[1], LIST.identities[2]] });
+press(document.querySelector('.sso-identity-row[data-identity="i-carol"] .sso-identity-unlink'));
+await tick(); await tick(); await tick();
+const unlinked = at();
+answers[IDS] = Object.assign({}, LIST, { total: 0, counts: {}, identities: [] });
+press(document.querySelector('.sso-identity-row[data-identity="i-bob"] .sso-identity-unlink'));
+await tick(); await tick(); await tick();
+out({ lifted, unlinked, none: at() });
+""")
+    assert got["lifted"] == {"inList": True, "text": "Unlink", "label": "Unlink carol from Contoso", "id": None,
+                             "tabindex": None}
+    assert got["unlinked"] == {"inList": True, "text": "Unlink", "label": "Unlink bob from Contoso", "id": None,
+                               "tabindex": None}
+    assert got["none"] == {"inList": True, "text": "0 linked accounts", "label": None, "id": "sso-identities-counts",
+                           "tabindex": "-1"}
+
+
 def test_an_answer_that_comes_after_a_later_one_draws_nothing():
     """The person pages on, and back, faster than the server answers: the list shows the page asked for last, whatever
     order the answers come in."""

@@ -625,7 +625,13 @@
         return box;
     }
 
-    async function readIdentities(providerId, list) {
+    // `focus`, after a click on one of the list's own controls (a page of it, a lift, an unlink): the list is drawn
+    // anew, that control with it, and the keyboard goes back into the list near where it was, so a person using a
+    // keyboard or a screen reader stays inside the dialog. {pager: 'next' | 'prev'}: the pager's button of that name,
+    // or the other one where that one is at its end. {rows: [ids]}: the first of those accounts still listed with a
+    // button (the account acted on, then those after it). Else the line that counts the accounts, or the one that
+    // says the list could not be read.
+    async function readIdentities(providerId, list, focus) {
         const mine = ++identityReads;
         let read;
         try {
@@ -633,7 +639,9 @@
                 + `?skip=${identitiesFrom}&limit=${IDENTITIES_PAGE}`, { silent: true });
         } catch (e) {
             if (mine === identityReads) {
-                list.replaceChildren(_el('p', 'text-error text-sm', e.message || 'The linked accounts could not be read.'));
+                const failed = _el('p', 'text-error text-sm', e.message || 'The linked accounts could not be read.');
+                list.replaceChildren(failed);
+                if (focus) focusIdentities(list, failed);
             }
             return;
         }
@@ -643,7 +651,7 @@
         const rows = Array.isArray(read.identities) ? read.identities : [];
         const total = Number(read.total) || 0;
         const from = Number(read.skip) || 0;
-        if (!rows.length && from > 0) { identitiesFrom = 0; readIdentities(providerId, list); return; }
+        if (!rows.length && from > 0) { identitiesFrom = 0; readIdentities(providerId, list, focus); return; }
         list.replaceChildren();
         const counts = read.counts || {};
         const summary = _el('p', 'text-sm mb-sm', total === 1 ? '1 linked account' : `${total} linked accounts`);
@@ -652,22 +660,62 @@
         list.appendChild(summary);
         if (!total) {
             list.appendChild(_el('p', 'text-secondary text-sm', 'No account is linked to this provider.'));
+            if (focus) focusIdentities(list, summary);
             return;
         }
         rows.forEach((identity) => list.appendChild(identityRow(providerId, identity, list)));
+        let prev = null, next = null;
         if (total > rows.length) {
             const pager = _el('div', 'sso-identities-pager flex items-center gap-sm mt-sm');
-            const prev = _el('button', 'btn btn-secondary btn-sm', 'Previous');
+            prev = _el('button', 'btn btn-secondary btn-sm', 'Previous');
             prev.type = 'button';
             prev.disabled = from <= 0;
-            prev.addEventListener('click', () => { identitiesFrom = Math.max(0, from - IDENTITIES_PAGE); readIdentities(providerId, list); });
-            const next = _el('button', 'btn btn-secondary btn-sm', 'Next');
+            prev.addEventListener('click', () => {
+                identitiesFrom = Math.max(0, from - IDENTITIES_PAGE);
+                readIdentities(providerId, list, { pager: 'prev' });
+            });
+            next = _el('button', 'btn btn-secondary btn-sm', 'Next');
             next.type = 'button';
             next.disabled = from + rows.length >= total;
-            next.addEventListener('click', () => { identitiesFrom = from + rows.length; readIdentities(providerId, list); });
+            next.addEventListener('click', () => {
+                identitiesFrom = from + rows.length;
+                readIdentities(providerId, list, { pager: 'next' });
+            });
             pager.append(prev, _el('span', 'text-secondary text-sm', `${from + 1} to ${from + rows.length} of ${total}`), next);
             list.appendChild(pager);
         }
+        if (!focus) return;
+        const usable = (button) => (button && !button.disabled ? button : null);
+        let to = null;
+        if (focus.pager) {
+            to = focus.pager === 'next' ? (usable(next) || usable(prev)) : (usable(prev) || usable(next));
+        } else if (Array.isArray(focus.rows)) {
+            const drawn = Array.from(list.querySelectorAll('.sso-identity-row'));
+            for (const id of focus.rows) {
+                const row = drawn.find((r) => r.dataset.identity === id);
+                to = row ? Array.from(row.querySelectorAll('button')).find((b) => !b.disabled) || null : null;
+                if (to) break;
+            }
+        }
+        focusIdentities(list, to || summary);
+    }
+
+    // The keyboard goes to `to`, while the dialog still shows `list`. A line that is not a control takes it too, so a
+    // screen reader reads it, and Tab goes on from there.
+    function focusIdentities(list, to) {
+        if (!to || byId('sso-identities') !== list) return;
+        if (to.localName !== 'button') to.setAttribute('tabindex', '-1');
+        try { to.focus(); } catch (_) {}
+    }
+
+    // The account of the row `button` is in, and those listed after it, by id: where the keyboard goes once the list
+    // is drawn again after a lift or an unlink.
+    function fromThisRow(button) {
+        const ids = [];
+        for (let row = button.closest('.sso-identity-row'); row; row = row.nextElementSibling) {
+            if (row.classList.contains('sso-identity-row')) ids.push(row.dataset.identity);
+        }
+        return { rows: ids };
     }
 
     // What lifting the refusal or hold on an account gives, from where the server says the lift leaves it
@@ -728,6 +776,7 @@
         unlink.addEventListener('click', async () => {
             const ok = await showConfirm(unlinkSays(name, label, identity), 'Unlink', null, 'Unlink');
             if (!ok) return;
+            const focus = fromThisRow(unlink);
             unlink.disabled = true;
             try {
                 const out = await apiRequest(`/admin/sso/identities/${encodeURIComponent(identity.id)}`,
@@ -735,7 +784,7 @@
                 showToast(unlinkDid(name, label, out), 'success');
             } catch (e) { showToast(e.message || 'The account was not unlinked.', 'error'); }
             // Read again whatever the answer: the list says how the accounts stand now.
-            readIdentities(providerId, list);
+            readIdentities(providerId, list, focus);
             load();
         });
         return unlink;
@@ -782,6 +831,7 @@
                 const off = !!(open && open.id === providerId && open.state !== 'enabled');
                 const ok = await showConfirm(liftSays(name, identity, off), 'Lift refusal', null, 'Lift refusal');
                 if (!ok) return;
+                const focus = fromThisRow(lift);
                 lift.disabled = true;
                 try {
                     await apiRequest(`/admin/sso/identities/${encodeURIComponent(identity.id)}/clear-refusal`,
@@ -789,7 +839,7 @@
                     showToast(`The refusal on ${name} was lifted.`, 'success');
                 } catch (e) { showToast(e.message || 'The refusal was not lifted.', 'error'); }
                 // Read again whatever the answer: the list says how the account stands now.
-                readIdentities(providerId, list);
+                readIdentities(providerId, list, focus);
                 load();
             });
             row.appendChild(lift);
