@@ -274,3 +274,48 @@ def test_the_installed_ssh_library_offers_the_hybrid_exchange_first():
     assert callable(getattr(KexMLKEM768X25519, "_parse_hybrid_init", None))             # the server's side
     assert K.disabled_kex("pq-required", paramiko.Transport) == [
         name for name in paramiko.Transport._preferred_kex if name != HYBRID]
+
+
+def _tool():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dockvault_tool_for_kex", ROOT / "dockvault.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_setup_tool_refuses_a_new_set_while_the_policy_is_no_policy(capsys):
+    """SFTP_KEX_POLICY=pq_required, with an underscore, in the .env a new volume set is made from. The vault
+    refuses that value at its start. The tool carried the setting to the new set only when it was a policy and
+    dropped anything else without a word, so the new set started with the default and took classical clients
+    where only the hybrid exchange had been meant. It stops before anything is written or set aside, and says
+    what the vault itself says."""
+    tool = _tool()
+    assert tool.SFTP_KEX_POLICIES == ("default", "pq-required")
+    for fine in (None, "", "default", " PQ-Required ", "Default"):
+        assert tool.sftp_kex_policy_problem(fine) is None, fine
+    for wrong in ("pq_required", "required", "pq-preferred", "yes"):
+        assert tool.sftp_kex_policy_problem(wrong) == (
+            "SFTP_KEX_POLICY must be one of default, pq-required (the .env has %r)" % wrong)
+
+    class Plain:
+        def paint(self, text, colour):
+            return text
+    tool.refuse_a_kex_policy_that_is_none({"SFTP_KEX_POLICY": "pq-required"}, Plain())
+    tool.refuse_a_kex_policy_that_is_none({}, Plain())
+    tool.refuse_a_kex_policy_that_is_none(None, Plain())
+    assert capsys.readouterr().out == ""
+    with pytest.raises(SystemExit) as stopped:
+        tool.refuse_a_kex_policy_that_is_none({"SFTP_KEX_POLICY": "pq_required"}, Plain())
+    assert stopped.value.code == 2
+    said = capsys.readouterr().out
+    assert "SFTP_KEX_POLICY must be one of default, pq-required (the .env has 'pq_required')" in said
+    assert "Nothing was written" in said and "Correct the line in .env" in said
+    # Asked in both places a new set is authored, before the current .env is set aside.
+    source = (ROOT / "dockvault.py").read_text(encoding="utf-8")
+    assert source.count("        refuse_a_kex_policy_that_is_none(env, pal)\n") == 2
+    for place in ("    def _new_set_from(self, env, current_env_is_fresh=False):", "    def _volume_new(self, env, args=None):"):
+        body = source[source.index(place):]
+        body = body[:body.index("\n    def ", 10)]
+        assert body.index("refuse_a_kex_policy_that_is_none(env, pal)") < body.index("self._archive_env(") \
+            < body.index("new_set_config(env, new_prefix, new_id)"), place

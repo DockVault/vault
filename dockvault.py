@@ -2275,6 +2275,32 @@ def parse_envelope_hold_days(raw):
     return value if 0 <= value <= 14 else None
 
 
+SFTP_KEX_POLICIES = ("default", "pq-required")
+
+
+def sftp_kex_policy_problem(value):
+    """Why ``value`` (SFTP_KEX_POLICY as a .env has it) is no policy the vault takes, in the vault's own words, or
+    None. Left out or empty is the default."""
+    text = str(value or "").strip().lower()
+    if not text or text in SFTP_KEX_POLICIES:
+        return None
+    return "SFTP_KEX_POLICY must be one of default, pq-required (the .env has %r)" % (str(value).strip(),)
+
+
+def refuse_a_kex_policy_that_is_none(env, pal):
+    """Before a new set is authored from ``env``: stop, in words, where its SFTP_KEX_POLICY is no policy. The
+    vault refuses such a value at its start, so that a value which only looks like pq-required cannot leave the
+    classical key exchanges on offer unseen. A new set carried the setting over only when it was a policy, and
+    dropped anything else without a word: the new set then started with the default, accepting classical
+    clients, where pq-required had been meant. Nothing is written or set aside before this is asked."""
+    problem = sftp_kex_policy_problem((env or {}).get("SFTP_KEX_POLICY"))
+    if problem:
+        print(pal.paint("  %s. Nothing was written. A new set made without it would start with the default, "
+                        "which leaves the classical key exchanges on offer. Correct the line in .env, then "
+                        "run this again." % problem, "red"))
+        raise SystemExit(2)
+
+
 def new_set_config(current_env, new_prefix, new_id):
     """Config for a FRESH set (born together with its own .env): keep the current .env's NON-secret
     settings (server, admin, ports, mode, flags) but generate BRAND-NEW secrets - a new set is new
@@ -6671,6 +6697,7 @@ class DockVault:
         secret file. A real, pre-existing .env is archived and the operator is warned in red that the
         archive is plaintext and holds that deployment's ENCRYPTION_KEY."""
         pal = self.pal
+        refuse_a_kex_policy_that_is_none(env, pal)
         new_id = gen_deployment_id()
         new_prefix = "%s-%s" % (DEFAULT_PROJECT, new_id)
         archived = None if current_env_is_fresh else self._archive_env(volume_prefix(env))
@@ -8185,6 +8212,7 @@ class DockVault:
                 "Create a NEW empty set (fresh secrets + .env)? Your current set is kept.", pal, default=False):
             print(pal.paint("  Cancelled.\n", "yellow"))
             return
+        refuse_a_kex_policy_that_is_none(env, pal)
         new_id = gen_deployment_id()
         new_prefix = "%s-%s" % (DEFAULT_PROJECT, new_id)
         archived = self._archive_env(volume_prefix(env)) if env else None
