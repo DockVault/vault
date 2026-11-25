@@ -281,7 +281,7 @@ def test_a_provider_that_only_pauses_the_keys_leaves_every_other_way_in(out):
 def test_a_refusal_holds_at_once_and_says_so(out):
     refused = out["refused"]
     assert refused["web"][:2] == ["refused", "SignInThroughProviderError"]
-    assert refused["web"][3].startswith("Contoso did not admit your account")
+    assert refused["web"][3].startswith("Your account is held to a sign-in through Contoso")
     assert refused["passkey"][:3] == ["refused", "ProviderOnly", 403]
 
 

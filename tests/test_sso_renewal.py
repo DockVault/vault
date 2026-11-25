@@ -668,7 +668,8 @@ def test_a_session_the_password_made_is_kept_going_only_while_the_password_would
     without = {**{k: v for k, v in old.items() if k != "idp"}, "amr": ["pwd"]}
     with pytest.raises(HTTPException) as refused:
         sign_in.renew(db, user, without, client_ip="127.0.0.1")
-    assert refused.value.status_code == 403 and "Contoso did not admit your account" in refused.value.detail
+    assert refused.value.status_code == 403
+    assert "Your account is held to a sign-in through Contoso" in refused.value.detail
     # Refused before anything changed: the session stands, and is kept going once the provider only pauses keys.
     p.policy = {"sso_freshness_days": 1, "sso_lapse_ends_sign_in": False}
     db.commit()

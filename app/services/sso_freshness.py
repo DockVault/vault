@@ -250,11 +250,34 @@ def way_in_text(db, found: Deadline) -> str:
         return (f"Your account signs in only through {name} until it has signed in there again, and {name} is not "
                 "available on this vault right now. " + (other or "Ask your administrator."))
     if found.refused:
+        # A hold on record is one of two things, and the row does not say which: the provider excluded the person
+        # at their last sign-in there, or their days had run out when the provider was turned off or was to be
+        # removed (app/services/sso_providers.py, hold_lapsed). "It did not admit your account" was said of both,
+        # and is true of the first alone. What is said is true of both, and so is what to do.
         other = another_way_in(db, found)
-        return (f"{name} did not admit your account when it last signed in there, so its password and passkeys do "
-                f"not sign it in. " + (other or f"Sign in through {name} once it admits you, or ask your administrator."))
+        return (f"Your account is held to a sign-in through {name}: its password and passkeys do not sign it in "
+                f"until {name} admits it. "
+                + (other or f"{_how_to_reach(row, name)} If {name} does not admit you, ask your administrator."))
     return (f"Sign in through {name}: your account has not signed in there within the time your organisation "
             f"allows, so its password and passkeys do not sign it in until it does. {_how_to_reach(row, name)}")
+
+
+def after_a_hold_is_lifted(db, user, identity, provider, *, whose: str, now: Optional[datetime] = None) -> str:
+    """What is said of an account's keys once an administrator lifted the hold on record for ``identity``
+    (``whose``: "your" to the person, "its" to the administrators). They work again, unless the provider's days
+    have run out as well: the days went on counting under the hold, and lifting it does not start them again.
+    Then the keys stay paused until a sign-in through the provider, and where the provider closes the other ways
+    in, and is on, the password and passkeys do too. Told "they work again" in that state, the person found that
+    nothing did."""
+    now = now or datetime.utcnow()
+    standing = deadline_of(identity, provider)
+    if standing is None or standing.refused or standing.due > now:
+        return (f"{whose} SSH keys, temporary credentials and devices work again unless another rule pauses them.")
+    closed = closes_now(standing, now) and user is not None and closes_the_other_ways_in(db, user, standing)
+    return (f"{whose} time to sign in through {standing.provider_name} has run out as well, so {whose} SSH keys, "
+            "temporary credentials and devices stay paused"
+            + (f", and {whose} password and passkeys sign in to nothing," if closed else "")
+            + f" until a sign-in through {standing.provider_name}.")
 
 
 def due_date(db, user_id) -> Optional[datetime]:

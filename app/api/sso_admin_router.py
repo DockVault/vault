@@ -172,13 +172,16 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     user = db.query(User).filter(User.id == identity.user_id).first()
     provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
     label = ((provider.name or provider.label) if provider is not None else None) or "an identity provider"
+    # What the lifting gives back, said as it is: the provider's days may have run out under the hold.
+    to_the_person = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="your")
+    to_the_administrators = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="its")
     try:
         from app.core import owner_notices
         if user is not None:
             owner_notices.notify_in_transaction(
                 db, [user.id], title="An administrator lifted a sign-in refusal",
-                body=(f"{current_user.username} lifted the refusal {label} recorded for your account; your SSH keys, "
-                      "temporary credentials and devices work again unless another rule pauses them."),
+                body=(f"{current_user.username} lifted the refusal {label} recorded for your account: "
+                      + to_the_person),
                 ntype="sso_refusal_cleared", target="#profile")
     except Exception as exc:  # noqa: BLE001 -- the clearing stands without its notice
         log.info("sso refusal-cleared notice skipped: %s", type(exc).__name__)
@@ -194,8 +197,7 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
         sso_providers_router._tell_administrators(
             current_user.username, "A single sign-on refusal was lifted",
             f"{current_user.username} lifted the refusal {label} recorded for "
-            f"{user.username if user is not None else 'an account'}: its SSH keys, temporary credentials and devices "
-            "work again unless another rule pauses them.")
+            f"{user.username if user is not None else 'an account'}: " + to_the_administrators)
     except Exception as exc:  # noqa: BLE001 -- the clearing stands without its notice
         log.info("sso refusal-cleared notice to administrators skipped: %s", type(exc).__name__)
     return {"cleared": True}

@@ -675,7 +675,8 @@ def test_your_account_is_told_for_each_identity_why_its_unlink_would_be_refused(
     assert said[str(lapsed.id)] == {"reason": "sso_freshness_lapsed",
                                     "message": "Sign in through lapsed again before you unlink it."}
     assert said[str(refusing.id)] == {"reason": "sso_freshness_lapsed", "message": (
-        "refusing refused your account; an administrator must clear that before you can unlink it.")}
+        "Your account is held to a sign-in through refusing: sign in there again, or ask an administrator to lift "
+        "the hold, before you unlink it.")}
     # What the list says is what the unlink answers.
     for name in ("lapsed", "refusing"):
         status, body, _ = _call(h.S, "DELETE", f"/users/me/identities/{rows[name].id}")

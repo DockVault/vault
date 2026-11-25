@@ -1400,7 +1400,10 @@ def owners_unlink_refusal(db, account, identity, row, *, now: Optional[datetime]
     standing = sso_freshness.deadline_of(identity, row)
     if standing is not None and (standing.refused or standing.due <= now):
         return (UNLINK_LAPSED, (
-            f"{standing.provider_name} refused your account; an administrator must clear that before you can unlink it."
+            # True of both holds a row can carry: the provider's refusal, and the vault's own, written when the
+            # person's days had run out and the provider was turned off. A sign-in the provider admits lifts either.
+            f"Your account is held to a sign-in through {standing.provider_name}: sign in there again, or ask an "
+            "administrator to lift the hold, before you unlink it."
             if standing.refused else
             f"Sign in through {standing.provider_name} again before you unlink it."))
     return None

@@ -224,9 +224,16 @@ def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
     assert F.way_in_text(db, held).endswith("Use the “Contoso” button on the sign-in page.")
     i.refused_at = datetime.utcnow()
     refused = F.held_to_a_provider(db, alice)
+    # A hold on record is the provider's refusal, or the vault's own from a turn-off while the days had run out:
+    # the row does not say which, and the sentence is true of both.
     assert refused.refused and F.way_in_text(db, refused) == (
-        "Contoso did not admit your account when it last signed in there, so its password and passkeys do not sign "
-        "it in. Sign in through Contoso once it admits you, or ask your administrator.")
+        "Your account is held to a sign-in through Contoso: its password and passkeys do not sign it in until "
+        "Contoso admits it. Use the “Contoso” button on the sign-in page. If Contoso does not admit you, ask your "
+        "administrator.")
+    assert "did not admit your account" not in F.way_in_text(db, refused)
+    p.show_on_sign_in = False
+    assert "Use the sign-in link your organisation gave you. If Contoso does not admit you" in F.way_in_text(db, refused)
+    p.show_on_sign_in = True
     # A provider that is off sends nobody to a button that is not there (an account held before it went off).
     p.state = "disabled"
     assert F.way_in_text(db, held) == NOT_AVAILABLE and F.way_in_text(db, refused) == NOT_AVAILABLE
@@ -252,8 +259,9 @@ def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
     refused = F.held_to_a_provider(db, alice)
     assert refused.refused and refused.provider_id == str(p.id)
     assert F.way_in_text(db, refused) == (
-        "Contoso did not admit your account when it last signed in there, so its password and passkeys do not sign "
-        "it in. You can sign in through Fabrikam instead: Use the “Staff sign-in” button on the sign-in page.")
+        "Your account is held to a sign-in through Contoso: its password and passkeys do not sign it in until "
+        "Contoso admits it. You can sign in through Fabrikam instead: Use the “Staff sign-in” button on the "
+        "sign-in page.")
     assert F.another_way_in(db, refused) == (
         "You can sign in through Fabrikam instead: Use the “Staff sign-in” button on the sign-in page.")
     fabrikam.show_on_sign_in = False
@@ -282,7 +290,7 @@ def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
     assert F.another_way_in(db, refused).startswith("You can sign in through Fabrikam instead")
     hers.refused_at = datetime.utcnow()
     assert F.another_way_in(db, refused) is None
-    assert F.way_in_text(db, refused).endswith("Sign in through Contoso once it admits you, or ask your administrator.")
+    assert F.way_in_text(db, refused).endswith("If Contoso does not admit you, ask your administrator.")
     adatum.state, hers.refused_at = "enabled", None
     # Where the provider that holds the account can be reached, it is the one named, and no other.
     i.refused_at = None
