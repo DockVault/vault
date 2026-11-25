@@ -1790,9 +1790,13 @@ def test_a_save_that_changes_the_connection_and_the_days_tells_whom_it_holds(mon
     monkeypatch.setattr(h.R, "_end_sessions_of", lambda db, provider_id, **record: 0)
     monkeypatch.setattr(h.R, "_sessions_standing", lambda db, provider_id: 0)
     label = row.label or row.name
+    asked_about, real = [], h.R._tell_those_a_turn_off_held
+    monkeypatch.setattr(h.R, "_tell_those_a_turn_off_held", lambda db, ids, before, provider_id, shown: (
+        asked_about.append(provider_id), real(db, ids, before, provider_id, shown))[1])
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}",
                          {"client_id": "another-client", "policy": {"sso_freshness_days": 7}})
     assert status == 200 and out["turned_off"] is True and out["held"] == 2, out
+    assert asked_about == [row.id]          # what is said of the password is asked of this provider's hold
     held = [t for t in h.accounts_told if t[1] == "Your keys are paused on this vault"]
     assert [sorted(t[0]) for t in held] == [["ben", "cy"]]
     assert held[0][2] == (
@@ -1806,12 +1810,19 @@ def test_a_save_that_changes_the_connection_and_the_days_tells_whom_it_holds(mon
 def test_who_is_told_of_a_turn_offs_hold_and_in_which_words(monkeypatch):
     from app.api import sso_providers_router as R
     from app.services import sign_in, sso_freshness
-    people = {name: _user(name) for name in ("ann", "ben", "cy", "dee", "eve")}
+    people = {name: _user(name) for name in ("ann", "ben", "cy", "dee", "eve", "fay")}
     people["dee"].is_active = False
-    told = []
+    told, asked_of = [], []
     monkeypatch.setattr(R, "_tell_accounts", lambda users, title, change, once_for=None: told.append(
         (sorted(u[1] for u in users), title, change)))
-    monkeypatch.setattr(sso_freshness, "held_to_a_provider", lambda db, user: object() if user.username == "ann" else None)
+
+    def held_to_a_provider(db, user, provider_id=None):
+        """ann: this provider's hold closes her password. fay: another provider's does, this one's does not."""
+        asked_of.append((user.username, provider_id))
+        if user.username == "ann":
+            return object()
+        return object() if user.username == "fay" and provider_id is None else None
+    monkeypatch.setattr(sso_freshness, "held_to_a_provider", held_to_a_provider)
     monkeypatch.setattr(sign_in, "has_a_password_it_can_type", lambda user: user.username != "cy")
 
     class DB:
@@ -1827,16 +1838,22 @@ def test_who_is_told_of_a_turn_offs_hold_and_in_which_words(monkeypatch):
         def rollback(self):
             pass
     ids = [u.id for u in people.values()]
-    R._tell_those_a_turn_off_held(DB(), ids, {people["eve"].id}, "Contoso")
+    R._tell_those_a_turn_off_held(DB(), ids, {people["eve"].id}, "the-providers-id", "Contoso")
     said = {tuple(names): text for names, _title, text in told}
-    assert set(said) == {("ann",), ("ben",), ("cy",)}                 # not dee (turned off), not eve (held before)
+    assert set(said) == {("ann",), ("ben",), ("cy", "fay")}           # not dee (turned off), not eve (held before)
     assert said[("ann",)].endswith("stay paused, and your password and passkeys do not sign you in, until an "
                                    "administrator lifts that or Contoso is turned on again and admits you.")
     assert said[("ben",)].endswith("stay paused until an administrator lifts that. Your password signs you in as before.")
-    assert said[("cy",)].endswith("stay paused until an administrator lifts that.")          # no password it can type
+    # cy has no password it can type. fay has one, and another provider holds her account: this provider's hold
+    # pauses her keys alone, so she is not told that lifting it or turning Contoso on lets her in, and not that
+    # her password signs her in either.
+    assert said[("cy", "fay")].endswith("stay paused until an administrator lifts that.")
+    # Each is asked about this provider first.
+    assert [one for one in asked_of if one[1] is not None] == [(name, "the-providers-id")
+                                                               for name in ("ann", "ben", "cy", "fay")]
     # Nobody held: nothing is read or told.
     del told[:]
-    R._tell_those_a_turn_off_held(object(), [], set(), "Contoso")
+    R._tell_those_a_turn_off_held(object(), [], set(), "the-providers-id", "Contoso")
     assert told == []
 
 

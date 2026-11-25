@@ -164,8 +164,10 @@ def may_be_held(db, user) -> bool:
     return grant is None or getattr(grant, "status", None) != "active"
 
 
-def held_to_a_provider(db, user, *, now: Optional[datetime] = None) -> Optional[Deadline]:
-    """The missed deadline that leaves ``user`` no way in but a provider's sign-in, or None.
+def held_to_a_provider(db, user, *, now: Optional[datetime] = None, provider_id=None) -> Optional[Deadline]:
+    """The missed deadline that leaves ``user`` no way in but a provider's sign-in, or None. ``provider_id``: asked
+    of that provider alone (whether the deadline the account keeps there is such a one), for what is said of one
+    provider's hold to an account that is linked to several.
 
     Missed (the days ran out, or the provider refused the person) on a provider that closes the other ways in
     then. The days count for this only while the provider is turned on; a refusal holds whatever the provider's
@@ -176,7 +178,8 @@ def held_to_a_provider(db, user, *, now: Optional[datetime] = None) -> Optional[
     if user is None or getattr(user, "id", None) is None:
         return None
     now = now or datetime.utcnow()
-    missed = [found for found in deadlines(db, user.id) if closes_now(found, now)]
+    missed = [found for found in deadlines(db, user.id) if closes_now(found, now)
+              and (provider_id is None or found.provider_id == str(provider_id))]
     if not missed:
         return None
     if not may_be_held(db, user):

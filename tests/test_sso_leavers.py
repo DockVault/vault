@@ -209,6 +209,11 @@ def test_the_provider_that_holds_the_account_is_the_one_it_is_told_about():
     db.tables[SsoProvider].append(r)
     db.tables[ExternalIdentity].append(k)
     assert F.held_to_a_provider(db, alice).provider_id == str(q.id)
+    # Asked of one provider alone: the deadline kept there, when it is one that holds the account. The provider
+    # that only pauses keys holds nobody, though the account is held (by another).
+    assert F.held_to_a_provider(db, alice, provider_id=r.id).provider_id == str(r.id)
+    assert F.held_to_a_provider(db, alice, provider_id=str(q.id)).provider_id == str(q.id)
+    assert F.held_to_a_provider(db, alice, provider_id=p.id) is None
 
 
 def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():

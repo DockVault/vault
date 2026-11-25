@@ -265,11 +265,13 @@ def _held_after(db, row, *, by, ip, held_before) -> tuple:
         return [], set()
 
 
-def _tell_those_a_turn_off_held(db, held_ids, held_before, label: str) -> None:
+def _tell_those_a_turn_off_held(db, held_ids, held_before, provider_id, label: str) -> None:
     """Tell the accounts a save has just held because it turned their provider off with their days run out, in
     the app and by email. Not an account that is turned off, and not one the provider held before the save (it
-    was told when that began). Each is told what holds for it: where the hold also closes its password, that;
-    where it pauses the keys alone, that its password signs it in as before, when it has one it can type.
+    was told when that began). Each is told what holds for it: where this provider's hold also closes its
+    password, that; where it pauses the keys alone, that its password signs it in as before, when it has one it
+    can type and no other provider holds the account. Asked of whichever provider holds the account, an account
+    another provider held was told that lifting this hold, or turning this provider on, would let it in.
 
     A save that changed a provider's connection and its days at once judged the hold by the new days, turned
     the provider off, and counted the accounts its days hold only while it is on: nobody was told."""
@@ -281,12 +283,13 @@ def _tell_those_a_turn_off_held(db, held_ids, held_before, label: str) -> None:
         for user in db.query(User).filter(User.id.in_(list(held_ids))).all():
             if not user.is_active or user.id in held_before:
                 continue
-            if sso_freshness.held_to_a_provider(db, user) is not None:
+            if sso_freshness.held_to_a_provider(db, user, provider_id=provider_id) is not None:
                 ends = (", and your password and passkeys do not sign you in, until an administrator lifts that or "
                         f"{label} is turned on again and admits you.")
             else:
-                ends = (" until an administrator lifts that."
-                        + (" Your password signs you in as before." if sign_in.has_a_password_it_can_type(user) else ""))
+                as_before = (sign_in.has_a_password_it_can_type(user)
+                             and sso_freshness.held_to_a_provider(db, user) is None)
+                ends = " until an administrator lifts that." + (" Your password signs you in as before." if as_before else "")
             told.setdefault(ends, []).append((user.id, user.username, user.email))
         db.rollback()
     except Exception as exc:  # noqa: BLE001
@@ -484,7 +487,7 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
         f"sign-in through {label}: its password and passkeys do not sign it in to this vault until {label} has "
         "admitted it again. If it does not, ask your administrator."), once_for=today)
-    _tell_those_a_turn_off_held(db, held_ids, held_before, label)
+    _tell_those_a_turn_off_held(db, held_ids, held_before, row.id, label)
     _tell_accounts(owners, f"{label} was pointed somewhere else", (
         f"An administrator changed where this vault finds {label}, a sign-in your account is linked to. Nobody signs "
         f"in through {label} until an administrator has tested it again and turned it on. If the sign-in you meet "
