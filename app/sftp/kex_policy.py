@@ -3,14 +3,18 @@
 The SSH library offers the hybrid post-quantum key exchange ``mlkem768x25519-sha256`` (ML-KEM-768 together with
 X25519) first, when the cryptography library underneath it has ML-KEM. This module only filters what it offers:
 
-* ``pq-preferred`` (the default) and ``default``: nothing is taken away. A client that offers the hybrid exchange
-  gets it; one that does not agrees a classical one.
+* ``default``: nothing is taken away. In SSH the client's order decides which exchange is agreed, so the hybrid
+  exchange is agreed with every client that lists it before any classical exchange this server supports
+  (OpenSSH 9.9 and later do by default), and a client that does not agrees a classical one.
 * ``pq-required``: every other exchange is taken away, so a connection is agreed with the hybrid exchange or
   not at all. Where the hybrid exchange is not available here, SFTP does not start: offering nothing would
   refuse everybody with no word why. In the one-container shape the supervisor stops the container when either
-  half ends, so the web side stops too, until the setting is changed (``pq-preferred`` is the recommended value).
+  half ends, so the web side stops too, until the setting is changed (``default`` is the recommended value).
 
-A value that is not one of the three never reaches this module from the settings: they refuse it when the server
+There is no third value that "prefers" the hybrid exchange: a server cannot prefer, the client's order picks, so
+such a value could take nothing away and reorder nothing, and did exactly what ``default`` does.
+
+A value that is not one of the two never reaches this module from the settings: they refuse it when the server
 starts (app/core/config.py). :func:`policy` reads one given to it directly as the default.
 """
 from __future__ import annotations
@@ -18,8 +22,8 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 HYBRID = "mlkem768x25519-sha256"
-DEFAULT, PREFERRED, REQUIRED = "default", "pq-preferred", "pq-required"
-POLICIES = (DEFAULT, PREFERRED, REQUIRED)
+DEFAULT, REQUIRED = "default", "pq-required"
+POLICIES = (DEFAULT, REQUIRED)
 
 
 class HybridUnavailable(RuntimeError):
@@ -29,7 +33,7 @@ class HybridUnavailable(RuntimeError):
 def policy(value) -> str:
     """The policy in force for the configured ``value``: one of :data:`POLICIES`."""
     text = str(value or "").strip().lower()
-    return text if text in POLICIES else PREFERRED
+    return text if text in POLICIES else DEFAULT
 
 
 def offered(transport_class) -> Tuple[str, ...]:
@@ -50,7 +54,7 @@ def disabled_kex(value, transport_class) -> list:
         raise HybridUnavailable(
             "SFTP_KEX_POLICY=pq-required, and the hybrid key exchange " + HYBRID + " is not available in this "
             "server (its cryptography library has no ML-KEM). SFTP is not started; where the web side runs in the "
-            "same container, the vault stops with it. Set SFTP_KEX_POLICY=pq-preferred to start it and let clients "
+            "same container, the vault stops with it. Set SFTP_KEX_POLICY=default to start it and let clients "
             "connect with a classical key exchange.")
     return [name for name in offered(transport_class) if name != HYBRID]
 

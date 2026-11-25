@@ -4,7 +4,7 @@
   * an OpenSSH 10 client that offers only the hybrid exchange completes it: the server has it, in the image
     as it is built (a cryptography library without ML-KEM would make the SSH library fall back with no word);
   * left to choose, the same client and the server agree the hybrid exchange: it is the first choice of both;
-  * a client that offers only a classical exchange still connects (SFTP_KEX_POLICY=pq-preferred, the default);
+  * a client that offers only a classical exchange still connects (SFTP_KEX_POLICY=default);
   * a client whose X25519 share is all zeros is refused by the server, and the same client with an honest share
     is not.
 

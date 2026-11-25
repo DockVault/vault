@@ -115,17 +115,18 @@ class Settings(BaseSettings):
     # How an SFTP connection agrees its session keys. File bytes of a Standard vault travel inside SSH, and
     # what is recorded today can be decrypted later by whoever breaks the classical key exchange: the hybrid
     # exchange mlkem768x25519-sha256 (ML-KEM-768 with X25519; OpenSSH's default since 10.0) is not broken by
-    # that. "pq-preferred" (the default): the hybrid exchange is chosen with every client that offers it, and a
-    # client that does not still connects with a classical one. "pq-required": only the hybrid exchange is
-    # offered, so a client older than OpenSSH 9.9 (or another without it) can no longer connect. "default":
-    # the SSH library's own order, unchanged. Host and user keys are not part of this: they prove who is
+    # that. "default": nothing is taken away. In SSH the client's order decides, so the hybrid exchange is agreed
+    # with every client that lists it before any classical exchange this server supports (OpenSSH 9.9 and
+    # later do by default), and a client that does not still connects with a classical one. "pq-required":
+    # the classical exchanges are taken away, so a client older than OpenSSH 9.9 (or another without the
+    # hybrid exchange) can no longer connect. Host and user keys are not part of this: they prove who is
     # speaking, and are not what a recording decrypts. Any other value is refused at start (the validator
     # below): a value that only looks like pq-required must not leave the classical exchanges on offer
-    # unseen. pq-preferred is the recommended value: under pq-required a server that cannot offer the hybrid
+    # unseen. default is the recommended value: under pq-required a server that cannot offer the hybrid
     # exchange does not start SFTP, and where the web side and SFTP run in one container (the default shape,
     # run_combined.py stops the container when either half ends) the whole vault stops with it until the
     # setting is changed. See app/sftp/kex_policy.py.
-    sftp_kex_policy: str = Field(default="pq-preferred")
+    sftp_kex_policy: str = Field(default="default")
     # The per-address cap on AUTHENTICATED sessions, separate from the pre-auth one above: a fleet
     # of devices behind one NAT all authenticate from one address, and with a single per-address cap
     # sized against a flood (10), the tenth device found the door shut by the first nine. The
@@ -597,10 +598,10 @@ class Settings(BaseSettings):
     
     @validator('sftp_kex_policy')
     def validate_sftp_kex_policy(cls, v):
-        """One of the three policies, in any case: refused at start otherwise (see sftp_kex_policy)."""
+        """One of the two policies, in any case: refused at start otherwise (see sftp_kex_policy)."""
         value = str(v or "").strip().lower()
-        if value not in ("default", "pq-preferred", "pq-required"):
-            raise ValueError('SFTP_KEX_POLICY must be one of default, pq-preferred, pq-required')
+        if value not in ("default", "pq-required"):
+            raise ValueError('SFTP_KEX_POLICY must be one of default, pq-required')
         return value
 
     @validator('zk_envelope_hold_days')

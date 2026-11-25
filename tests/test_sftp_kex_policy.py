@@ -30,10 +30,13 @@ def _library(with_the_hybrid=True):
 
 def test_the_policy_takes_nothing_away_by_default_and_everything_else_when_the_hybrid_is_required():
     from app.sftp import kex_policy as K
-    assert K.HYBRID == HYBRID and K.POLICIES == ("default", "pq-preferred", "pq-required")
-    assert K.policy(None) == K.policy("") == K.policy("nonsense") == "pq-preferred"
+    assert K.HYBRID == HYBRID and K.POLICIES == ("default", "pq-required")
+    assert K.policy(None) == K.policy("") == K.policy("nonsense") == "default"
     assert K.policy(" PQ-Required ") == "pq-required" and K.policy("default") == "default"
-    for value in ("default", "pq-preferred", None, "", "nonsense"):
+    # No third value: one that "prefers" the hybrid exchange could do nothing the default does not, because the
+    # client's order picks the exchange. Given directly, it is read as the default it always was.
+    assert K.policy("pq-preferred") == "default" and not hasattr(K, "PREFERRED")
+    for value in ("default", None, "", "nonsense"):
         assert K.disabled_kex(value, _library()) == [], value
         assert K.disabled_kex(value, _library(with_the_hybrid=False)) == [], value      # classical clients connect
     assert K.disabled_kex("pq-required", _library()) == list(CLASSICAL)
@@ -68,7 +71,7 @@ def test_the_hybrid_required_where_it_cannot_be_offered_is_an_error_that_says_wh
     said = str(refused.value)
     assert "SFTP_KEX_POLICY=pq-required" in said and HYBRID in said and "SFTP is not started" in said
     assert "where the web side runs in the same container, the vault stops with it" in said
-    assert "Set SFTP_KEX_POLICY=pq-preferred" in said
+    assert "Set SFTP_KEX_POLICY=default" in said and "pq-preferred" not in said
 
 
 def test_the_transport_keeps_the_exchange_it_agreed_and_says_it_once(monkeypatch):
@@ -154,9 +157,11 @@ def _handshake(monkeypatch, configured, client_offers=None):
 def test_a_real_handshake_agrees_the_hybrid_exchange_and_a_classical_one_only_where_the_policy_lets_it(monkeypatch):
     classical = ("curve25519-sha256@libssh.org",)
     # The default policy: the hybrid exchange with a client that offers it, a classical one with one that does not.
-    assert _handshake(monkeypatch, "pq-preferred") == (True, HYBRID, ["kex.agreed.hybrid"])
-    assert _handshake(monkeypatch, "pq-preferred", classical) == (True, classical[0], ["kex.agreed.classical"])
+    assert _handshake(monkeypatch, "default") == (True, HYBRID, ["kex.agreed.hybrid"])
     assert _handshake(monkeypatch, "default", classical) == (True, classical[0], ["kex.agreed.classical"])
+    # The client's order picks: one that lists a classical exchange before the hybrid one agrees the classical
+    # one under the default, and nothing a server sets short of taking the classical ones away changes that.
+    assert _handshake(monkeypatch, "default", classical + (HYBRID,)) == (True, classical[0], ["kex.agreed.classical"])
     # Only the hybrid exchange: a client that offers it connects, a classical one finds nothing in common.
     assert _handshake(monkeypatch, "pq-required") == (True, HYBRID, ["kex.agreed.hybrid"])
     assert _handshake(monkeypatch, "pq-required", (HYBRID,)) == (True, HYBRID, ["kex.agreed.hybrid"])
@@ -183,10 +188,10 @@ def test_the_server_applies_the_policy_to_every_connection_and_checks_it_before_
     assert "self.agreed_kex = None" in inspect.getsource(S._Transport.__init__)
 
 
-@pytest.mark.parametrize("raw, read", [("pq-preferred", "pq-preferred"), (" PQ-Required ", "pq-required"),
+@pytest.mark.parametrize("raw, read", [("default", "default"), (" PQ-Required ", "pq-required"),
                                        ("Default", "default"), ("pq_required", None), ("required", None),
-                                       ("pq-require", None), ("", None), ("yes", None)])
-def test_a_value_that_is_not_one_of_the_three_stops_the_server_at_its_start(monkeypatch, raw, read):
+                                       ("pq-require", None), ("", None), ("yes", None), ("pq-preferred", None)])
+def test_a_value_that_is_not_one_of_the_two_stops_the_server_at_its_start(monkeypatch, raw, read):
     """A value that only looks like pq-required, taken for the default, would leave the classical exchanges on
     offer with nobody the wiser: the settings refuse it, as they refuse any other bad setting."""
     set_bare_api_env()
@@ -198,14 +203,14 @@ def test_a_value_that_is_not_one_of_the_three_stops_the_server_at_its_start(monk
         return
     with pytest.raises(ValidationError) as refused:
         Settings()
-    assert "SFTP_KEX_POLICY must be one of default, pq-preferred, pq-required" in str(refused.value)
+    assert "SFTP_KEX_POLICY must be one of default, pq-required" in str(refused.value)
 
 
 def test_left_unset_the_policy_is_the_default(monkeypatch):
     set_bare_api_env()
     from app.core.config import Settings
     monkeypatch.delenv("SFTP_KEX_POLICY", raising=False)
-    assert Settings().sftp_kex_policy == "pq-preferred"
+    assert Settings().sftp_kex_policy == "default"
 
 
 def test_one_container_stops_whole_when_its_sftp_half_does_not_start():
@@ -222,18 +227,25 @@ def test_one_container_stops_whole_when_its_sftp_half_does_not_start():
 def test_the_setting_has_its_default_its_words_and_its_place_in_the_setup_tool():
     set_bare_api_env()
     from app.core.config import Settings
-    assert Settings.model_fields["sftp_kex_policy"].default == "pq-preferred"
+    assert Settings.model_fields["sftp_kex_policy"].default == "default"
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "\nSFTP_KEX_POLICY=pq-preferred\n" in example.replace("\r\n", "\n")
-    words = example[example.index("# How an SFTP connection agrees its session keys."):example.index("SFTP_KEX_POLICY=pq-preferred")]
-    for said in ("mlkem768x25519-sha256", "pq-required: only the hybrid exchange", "can no longer connect",
-                 "default: the SSH library's own order", "Any other value stops the server at its start",
-                 "pq-preferred is the recommended value",
+    assert "\nSFTP_KEX_POLICY=default\n" in example.replace("\r\n", "\n")
+    words = example[example.index("# How an SFTP connection agrees its session keys."):example.index("SFTP_KEX_POLICY=default")]
+    # Two values, and none that says it prefers: nowhere in what an operator reads or the server takes.
+    for text in (example, (ROOT / "app" / "core" / "config.py").read_text(encoding="utf-8"),
+                 (ROOT / "app" / "sftp" / "kex_policy.py").read_text(encoding="utf-8"),
+                 (ROOT / "dockvault.py").read_text(encoding="utf-8")):
+        assert "pq-preferred" not in text and "pq_preferred" not in text
+    for said in ("mlkem768x25519-sha256", "pq-required: the classical exchanges are taken away", "can no longer connect",
+                 "default: nothing is taken away. The client's order decides",
+                 "every client that lists it before any classical exchange this server supports",
+                 "Any other value stops the server at its start",
+                 "default is the recommended value",
                  "Under pq-required a server that cannot offer the hybrid exchange does not start SFTP at all",
                  "the whole vault stops with it until the setting is changed"):
         assert said in words.replace("\n# ", " ").replace("\r", ""), said
     tool = (ROOT / "dockvault.py").read_text(encoding="utf-8")
-    assert 'if sftp_active and _kex_policy in ("default", "pq-required"):\n        bare("SFTP_KEX_POLICY", _kex_policy)' in tool
+    assert 'if sftp_active and _kex_policy == "pq-required":\n        bare("SFTP_KEX_POLICY", _kex_policy)' in tool
     assert '"sftp_kex_policy": (current_env.get("SFTP_KEX_POLICY") or "").strip() or None,' in tool
 
 

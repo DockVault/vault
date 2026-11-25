@@ -1079,9 +1079,9 @@ def build_env_lines(cfg):
         if sftp_active and cfg.get(_cfg_key) not in (None, "") and int(cfg[_cfg_key]) != _default:
             bare(_env_name, int(cfg[_cfg_key]))
     # How SFTP agrees its session keys (see .env.example), same rule: authored only when it is not the
-    # default (pq-preferred), so an operator's choice of pq-required or default survives a fresh volume set.
+    # default, so an operator's choice of pq-required survives a fresh volume set.
     _kex_policy = str(cfg.get("sftp_kex_policy") or "").strip().lower()
-    if sftp_active and _kex_policy in ("default", "pq-required"):
+    if sftp_active and _kex_policy == "pq-required":
         bare("SFTP_KEX_POLICY", _kex_policy)
     # SFTP streaming upload (default ON): a normal install never mentions it. Author SFTP_STREAMING_UPLOAD
     # only when the operator explicitly DISABLED it (the buffered rollback), preserving that choice
