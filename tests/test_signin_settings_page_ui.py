@@ -1,6 +1,7 @@
 """Settings -> Sign-in as an administrator reads it (static/js/settings-signin.js): what the counts the server reads
 mean under the rows they concern, and that a save which applies reads the page again for them; the alert while
-direct attestation has no trust anchors; and the note while 'Required for roles' names no role.
+direct attestation has no trust anchors; the note while 'Required for roles' names no role; and the accounts the
+server's operator lifted the requirement for, listed as text.
 
 Driven in Node against the shipped script, on the small document of tests/js/mini_dom.js, with the server's answer
 built from the passkey settings as they are registered (app/core/webauthn_settings.py).
@@ -236,3 +237,39 @@ out({ roles: rowOf('webauthn_mode').querySelectorAll('.signin-roles-note').lengt
       counts: rowOf('webauthn_mode').querySelectorAll('.signin-setting-note').length });
 """ % json.dumps(next(row for row in _answer()["settings"] if row["key"] == "webauthn_enrollment_grace_days")))
     assert got == {"roles": 1, "counts": 1}
+
+
+LIFTED = r"""
+const box = byId('signin-passkey-lifted');
+out({ shown: !!box && !box.hidden, text: textOf(box), said: box ? textOf(box.querySelector('p')) : null,
+      items: box ? box.querySelectorAll('li').map((li) => li.textContent) : [],
+      images: box ? box.querySelectorAll('img').length : 0,
+      placed: !!box && byId('signin-passkey-settings').nextElementSibling === box });
+"""
+
+
+def test_the_accounts_the_requirement_was_lifted_for_are_listed_as_text_under_the_settings():
+    got = _loaded(_answer(requirement_lifted_for=[
+        {"username": "<img src=x onerror=alert(1)>", "role": "user", "lifted_at": "2026-11-20T10:00:00Z"},
+        {"username": "bob", "role": "admin", "lifted_at": "2026-11-21T10:00:00Z"}]), LIFTED)
+    assert got["shown"] and got["placed"] and got["images"] == 0
+    assert got["said"] == ("The server's operator lifted the passkey requirement for 2 accounts: none of them is "
+                           "asked for the passkey a role requires. It stays lifted for an account until the account "
+                           "adds a passkey or its role changes, or until the operator puts it back (python "
+                           "dockvault.py accounts, restore-passkey-requirement).")
+    assert len(got["items"]) == 2
+    assert got["items"][0].startswith("<img src=x onerror=alert(1)> (Users), since ") and "2026" in got["items"][0]
+    assert got["items"][1].startswith("bob (Administrators), since ")
+
+
+def test_the_list_of_lifted_accounts_says_when_it_shows_only_the_first_500_and_hides_when_empty():
+    many = [{"username": "user%03d" % i, "role": "user", "lifted_at": "2026-11-20T10:00:00Z"} for i in range(500)]
+    got = _loaded(_answer(requirement_lifted_for=many), LIFTED)
+    assert got["said"].startswith("The server's operator lifted the passkey requirement for 500 accounts or more: ")
+    assert got["said"].endswith(" The first 500 by name are listed.") and len(got["items"]) == 500
+    got = _loaded(_answer(requirement_lifted_for=[
+        {"username": "ann", "role": "external", "lifted_at": "2026-11-20T10:00:00Z"}]), LIFTED)
+    assert got["said"].startswith("The server's operator lifted the passkey requirement for 1 account: it is not "
+                                  "asked for the passkey a role requires.")
+    assert got["items"][0].startswith("ann (External people), since ")
+    assert not _loaded(_answer(), LIFTED)["shown"]

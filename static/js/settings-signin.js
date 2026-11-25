@@ -319,6 +319,45 @@
             `No role is chosen under “${label}”: nobody is required to hold a passkey.`));
     }
 
+    // The accounts the server's operator lifted a role's passkey requirement for (python dockvault.py accounts,
+    // clear-passkey-requirement), under the settings: the server sends the first 500 by name. A lifting ends when the
+    // account adds a passkey or its role changes, or when the operator puts the requirement back.
+    const LIFTED_SHOWN = 500;
+
+    function drawLifted(data) {
+        let box = byId('signin-passkey-lifted');
+        const lifted = Array.isArray(data.requirement_lifted_for) ? data.requirement_lifted_for : [];
+        if (!lifted.length) {
+            if (box) { box.replaceChildren(); box.hidden = true; }
+            return;
+        }
+        if (!box) {
+            const settings = byId('signin-passkey-settings');
+            if (!settings || !settings.parentNode) return;
+            box = el('div', 'mt-md');
+            box.id = 'signin-passkey-lifted';
+            box.style.overflowWrap = 'anywhere';        // a long user name wraps on a phone
+            settings.parentNode.insertBefore(box, settings.nextElementSibling);
+        }
+        const one = lifted.length === 1;
+        const capped = lifted.length >= LIFTED_SHOWN;
+        const who = capped ? `${lifted.length} accounts or more` : (one ? '1 account' : `${lifted.length} accounts`);
+        const said = el('p', 'text-secondary text-sm',
+            `The server's operator lifted the passkey requirement for ${who}: `
+            + (one ? 'it is not' : 'none of them is') + ' asked for the passkey a role requires. It stays lifted for '
+            + 'an account until the account adds a passkey or its role changes, or until the operator puts it back '
+            + '(python dockvault.py accounts, restore-passkey-requirement).'
+            + (capped ? ` The first ${LIFTED_SHOWN} by name are listed.` : ''));
+        const list = el('ul', 'text-sm');
+        lifted.forEach((entry) => {
+            const since = entry.lifted_at ? new Date(entry.lifted_at) : null;
+            const day = since && !Number.isNaN(since.getTime()) ? `, since ${since.toLocaleDateString()}` : '';
+            list.appendChild(el('li', null, `${entry.username} (${named(entry.role)})${day}`));
+        });
+        box.replaceChildren(said, list);
+        box.hidden = false;
+    }
+
     // Everything said around the rows, from one read of the page.
     function drawAround(data) {
         drawReadiness(data);
@@ -326,6 +365,7 @@
         drawOlder(data);
         drawCounts(data);
         drawRolesNote(data);
+        drawLifted(data);
     }
 
     async function load() {
@@ -372,6 +412,8 @@
         if (older) { older.textContent = ''; older.hidden = true; }
         const anchors = byId('signin-passkey-anchors');
         if (anchors) { anchors.textContent = ''; anchors.hidden = true; }
+        const lifted = byId('signin-passkey-lifted');
+        if (lifted) { lifted.replaceChildren(); lifted.hidden = true; }
     }
 
     document.addEventListener('click', (e) => {

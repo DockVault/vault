@@ -286,3 +286,24 @@ def test_required_for_roles_with_no_role_chosen_says_nobody_is_required(page: Pa
     page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
     expect(page.locator(MODE + " .signin-roles-note")).to_have_count(0, timeout=10000)
     page.unroute_all(behavior="ignoreErrors")
+
+
+def test_the_page_lists_the_accounts_the_requirement_was_lifted_for_as_text(page: Page, admin_creds):
+    def lifted(body):
+        body["requirement_lifted_for"] = [
+            {"username": "<img src=x onerror=alert(1)>", "role": "user", "lifted_at": "2026-11-20T10:00:00Z"},
+            {"username": "bob", "role": "admin", "lifted_at": "2026-11-21T10:00:00Z"}]
+    _with_the_answer_changed(page, lifted)
+    _open(page, admin_creds)
+    box = page.locator("#signin-passkey-lifted")
+    expect(box).to_be_visible()
+    expect(box).to_contain_text("2 accounts")
+    expect(box.locator("li")).to_have_count(2)
+    assert (box.locator("li").first.text_content() or "").startswith("<img")
+    expect(box.locator("img")).to_have_count(0)
+    expect(box).to_contain_text("bob (Administrators)")
+    page.unroute_all(behavior="ignoreErrors")
+    # The server's own answer: nobody's requirement was lifted on this stack.
+    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    expect(page.locator('#signin-passkey-settings [data-setting="webauthn_mode"]')).to_be_visible(timeout=10000)
+    expect(box).to_be_hidden(timeout=10000)
