@@ -953,6 +953,14 @@ def accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolut
                       inviter_name=inviter_name)
 
 
+def invitation_takes_a_provider(inv) -> bool:
+    """Whether ``inv`` may be accepted through a provider: any invitation but an administrator's, which is accepted
+    with the form (``ADMINISTRATOR_INVITATION``): an administrator types the account's password at every sign-in, and
+    an account made at a provider's callback holds a password nobody knows. The start refuses it before the person is
+    sent to the provider, and the invitation page offers no provider for it."""
+    return str(getattr(inv, "role", "")) != "admin"
+
+
 def made_here_is_provider_only(row) -> bool:
     """Whether an account made at its first sign-in through ``row`` signs in only through its provider: the
     provider's people hold no password, or it does not let the accounts it makes set one."""

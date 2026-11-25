@@ -1479,6 +1479,54 @@ async function initInviteFlow(token) {
     _renderInviteForm(token, info);
 }
 
+// The single sign-on buttons the invitation may be accepted through (GET /invites/{token} lists them: the sign-in
+// page's buttons, and none for an administrator's invitation, which is accepted with the form). The page leaves for
+// the provider with the invitation's token, and the account is made when the provider sends the browser back to the
+// sign-in page. A start the server refuses is said here in its words, as the sign-in page says it; a refusal the
+// provider's answer brings back is said on the sign-in page, in the same words as for any sign-in. A page opened at
+// another address than the vault's own offers none (the provider would send the browser back there) and says where.
+function _inviteProviders(body, token, info) {
+    const providers = (info && Array.isArray(info.providers))
+        ? info.providers.filter((p) => p && typeof p.id === 'string' && p.id) : [];
+    if (!providers.length || !window.Sso) return false;
+    const box = _el('div', 'invite-providers mt-lg');
+    box.id = 'invite-sso';
+    const elsewhere = _signInOriginElsewhere({ methods: { origin: info.origin } });
+    if (elsewhere) {
+        box.appendChild(_el('p', 'text-secondary text-sm', 'This invitation can also be accepted through your '
+            + 'organisation\'s sign-in at ' + elsewhere + '. Open your invitation link there to do that.'));
+        body.appendChild(box);
+        return false;
+    }
+    box.appendChild(_el('p', 'text-secondary text-sm', 'Or accept it through your organisation\'s sign-in: you sign in '
+        + 'there, and your account is made when you come back.'));
+    const said = _el('div', 'alert alert-error mt-sm');
+    said.id = 'invite-sso-error';
+    said.style.display = 'none';
+    said.setAttribute('role', 'alert');
+    providers.forEach((provider) => {
+        const button = _el('button', 'btn btn-secondary btn-block mt-sm sso-sign-in-btn',
+            typeof provider.label === 'string' && provider.label ? provider.label : 'Single sign-on');
+        button.type = 'button';
+        button.dataset.provider = provider.id;
+        if (typeof provider.icon === 'string' && /^[a-z]{1,20}$/.test(provider.icon)) button.dataset.icon = provider.icon;
+        button.addEventListener('click', async () => {
+            box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+            said.style.display = 'none';
+            try { await Sso.startSignIn(provider.id, { invitation: token }); }      // leaves the page
+            catch (e) {
+                box.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+                said.textContent = (e && e.message) || 'This sign-in could not be started. Try again in a moment.';
+                said.style.display = 'block';
+            }
+        });
+        box.appendChild(button);
+    });
+    box.appendChild(said);
+    body.appendChild(box);
+    return true;
+}
+
 function _renderInviteForm(token, info) {
     const body = _inviteCard();
     if (!body) return;
@@ -1487,7 +1535,11 @@ function _renderInviteForm(token, info) {
     const sub = _el('p', 'text-secondary mb-lg');
     sub.appendChild(document.createTextNode('You are claiming the username '));
     sub.appendChild(_el('strong', null, info.username || ''));
-    sub.appendChild(document.createTextNode('. Set a password to finish.'));
+    const providersHere = !!window.Sso && Array.isArray(info.providers) && info.providers.length > 0
+        && !_signInOriginElsewhere({ methods: { origin: info.origin } });
+    sub.appendChild(document.createTextNode(providersHere
+        ? '. Set a password to finish, or accept it through your organisation\'s sign-in below.'
+        : '. Set a password to finish.'));
     body.appendChild(sub);
 
     const form = _el('form');
@@ -1560,6 +1612,7 @@ function _renderInviteForm(token, info) {
         }
     });
     body.appendChild(form);
+    _inviteProviders(body, token, info);
     if (emailInput) emailInput.focus(); else pw.focus();
 }
 

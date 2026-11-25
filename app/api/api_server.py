@@ -5832,9 +5832,17 @@ def _audit_accept_failure(db: Session, prefix: str, ip: str, reason: str) -> Non
 @app.get("/invites/{token}")
 async def get_invite(token: str, request: Request, db: Session = Depends(get_db)):
     """PUBLIC: what the acceptance form needs for a claimable token (the claimed username, whether an
-    email is still required, the password policy). Every non-usable state returns the same 404."""
+    email is still required, the password policy). Every non-usable state returns the same 404.
+
+    ``providers``: the single sign-on buttons the invitation may be accepted through instead (POST
+    /auth/sso/{id}/start with the token: the account is made at the provider's callback). They are the sign-in
+    page's buttons (a provider that is on and shown there, while the vault has an address a provider can send the
+    browser back to), and none for an administrator's invitation, which is accepted with the form
+    (app/services/sso_sign_in.py invitation_takes_a_provider). ``origin`` is the address those work at, as the
+    sign-in page is told it."""
     import time as _t
-    from app.core import invitations
+    from app.core import invitations, public_url
+    from app.services import sso_sign_in
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
     client_ip = get_client_ip(request)
     try:
@@ -5859,6 +5867,8 @@ async def get_invite(token: str, request: Request, db: Session = Depends(get_db)
         "email_required": (pol.get("email_requirement") == "required") and not inv.email,
         "password_policy": _password_policy_view(db),
         "expires_at": inv.expires_at.isoformat(),
+        "providers": _sign_in_providers(db) if sso_sign_in.invitation_takes_a_provider(inv) else [],
+        "origin": public_url.public_base_url() or None,
     }
 
 

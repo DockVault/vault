@@ -337,7 +337,7 @@ def _invitation_for_start(db, token: str, client_ip: str):
         api._audit_accept_failure(db, prefix, client_ip, reason="sso_start_unresolved")
         raise HTTPException(status_code=404, detail={"reason": sso.INVITATION_UNUSABLE,
                                                      "message": sso.reason_text(sso.INVITATION_UNUSABLE)})
-    if str(getattr(inv, "role", "")) == "admin":
+    if not sso.invitation_takes_a_provider(inv):
         # Said before the person is sent to the provider: an administrator's invitation is accepted with the form.
         raise HTTPException(status_code=409, detail={"reason": sso.ADMINISTRATOR_INVITATION,
                                                      "message": sso.reason_text(sso.ADMINISTRATOR_INVITATION)})

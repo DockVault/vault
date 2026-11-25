@@ -88,3 +88,43 @@ def test_invalid_link_shows_one_generic_message(page: Page, admin, invites_on):
     # no form, no token stored
     expect(page.locator("#invite-card-body input[type=password]")).to_have_count(0)
     assert page.evaluate("() => localStorage.getItem('authToken')") in (None, "")
+
+
+def test_the_page_offers_the_providers_the_invitation_may_be_accepted_through(page: Page, admin, invites_on):
+    """The server lists the providers an invitation may be accepted through (none for an administrator's): the page
+    shows their buttons beside the form, starts the sign-in with the invitation's token, and says a start the server
+    refuses in its words. The provider and its start are stood in for: the server's side has its own tests."""
+    import re
+    uname = "uisso" + str(abs(hash(page)) % 100000)
+    token = _mint(admin, uname)
+    provider = "00000000-0000-4000-8000-0000000000aa"
+    starts = []
+
+    def info(route):
+        response = route.fetch()
+        body = response.json()
+        body["providers"] = [{"id": provider, "label": "Company sign-in", "kind": "oidc", "icon": "microsoft",
+                              "order": 1}]
+        body["origin"] = page.evaluate("() => location.origin")
+        route.fulfill(response=response, json=body)
+    page.route(re.compile(r".*/invites/[A-Za-z0-9_-]+$"), info)
+
+    def start(route):
+        starts.append(route.request.post_data_json or {})
+        route.fulfill(status=409, json={"detail": {"reason": "invitation_unusable",
+                                                   "message": "This invitation can no longer be used."}})
+    page.route(re.compile(r".*/auth/sso/[0-9a-f-]{36}/start$"), start)
+    try:
+        page.goto(f"/?invite={token}")
+        expect(page.locator("#invite-screen")).to_be_visible(timeout=10000)
+        expect(page.locator("#invite-card-body")).to_contain_text("or accept it through your organisation's sign-in")
+        button = page.locator("#invite-sso .sso-sign-in-btn")
+        expect(button).to_have_text(["Company sign-in"], timeout=10000)
+        expect(page.locator("#invite-card-body input[type=password]")).to_be_visible()
+        button.click()
+        expect(page.locator("#invite-sso-error")).to_have_text("This invitation can no longer be used.", timeout=10000)
+        assert len(starts) == 1 and starts[0]["invitation"] == token and len(starts[0]["verifier_hash"]) == 64
+        expect(button).to_be_enabled()
+    finally:
+        page.unroute_all(behavior="ignoreErrors")
+        _cleanup(admin, uname)
