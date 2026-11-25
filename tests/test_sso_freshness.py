@@ -544,3 +544,27 @@ def test_the_sweep_sends_nobody_to_a_provider_that_is_turned_off_and_tells_them_
     ia.refused_at = NOW + DAY
     p.state = "disabled"
     assert F.sweep(db, NOW + 2 * DAY) == {"warned": 0, "lapsed": 0} and len(told.notices) == 3
+
+
+def test_an_accounts_deadlines_are_read_in_two_queries_however_many_providers_it_is_linked_to():
+    """The deadlines are asked at every door and on every SFTP operation. One read for the account's identities,
+    which is the only one for an account linked to nothing, and one for their providers together: a read per
+    identity made an operation cost more with every provider the account was linked to."""
+    alice, bob = _user(), _user("bob")
+    providers = [_provider(30, name=f"p{n}") for n in range(4)]
+    links = [_identity(alice, p, signed_in=NOW - (n + 1) * DAY) for n, p in enumerate(providers)]
+    db = _db([alice, bob], providers, links)
+    asked, through = [], db.query
+
+    def query(*entities):
+        asked.append(getattr(entities[0], "__tablename__", None))
+        return through(*entities)
+    db.query = query
+    found = F.deadlines(db, alice.id)
+    assert asked == ["external_identities", "sso_providers"]
+    assert [d.provider_name for d in found] == ["p3", "p2", "p1", "p0"]          # earliest first, each with its own
+    del asked[:]
+    assert F.deadlines(db, bob.id) == [] and asked == ["external_identities"]     # linked to nothing: one read
+    # An identity whose provider is gone asks nothing of anybody.
+    db.tables[SsoProvider].remove(providers[0])
+    assert [d.provider_name for d in F.deadlines(db, alice.id)] == ["p3", "p2", "p1"]

@@ -111,10 +111,15 @@ def deadlines(db, user_id) -> List[Deadline]:
     if user_id is None or not _tables_present(db):
         return []
     from app.core.models import ExternalIdentity, SsoProvider
+    # Asked at every door and on every SFTP operation: one read for the account's identities (the only one for an
+    # account linked to nothing), and one for the providers, of which a vault holds a handful.
+    identities = db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user_id).all()
+    if not identities:
+        return []
+    providers = {row.id: row for row in db.query(SsoProvider).all()}
     out = []
-    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user_id).all():
-        provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
-        found = deadline_of(identity, provider)
+    for identity in identities:
+        found = deadline_of(identity, providers.get(identity.provider_id))
         if found is not None:
             out.append(found)
     return sorted(out, key=lambda d: d.due)
