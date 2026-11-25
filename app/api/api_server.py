@@ -7207,14 +7207,16 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     # the row, waited for the promotion while the promotion waited for it, and the database ended one of the
     # two, in practice the promotion.
     _sessions_turn(db, user.id)
-    # The account's flag and role as they are committed, read again in the turn. A save of a provider's setting
-    # may have made the account sign in only through its provider a moment ago, or ended that. Decided on what
-    # was loaded before the turn, the promotion left an administrator flagged, with a password nobody knows and
-    # a reset link that was refused. Only these two are read again: what the caller has changed on the account
-    # stays as it is.
+    # The account's flag as it is committed, read again in the turn. A save of a provider's setting may have
+    # made the account sign in only through its provider a moment ago, or ended that. Decided on what was loaded
+    # before the turn, the promotion left an administrator flagged, with a password nobody knows and a reset
+    # link that was refused. Only the flag is read again, and nothing below reads anything else of the account
+    # that another request could have changed: what the caller has changed on it stays as it is. The role above
+    # all: a caller may have set it already, and read again it would come back as it was committed, the
+    # promotion undone with no word.
     refresh = getattr(db, "refresh", None)
     if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
-        refresh(user, attribute_names=["sso_only", "role"])
+        refresh(user, attribute_names=["sso_only"])
     refusal = auditor_rights.promotion_refusal(db, user)
     if refusal is not None:
         raise HTTPException(status_code=409, detail=refusal)

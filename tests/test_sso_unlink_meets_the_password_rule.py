@@ -241,6 +241,22 @@ def test_an_account_held_to_its_providers_sign_in_adds_no_other_way_in(db, world
         assert "sso_sign_in_due" not in str(getattr(other.value, "detail", other.value)), route.__name__
 
 
+def test_a_promotion_keeps_the_role_its_caller_has_just_set(db, world, monkeypatch):
+    """The promotion reads the account's flag again in its turn, and nothing else of the account. A caller that
+    has set the new role before it records the grant keeps it: read again with the flag, the role came back as
+    it was committed, and the promotion was undone with no word."""
+    from app.core.models import RoleEnum, User
+    _provider, alice, _identity = _linked(db)
+    db.commit()
+    me = db.query(User).filter(User.id == alice.id).first()
+    assert me.role == RoleEnum.USER
+    me.role = RoleEnum.ADMIN                               # the caller's change, not written yet
+    api._record_admin_grant(db, me, by=None)
+    assert me.role == RoleEnum.ADMIN
+    db.commit()
+    assert db.query(User).filter(User.id == alice.id).first().role == RoleEnum.ADMIN
+
+
 def test_a_promotion_decides_on_the_flag_as_it_is_committed_when_its_turn_comes(db, world, monkeypatch):
     """An account made at a first sign-in is loaded while its provider lets such accounts set a password: not
     flagged. A save of that setting flags it and commits before the promotion's turn comes. The promotion reads
