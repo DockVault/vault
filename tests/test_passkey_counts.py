@@ -387,6 +387,31 @@ def test_the_users_list_gives_both_numbers_to_the_page(S):
     assert fields["passkey_count"].annotation is int and fields["passkey_unusable_count"].annotation is int
 
 
+def test_every_passkey_a_reset_retires_is_counted_whatever_the_switch(S, db, monkeypatch):
+    """A reset of the second factor retires every passkey the account holds, usable or not, and whether passkeys
+    are on or off. Turned off, none counts as a way to sign in or as one held in name only, yet the reset retires
+    them for good: the list gives the page their number apart, so its confirmation can say so."""
+    wss = _the_rules(monkeypatch)
+    two, moved, retired, none = (_user(db, n) for n in ("two", "moved", "retired", "none"))
+    _key(db, two)
+    _key(db, two)
+    _key(db, moved, rp_id=ELSEWHERE)
+    _key(db, retired, retired_at=datetime(2026, 11, 1))
+    everyone = [u.id for u in (two, moved, retired, none)]
+    assert S._passkeys_held(db, everyone) == {two.id: 2, moved.id: 1}
+    monkeypatch.setattr(wss, "enabled", lambda: False)
+    assert S._passkey_tally(db, everyone) == {}
+    assert S._passkeys_held(db, everyone) == {two.id: 2, moved.id: 1}
+    assert S._passkeys_held(db, []) == {}
+    fields = S.UserResponse.model_fields
+    assert fields["passkey_held_count"].default == 0 and fields["passkey_held_count"].annotation is int
+    source = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    listing = source[source.index("async def list_users("):]
+    listing = listing[:listing.index("\n@app.")]
+    assert listing.count("_passkeys_held(db, [u.id for u in users])") == 1
+    assert "item.passkey_held_count = passkeys_held.get(user.id, 0)" in listing
+
+
 def test_a_shown_passkey_says_whether_it_is_a_factor_now_and_why_not(S, db, monkeypatch):
     """The profile and the administrator's list show every key the account holds. One that cannot be used says
     so, with the reason, and never the address it was made at."""

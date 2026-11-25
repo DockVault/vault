@@ -30,7 +30,8 @@ ROOT = Path(__file__).resolve().parent.parent
 APP_JS = ROOT / "static" / "js" / "app.js"
 _SHIPPED = ("_el", "parseServerTime", "formatDayMonth", "_changedBy", "pendingApproval", "confirmCredentialChange",
             "_passkeysShownFor", "loadUserPasskeys", "renderUserPasskeys", "_passkeyWhen", "_passkeyStateText",
-            "_zkKeyHoldSays", "removeUserPasskey", "_passkeysHeld", "renderUserDetail")
+            "_zkKeyHoldSays", "removeUserPasskey", "_passkeysCounted", "_passkeysHeld",
+            "renderUserDetail")
 
 
 def _function(js, name):
@@ -363,6 +364,35 @@ out({
     assert got["keys"]["confirm"][0].startswith("carol will be signed out everywhere. Their 3 passkeys stop working.")
     assert got["keys"]["toasts"] == [["success", "Second factor reset. carol sets one up again at the next sign-in."]]
     assert got["posted"] == ["/users/u-carol/second-factor/reset"] * 4
+
+
+def test_while_passkeys_are_off_the_reset_says_it_retires_the_passkeys_the_account_holds():
+    """Turned off, no passkey counts as a way to sign in or as one held in name only, yet a reset retires every
+    passkey the account holds, and they do not come back when passkeys are turned on again. The list gives their
+    number apart (passkey_held_count): the confirmation says it, and an account that holds only passkeys can be
+    reset too."""
+    got = _node(r"""
+People.placeholder = () => '';
+Object.assign(carol, { second_factor_enabled: true, passkey_count: 0, passkey_unusable_count: 0,
+                       passkey_held_count: 2, password_to_type: true });
+answers['/users/u-carol/second-factor/reset'] = { reset: true, passkeys_retired: 2, own_password: true };
+await resetUserSecondFactor('u-carol');
+const dave = { id: 'u-dave', username: 'dave', role: 'user', groups: [], is_active: true, second_factor_enabled: false,
+               passkey_count: 0, passkey_unusable_count: 0, passkey_held_count: 1 };
+out({ confirm: confirms[0], toasts, button: renderUserRow(dave).includes('reset-second-factor-btn'),
+      ends: _resetEnds(dave), on: _resetEnds({ passkey_count: 1, passkey_unusable_count: 1, passkey_held_count: 2 }) });
+""", _RESET)
+    assert got["confirm"][0] == ("carol will be signed out everywhere. Their authenticator app and its recovery codes "
+                                 "stop working, and their 2 passkeys are retired: passkeys are turned off on this "
+                                 "vault now, and they do not count again when passkeys are turned back on. They set "
+                                 "up a new second factor at their next sign-in, with their own password.")
+    assert got["toasts"] == [["success", "Second factor reset and 2 passkeys retired. carol sets one up again at the "
+                                         "next sign-in."]]
+    assert got["button"] is True
+    assert got["ends"] == (" Their passkey is retired: passkeys are turned off on this vault now, and it does not "
+                           "count again when passkeys are turned back on.")
+    # Passkeys on: the two numbers the list gives already hold every key, and the confirmation is as before.
+    assert got["on"] == " Their 2 passkeys stop working."
 
 
 # --------------------------------------------------------------------------- the routes the page uses

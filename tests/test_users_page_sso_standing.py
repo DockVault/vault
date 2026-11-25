@@ -28,8 +28,8 @@ ROOT = Path(__file__).resolve().parent.parent
 APP_JS = ROOT / "static" / "js" / "app.js"
 _SHIPPED = ("parseServerTime", "formatDayMonth", "formatServerTime", "_el", "credentialChangeNoteText",
             "_ssoStanding", "_ssoStandingNote", "fillCredentialChangeNotes", "fillSsoStandingBadges",
-            "signInMethods", "signInMethodBadges", "_holdsAFactor", "_passkeysHeld", "_passkeysShownFor",
-            "renderUserDetail", "renderUserRow")
+            "signInMethods", "signInMethodBadges", "_holdsAFactor", "_passkeysCounted", "_passkeysHeld",
+            "_passkeysShownFor", "renderUserDetail", "renderUserRow")
 
 
 def _function(js, name):

@@ -142,8 +142,8 @@ const before = { lines: (fillCredentialChangeNotes(), lines()), badge: renderUse
 carol.passkey_requirement_cleared_at = '2026-05-02T09:00:00Z';
 fillCredentialChangeNotes();
 out({ before, lines: lines(), badge: renderUserRow(carol).includes('Passkey requirement lifted'), day });
-""", ("signInMethods", "signInMethodBadges", "_holdsAFactor", "_passkeysHeld", "_passkeysShownFor", "renderUserDetail",
-      "renderUserRow"))
+""", ("signInMethods", "signInMethodBadges", "_holdsAFactor", "_passkeysCounted", "_passkeysHeld", "_passkeysShownFor",
+      "renderUserDetail", "renderUserRow"))
     assert got["before"] == {"lines": None, "badge": False}
     assert got["lines"] == [f"The server’s operator lifted the passkey requirement for this account on {got['day']}: it "
                             "signs in without a passkey although its role must hold one. That ends when the account "

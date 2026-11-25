@@ -1149,6 +1149,9 @@ class UserResponse(BaseModel):
     # the vault asks for that). Retired ones are in neither; with passkeys turned off both are 0.
     passkey_count: int = 0
     passkey_unusable_count: int = 0
+    # Every passkey the account holds that is not retired, usable or not and whether passkeys are on or off: the
+    # ones a reset of its second factor retires for good. Filled in by the admin users list.
+    passkey_held_count: int = 0
     # When the server's operator lifted the role's passkey requirement for this account (None: it applies).
     passkey_requirement_cleared_at: Optional[datetime] = None
     # Whether the vault itself confirmed the account's address (app/core/email_confirmation.py): only such an
@@ -11265,6 +11268,8 @@ async def list_users(
     users = db.query(User).all()
     # The passkeys each account can use and the ones it cannot, in one query (the list's sign-in methods column).
     passkey_tally = _passkey_tally(db, [u.id for u in users])
+    # And every passkey each holds, whatever the switch: what a reset of the second factor retires.
+    passkeys_held = _passkeys_held(db, [u.id for u in users])
     # The providers each account is linked to, in one query (the same column).
     provider_names = _sso_provider_names(db, [u.id for u in users])
     # Batch the "has an active second factor?" lookup so the list stays one extra query, not one
@@ -11305,6 +11310,7 @@ async def list_users(
         item.password_to_type = sign_in.has_a_password_it_can_type(user)
         item.second_factor_reset_pending = user.second_factor_reset_at is not None
         item.passkey_count, item.passkey_unusable_count = passkey_tally.get(user.id, (0, 0))
+        item.passkey_held_count = passkeys_held.get(user.id, 0)
         item.email_confirmed = email_confirmation.confirmed(user)
         item.email_confirm_wanted = user.id in confirm_wanted
         item.sso_providers = provider_names.get(user.id, [])
@@ -12385,6 +12391,23 @@ def _passkey_tally(db, user_ids) -> dict:
             not_usable += 1
         tally[key.user_id] = (usable, not_usable)
     return tally
+
+
+def _passkeys_held(db, user_ids) -> dict:
+    """For each of ``user_ids`` that holds a passkey that is not retired: how many, usable or not, and whether
+    passkeys are on or off. These are the keys a reset of the account's second factor retires
+    (_apply_credential_change), which :func:`_passkey_tally` does not count while passkeys are off. An account
+    with none is absent; a database without the table holds none."""
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    ids = list(user_ids)
+    if not ids or not has_table(db, WebAuthnCredential.__tablename__):
+        return {}
+    held = {}
+    for (user_id,) in (db.query(WebAuthnCredential.user_id)
+                       .filter(WebAuthnCredential.user_id.in_(ids), WebAuthnCredential.retired_at.is_(None)).all()):
+        held[user_id] = held.get(user_id, 0) + 1
+    return held
 
 
 def _passkey_counts(db, user_ids) -> dict:

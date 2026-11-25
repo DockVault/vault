@@ -7669,8 +7669,13 @@ async function confirmUserEmail(userId, btn) {
 }
 
 // A reset retires every passkey the account holds, the ones it signs in with and the ones that are no factor now.
-function _passkeysHeld(u) {
+// While passkeys are turned off the list counts none as either, and passkey_held_count still says how many it holds.
+function _passkeysCounted(u) {
     return (Number(u && u.passkey_count) || 0) + (Number(u && u.passkey_unusable_count) || 0);
+}
+
+function _passkeysHeld(u) {
+    return Math.max(_passkeysCounted(u), Number(u && u.passkey_held_count) || 0);
 }
 
 // Whether the account has a second factor it can use now: an authenticator app, or a passkey it signs in with
@@ -7680,11 +7685,17 @@ function _holdsAFactor(u) {
 }
 
 // What a reset ends, as the confirmation says it: "Their authenticator app and its recovery codes stop working."
+// While passkeys are turned off the account's passkeys sign nobody in already, but the reset retires them for good:
+// they do not count again when passkeys are turned back on.
 function _resetEnds(u) {
     const keys = _passkeysHeld(u);
     const passkeys = keys === 1 ? 'their passkey' : 'their ' + keys + ' passkeys';
     let ends = '';
-    if (u && u.second_factor_enabled) {
+    if (keys > _passkeysCounted(u)) {
+        ends = (u && u.second_factor_enabled ? 'their authenticator app and its recovery codes stop working, and ' : '')
+            + passkeys + (keys === 1 ? ' is' : ' are') + ' retired: passkeys are turned off on this vault now, and '
+            + (keys === 1 ? 'it does' : 'they do') + ' not count again when passkeys are turned back on.';
+    } else if (u && u.second_factor_enabled) {
         ends = keys > 0 ? 'their authenticator app, its recovery codes and ' + passkeys + ' stop working.'
             : 'their authenticator app and its recovery codes stop working.';
     } else if (keys > 0) {
