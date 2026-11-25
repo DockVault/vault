@@ -737,6 +737,139 @@ def test_a_logout_signed_with_a_key_too_short_to_trust_is_a_token_that_is_not_va
     assert all(s.is_active for s in h.active_sessions()) and h.revoked == []
 
 
+def test_a_burst_of_logouts_behind_a_held_row_leaves_the_servers_threads_to_its_other_requests(monkeypatch):
+    """A provider signs everybody out at once while a save holds its row. Each logout's database part waits for
+    the row in a thread of the pool every request is answered from, holding a connection. The slot that bounds
+    how many logouts are verified at once was given back before that part: 45 logouts took all 40 threads, and
+    no other request of the vault (a sign-in, a file, a page) was answered until the burst had drained.
+
+    The slot is kept to the end of the database's part: as many logouts as there are slots wait for the row, the
+    rest wait for a slot on the loop and are answered as a failed logout, token not spent, when none comes."""
+    import asyncio
+    import json
+    import threading
+    from urllib.parse import urlencode
+    from fastapi.responses import JSONResponse
+    from starlette.concurrency import run_in_threadpool
+    from _async_run import run_coroutine
+    from app.api import sso_router
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    row_let_go, lock = threading.Event(), threading.Lock()
+    inside, most = [0], [0]
+
+    def waits_for_the_row(db, row_id, scope, claims, client_ip):
+        with lock:
+            inside[0] += 1
+            most[0] = max(most[0], inside[0])
+        row_let_go.wait(20)
+        with lock:
+            inside[0] -= 1
+        return JSONResponse(status_code=200, content={})
+    monkeypatch.setattr(sso_router, "_end_what_a_logout_names", waits_for_the_row)
+    monkeypatch.setattr(sso_router, "BACKCHANNEL_WAIT_SECONDS", 0.4)
+    slots = sso_router.BACKCHANNEL_CONCURRENCY
+    burst = 45
+    tokens = [h.logout_token(sid="s-1", sub="subject-1") for _ in range(burst)]
+
+    async def post(token):
+        payload = urlencode({"logout_token": token}).encode()
+        path = f"/auth/sso/{p.id}/backchannel-logout"
+        scope = {"type": "http", "http_version": "1.1", "method": "POST", "path": path, "raw_path": path.encode(),
+                 "query_string": b"", "client": ("203.0.113.9", 1234), "server": ("testserver", 80), "scheme": "https",
+                 "headers": [(b"content-type", b"application/x-www-form-urlencoded"),
+                             (b"content-length", str(len(payload)).encode())]}
+        got = {"body": b""}
+
+        async def receive():
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                got["status"] = message["status"]
+            elif message["type"] == "http.response.body":
+                got["body"] += message.get("body", b"")
+        await h.S.app(scope, receive, send)
+        return got["status"], json.loads(got["body"] or b"null")
+
+    async def meet():
+        # The slots belong to this loop.
+        monkeypatch.setattr(sso_router, "_BACKCHANNEL_SLOTS", asyncio.Semaphore(slots))
+        sent = [asyncio.ensure_future(post(token)) for token in tokens]
+        try:
+            # Every logout is now at the row, waiting for a slot, or answered as failed for want of one.
+            await asyncio.sleep(1.2)
+            at_the_row = inside[0]
+            # What any other request needs first: a thread of the pool. Asked while the row is still held.
+            other = await asyncio.wait_for(run_in_threadpool(lambda: "answered"), timeout=3)
+            answered_early = sum(1 for one in sent if one.done())
+        finally:
+            row_let_go.set()
+        return at_the_row, other, answered_early, await asyncio.gather(*sent)
+
+    at_the_row, other, answered_early, answers = run_coroutine(meet(), timeout=60)
+    assert other == "answered"
+    assert at_the_row == slots == most[0], (at_the_row, most[0])        # never more of them at the row than slots
+    assert answered_early == burst - slots                              # the rest were answered while it was held
+    assert sorted(a[0] for a in answers) == [200] * slots + [400] * (burst - slots)
+    assert [a[1] for a in answers if a[0] == 400] == [{"error": "logout_failed"}] * (burst - slots)
+    # Recorded as busy (at most once a window for a provider and a source, which the limiter's own test holds).
+    refused = [a[2].get("reason") for a in h.audits if a[0] == "sso_backchannel_logout" and a[1] == "failure"]
+    assert refused and set(refused) == {"busy"}, refused
+    assert 1 <= slots <= 8
+
+
+def test_a_logout_gives_its_slot_back_however_it_ends(monkeypatch):
+    """Kept through the database's part, the slot is still given back: after a logout that ended sessions, one
+    refused as not valid, one the vault could not act on, and one whose database part raised."""
+    import asyncio
+    from app.api import sso_router
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    slots = sso_router.BACKCHANNEL_CONCURRENCY
+
+    class Counted(asyncio.Semaphore):
+        taken = given = 0
+
+        async def acquire(self):
+            type(self).taken += 1
+            return await super().acquire()
+
+        def release(self):
+            type(self).given += 1
+            return super().release()
+
+    def logout(token):
+        """The route itself, on a loop of its own with slots of its own."""
+        from _async_run import run_coroutine
+
+        class Request:
+            headers = {}
+            client = types.SimpleNamespace(host="203.0.113.9")
+
+            async def form(self):
+                return {"logout_token": token}
+
+        async def run():
+            monkeypatch.setattr(sso_router, "_BACKCHANNEL_SLOTS", Counted(slots))
+            return (await sso_router.backchannel_logout(str(p.id), Request(), h.db)).status_code
+        return run_coroutine(run(), timeout=30)
+
+    assert logout(h.logout_token(sid="s-1", sub="subject-1")) == 200
+    assert (Counted.taken, Counted.given) == (1, 1)
+    assert logout("not-a-token") == 400
+    assert (Counted.taken, Counted.given) == (2, 2)
+
+    def raises(*a, **k):
+        raise RuntimeError("the database went away")
+    monkeypatch.setattr(sso_router, "_end_what_a_logout_names", raises)
+    with pytest.raises(RuntimeError, match="the database went away"):
+        logout(h.logout_token(sid="s-1", sub="subject-1"))
+    assert (Counted.taken, Counted.given) == (3, 3)
+
+
 def test_a_logout_that_could_not_be_applied_does_not_spend_the_token(monkeypatch):
     """The token's id is recorded when it is verified; if the sessions could not be ended, the id is forgotten and
     the answer is the failed logout, so the same token sent again ends them."""

@@ -48,7 +48,8 @@ START_LIMIT = 30                     # starts per address per START_WINDOW, besi
 START_WINDOW = 300
 LOGOUT_LIMIT = 600                 # back-channel logouts per source address and window, for each provider (and one
                                    # bucket for every id with no provider): signing many people out is not a person
-BACKCHANNEL_CONCURRENCY = 4         # back-channel verifications in flight at once, per process
+BACKCHANNEL_CONCURRENCY = 4         # back-channel logouts in flight at once, per process: each from its
+                                    # verification to the end of what it writes
 BACKCHANNEL_WAIT_SECONDS = 5.0      # how long a logout waits for one of them before it is answered as failed (the
                                     # provider may send it again; the refusal is recorded)
 _BACKCHANNEL_SLOTS = asyncio.Semaphore(BACKCHANNEL_CONCURRENCY)
@@ -911,30 +912,36 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
                                       seen_jti=lambda jti, ttl: sso_state.seen_logout_jti(jti, ttl, scope=scope))
     from starlette.concurrency import run_in_threadpool
     try:
-        claims = await run_in_threadpool(verify)
-    except _ProviderUnusable as exc:
-        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": scope, "reason": exc.code})
-        return failed
-    except sso_state.Unavailable:
-        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": scope, "reason": "store_unavailable"})
-        return failed
-    except oc.OidcError as exc:
-        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": scope, "reason": exc.code})
-        return invalid if exc.code in TOKEN_REFUSALS else failed
-    except Exception as exc:  # noqa: BLE001 -- anything else (a key the library cannot read): the logout failed
-        log.warning("sso back-channel logout not verified: %s", type(exc).__name__)
-        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": scope, "reason": "verification_error"})
-        return failed
+        try:
+            claims = await run_in_threadpool(verify)
+        except _ProviderUnusable as exc:
+            _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+                   details={"provider_id": scope, "reason": exc.code})
+            return failed
+        except sso_state.Unavailable:
+            _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+                   details={"provider_id": scope, "reason": "store_unavailable"})
+            return failed
+        except oc.OidcError as exc:
+            _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+                   details={"provider_id": scope, "reason": exc.code})
+            return invalid if exc.code in TOKEN_REFUSALS else failed
+        except Exception as exc:  # noqa: BLE001 -- anything else (a key the library cannot read): the logout failed
+            log.warning("sso back-channel logout not verified: %s", type(exc).__name__)
+            _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+                   details={"provider_id": scope, "reason": "verification_error"})
+            return failed
+        # What the token names is ended off the server's loop, and still in the slot. Each account's turn,
+        # and the provider's row, are waited for as long as the connection waits for any lock: a provider
+        # rarely sends a logout twice, so this is never answered as busy for a wait of its own. The logouts of
+        # one provider take its row one after another, each holding a thread and a connection while it
+        # waits. Given the slot back before this part, a burst of them behind a row that a save held took
+        # every thread the server answers its other requests with, and those stood still until the burst
+        # had drained. In the slot, no more of them wait at once than BACKCHANNEL_CONCURRENCY; the rest wait
+        # for a slot on the loop, holding nothing, and are answered as a failed logout when none comes.
+        return await run_in_threadpool(_end_what_a_logout_names, db, row_id, scope, claims, client_ip)
     finally:
         _BACKCHANNEL_SLOTS.release()
-    # What the token names is ended off the server's loop. Each account's turn, and the provider's row, are waited
-    # for as long as the connection waits for any lock: a provider rarely sends a logout twice, so this is never
-    # answered as busy for a wait. On the loop, that wait was every other request's too.
-    return await run_in_threadpool(_end_what_a_logout_names, db, row_id, scope, claims, client_ip)
 
 
 @router.post("/users/me/identities/{provider_id}/reauth")

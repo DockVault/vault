@@ -497,6 +497,56 @@ elif pair == "a row held for longer than a sign-in waits":
             s.rollback()
             return "let go"
     out = together(holder=hold_the_row, writer=after_the_turn_is_held(through_the_provider(alice, contoso, "s-1")))
+elif pair == "a burst of logouts while the provider's row is held":
+    from sqlalchemy import text
+    from starlette.concurrency import run_in_threadpool
+    BURST = 45
+    sso_router.BACKCHANNEL_WAIT_SECONDS = 1.0
+
+    def hold_the_row():
+        with SessionLocal() as s:
+            R._row_or_404(s, contoso, lock=True)
+            in_turn.set()
+            time.sleep(4.0)
+            s.rollback()
+            return "let go"
+
+    class Request:
+        headers = {}
+        client = types.SimpleNamespace(host=IP)
+
+        async def form(self):
+            return {"logout_token": "a-token"}
+
+    def the_burst():
+        logout_claims.clear()
+        logout_claims.update({"sid": "s-1", "sub": SUBJECT, "jti": uuid.uuid4().hex})
+
+        async def one():
+            with SessionLocal() as s:
+                return (await sso_router.backchannel_logout(str(contoso), Request(), s)).status_code
+
+        async def meet():
+            # The slots belong to this loop; the pool of threads is the one every request of a server shares.
+            sso_router._BACKCHANNEL_SLOTS = asyncio.Semaphore(sso_router.BACKCHANNEL_CONCURRENCY)
+            sent = [asyncio.ensure_future(one()) for _ in range(BURST)]
+            await asyncio.sleep(1.5)
+            began = time.monotonic()
+            try:
+                other = await asyncio.wait_for(run_in_threadpool(lambda: "answered"), timeout=2)
+            except asyncio.TimeoutError:
+                other = "not answered"
+            waited = round(time.monotonic() - began, 2)
+            with SessionLocal() as s:
+                at_the_row = s.execute(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                                            "AND wait_event_type = 'Lock'")).scalar()
+            early = sum(1 for task in sent if task.done())
+            codes = await asyncio.gather(*sent, return_exceptions=True)
+            return {"another request": other, "another request seconds": waited, "at the row": at_the_row,
+                    "answered while it was held": early, "slots": sso_router.BACKCHANNEL_CONCURRENCY,
+                    "answers": sorted(c if isinstance(c, int) else 599 for c in codes)}
+        return asyncio.run(meet())
+    out = together(holder=hold_the_row, writer=after_the_turn_is_held(the_burst))
 out["after"], out["the turn was held"] = state(alice, contoso), in_turn.is_set()
 print(json.dumps(out))
 '''
@@ -558,6 +608,23 @@ def test_a_sign_in_waits_a_short_time_for_a_providers_row_that_is_held_and_is_an
     assert out["writer"][:3] == ["error", "HTTPException", "503"] and "busy" in out["writer"][3], out
     assert 0.3 <= out["writer seconds"] < 1.5, out           # its own short wait: not the 2.5 s, nor the connection's 5
     assert out["after"]["sessions"] == [] and out["after"]["provider sessions"] == 0, out
+
+
+def test_a_burst_of_logouts_behind_a_held_row_leaves_the_threads_every_request_needs(db_name):
+    """A provider signs everybody out while a save holds its row: 45 logouts in the time the row is held. Each
+    logout's database part waits for the row in a thread of the pool every request is answered from. Bounded only
+    while they were verified, they took every thread, and nothing else was answered until the burst had drained.
+    Kept in their slots to the end, as many wait for the row as there are slots; the rest are answered as a
+    failed logout, their token not spent, and another request finds a thread at once."""
+    out = run_in(db_name, SCENARIO, env={"PAIR": "a burst of logouts while the provider's row is held"})
+    assert out["holder"] == ["ok", "let go"] and out["writer"][0] == "ok", out
+    burst = out["writer"][1]
+    slots = burst["slots"]
+    assert burst["another request"] == "answered" and burst["another request seconds"] < 1.0, out
+    assert 1 <= burst["at the row"] <= slots, out                     # never more of them at the row than slots
+    assert burst["answered while it was held"] == 45 - slots, out
+    assert burst["answers"] == [200] * slots + [400] * (45 - slots), out
+    assert out["the turn was held"] is True, out
 
 
 def test_a_link_that_comes_while_a_save_restores_the_account_waits_and_decides_on_what_the_save_left(db_name):
