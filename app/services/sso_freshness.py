@@ -480,8 +480,8 @@ def _audit(db, action: str, *, user, details: dict) -> None:
 def sweep(db, now: Optional[datetime] = None) -> dict:
     """The daily pass: a person whose deadline is near (:func:`warning_lead`) is told, in the app and by email, once
     for that deadline; one whose deadline has passed is told their keys paused, once for that deadline, and the
-    administrators get one notice for the accounts that paused in this pass. A refusal was told when it happened and
-    is not told again here. What was told is kept on the identity row (``freshness_warned_for``,
+    administrators get one notice for the accounts that paused in this pass. A refusal is told to the person and the
+    administrators when it happens and is not told again here. What was told is kept on the identity row (``freshness_warned_for``,
     ``freshness_paused_for``) in ``db``, with the audit rows, so a pass that rolls back tells again and a notice the
     person deleted is not sent again; the notices commit in their own sessions and keep their own dedup keys, so a
     retried pass adds no second notice or email. The caller commits. Returns the counts.
@@ -585,7 +585,7 @@ def end_access_on_refusal(db, row, answer, *, client_ip: Optional[str] = None,
     out, which is proof (a missing claim or an overage marker is not, and the caller does not pass those here). With
     ``sso_refusal_ends_access`` on, the account's sessions end durably (its SFTP connections close), its SSH keys,
     temporary credentials and devices pause until a sign-in the provider admits (``refused_at``), the step is
-    recorded and the administrators are told. Commits. Returns whether access was ended."""
+    recorded, and the administrators and the person are told. Commits. Returns whether access was ended."""
     from app.services import sso_sign_in as sso
     if not sso.policy_of(row)["sso_refusal_ends_access"]:
         return False
@@ -618,6 +618,21 @@ def end_access_on_refusal(db, row, answer, *, client_ip: Optional[str] = None,
                                 "credentials and devices paused until a later sign-in the provider admits, or until "
                                 "an administrator clears the refusal." + password_too),
                           target="#users", dedup_prefix=f"{ENDED}:{identity.id}:{identity.refused_at:%Y-%m-%d}")
+    except Exception:  # noqa: BLE001 -- the ending and its row stand without the notice
+        pass
+    # The person, too: their keys stopped on another device with no word of why. Named as its button names it.
+    try:
+        named = _button_name(row) or "your identity provider"
+        found = deadline_of(identity, row)
+        stops = what_stops(user) if found is not None and closes_the_other_ways_in(db, user, found) else ""
+        api._notify_users([str(user.id)], ENDED, title=f"{named} no longer admits your account here",
+                          body=(f"{named} left your account out at your last sign-in there (a tenant, a domain or a "
+                                "required group). Your sessions here ended, and your SSH keys, temporary credentials "
+                                f"and devices are paused until {named} admits you again or an administrator lifts the "
+                                "refusal." + (f" {_capitalised(stops)} do not sign you in either until then."
+                                              if stops else "")),
+                          target=NOTICE_TARGET,
+                          dedup_prefix=f"{ENDED}:{identity.id}:{identity.refused_at:%Y-%m-%d}:owner")
     except Exception:  # noqa: BLE001 -- the ending and its row stand without the notice
         pass
     return True

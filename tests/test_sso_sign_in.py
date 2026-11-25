@@ -1134,6 +1134,7 @@ def _refusal_world(monkeypatch, **policy):
 def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provider_admits_it(monkeypatch):
     from app.services import sso_freshness as F
     h, alice, root, p, identity, callback_with = _refusal_world(monkeypatch)
+    p.label = "Contoso"                                  # what its button says, and how alice knows it
     from app.core.models import PendingLogin
     pending = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, consumed_at=None)
     others = types.SimpleNamespace(id=uuid.uuid4(), user_id=root.id, consumed_at=None)
@@ -1150,6 +1151,14 @@ def test_a_verified_refusal_of_a_known_identity_ends_its_access_until_the_provid
     assert ("sso_sign_in_refused", "failure",
             {"provider_id": str(p.id), "purpose": "sign_in", "reason": "restricted"}) in h.audits
     assert ([str(root.id)], "contoso refused alice: sessions ended, keys paused") in h.notices
+    # Alice is told too, once, of what ended and what is paused, and that her password and passkeys do not sign
+    # her in either (the provider closes the other ways in).
+    to_alice = [(title, body) for ids, title, body in h.notice_bodies if ids == [str(alice.id)]]
+    assert to_alice == [("Contoso no longer admits your account here", (
+        "Contoso left your account out at your last sign-in there (a tenant, a domain or a required group). Your "
+        "sessions here ended, and your SSH keys, temporary credentials and devices are paused until Contoso admits "
+        "you again or an administrator lifts the refusal. Your password and your passkeys do not sign you in either "
+        "until then."))]
     # A sign-in already under way for alice ends with the refusal; another account's does not.
     assert pending.consumed_at is not None and others.consumed_at is None
     assert F.lapsed(h.db, alice.id) is not None
@@ -1193,6 +1202,7 @@ def test_a_refusal_ends_nothing_when_the_option_is_off_or_the_subject_is_nobodys
     assert callback_with(groups=["sales"]) == "/#sso-error=restricted"
     assert identity.refused_at is None and h.revoked == []
     assert not any(a == "sso_access_ended_by_refusal" for a, _, _ in h.audits)
+    assert not any(ids == [str(alice.id)] for ids, _title in h.notices)         # nothing ended: nothing to tell
     p.policy = {"sso_required_groups": ["vault-users"]}
     assert callback_with(groups=["sales"], sub="somebody-else") == "/#sso-error=restricted"
     assert identity.refused_at is None and h.revoked == []
