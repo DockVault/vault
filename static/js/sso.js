@@ -159,7 +159,8 @@
     // The provider buttons, from /auth/policy's methods.providers: [{id, label, kind, icon, order}], in the order
     // given, under a heading that says what they do (a button carries the provider's name alone) and names the
     // group for a screen reader (the box's aria-labelledby). `onError(message)` shows what a start that failed said.
-    function renderButtons(providers, onError) {
+    // `options.returnTo()`, asked at the click, names the app's view the provider's answer brings the page back to.
+    function renderButtons(providers, onError, options) {
         const box = document.getElementById('sso-sign-in');
         if (!box) return;
         const list = Array.isArray(providers) ? providers.filter((p) => p && typeof p.id === 'string' && p.id) : [];
@@ -178,7 +179,10 @@
             if (typeof provider.icon === 'string' && /^[a-z]{1,20}$/.test(provider.icon)) button.dataset.icon = provider.icon;
             button.addEventListener('click', async () => {
                 box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
-                try { await startSignIn(provider.id); }
+                try {
+                    const returnTo = (options && typeof options.returnTo === 'function') ? options.returnTo() : '';
+                    await startSignIn(provider.id, { returnTo });
+                }
                 catch (e) {
                     box.querySelectorAll('button').forEach((b) => { b.disabled = false; });
                     if (typeof onError === 'function') onError((e && e.message) || GENERIC);

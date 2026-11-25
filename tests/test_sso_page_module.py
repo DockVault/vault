@@ -90,7 +90,7 @@ out(seen);
 def test_the_tabs_proof_is_made_kept_for_the_tab_and_forgotten_when_the_page_comes_back():
     got = _node(r"""
 fetched['/api/auth/sso/p-1/start'] = { ok: true, json: { authorization_url: 'https://idp.example.org/auth?x=1' } };
-await window.Sso.startSignIn('p-1', { returnTo: 'profile' });
+await window.Sso.startSignIn('p-1', { returnTo: '#profile' });
 const kept = flow();
 const sent = asked[0].body;
 const back = arrive('#sso=the-code');
@@ -101,7 +101,7 @@ out({ kept: { purpose: kept.purpose, provider: kept.provider, length: kept.verif
       again: arrive('#sso=the-code').flow });
 """)
     assert got["kept"] == {"purpose": "sign_in", "provider": "p-1", "length": 43, "shape": True, "fresh": True}
-    assert got["sent"] == {"verifier_hash": got["hashOf"], "return_to": "profile"} and len(got["hashOf"]) == 64
+    assert got["sent"] == {"verifier_hash": got["hashOf"], "return_to": "#profile"} and len(got["hashOf"]) == 64
     assert got["left"] == ["https://idp.example.org/auth?x=1"]
     assert got["after"] is None                       # forgotten the moment the page came back
     assert got["back"] == {"kind": "sso", "same": True, "purpose": "sign_in"}

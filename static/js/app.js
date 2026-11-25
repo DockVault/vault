@@ -1975,6 +1975,15 @@ function _noteSignInOrigin(policy, kinds) {
     note.appendChild(document.createTextNode('. Open the vault there to use it.'));
 }
 
+// The view a sign-in through a provider brings the page back to: the hash this page was loaded with (a link to Your
+// account from a notice or an email), when it is one of the app's own views the server keeps (sso_state.RETURN_TO,
+// compared as it is, with its '#'); '' otherwise, and the server's default applies. Read when the sign-in starts:
+// the page may keep its hash for the sign-in after the buttons were drawn.
+function _ssoReturnTo() {
+    const allowed = ['#vaults', '#shared', '#notes', '#profile', '#activity', '#temp-creds', '#users'];
+    return allowed.includes(_hashForSignIn) ? _hashForSignIn : '';
+}
+
 // Single sign-on at sign-in (static/js/sso.js makes the tab's proof and leaves for the provider). The buttons are
 // the providers /auth/policy lists (methods.providers), in the administrator's order. A sign-in that came back from
 // a provider is a sign-in under way on this page until the app is shown or it ends, as a passkey's is.
@@ -1984,7 +1993,7 @@ function _initSsoSignIn(policy) {
     // A page opened at another address than the configured one offers no button: the provider sends the browser
     // back to the configured address, to a page that did not start the sign-in. The note says where to go.
     const elsewhere = _signInOriginElsewhere(policy);
-    Sso.renderButtons(elsewhere ? [] : providers, (message) => { _showLoginError(message); });
+    Sso.renderButtons(elsewhere ? [] : providers, (message) => { _showLoginError(message); }, { returnTo: _ssoReturnTo });
     const kinds = [];
     if (policy && policy.methods && policy.methods.passkeys) kinds.push('a passkey');
     if (providers.length) kinds.push("your organisation's sign-in");
@@ -1999,7 +2008,7 @@ function _initSsoSignIn(policy) {
 // server says whether the provider can serve a sign-in, and its refusal is shown like any other.
 function _ssoStartHandOut(providerId) {
     if (!window.Sso) return;
-    const start = () => Sso.startSignIn(providerId).catch((e) => {
+    const start = () => Sso.startSignIn(providerId, { returnTo: _ssoReturnTo() }).catch((e) => {
         _showLoginError((e && e.message) || 'This sign-in could not be started.');
     });
     // Opened at another address than the configured one, the link is followed there first: a sign-in started here

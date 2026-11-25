@@ -213,3 +213,55 @@ out({ kids, heading: heading && heading.textContent, buttons, shown,
     assert rule and "border-top: 1px solid var(--surface-3)" in rule.group(1), rule
     for skin in ("theme.css", "ui-v2.css"):
         assert "--surface-3:" in (ROOT / "static" / "css" / skin).read_text(encoding="utf-8"), skin
+
+
+def _start_body(loaded_with: str, *, set_after_drawing: bool = False, hand_out: bool = False) -> dict:
+    """What the page sends to start a provider's sign-in when it was loaded at /<loaded_with> signed out."""
+    return _node(r"""
+const first = PROVIDERS[0].id;
+answers['POST /api/auth/sso/' + first + '/start'] = { status: 200, json: { authorization_url: 'https://idp.example.org/a' } };
+answers['GET /api/auth/policy'] = { status: 200, json: {} };
+if (!AFTER) _hashForSignIn = LOADED;
+if (HAND_OUT) {
+    _ssoStartHandOut(first);
+} else {
+    _initSsoSignIn({ methods: { providers: PROVIDERS } });
+    if (AFTER) _hashForSignIn = LOADED;          // the page's hash was kept after the buttons were drawn
+    ssoBox.querySelectorAll('button')[0].click();
+}
+await settle();
+const start = sent.find((s) => s.method === 'POST');
+out({ body: start ? start.body : null, left });
+""".replace("PROVIDERS", json.dumps(TWO)).replace("LOADED", json.dumps(loaded_with))
+                 .replace("AFTER", "true" if set_after_drawing else "false")
+                 .replace("HAND_OUT", "true" if hand_out else "false"))
+
+
+@pytest.mark.parametrize("hand_out", [False, True], ids=["button", "hand-out link"])
+def test_a_link_the_signed_out_page_was_opened_at_goes_to_the_provider_and_back(hand_out):
+    """A link to one of the app's own views (Your account, from a notice or an email) opened while signed out: a
+    sign-in through a provider leaves the page, so the start names the view (with its '#', the form the server keeps)
+    and the provider's answer brings the page back to it. Read at the click: the page keeps the hash after the
+    buttons are drawn, as often as not."""
+    got = _start_body("#profile", hand_out=hand_out)
+    assert got["body"]["return_to"] == "#profile" and set(got["body"]) == {"verifier_hash", "return_to"}, got
+    assert got["left"] == ["https://idp.example.org/a"]
+    if not hand_out:
+        assert _start_body("#users", set_after_drawing=True)["body"]["return_to"] == "#users"
+
+
+@pytest.mark.parametrize("loaded_with", ["", "#activity?q=x", "#vault/abc", "#sso=x", "#profile2"])
+def test_anything_but_one_of_the_apps_own_views_is_not_sent(loaded_with):
+    """The server keeps a view on its list and turns anything else into Vaults; the page sends nothing else (an
+    Activity search is not on the list)."""
+    got = _start_body(loaded_with)
+    assert got["body"] is not None and set(got["body"]) == {"verifier_hash"}, got
+
+
+def test_the_pages_list_of_views_is_the_servers():
+    from app.core import sso_state
+    js = APP_JS.read_text(encoding="utf-8")
+    body = _function(js, "_ssoReturnTo")
+    listed = re.search(r"const allowed = \[([^\]]*)\];", body)
+    assert listed, body
+    assert tuple(re.findall(r"'([^']*)'", listed.group(1))) == sso_state.RETURN_TO
