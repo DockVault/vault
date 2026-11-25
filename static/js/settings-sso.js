@@ -13,6 +13,11 @@
  * accounts linked to the provider (GET /admin/sso/providers/{id}/identities) and where each stands, and lifts a
  * refusal or a hold (POST /admin/sso/identities/{id}/clear-refusal, under the same step-up as a change).
  *
+ * When the deployment locks single sign-on (SETTINGS_LOCKED_KEYS naming sso or *), the server refuses every change
+ * to a provider, and the card and the dialog say so in the server's words (`locked_message`) and offer none: no "Add
+ * a provider", Turn on or off, Remove or Save, and a provider's fields are read-only. Open, the test sign-in, the
+ * addresses to copy and the Identities page's Lift stay, as their routes do.
+ *
  * Uses app.js's apiRequest, openModal, closeModal, showConfirm, showToast and _el, and sso.js's Sso.startTest.
  * Builds everything with createElement and textContent.
  */
@@ -41,6 +46,9 @@
 
     const lines = (value) => String(value || '').split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
     const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    // The deployment's lock, as the last read of the list says.
+    const lockedNow = () => !!(data && data.locked);
+    const LOCKED_FALLBACK = 'Single sign-on is locked in this deployment: nothing can be changed here.';
 
     // ---------------------------------------------------------------- the card
 
@@ -62,6 +70,25 @@
             line.className = 'alert alert-warning mb-md';
             line.textContent = 'No provider can be tested or turned on yet. ' + (address.why_not || '');
         }
+    }
+
+    // Under the lock: a line above the list says so, in the server's words; without it the line is hidden.
+    function drawLocked() {
+        let line = byId('signin-sso-locked');
+        if (!lockedNow()) {
+            if (line) { line.textContent = ''; line.hidden = true; }
+            return;
+        }
+        if (!line) {
+            const anchor = byId('signin-sso-address') || byId('signin-sso-providers');
+            if (!anchor || !anchor.parentNode) return;
+            line = _el('div', 'alert alert-info mb-md');
+            line.id = 'signin-sso-locked';
+            line.setAttribute('role', 'status');
+            anchor.parentNode.insertBefore(line, anchor);
+        }
+        line.hidden = false;
+        line.textContent = data.locked_message || LOCKED_FALLBACK;
     }
 
     function drawRow(provider) {
@@ -89,6 +116,7 @@
     function draw() {
         const box = byId('signin-sso-providers');
         if (!box || !data) return;
+        drawLocked();
         drawAddress();
         const providers = data.providers || [];
         box.replaceChildren(...providers.map(drawRow));
@@ -97,7 +125,7 @@
                 + ' (and a passkey, when they have one).'));
         }
         const add = byId('signin-sso-add');
-        if (add) add.disabled = providers.length >= (data.limit || 20);
+        if (add) add.disabled = lockedNow() || providers.length >= (data.limit || 20);
     }
 
     async function load() {
@@ -192,9 +220,11 @@
         const save = _el('button', 'btn btn-primary btn-sm', 'Save');
         save.type = 'button';
         save.id = 'sso-save';
+        save.disabled = lockedNow();
         bar.appendChild(save);
         bar.appendChild(said);
         save.addEventListener('click', async () => {
+            if (lockedNow()) return;
             const body = collect();
             said.className = 'text-sm ml-sm sso-said';
             said.setAttribute('role', 'status');
@@ -734,6 +764,12 @@
         if (opts.keep !== false) keepDraft(body);
         if (title) title.textContent = open.label || open.name;
         body.replaceChildren();
+        const locked = lockedNow();
+        if (locked) {
+            const said = _el('div', 'alert alert-info mb-md', data.locked_message || LOCKED_FALLBACK);
+            said.id = 'sso-locked-line';
+            body.appendChild(said);
+        }
         const head = _el('div', 'flex items-center gap-sm mb-md');
         const [word, badge] = status(open);
         const mark = _el('span', 'badge ' + badge, word);
@@ -742,12 +778,14 @@
         const toggle = _el('button', 'btn btn-secondary btn-sm', open.state === 'enabled' ? 'Turn off' : 'Turn on');
         toggle.type = 'button';
         toggle.id = 'sso-toggle';
+        toggle.disabled = locked;
         toggle.addEventListener('click', () => setState(open.state === 'enabled' ? 'disabled' : 'enabled'));
         head.appendChild(toggle);
         if (open.state !== 'enabled') {
             const gone = _el('button', 'btn btn-danger btn-sm', 'Remove');
             gone.type = 'button';
             gone.id = 'sso-remove';
+            gone.disabled = locked;
             gone.addEventListener('click', remove);
             head.appendChild(gone);
         }
@@ -782,6 +820,10 @@
         shown.dataset.ssoShown = page;
         shown.setAttribute('role', 'tabpanel');
         shown.setAttribute('aria-labelledby', 'sso-tab-' + page);
+        // Locked, nothing on the page can be saved: its fields are read-only too (an address to copy already is).
+        if (locked) {
+            shown.querySelectorAll('input, select, textarea').forEach((node) => { if (!node.readOnly) node.disabled = true; });
+        }
         body.appendChild(shown);
         fresh = valuesOf(shown);
         // The page as built is what the dialog holds; what was typed on it before, put back now, is an edit.
@@ -837,7 +879,9 @@
         const make = _el('button', 'btn btn-primary btn-sm mt-md', 'Add');
         make.type = 'button';
         make.id = 'sso-new-add';
+        make.disabled = lockedNow();
         make.addEventListener('click', async () => {
+            if (lockedNow()) return;
             make.disabled = true;
             said.className = 'text-sm ml-sm sso-said';
             said.textContent = '';
@@ -887,6 +931,8 @@
         if (box) box.replaceChildren();
         const line = byId('signin-sso-address');
         if (line) { line.textContent = ''; line.hidden = true; }
+        const lock = byId('signin-sso-locked');
+        if (lock) { lock.textContent = ''; lock.hidden = true; }
         const body = byId('sso-provider-body');
         if (body) body.replaceChildren();
     }

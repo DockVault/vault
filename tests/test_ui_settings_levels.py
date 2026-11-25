@@ -5,7 +5,8 @@ marked Advanced, and a container left with no setting showing goes too (the rate
 groups of how long records are kept). A page whose every setting is advanced says so. "New" follows the
 catalogue, and its mark leaves a field's label as it was for assistive technology. The settings the provider
 has locked leave their place for one collapsed, read-only list at the foot of their page, "Set by your
-provider (N)", with each one's value and reason, and the toggle's N leaves them out. What the marks say
+provider (N)", with each one's value and reason, and the toggle's N leaves them out; the single sign-on card,
+which shows its own lock, keeps its place and is listed there too. What the marks say
 reaches assistive technology as each field's description, never on screen: each field names the note once,
 beside a description of its own, which stays when the mark goes. Opening Settings again reads the catalogue again.
 A search box above the tabs finds a setting by its label or its help text on any page (label hits first, at
@@ -449,7 +450,40 @@ def test_the_fold_lists_what_the_deployment_locked(page: Page, levels_admin, adm
             expect(fold.locator(f'.settings-provider-item[data-fold-key="{e["key"]}"] .settings-provider-reason')
                    ).to_have_text(e["reason"])
             for node in page.locator(f'#settings-tab-{name} [data-setting="{e["key"]}"]').all():
-                expect(node).to_be_hidden()
+                # A card that shows its own lock (the single sign-on card) stays, read-only; the others leave.
+                if node.get_attribute("data-setting-shows-lock") is not None:
+                    expect(node).to_be_visible()
+                else:
+                    expect(node).to_be_hidden()
+
+
+def _sso_locked(data):
+    for e in data["entries"]:
+        if e["key"] == "sso":
+            e.update(locked=True, value="The providers are kept as they are.",
+                     reason="Locked in the deployment with SETTINGS_LOCKED_KEYS, so it cannot be changed here.")
+
+
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+def test_locked_single_sign_on_keeps_its_card_and_is_listed_in_the_fold(page: Page, levels_admin, skin):
+    """The single sign-on card shows its own lock, read-only: it stays on the Sign-in page, and the page's fold
+    lists the providers all the same."""
+    errors = _errors(page)
+    _serve_catalogue(page, _sso_locked)
+    _login(page, levels_admin, skin)
+    _open(page)
+    _tab(page, "signin")
+    _settled(page)
+    card = page.locator("#signin-sso-card")
+    expect(card).to_be_visible()
+    expect(card).not_to_have_class(re.compile(r"\bsetting-folded\b"))
+    fold = page.locator("#settings-tab-signin > .settings-provider-fold")
+    expect(fold).to_be_visible()
+    fold.locator("summary").click()
+    item = fold.locator('.settings-provider-item[data-fold-key="sso"]')
+    expect(item).to_contain_text("Single sign-on providers")
+    expect(item.locator(".settings-provider-value")).to_have_text("The providers are kept as they are.")
+    assert not errors, errors
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])

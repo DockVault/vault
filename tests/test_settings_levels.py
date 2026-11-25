@@ -274,6 +274,25 @@ def test_a_locked_setting_no_env_line_sets_says_it_keeps_its_default(monkeypatch
     assert "WEBAUTHN_MODE" in mode["reason"] and "keeps its default" not in mode["reason"]
 
 
+def test_locked_single_sign_on_says_the_providers_are_kept_as_they_are(monkeypatch):
+    """Nothing in a deployment sets a provider: the lock keeps the providers as they are. The fold and the refusal
+    say that, and neither says a provider set them (on a single sign-on page that reads as the identity provider)."""
+    from app.core import sso_settings
+    settings = reg._deployment_settings()
+    monkeypatch.setattr(settings, "settings_locked_keys", "sso", raising=False)
+    row = {r["key"]: r for r in catalogue.entries(current="0.36.0")}["sso"]
+    assert row["kind"] == "group" and row["locked"] is True
+    assert row["value"] == ("The providers are kept as they are: none can be added, changed, turned on or off, or "
+                            "removed here. Reading them and running a test sign-in stay open.")
+    assert row["reason"] == ("Locked in the deployment with SETTINGS_LOCKED_KEYS, so it cannot be changed here. "
+                             "Whoever runs the vault lifts the lock to change it.")
+    assert sso_settings.LOCKED_TEXT == (
+        "Single sign-on is locked in this deployment (SETTINGS_LOCKED_KEYS): the providers are kept as they are and "
+        "nothing can be changed here. Whoever runs the vault lifts the lock to change them.")
+    for text in (sso_settings.LOCKED_TEXT, row["value"], row["reason"]):
+        assert "set by your provider" not in text.lower() and "set in the deployment" not in text, text
+
+
 # --------------------------------------------------------------------------- the pages' markup
 
 _VOID = {"input", "img", "br", "hr", "meta", "link", "source", "area", "base", "col", "embed", "param", "track", "wbr"}

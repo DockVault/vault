@@ -4,6 +4,9 @@ dates the vault keeps; says on the page what a refusal and a hold are and how ea
 (POST /admin/sso/identities/{id}/clear-refusal) for a refused or held account that is not the administrator's own,
 after a confirmation that says what lifting does; reads the list again afterwards; and pages through a long list.
 
+The card and the dialog under SETTINGS_LOCKED_KEYS: they say so in the server's words and offer nothing that would
+change a provider, while what only reads or tests stays.
+
 Driven in Node against the shipped module, on the small document of tests/js/mini_dom.js, by the clicks a person
 makes: open the provider, open its Identities page.
 """
@@ -272,3 +275,62 @@ await tick(); await tick();
 out({ first: rows()[0].name, count: rows().length, said: pager().children[1].textContent });
 """)
     assert got == {"first": "user0", "count": 50, "said": "1 to 50 of 70"}
+
+
+LOCKED = ("Single sign-on is locked in this deployment (SETTINGS_LOCKED_KEYS): the providers are kept as they are and "
+          "nothing can be changed here. Whoever runs the vault lifts the lock to change them.")
+
+
+@pytest.mark.parametrize("locked", [True, False])
+def test_under_the_lock_the_card_and_the_dialog_say_so_and_offer_no_change(locked):
+    """SETTINGS_LOCKED_KEYS naming sso: the card says so in the server's words and offers no "Add a provider"; a
+    provider still opens, its dialog says so first and offers no Turn on or off, Remove or Save, and its fields are
+    read-only. What changes nothing stays: Open, the test sign-in, the addresses to copy, the Identities page's
+    Lift. Without the lock all of it is offered."""
+    got = _node(r"""
+const LOCK = %s;
+PROVIDER.state = 'disabled';
+PROVIDER.addresses = { redirect_uri: 'https://vault.example.test/r', backchannel_logout_uri: 'https://vault.example.test/b',
+                       post_logout_redirect_uri: 'https://vault.example.test/p', sign_in_link: 'https://vault.example.test/s' };
+answers['/admin/sso/providers'].locked = LOCK;
+answers['/admin/sso/providers'].locked_message = LOCK ? %s : null;
+answers[IDS] = LIST;
+await window.SsoSettings.load();
+const line = byId('signin-sso-locked');
+const card = { add: !!byId('signin-sso-add').disabled, open: !!document.querySelector('.sso-provider-row button').disabled,
+               line: line && !line.hidden ? [line.textContent, line.className, line.getAttribute('role')] : null };
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+const said = byId('sso-locked-line');
+const fields = byId('sso-page-connection').querySelectorAll('input, select, textarea');
+const dialog = { toggle: !!byId('sso-toggle').disabled, save: !!byId('sso-save').disabled,
+                 remove: !!byId('sso-remove').disabled, test: !!byId('sso-test').disabled,
+                 line: said ? said.textContent : null, first: byId('sso-provider-body').children[0] === said,
+                 editable: fields.filter((n) => !n.readOnly).every((n) => !!n.disabled),
+                 copies: fields.filter((n) => n.readOnly).map((n) => !!n.disabled),
+                 copyButtons: byId('sso-page-connection').querySelectorAll('button')
+                     .filter((b) => (b.getAttribute('aria-label') || '').startsWith('Copy ')).map((b) => !!b.disabled) };
+byId('sso-name').value = 'renamed';
+byId('sso-save').click();
+await tick(); await tick();
+const patches = asked.filter((a) => a.method === 'PATCH').length;
+byId('sso-tab-identities').click();
+await tick(); await tick();
+const lift = !!document.querySelector('.sso-identity-row button').disabled;
+document.listeners.click.forEach((f) => f({ target: byId('signin-sso-add') }));
+await tick();
+out({ card, dialog, patches, lift, wizardAdd: !!byId('sso-new-add').disabled });
+""" % (json.dumps(locked), json.dumps(LOCKED)))
+    card, dialog = got["card"], got["dialog"]
+    assert card["open"] is False and dialog["test"] is False and got["lift"] is False
+    assert dialog["copies"] == [False] * 4 and dialog["copyButtons"] == [False] * 4
+    if locked:
+        assert card["add"] is True and card["line"] == [LOCKED, "alert alert-info mb-md", "status"]
+        assert dialog["toggle"] is True and dialog["save"] is True and dialog["remove"] is True
+        assert dialog["line"] == LOCKED and dialog["first"] is True and dialog["editable"] is True
+        assert got["patches"] == 0 and got["wizardAdd"] is True
+    else:
+        assert card["add"] is False and card["line"] is None
+        assert dialog["toggle"] is False and dialog["save"] is False and dialog["remove"] is False
+        assert dialog["line"] is None and dialog["editable"] is False
+        assert got["patches"] == 1 and got["wizardAdd"] is False

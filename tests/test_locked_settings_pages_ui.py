@@ -3,6 +3,11 @@ tests/js/mini_dom.js.
 
 Settings -> Sign-in (static/js/settings-signin.js) shows a locked passkey setting read-only, and says where its value
 comes from: a setting a .env line sets is set by the provider; one no line sets keeps its default.
+
+The levels (static/js/settings-levels.js) take a locked setting out of its place and list it, with its value and
+reason, under "Set by your provider (N)" at the foot of its page. A container marked data-setting-shows-lock (the
+single sign-on card, whose own page shows the lock and stays readable) stays where it is, is listed all the same,
+and counts neither as an essential setting nor as an advanced one.
 """
 import json
 import os
@@ -16,6 +21,7 @@ pytestmark = pytest.mark.unit
 
 ROOT = Path(__file__).resolve().parent.parent
 SIGN_IN = ROOT / "static" / "js" / "settings-signin.js"
+LEVELS = ROOT / "static" / "js" / "settings-levels.js"
 
 PRELUDE = r"""
 const dom = require('./tests/js/mini_dom.js');
@@ -68,3 +74,71 @@ out(document.querySelectorAll('.signin-setting').map((item) => ({
         {"key": "webauthn_attestation", "said": "Kept at its default by your provider (locked): it cannot be changed "
                                                 "here.", "disabled": True},
     ]
+
+
+# The small document knows no [id^="..."] selector and no Element.after: every page here is a settings-tab-* page,
+# so the prefix test is left out, and after() is placed by the small document's own insertBefore.
+_LEVELS_SETUP = r"""
+const PREFIX = '[id^="settings-tab-"]';
+const plain = (sel) => sel.split(PREFIX).join('');
+for (const proto of [dom.Element.prototype, dom.Document.prototype]) {
+    const all = proto.querySelectorAll;
+    proto.querySelectorAll = function (sel) { return all.call(this, plain(sel)); };
+    proto.querySelector = function (sel) { return this.querySelectorAll(sel)[0] || null; };
+}
+const matches = dom.Element.prototype.matches;
+dom.Element.prototype.matches = function (sel) { return matches.call(this, plain(sel)); };
+dom.Element.prototype.after = function (node) { this.parentNode.insertBefore(node, this.nextSibling()); };
+global.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+const section = document.createElement('div');
+section.id = 'settings-section'; section.className = 'active';
+document.body.appendChild(section);
+const signin = document.createElement('div');
+signin.id = 'settings-tab-signin'; signin.className = 'settings-tab-content';
+section.appendChild(signin);
+function card(key, title, showsLock) {
+    const node = document.createElement('div');
+    node.className = 'card'; node.dataset.setting = key;
+    if (showsLock) node.setAttribute('data-setting-shows-lock', '');
+    const head = document.createElement('div'); head.className = 'card-header';
+    const h3 = document.createElement('h3'); h3.textContent = title;
+    head.appendChild(h3); node.appendChild(head);
+    signin.appendChild(node);
+    return node;
+}
+const sso = card('sso', 'Single sign-on', true);
+const mode = card('webauthn_mode', 'Passkeys', false);
+const algs = card('webauthn_allowed_algs', 'Signature algorithms', false);
+"""
+
+
+def test_a_locked_card_that_shows_its_own_lock_stays_listed_and_uncounted():
+    catalogue = {"entries": [
+        {"key": "sso", "kind": "group", "page": "signin", "level": "essential", "since": "0.36.0", "new": False,
+         "label": "Single sign-on providers", "help": "", "locked": True,
+         "value": "The providers are kept as they are.", "reason": "Locked in the deployment."},
+        {"key": "webauthn_mode", "kind": "setting", "page": "signin", "level": "essential", "since": "0.36.0",
+         "new": False, "label": "Passkeys", "help": "", "locked": True, "value": "off",
+         "reason": "Set by your provider."},
+        {"key": "webauthn_allowed_algs", "kind": "setting", "page": "signin", "level": "advanced", "since": "0.36.0",
+         "new": False, "label": "Signature algorithms", "help": "", "locked": False},
+    ]}
+    # The catalogue is there before the script starts: opening Settings reads it at once.
+    got = _node(LEVELS, _LEVELS_SETUP + "answers['/settings/catalogue'] = %s;" % json.dumps(catalogue), r"""
+await window.SettingsLevels.load();
+const fold = signin.querySelector(':scope > .settings-provider-fold');
+const bar = signin.querySelector(':scope > .settings-level-bar');
+out({ sso: sso.className, mode: mode.className, algs: algs.className,
+      summary: fold.querySelector('summary').textContent, hidden: fold.hidden,
+      listed: fold.querySelectorAll('.settings-provider-item').map((item) => [item.dataset.foldKey,
+          item.querySelector('strong').textContent]),
+      toggle: bar.querySelector('.settings-advanced-toggle').textContent,
+      allAdvanced: !bar.querySelector('.settings-level-note').hidden });
+""")
+    # The single sign-on card stays in its place; the other locked setting leaves for the list.
+    assert "setting-folded" not in got["sso"].split() and "setting-level-hidden" not in got["sso"].split()
+    assert "setting-folded" in got["mode"].split()
+    assert got["hidden"] is False and got["summary"] == "Set by your provider (2)"
+    assert got["listed"] == [["sso", "Single sign-on providers"], ["webauthn_mode", "Passkeys"]]
+    # Neither locked one is counted: the page's one counted setting is advanced, and the page says so.
+    assert got["toggle"] == "Show advanced settings (1)" and got["allAdvanced"] is True

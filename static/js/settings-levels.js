@@ -14,7 +14,9 @@
  *     reaches assistive technology as a visually hidden note right after the setting's title, which each of
  *     the setting's own fields names as its description;
  *   - the settings the provider has locked leave their place for one collapsed list at the foot of the page,
- *     "Set by your provider (N)", read-only, each with its value and the reason.
+ *     "Set by your provider (N)", read-only, each with its value and the reason. A container marked
+ *     data-setting-shows-lock (the single sign-on card) shows its own read-only state, so it stays where it is,
+ *     listed there all the same and counted neither as essential nor as advanced.
  * A search box above the tabs finds a setting by its label and help text on every page, and goes to it (its
  * page, its advanced settings shown, or its line in the provider's list).
  *
@@ -245,13 +247,14 @@
         pageEl.querySelectorAll('[data-setting]').forEach((node) => {
             const key = node.dataset.setting;
             const entry = entryOf(key);
-            const folded = isFolded(entry);
+            const locked = isFolded(entry);
+            const folded = locked && !node.hasAttribute('data-setting-shows-lock');
             toggleClass(node, 'setting-folded', folded);
             toggleClass(node, 'setting-advanced', isAdvanced(entry));
-            toggleClass(node, 'setting-level-hidden', !folded && isAdvanced(entry) && !show);
+            toggleClass(node, 'setting-level-hidden', !locked && isAdvanced(entry) && !show);
             setChips(node, entry);
             setNote(node, entry);
-            if (folded || !present(node)) return;
+            if (locked || !present(node)) return;
             (isAdvanced(entry) ? advanced : essential).add(key);
         });
         pageEl.querySelectorAll('[data-setting-group]').forEach((group) => {

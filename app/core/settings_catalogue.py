@@ -4,9 +4,10 @@ administrator looking, and whether the deployment has locked it.
 
 A locked entry says what it is set to and why: the pages fold it into "Set by your provider (N)", read-only.
 Its reason names the .env setting that gives the value and SETTINGS_LOCKED_KEYS, which locks it; a setting
-no .env line sets keeps its default under the lock, and its reason says that instead. The words for whoever set
-it are "your provider" (a managing operator, or the person who runs the vault). A fixed setting is the same on
-every install and a field is never covered by the lock, so neither is ever locked.
+no .env line sets keeps its default under the lock, and a group no line sets (the single sign-on providers) is
+kept as it is: their reasons say so instead. The words for whoever set it are "your provider" (a managing
+operator, or the person who runs the vault). A fixed setting is the same on every install and a field is never
+covered by the lock, so neither is ever locked.
 
 Nothing here reads the database: the values come from each process's copy of the managed settings and from
 the deployment's settings, and the release this administrator last opened the pages at is passed in.
@@ -32,6 +33,13 @@ def kept_at_default_reason() -> str:
     """Why a locked setting that no .env line sets cannot be changed on the pages: the lock holds its default."""
     return ("Locked by your provider with SETTINGS_LOCKED_KEYS: no .env line sets it, so it keeps its default and "
             "cannot be changed here. Whoever runs the vault can lift the lock.")
+
+
+def group_reason() -> str:
+    """Why a locked group that no .env line sets (the single sign-on providers) cannot be changed on the pages:
+    the lock keeps it as it is."""
+    return ("Locked in the deployment with SETTINGS_LOCKED_KEYS, so it cannot be changed here. Whoever runs the "
+            "vault lifts the lock to change it.")
 
 
 def _row(key: str, entry, current: str, seen: Optional[str], kind: str) -> dict:
@@ -71,7 +79,7 @@ def entries(*, current: str, seen: Optional[str] = None, settings=None) -> list[
     for group in registry.all_lock_groups():
         row = _row(group.name, group, current, seen, "group")
         if registry.group_locked(group.name, settings):
-            _lock(row, group.shown() if group.shown else "", reason(group.env))
+            _lock(row, group.shown() if group.shown else "", reason(group.env) if group.env else group_reason())
         rows.append(row)
     for field in registry.all_fields():
         rows.append(_row(field.key, field, current, seen, "field"))

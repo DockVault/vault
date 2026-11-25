@@ -2,9 +2,11 @@
 
 The providers keep a table of their own (``sso_providers``), with each provider's policy on its row, so the
 registry lists them as a group the deployment may lock: with ``SETTINGS_LOCKED_KEYS`` naming ``sso`` (or ``*``),
-the providers are the deployment's: nothing is added, changed, turned on or off, or removed through the panel or
-its routes, and the Settings page lists the group among what the deployment set. Reading the providers and running
-a test sign-in stay open to an administrator. Sign-ins go on as before.
+the providers are kept as they are: nothing is added, changed, turned on or off, or removed through the panel or
+its routes. Nothing in a deployment's .env sets a provider, so the lock only keeps the rows the database holds;
+whoever runs the vault lifts it to change them. The Settings page lists the group among the locked entries and keeps
+the providers' card, read-only. Reading the providers and running a test sign-in stay open to an administrator.
+Sign-ins go on as before.
 """
 from __future__ import annotations
 
@@ -13,7 +15,8 @@ from app.core import settings_registry as registry
 LOCK_GROUP = "sso"
 PAGE = "signin"
 SINCE = "0.36.0"
-LOCKED_TEXT = "Single sign-on is set by your provider on this deployment: nothing can be changed here."
+LOCKED_TEXT = ("Single sign-on is locked in this deployment (SETTINGS_LOCKED_KEYS): the providers are kept as they "
+               "are and nothing can be changed here. Whoever runs the vault lifts the lock to change them.")
 
 
 def locked(settings=None) -> bool:
@@ -22,8 +25,9 @@ def locked(settings=None) -> bool:
 
 
 def _in_words() -> str:
-    """What a locked group shows on the Settings pages: who sets the providers."""
-    return "The providers and their rules are set in the deployment."
+    """What a locked group shows on the Settings pages: what the lock keeps, and what stays open."""
+    return ("The providers are kept as they are: none can be added, changed, turned on or off, or removed here. "
+            "Reading them and running a test sign-in stay open.")
 
 
 def _register() -> None:

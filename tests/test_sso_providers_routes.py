@@ -590,16 +590,21 @@ def test_a_locked_deployment_changes_nothing_and_asks_nothing(monkeypatch):
     row = _tested(_provider(state="draft", created_at=None, updated_at=None))
     h = Admin(monkeypatch, [row])
     h.is_locked = True
-    locked = {"detail": {"reason": "locked", "message": "Single sign-on is set by your provider on this deployment: "
-                                                         "nothing can be changed here."}}
+    locked = {"detail": {"reason": "locked", "message": "Single sign-on is locked in this deployment "
+                         "(SETTINGS_LOCKED_KEYS): the providers are kept as they are and nothing can be changed here. "
+                         "Whoever runs the vault lifts the lock to change them."}}
     path = f"/admin/sso/providers/{row.id}"
     for method, where, body in (("POST", "/admin/sso/providers", {"name": "new"}), ("PATCH", path, {"label": "x"}),
                                 ("POST", path + "/state", {"state": "enabled"}), ("DELETE", path, None)):
         assert h.call(method, where, body) == (409, locked), (method, where)
     assert h.order == [] and h.audits == [] and h.told == [] and h.rows() == [row] and row.state == "draft"
-    # It is still listed, and says it is locked.
+    # It is still listed, and says it is locked, in the words the page shows.
     status, out = h.call("GET", "/admin/sso/providers")
     assert status == 200 and out["locked"] is True and len(out["providers"]) == 1
+    assert out["locked_message"] == locked["detail"]["message"]
+    h.is_locked = False
+    status, out = h.call("GET", "/admin/sso/providers")
+    assert status == 200 and out["locked"] is False and out["locked_message"] is None
 
 
 def test_only_an_administrator_reaches_these_routes(monkeypatch):

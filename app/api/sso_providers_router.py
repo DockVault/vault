@@ -344,12 +344,14 @@ def _address() -> dict:
 @router.get("/admin/sso/providers")
 def list_providers(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """The providers in the sign-in page's order, the wizard's presets, the vault's address as a provider needs it,
-    and whether the deployment locked single sign-on."""
+    and whether the deployment locked single sign-on, with the words the page shows for it."""
     rows = sorted(db.query(SsoProvider).all(),
                   key=lambda r: (r.sort_order or 0, (r.label or r.name or "").lower(), str(r.id)))
+    locked = sso_settings.locked()
     return {"providers": [providers.public(db, row) for row in rows], "presets": sso_presets.public(),
             "icons": list(providers.ICONS), "limit": providers.MAX_PROVIDERS, "address": _address(),
-            "locked": sso_settings.locked(), "step_up": STEP_UP_ACTION}
+            "locked": locked, "locked_message": sso_settings.LOCKED_TEXT if locked else None,
+            "step_up": STEP_UP_ACTION}
 
 
 @router.get("/admin/sso/providers/{provider_id}")
