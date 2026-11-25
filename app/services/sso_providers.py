@@ -541,11 +541,13 @@ def check(db, row, changes: dict, *, account_policy=None) -> dict:
     if policy["sso_account_creation"] == "jit" and not restricted:
         raise Conflict(NEEDS_RESTRICTION, (
             "Accounts are made at the first sign-in only for a provider that says who may sign in. Set a tenant, a "
-            "domain or a required group first." + repeats))
+            "domain or a required group, or hold people to the sign-up allow-list of the Accounts & Access page, "
+            "first." + repeats))
     if policy["sso_link_by_email"] and not restricted:
         raise Conflict(NEEDS_RESTRICTION, (
             "An account is linked by its verified email address only for a provider that says who may sign in. Set a "
-            "tenant, a domain or a required group first." + repeats))
+            "tenant, a domain or a required group, or hold people to the sign-up allow-list of the Accounts & "
+            "Access page, first." + repeats))
     if "policy" not in changes:
         return None
     was = sso_policy.effective(row.policy)["sso_password_login"]

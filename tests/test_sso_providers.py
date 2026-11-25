@@ -396,6 +396,9 @@ def test_accounts_are_made_or_linked_by_email_only_for_a_provider_that_says_who_
         with pytest.raises(P.Conflict) as refused:
             P.check(db, row, P.clean({"policy": change}))
         assert refused.value.reason == P.NEEDS_RESTRICTION
+        # The refusal names every way to say who may sign in that the rule accepts, the sign-up allow-list among them.
+        assert ("Set a tenant, a domain or a required group, or hold people to the sign-up allow-list of the "
+                "Accounts & Access page, first.") in str(refused.value)
         for restriction in ({"sso_allowed_tenants": ["t-1"]}, {"sso_allowed_domains": ["example.org"]},
                             {"sso_required_groups": ["staff"]}):
             stored = P.check(db, row, P.clean({"policy": {**change, **restriction}}))

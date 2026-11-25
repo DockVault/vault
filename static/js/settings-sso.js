@@ -432,8 +432,14 @@
         const tenants = area('sso-tenants', policy.sso_allowed_tenants);
         const domains = area('sso-domains', policy.sso_allowed_domains);
         const groups = area('sso-groups', policy.sso_required_groups);
+        // The account policy's sign-up domain list (sso_policy.restriction): held to in every mode but Off; only an
+        // allow-list with domains on it says who may sign in (sso_policy.is_restricted).
         const signup = tick('sso-signup-domains', 'Also hold people to the sign-up domain list', policy.sso_use_signup_domains,
-            'The list on the Accounts page, when it is an allow-list.');
+            'The Email domain gate on the Accounts & Access page, when it is on. An allow-list admits only its domains '
+            + 'and, when it holds any, counts as saying who may sign in, which making accounts at a first sign-in and '
+            + 'linking by email need; a deny-list keeps its domains out and does not count. Either way, a person '
+            + 'whose domain the provider does not vouch for (no verified address, or at a provider with an '
+            + 'organisation-domain claim, no such claim) is kept out. Set to Off there, this does nothing.');
         const creation = choice('sso-creation', [['invite_only', 'Only invited or linked people sign in'],
             ['jit', 'Make an account at a person\'s first sign-in']], policy.sso_account_creation);
         const role = choice('sso-role', [['user', 'User'], ['external', 'External']], policy.sso_default_role);
@@ -450,7 +456,8 @@
             + 'provider no longer signs in cannot give themselves a password and stay. Making such an account an '
             + 'administrator ends that for it: it is sent a link to choose a password.');
         box.appendChild(_el('p', 'text-secondary text-sm mb-sm', 'Who may sign in through this provider. With none of the '
-            + 'three lists, anyone the provider signs in may try; accounts are then made only by invitation.'));
+            + 'three lists, and the sign-up domain list not held to below, anyone the provider signs in may try; '
+            + 'accounts are then made only by invitation.'));
         box.appendChild(field('Tenants', tenants, 'Microsoft Entra ID: the tenant ids whose accounts may sign in.'));
         box.appendChild(field('Domains', domains, 'Google Workspace: the hosted domains, else the verified email\'s domain.'));
         box.appendChild(field('Required groups', groups, 'A person must be in at least one of these groups.'));
