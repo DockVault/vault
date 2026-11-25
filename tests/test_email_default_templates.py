@@ -362,3 +362,19 @@ def test_the_freshness_warning_links_to_the_vault():
     """The email asks the person to sign in through their provider by a date: it links to the vault, where they do."""
     body = ea.DEFAULT_TEMPLATES["sso_freshness_warning"]["body_html"]
     assert '<a href="{{vault.url}}">Open {{vault.name}}</a>' in body
+
+
+def test_the_freshness_warning_and_an_administrators_change_are_described_as_they_are_sent():
+    """The warning comes up to five days before the keys pause, never more than half the provider's window (a
+    window of one day sends none), and links to the vault; read as "five days before", an administrator with a
+    seven-day window expected one that came three days before. An administrator's removal of a passkey and their
+    confirmation of an address are told by the account-change email too."""
+    described = ea.SPEC_BY_KEY["sso_freshness_warning"]["description"]
+    assert "up to five days" in described and "never more than half the provider's window" in described
+    assert "a window of one day sends none" in described and "with a link to the vault" in described
+    assert "identity provider five days" not in described
+    changed = ea.SPEC_BY_KEY["account_changed_by_admin"]["description"]
+    assert "passkey" in changed and "confirms their email address" in changed
+    help_of = {a.token: a.description for a in es.DYNAMIC_ACTIONS}
+    assert "a date to act by" in help_of["action.change"] and "the date the email is about" in help_of["action.when"]
+

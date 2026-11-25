@@ -604,9 +604,10 @@ def run_value_removals(p: Pass) -> JobResult:
 
 
 def run_sso_freshness(p: Pass) -> JobResult:
-    """Single sign-on freshness (app/services/sso_freshness.py): the warning five days before an account's SSH keys,
-    temporary credentials and devices pause for want of a sign-in through its identity provider, and the notice when
-    they do. Nothing is paused here: the rule is read at each use, so a sign-in restores them at once."""
+    """Single sign-on freshness (app/services/sso_freshness.py): the warning up to five days (never more than half the
+    provider's window) before an account's SSH keys, temporary credentials and devices pause for want of a sign-in
+    through its identity provider, and the notice when they do. Nothing is paused here: the rule is read at each
+    use, so a sign-in restores them at once."""
     from app.services import sso_freshness
     with p.transaction() as db:
         sso_freshness.sweep(db, p.now)

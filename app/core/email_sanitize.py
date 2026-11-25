@@ -193,11 +193,11 @@ DYNAMIC_ACTIONS: tuple[DynamicAction, ...] = (
     DynamicAction("action.code", "Action code", "482913", "Automated action", "A one-time code — empty in a manual send"),
     DynamicAction("action.expires", "Expires", "in 24 hours", "Automated action", "When the link or code expires"),
     DynamicAction("action.change", "What changed", "Your password was changed.", "Automated action",
-                  "What an administrator changed on the account — empty in a manual send"),
+                  "What the email is about: a change, or a date to act by — empty in a manual send"),
     DynamicAction("action.by", "Changed by", "alice", "Automated action",
-                  "The administrator who made the change — empty in a manual send"),
+                  "Who made the change, when a person did — empty in a manual send"),
     DynamicAction("action.when", "Changed at", "2026-08-24 14:05 UTC", "Automated action",
-                  "When the change was made — empty in a manual send"),
+                  "When the change was made, or the date the email is about — empty in a manual send"),
 )
 
 

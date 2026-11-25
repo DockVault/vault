@@ -1,7 +1,7 @@
 """Single sign-on freshness (app/services/sso_freshness.py): an account linked to a provider keeps its SSH keys,
 temporary credentials and devices only while it keeps signing in there; the provider's verified refusal pauses them
-at once; the daily sweep warns five days before and tells when they pause; the administrators' user list shows the
-due date. Offline: an in-memory store, the clock the test's."""
+at once; the daily pass warns up to five days before and tells when they pause; the administrators' user list shows
+the due date. Offline: an in-memory store, the clock the test's."""
 import types
 import uuid
 from contextlib import contextmanager

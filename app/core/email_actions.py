@@ -412,7 +412,8 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Optional — notify a user when a temporary access credential is created for them.", OPTIONAL),
     ("account_changed_by_admin", "Account changed by an administrator",
      "Sent to a user when an administrator changes their password, reset link, second factor, email "
-     "address (to the old address), SSH keys, lock, activation or role — says what, when and by whom.",
+     "address (to the old address), SSH keys, lock, activation or role, removes one of their passkeys, or "
+     "confirms their email address — says what, when and by whom.",
      SYSTEM),
     ("administrator_added", "New administrator",
      "Sent to every administrator when an account is created as, promoted to or invited as an "
@@ -424,10 +425,11 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Sent to every administrator and to the account when the auditor right is proposed, granted, turned down, "
      "revoked, suspended, ended, reconfirmed, or lapses or expires -- says what, when and by whom.", SYSTEM),
     ("sso_freshness_warning", "Sign in through your organisation",
-     "Sent to a person whose account is linked to an identity provider five days before their SSH keys, temporary "
-     "credentials and devices pause for want of a sign-in through it (and, where the provider says so, their password "
-     "and passkeys stop signing them in) -- names the provider and the date. Its wording is fixed: it cannot be "
-     "changed or turned off.", LOCKED),
+     "Sent to a person whose account is linked to an identity provider up to five days (never more than half the "
+     "provider's window, so a window of one day sends none) before their SSH keys, temporary credentials and devices "
+     "pause for want of a sign-in through it (and, where the provider says so, their password and passkeys stop "
+     "signing them in) -- names the provider and the date, with a link to the vault. Its wording is fixed: it "
+     "cannot be changed or turned off.", LOCKED),
     ("compliance_access_notice", "Access to your vaults",
      "Sent to a vault's owner when an investigation may open their vaults, is extended, narrowed, ends or is "
      "closed, when a legal hold on their vaults is placed, confirmed, released, restored or lapses, and when files "

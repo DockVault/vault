@@ -10,8 +10,9 @@ provider admits answers it. Each such provider asks on its own: a sign-in throug
 it. Nothing is deleted, so the next sign-in through the provider restores everything. A refusal stays in force even
 when the provider is disabled afterwards; an administrator may clear it (app/api/sso_admin_router.py).
 
-The daily sweep warns the person :data:`WARNING_DAYS` days before, in the app and by email, and the administrators'
-user list shows the due date. Device credentials of the desktop app join the same check when they exist.
+The daily pass warns the person up to :data:`WARNING_DAYS` days before (never more than half the window:
+:func:`warning_lead`), in the app and by email, and the administrators' user list shows the due date. Device
+credentials of the desktop app join the same check when they exist.
 
 The other ways in. A provider that says so (``sso_lapse_ends_sign_in``, on unless an administrator turns it off)
 closes, from the same moment, every way in to the account that does not go through a provider
