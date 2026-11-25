@@ -643,3 +643,66 @@ def test_no_email_goes_out_for_the_unlink_of_an_account_no_hold_reaches(monkeypa
     assert _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")[0] == 200
     assert setting_changes.EMAIL_ACTION not in sent
     assert [ids for ids, title in h.notices if title == "alice unlinked " + (p.label or p.name)] == [[str(root.id)]]
+
+
+def test_your_account_is_told_for_each_identity_why_its_unlink_would_be_refused(monkeypatch):
+    """The page starts the provider's confirmation for an unlink that asks one. Where the unlink would be refused
+    on the person's return whatever the provider says, the list says why for that identity, in the words the
+    unlink itself answers, so that nobody is sent to the provider for nothing."""
+    from app.api import sso_router
+    from app.core import password_origin
+    from app.services import sso_sign_in as sso
+    monkeypatch.setattr(sso, "unlink_asks_the_provider", lambda db, user, identity, row: False)
+    alice = _user()
+    fine = _provider(name="fine", label="Fine")
+    lapsed = _provider(name="lapsed", label="Lapsed")
+    refusing = _provider(name="refusing", label="Refusing")
+    made = _provider(name="maker", label="Maker", policy={"sso_jit_password": False})
+    rows = {
+        "fine": _identity(alice, fine, subject="s-fine", last_sign_in_at=datetime.utcnow()),
+        "lapsed": _identity(alice, lapsed, subject="s-lapsed", last_sign_in_at=datetime.utcnow() - timedelta(days=40)),
+        "refusing": _identity(alice, refusing, subject="s-refusing", last_sign_in_at=datetime.utcnow(),
+                              refused_at=datetime.utcnow()),
+    }
+    h = Harness(monkeypatch, [alice], [fine, lapsed, refusing, made], identities=list(rows.values()))
+
+    def told():
+        out = _call(h.S, "GET", "/users/me/identities")[1]
+        return {i["provider_id"]: i["unlink_refusal"] for i in out["identities"]}
+    said = told()
+    assert said[str(fine.id)] is None
+    assert said[str(lapsed.id)] == {"reason": "sso_freshness_lapsed",
+                                    "message": "Sign in through lapsed again before you unlink it."}
+    assert said[str(refusing.id)] == {"reason": "sso_freshness_lapsed", "message": (
+        "refusing refused your account; an administrator must clear that before you can unlink it.")}
+    # What the list says is what the unlink answers.
+    for name in ("lapsed", "refusing"):
+        status, body, _ = _call(h.S, "DELETE", f"/users/me/identities/{rows[name].id}")
+        assert status == 409 and body["detail"] == said[str(rows[name].provider_id)], body
+    # The identity the account was made with, on a provider that holds such accounts to no password.
+    from app.core.models import ExternalIdentity
+    password_origin.mark_nobody_knows(alice)
+    alice.sso_only = True
+    made_with = _identity(alice, made, subject="s-made", linked_by="jit", last_sign_in_at=datetime.utcnow())
+    h.db.rows_of(ExternalIdentity).append(made_with)
+    said = told()
+    assert said[str(made.id)] == {"reason": "made_here", "message": (
+        "Your account was made at its first sign-in through Maker, which stays its way in: it is not unlinked here. "
+        "Ask an administrator.")}
+    status, body, _ = _call(h.S, "DELETE", f"/users/me/identities/{made_with.id}")
+    assert status == 409 and body["detail"] == said[str(made.id)]["message"], body
+    # The last way in of an account with no password anybody can type.
+    for row in list(h.identities()):
+        if row is not rows["fine"]:
+            h.db.rows_of(ExternalIdentity).remove(row)
+    alice.sso_only = False
+    said = told()
+    assert said[str(fine.id)]["reason"] == "no_way_in_left"
+    assert said[str(fine.id)]["message"].startswith("Your account has no password of its own, and no other identity")
+    status, body, _ = _call(h.S, "DELETE", f"/users/me/identities/{rows['fine'].id}")
+    assert status == 409 and body["detail"] == said[str(fine.id)]["message"], body
+    alice.sso_only = True
+    assert told()[str(fine.id)]["message"].startswith("Your account signs in only through single sign-on")
+    # One rule for both: the unlink raises what the list's rule says.
+    import inspect
+    assert "refusal = owners_unlink_refusal(db, account, identity, row)" in inspect.getsource(sso_router.unlink_my_identity)

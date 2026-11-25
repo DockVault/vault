@@ -1359,6 +1359,48 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
         log.info("sso kept-out notice skipped: %s", type(exc).__name__)
 
 
+# Why an owner's unlink is refused before anything is asked of the provider (the reasons of owners_unlink_refusal).
+UNLINK_NO_WAY_IN, UNLINK_MADE_HERE, UNLINK_LAPSED = "no_way_in_left", "made_here", "sso_freshness_lapsed"
+
+
+def owners_unlink_refusal(db, account, identity, row, *, now: Optional[datetime] = None):
+    """Why ``account``'s owner may not unlink ``identity`` (of provider ``row``) now, whatever the provider would
+    say: ``(reason, sentence)``, or None. Asked by the unlink itself, in the account's turn, and by the list of
+    the caller's identities for each of them.
+
+    - The account holds no password anybody can type, and no other identity on a provider that is on would sign
+      it in: without this one nothing would. One that is off, or not finished, is no way in.
+    - The identity is the one the account was made with at its first sign-in, while that provider holds such
+      accounts to no password: only an administrator's act ends that hold. Unlinked by its owner, who had linked
+      another provider meanwhile, the account could set itself the password the provider that made it says it
+      may not have.
+    - The provider refused the person, or its days have run out: unlinking would end the provider's say over the
+      account's keys and credentials."""
+    from app.services import sign_in
+    now = now or datetime.utcnow()
+    if not sign_in.has_a_password_it_can_type(account) and not sso_only.another_way_in(db, account, without=identity):
+        return (UNLINK_NO_WAY_IN, (
+            "Your account signs in only through single sign-on, and no other identity on a provider that is "
+            "on can sign you in now. Ask an administrator for a password first."
+            if getattr(account, "sso_only", False) else
+            "Your account has no password of its own, and no other identity on a provider that is on can sign "
+            "you in now: without this one nothing would sign you in. Set a password first (\"Forgot password\" "
+            "on the sign-in page, or ask an administrator for a reset link), then unlink."))
+    linked_by = getattr(identity, "linked_by", None)
+    if row is not None and linked_by == sso_only.MADE_AT_A_FIRST_SIGN_IN \
+            and sso_only.holds_to_no_password(row, account, linked_by):
+        return (UNLINK_MADE_HERE, (
+            f"Your account was made at its first sign-in through {row.label or row.name}, which stays its way in: "
+            "it is not unlinked here. Ask an administrator."))
+    standing = sso_freshness.deadline_of(identity, row)
+    if standing is not None and (standing.refused or standing.due <= now):
+        return (UNLINK_LAPSED, (
+            f"{standing.provider_name} refused your account; an administrator must clear that before you can unlink it."
+            if standing.refused else
+            f"Sign in through {standing.provider_name} again before you unlink it."))
+    return None
+
+
 def owners_unlink_text(username: str, label: str, *, asked: bool, linked_by, standing, policy, reached: bool,
                        now: datetime) -> str:
     """What the administrators are told when an owner unlinks an identity: whether the provider confirmed it, and
@@ -1438,6 +1480,10 @@ async def list_my_identities(
         # Whether unlinking it asks for a fresh sign-in there first, and whether the provider can give one now.
         out["unlink_asks_provider"] = sso.unlink_asks_the_provider(db, current_user, identity, row)
         out["provider_can_confirm"] = row is not None and sso.reauth_offered(row)
+        # Why its unlink would be refused whatever the provider says, or None: shown in place of the unlink, so
+        # that nobody is sent to the provider for nothing.
+        refusal = owners_unlink_refusal(db, current_user, identity, row)
+        out["unlink_refusal"] = {"reason": refusal[0], "message": refusal[1]} if refusal is not None else None
         return out
     return {"identities": [shown(i) for i in rows],
             "providers": [{"id": str(p.id), "label": p.label or p.name, "icon": p.icon or "generic",
@@ -1586,37 +1632,17 @@ async def unlink_my_identity(
     # The account as it is committed, read in the turn: the one the request was checked with was loaded before
     # it, and a setting that makes the account sign in only through its provider may have been saved since.
     account = db.query(User).filter(User.id == current_user.id).populate_existing().first() or current_user
-    from app.services import sign_in
-    if not sign_in.has_a_password_it_can_type(account):
-        # The account holds no password anybody can type: after the unlink it must still have a provider that is
-        # on to sign in through. One that is off, or not finished, is no way in.
-        if not sso_only.another_way_in(db, account, without=identity):
-            raise HTTPException(status_code=409, detail=(
-                "Your account signs in only through single sign-on, and no other identity on a provider that is "
-                "on can sign you in now. Ask an administrator for a password first."
-                if getattr(account, "sso_only", False) else
-                "Your account has no password of its own, and no other identity on a provider that is on can sign "
-                "you in now: without this one nothing would sign you in. Set a password first (\"Forgot password\" "
-                "on the sign-in page, or ask an administrator for a reset link), then unlink."))
     row = _provider(db, identity.provider_id)
-    # The identity the account was made with at its first sign-in, while that provider holds such accounts to no
-    # password: only an administrator's act ends that hold (the provider's setting, a promotion). Unlinked by its
-    # owner, who had linked another provider meanwhile, the account could set itself the password the provider
-    # that made it says it may not have.
-    if row is not None and sso_only.holds_to_no_password(row, account, getattr(identity, "linked_by", None)) \
-            and getattr(identity, "linked_by", None) == sso_only.MADE_AT_A_FIRST_SIGN_IN:
-        label = (row.label or row.name)
-        raise HTTPException(status_code=409, detail=(
-            f"Your account was made at its first sign-in through {label}, which stays its way in: it is not "
-            "unlinked here. Ask an administrator."))
-    # An identity whose provider refused the person, or whose freshness has lapsed, is not unlinked by its owner:
-    # unlinking would end the provider's say over the account's keys and credentials.
+    # What refuses the unlink before anything is asked of the provider (owners_unlink_refusal: no way in left,
+    # the identity the account was made with, a refusal or days run out). The list of the caller's identities
+    # says the same for each, so that the page does not send a person to the provider for an unlink that is
+    # refused on their return.
+    refusal = owners_unlink_refusal(db, account, identity, row)
+    if refusal is not None:
+        reason, message = refusal
+        raise HTTPException(status_code=409, detail=({"reason": reason, "message": message}
+                                                     if reason == UNLINK_LAPSED else message))
     standing = sso_freshness.deadline_of(identity, row)
-    if standing is not None and (standing.refused or standing.due <= datetime.utcnow()):
-        raise HTTPException(status_code=409, detail={"reason": "sso_freshness_lapsed", "message": (
-            f"{standing.provider_name} refused your account; an administrator must clear that before you can unlink it."
-            if standing.refused else
-            f"Sign in through {standing.provider_name} again before you unlink it.")})
     # Where the provider closes the account's other ways in, the unlink is confirmed by a fresh sign-in through
     # it, staged by this session a moment ago (sso.unlink_asks_the_provider). Asked last, so that a confirmation
     # is not spent on an unlink that is refused for another reason.
