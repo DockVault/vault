@@ -291,6 +291,13 @@ def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
     hers.refused_at = datetime.utcnow()
     assert F.another_way_in(db, refused) is None
     assert F.way_in_text(db, refused).endswith("If Contoso does not admit you, ask your administrator.")
+    # A refusal she has answered since (Fabrikam refused her once and admitted her the next day) holds nobody:
+    # Fabrikam lets her in, and is named.
+    hers.refused_at = datetime.utcnow() - timedelta(days=2)
+    hers.last_sign_in_at = datetime.utcnow() - timedelta(days=1)
+    assert F.another_way_in(db, refused) == (
+        "You can sign in through Fabrikam instead: Use the “Staff sign-in” button on the sign-in page.")
+    hers.last_sign_in_at = datetime.utcnow()
     adatum.state, hers.refused_at = "enabled", None
     # Where the provider that holds the account can be reached, it is the one named, and no other.
     i.refused_at = None

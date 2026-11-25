@@ -226,10 +226,15 @@ def _how_to_reach(row, name: str) -> str:
 
 def another_way_in(db, found: Deadline) -> Optional[str]:
     """Where the provider that holds the account cannot let the person in now (it is off, or it refused them):
-    another provider the account is linked to that is on and has not refused it, as "You can sign in through X
-    instead: ...", or None when there is none. A sign-in through any provider the account is linked to is let in
+    another provider the account is linked to that is on and holds no refusal of it, as "You can sign in through
+    X instead: ...", or None when there is none. A sign-in through any provider the account is linked to is let in
     (:func:`held_to_a_provider`), so the person is not sent to an administrator while such a way stands. The
-    first by name, so the sentence is the same each time."""
+    first by name, so the sentence is the same each time.
+
+    A refusal the person has answered since (the provider admitted a later sign-in, which leaves the stamp where
+    it is) holds nobody, and does not keep its provider from being named: skipped for the stamp alone, a provider
+    that refused the person once was never named again, and the door said "ask your administrator" beside a
+    button that would have let them in."""
     from app.core.models import ExternalIdentity, SsoProvider
     try:
         owner = uuid.UUID(str(found.user_id))
@@ -237,7 +242,7 @@ def another_way_in(db, found: Deadline) -> Optional[str]:
         return None
     others = []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == owner).all():
-        if getattr(identity, "refused_at", None) is not None:
+        if refusal_in_force(identity):
             continue                   # (the provider that holds the account is asked about only when it refused
                                        # the account or is off: it is left out by one of the two)
         other = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
