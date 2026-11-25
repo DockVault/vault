@@ -295,8 +295,9 @@ def test_the_provider_row_is_waited_for_a_short_time_only_and_busy_is_said_so():
         def get_bind(self):
             return type("Bind", (), {"dialect": type("Dialect", (), {"name": "postgresql"})()})()
 
-        def execute(self, statement):
-            self.ran.append(str(statement))
+        def execute(self, statement, params=None):
+            self.ran.append(str(statement) if params is None else (str(statement), dict(params)))
+            return type("Result", (), {"scalar": lambda result: "7s"})()
 
         def rollback(self):
             self.rolled_back += 1
@@ -324,8 +325,12 @@ def test_the_provider_row_is_waited_for_a_short_time_only_and_busy_is_said_so():
     row = object()
     free = Postgres(row)
     assert sso_router._provider_as_it_stands(free, pid) is row
-    assert free.ran == ["flush", "SET LOCAL lock_timeout = 500", "for update {'read': True}",
-                        f"SET LOCAL lock_timeout = {database._LOCK_TIMEOUT_MS}"] and free.rolled_back == 0
+    # The wait the transaction had (read before) is what it gets back, not the connection's usual one.
+    assert free.ran == ["flush", "SELECT current_setting('lock_timeout')",
+                        ("SELECT set_config('lock_timeout', :wait, true)", {"wait": "500ms"}),
+                        "for update {'read': True}",
+                        ("SELECT set_config('lock_timeout', :own, true)", {"own": "7s"})] and free.rolled_back == 0
+    assert database._LOCK_TIMEOUT_MS == 5000 != 7000
     held = Postgres(OperationalError("SELECT ... FOR SHARE", {}, Held()))
     with pytest.raises(sso_router.ProviderRowBusy):
         sso_router._provider_as_it_stands(held, pid)

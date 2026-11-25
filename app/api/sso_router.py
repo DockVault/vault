@@ -183,7 +183,8 @@ def _provider_as_it_stands(db, provider_id) -> Optional[SsoProvider]:
     A save of this provider that is under way holds the row, and settles every linked account before it commits.
     This read waits for it a short time only (PROVIDER_ROW_WAIT_MS, in place of the connection's own, longer
     wait): the routes that call it are answered on the server's one loop, and a wait here is a wait for every
-    request. Still held after that, :class:`ProviderRowBusy`: nothing was written, and the person tries again."""
+    request. Still held after that, :class:`ProviderRowBusy`: nothing was written, and the person tries again.
+    The transaction gets the wait it had back afterwards (read before), as sign_in.with_a_short_wait gives it."""
     try:
         pid = uuid.UUID(str(provider_id))
     except ValueError:
@@ -191,7 +192,9 @@ def _provider_as_it_stands(db, provider_id) -> Optional[SsoProvider]:
     db.flush()
     waits = _on_postgres(db)
     if waits:
-        db.execute(sa_text(f"SET LOCAL lock_timeout = {int(PROVIDER_ROW_WAIT_MS)}"))
+        own = db.execute(sa_text("SELECT current_setting('lock_timeout')")).scalar()
+        db.execute(sa_text("SELECT set_config('lock_timeout', :wait, true)"),
+                   {"wait": f"{int(PROVIDER_ROW_WAIT_MS)}ms"})
     try:
         row = (db.query(SsoProvider).filter(SsoProvider.id == pid)
                .populate_existing().with_for_update(read=True).first())
@@ -201,8 +204,7 @@ def _provider_as_it_stands(db, provider_id) -> Optional[SsoProvider]:
         db.rollback()
         raise ProviderRowBusy() from None
     if waits:
-        from app.core import database
-        db.execute(sa_text(f"SET LOCAL lock_timeout = {int(database._LOCK_TIMEOUT_MS)}"))
+        db.execute(sa_text("SELECT set_config('lock_timeout', :own, true)"), {"own": own})
     return row
 
 
