@@ -15,6 +15,9 @@ application's own functions, the meeting forced with events.
 - A promotion sent with a switch of the account's SFTP access, of an account whose password somebody else set:
   recording the grant writes the account's row, and the take-back of the password then asks for the turn the
   sign-in holds, while the sign-in goes on to write that row. The promotion takes the turn first now.
+- A sign-in that finds the account's turn held for longer than it waits where it is written: answered as busy
+  after a short wait, with nothing written, and not after the connection's own, longer wait (the routes that
+  finish a sign-in are answered on the server's one loop).
 - A held sign-in that goes on (to a session, or to a further hold) and an administrator's deletion of the account
   at that moment: the sign-in has spent its held row and holds the account's turn; the deletion's removal of the
   account's held sign-ins and the sign-in's next write waited for each other, and the database ended one of the
@@ -270,6 +273,37 @@ def a_deletion(admin_id, uid):
     return run
 
 
+def a_turn_held(uid, seconds):
+    """Something that holds the account's turn for a while, as a change that settles many accounts does."""
+    def run():
+        with SessionLocal() as s:
+            _take(s, uid)
+            in_turn.set()
+            time.sleep(seconds)
+            s.rollback()
+            return "let go"
+    return run
+
+
+def a_sign_in_that_comes_meanwhile(uid):
+    def run():
+        in_turn.wait(15)
+        s = SessionLocal()
+        try:
+            user = s.get(User, uid)
+            result = sign_in.SignInResult(user, [sign_in.PASSWORD], IP, sessions_ended=sign_in.as_read(user))
+            started = time.monotonic()
+            try:
+                sign_in.complete_sign_in(s, result)
+            finally:
+                waited.append(round(time.monotonic() - started, 2))
+            return "signed in"
+        finally:
+            s.close()
+    return run
+
+
+waited = []
 pair, out = os.environ["PAIR"], {}
 ada, _ = account("ada", RoleEnum.ADMIN)
 bea, _ = account("bea", RoleEnum.ADMIN)
@@ -346,6 +380,9 @@ elif pair in ("a deletion and a held sign-in that becomes a session", "a deletio
     with SessionLocal() as s:
         out["the account is there"] = s.get(User, alice) is not None
     out["sessions"], out["held"], out["the sign-in stayed"] = sessions(alice), held_open(alice), spent.is_set()
+elif pair == "a turn held for longer than a sign-in waits":
+    out = together(holder=a_turn_held(alice, 2.5), writer=a_sign_in_that_comes_meanwhile(alice))
+    out["sessions"], out["the sign-in waited"] = sessions(alice), waited
 elif pair in ("a session read before", "a held sign-in read before"):
     with SessionLocal() as s:
         user = s.get(User, alice)
@@ -408,3 +445,12 @@ def test_a_deletion_and_a_held_sign_in_that_goes_on_both_finish(db_name, becomes
     assert out["ender"] == ["ok", "deleted"], out            # not ended by the database as one of a ring of waiters
     assert out["ender seconds"] >= 1.0, out                  # it waited for the turn the sign-in held
     assert out["the account is there"] is False and out["sessions"] == [] and out["held"] == 0, out
+
+
+def test_a_sign_in_waits_a_short_time_for_a_turn_that_is_held_and_is_answered_as_busy(db_name):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "a turn held for longer than a sign-in waits"})
+    assert out["holder"] == ["ok", "let go"], out
+    assert out["writer"][:3] == ["error", "HTTPException", "503"], out
+    (waited,) = out["the sign-in waited"]
+    assert 0.3 <= waited < 1.5, out                          # its own short wait: not the 2.5 s, nor the connection's 5
+    assert out["sessions"] == [], out

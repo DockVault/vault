@@ -521,3 +521,40 @@ def test_a_change_of_somebody_elses_account_takes_that_accounts_turn_before_it_t
     order = [source.index(step) for step in steps]
     assert order == sorted(order), order
     assert source.count("_sessions_turn(db, user.id)") == 1
+
+
+def test_a_sign_in_waits_a_short_time_for_its_turn_and_the_transaction_gets_its_own_wait_back(monkeypatch):
+    """Where a sign-in is written it runs on the server's one loop: the wait for the account's turn is bounded
+    for that one statement, and the transaction's own wait is put back for what follows. Elsewhere than on
+    PostgreSQL nothing is set (there is no such wait there)."""
+    import types
+    import uuid
+    from app.api import api_server as api
+    from app.core import database
+    from app.services import sign_in
+
+    class Session:
+        def __init__(self, dialect):
+            self.said, self.dialect = [], dialect
+
+        def get_bind(self):
+            return types.SimpleNamespace(dialect=types.SimpleNamespace(name=self.dialect))
+
+        def execute(self, statement, params=None):
+            self.said.append(str(statement))
+
+    assert sign_in.WRITE_WAIT_MS == 500 < database._LOCK_TIMEOUT_MS
+    alice = uuid.uuid4()
+    monkeypatch.setattr(api, "_sessions_turn", lambda db, user_id: db.said.append(("the turn", user_id)))
+    pg = Session("postgresql")
+    assert sign_in.with_a_short_wait(pg, lambda: api._sessions_turn(pg, alice) or "taken") == "taken"
+    assert pg.said == ["SET LOCAL lock_timeout = 500", ("the turn", alice),
+                       f"SET LOCAL lock_timeout = {database._LOCK_TIMEOUT_MS}"]
+    other = Session("sqlite")
+    sign_in.with_a_short_wait(other, lambda: api._sessions_turn(other, alice))
+    assert other.said == [("the turn", alice)]
+    # The writer takes its turn through it, and nothing else.
+    import inspect
+    source = inspect.getsource(sign_in.in_the_accounts_turn)
+    assert "with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))" in source
+    assert source.count("_sessions_turn(") == 1

@@ -284,6 +284,35 @@ def ended_of(pending: Optional[PendingLogin]) -> int:
     return read if isinstance(read, int) else -1
 
 
+# How long a sign-in waits for a lock at the point where it is written. The routes that finish a sign-in are
+# answered on the server's one loop, where a wait is a wait for every request of every person; the connection's own
+# wait (app/core/database.py, five seconds) is for work that runs off that loop. A lock still held after this is
+# answered as busy, with nothing written, and the person tries again.
+WRITE_WAIT_MS = 500
+
+
+def _on_postgres(db) -> bool:
+    try:
+        return db.get_bind().dialect.name == "postgresql"
+    except Exception:  # noqa: BLE001 -- a stand-in session of a test, or SQLite: no such setting there
+        return False
+
+
+def with_a_short_wait(db, take):
+    """Run ``take``, which takes a lock, with the wait for it bounded by :data:`WRITE_WAIT_MS`, and give the
+    transaction its own wait back afterwards. A lock still held raises what the database raises
+    (lock_not_available), with the transaction as the database leaves it: the caller rolls back and answers."""
+    from sqlalchemy import text
+    from app.core import database
+    bounded = _on_postgres(db)
+    if bounded:
+        db.execute(text(f"SET LOCAL lock_timeout = {int(WRITE_WAIT_MS)}"))
+    taken = take()
+    if bounded:
+        db.execute(text(f"SET LOCAL lock_timeout = {int(database._LOCK_TIMEOUT_MS)}"))
+    return taken
+
+
 def in_the_accounts_turn(db, result: "SignInResult") -> None:
     """Before a session or a held sign-in is written for ``result``: take the account's turn at its sessions and
     judge the sign-in again in it, on the account as it is committed.
@@ -304,10 +333,11 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
     from app.api import api_server as api
     user = result.user
     try:
-        api._sessions_turn(db, user.id)
+        with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))
     except OperationalError as waited:
-        # The turn was held for longer than the connection waits (a change that settles many accounts at once).
-        # Nothing was written: the sign-in is refused as busy, and a session its proof made goes with it.
+        # The turn was held for longer than a sign-in waits where it is written (a change that settles many
+        # accounts at once). Nothing was written: the sign-in is refused as busy, and a session its proof made
+        # goes with it.
         if getattr(getattr(waited, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
             raise
         db.rollback()
