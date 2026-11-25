@@ -455,7 +455,7 @@ def test_a_key_set_up_on_the_providers_word_signs_in_after_the_provider_and_neve
     failures_before = list(w.h.failures)
     status, body = w.h.sign_in(auth, username="dana")
     assert status == 403, body
-    assert "through Contoso" in body["detail"] and "after that sign-in" in body["detail"], body
+    assert "through Sign in with Contoso" in body["detail"] and "after that sign-in" in body["detail"], body
     assert "password reset link" in body["detail"]
     assert w.h.failures[len(failures_before):] == [("dana", sign_in.KEY_AFTER_THE_PROVIDER_REASON, "passkey")]
     assert w.h.counted == [] and row.sign_count == 1 and row.last_used_at is None        # the proof was good

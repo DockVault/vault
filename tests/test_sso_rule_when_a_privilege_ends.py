@@ -89,8 +89,8 @@ def test_a_demotion_holds_an_account_made_at_a_first_sign_in_to_its_provider_aga
     db.commit()
     assert _as_it_stands(db, jay.id) == ("user", True, True, False)      # demoted, and held to Contoso again
     assert _held_again_records(db, jay.id) == [{"updated_username": "jay", "made_sso_only": True, "reason": "demoted"}]
-    assert told == [([(jay.id, "jay", "jay@example.com")], "Your account signs in only through contoso", (
-        "Your account is no longer an administrator. It signs in only through contoso from now on: its password "
+    assert told == [([(jay.id, "jay", "jay@example.com")], "Your account signs in only through Contoso", (
+        "Your account is no longer an administrator. It signs in only through Contoso from now on: its password "
         "and its SFTP password sign-in no longer work."))]
 
 
@@ -232,8 +232,8 @@ def test_an_auditor_grant_that_is_no_longer_open_has_the_rule_settled_once_it_is
     assert _as_it_stands(db, jay.id) == ("user", True, True, False)
     assert _held_again_records(db, jay.id) == [
         {"updated_username": "jay", "made_sso_only": True, "reason": "auditor_right_ended"}]
-    assert told == [([(jay.id, "jay", "jay@example.com")], "Your account signs in only through contoso", (
-        "Your account no longer holds the auditor right. It signs in only through contoso from now on: its "
+    assert told == [([(jay.id, "jay", "jay@example.com")], "Your account signs in only through Contoso", (
+        "Your account no longer holds the auditor right. It signs in only through Contoso from now on: its "
         "password and its SFTP password sign-in no longer work."))]
 
 
@@ -313,7 +313,7 @@ def test_what_signs_in_between_a_grants_end_and_its_settling_is_settled_with_the
     assert _held_again_records(db, jay.id) == [
         {"updated_username": "jay", "made_sso_only": True, "reason": "auditor_right_ended"}]
     assert ended == [ids["by a password"]]
-    assert [title for _users, title, _change in told] == ["Your account signs in only through contoso"]
+    assert [title for _users, title, _change in told] == ["Your account signs in only through Contoso"]
 
 
 def test_a_record_that_cannot_be_written_leaves_the_settling_as_it_is(db, world, monkeypatch):

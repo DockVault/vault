@@ -1602,7 +1602,8 @@ def renewal_refusal(db, user, provider_id, *, methods=(), subject: Optional[str]
     if identity is None or not same_identity(identity, subject):
         return unlinked
     provider = db.query(SsoProvider).filter(SsoProvider.id == row_id).first()
-    name = ((getattr(provider, "name", None) or "").strip() or (getattr(provider, "label", None) or "").strip()
+    # Named as its button names it: the person knows the provider by that, not by the administrators' name.
+    name = ((getattr(provider, "label", None) or "").strip() or (getattr(provider, "name", None) or "").strip()
             or "your identity provider")
     if provider is None or getattr(provider, "state", None) != "enabled":
         return f"Signing in through {name} is turned off. Sign in again another way, or ask an administrator."

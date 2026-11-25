@@ -549,14 +549,14 @@ def test_a_passkey_does_not_stand_in_for_the_provider(monkeypatch):
     told plainly to use the provider's button; one audit row with the password door's reason; nothing made."""
     from app.core.models import ActiveSession
     from app.services import sign_in as s
-    alice, p = _user(sso_only=True), _provider()
+    alice, p = _user(sso_only=True), _provider(label="Contoso")
     h = Resolving(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
     for method in (s.HARDWARE_KEY, s.SOFTWARE_KEY):
         with pytest.raises(s.ProviderOnly) as refused:
             _finish(h, alice, [method], user_verified=True, passwordless_allowed=True)
         assert refused.value.status_code == 403
-        assert refused.value.detail == ("Your organisation signs this account in through contoso. Use the "
-                                        "\u201cSign in with Contoso\u201d button on the sign-in page.")
+        assert refused.value.detail == ("Your organisation signs this account in through Contoso. Use the "
+                                        "\u201cContoso\u201d button on the sign-in page.")
     failures = [a for a in h.audits if a[0] == "login_failure"]
     assert failures == [("login_failure", "alice", s.PROVIDER_ONLY_REASON)] * 2
     assert h.db.rows_of(ActiveSession) == [] and alice.failed_login_attempts == 0
@@ -601,34 +601,36 @@ def test_a_temporary_credential_is_left_to_the_freshness_rule(monkeypatch):
 
 
 def test_the_message_names_the_provider_and_its_button(monkeypatch):
+    """Each provider is named as its button names it: the administrators call this one "entra-prod", and the person
+    has only ever seen "Contoso"."""
     privileged_accounts, sso_only = _mod()
-    alice, p = _user(sso_only=True), _provider(name="Contoso", label="Sign in with Contoso")
+    alice, p = _user(sso_only=True), _provider(name="entra-prod", label="Contoso")
     q = _provider(name="Fabrikam", label="Fabrikam SSO")
     h = Resolving(monkeypatch, [alice], [p, q], identities=[_identity(alice, p)])
     assert sso_only.provider_only_message(h.db, alice) == (
-        "Your organisation signs this account in through Contoso. Use the \u201cSign in with Contoso\u201d button on "
-        "the sign-in page.")
+        "Your organisation signs this account in through Contoso. Use the \u201cContoso\u201d button on the sign-in page.")
     # Two providers: both, and both buttons.
     from app.core.models import ExternalIdentity
     h.db.rows_of(ExternalIdentity).append(_identity(alice, q, subject="s-q"))
     assert sso_only.provider_only_message(h.db, alice) == (
-        "Your organisation signs this account in through Contoso or Fabrikam. Use the \u201cSign in with Contoso\u201d "
+        "Your organisation signs this account in through Contoso or Fabrikam SSO. Use the \u201cContoso\u201d "
         "or \u201cFabrikam SSO\u201d button on the sign-in page.")
     # One provider on the sign-in page and one not: both named, the button of the one that has it.
     q.show_on_sign_in = False
     assert sso_only.provider_only_message(h.db, alice) == (
-        "Your organisation signs this account in through Contoso or Fabrikam. Use the \u201cSign in with Contoso\u201d "
+        "Your organisation signs this account in through Contoso or Fabrikam SSO. Use the \u201cContoso\u201d "
         "button on the sign-in page.")
-    # A button without a label shows the provider's name.
+    # A button without a label shows the provider's name, and the sentence names it so too.
     q.show_on_sign_in, q.label = True, ""
     assert sso_only.provider_only_message(h.db, alice) == (
-        "Your organisation signs this account in through Contoso or Fabrikam. Use the \u201cSign in with Contoso\u201d "
+        "Your organisation signs this account in through Contoso or Fabrikam. Use the \u201cContoso\u201d "
         "or \u201cFabrikam\u201d button on the sign-in page.")
     # A provider not on the sign-in page: its link.
     q.state = "disabled"
     p.show_on_sign_in = False
     assert sso_only.provider_only_message(h.db, alice) == (
         "Your organisation signs this account in through Contoso. Use the sign-in link your organisation gave you.")
+    assert "entra-prod" not in sso_only.provider_only_message(h.db, alice)
     # No provider of the account enabled: ask an administrator.
     p.state = "disabled"
     assert "Ask your administrator" in sso_only.provider_only_message(h.db, alice)

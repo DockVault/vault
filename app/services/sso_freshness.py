@@ -53,13 +53,20 @@ class Deadline:
     identity_id: str
     user_id: str
     provider_id: str
-    provider_name: str          # the provider's name, else its button label
+    provider_name: str          # its name, else its button label: for the administrators and the records
     due: datetime               # naive UTC, like the columns
     refused: bool               # the provider refused the person after their last sign-in through it
     window_days: int = 0        # the provider's freshness window (0: off, a refusal alone)
     ends_sign_in: bool = False  # missed, it also closes the account's ways in that go through no provider
     provider_on: bool = True    # the provider is turned on here (its days close the other ways in only then)
     keys_only_hold: bool = False  # the hold on record is the vault's own, written while the days only paused keys
+    # What the sign-in page's button says (its label, else the name): the person knows the provider by it, so every
+    # sentence for the person names it so. The name is the administrators', and the person may never see it.
+    provider_label: str = ""
+
+    def __post_init__(self):
+        if not self.provider_label:
+            object.__setattr__(self, "provider_label", self.provider_name)
 
 
 def warning_lead(window_days: int) -> timedelta:
@@ -100,13 +107,15 @@ def deadline_of(identity, provider) -> Optional[Deadline]:
         return None
     since = last or getattr(identity, "linked_at", None) or datetime.utcnow()
     due = since + timedelta(days=days) if days > 0 else refused_at
-    name = (getattr(provider, "name", None) or "").strip() or (getattr(provider, "label", None) or "").strip()
+    name = (getattr(provider, "name", None) or "").strip()
+    label = (getattr(provider, "label", None) or "").strip()
     keys_only = getattr(identity, "keys_only_hold_at", None)
     return Deadline(identity_id=str(identity.id), user_id=str(identity.user_id), provider_id=str(identity.provider_id),
-                    provider_name=name or "your identity provider", due=due, refused=refused, window_days=days,
-                    ends_sign_in=bool(policy["sso_lapse_ends_sign_in"]),
+                    provider_name=name or label or "your identity provider", due=due, refused=refused,
+                    window_days=days, ends_sign_in=bool(policy["sso_lapse_ends_sign_in"]),
                     provider_on=getattr(provider, "state", None) == "enabled",
-                    keys_only_hold=bool(refused and keys_only is not None and keys_only == refused_at))
+                    keys_only_hold=bool(refused and keys_only is not None and keys_only == refused_at),
+                    provider_label=label or name or "your identity provider")
 
 
 def deadlines(db, user_id) -> List[Deadline]:
@@ -222,8 +231,13 @@ def closes_a_connection(db, user, *, by_password: bool) -> bool:
     return lapsed(db, getattr(user, "id", None)) is not None
 
 
+def _button_name(row) -> str:
+    """What ``row``'s button on the sign-in page says: its label, else its name. The person knows a provider by it."""
+    return (getattr(row, "label", None) or "").strip() or (getattr(row, "name", None) or "").strip()
+
+
 def _how_to_reach(row, name: str) -> str:
-    label = (getattr(row, "label", None) or "").strip() or name
+    label = _button_name(row) or name
     return (f"Use the “{label}” button on the sign-in page." if getattr(row, "show_on_sign_in", True)
             else "Use the sign-in link your organisation gave you.")
 
@@ -232,8 +246,8 @@ def another_way_in(db, found: Deadline) -> Optional[str]:
     """Where the provider that holds the account cannot let the person in now (it is off, or it refused them):
     another provider the account is linked to that is on and holds no refusal of it, as "You can sign in through
     X instead: ...", or None when there is none. A sign-in through any provider the account is linked to is let in
-    (:func:`held_to_a_provider`), so the person is not sent to an administrator while such a way stands. The
-    first by name, so the sentence is the same each time.
+    (:func:`held_to_a_provider`), so the person is not sent to an administrator while such a way stands. Named as
+    its button names it; the first by that, so the sentence is the same each time.
 
     A refusal the person has answered since (the provider admitted a later sign-in, which leaves the stamp where
     it is) holds nobody, and does not keep its provider from being named: skipped for the stamp alone, a provider
@@ -251,7 +265,7 @@ def another_way_in(db, found: Deadline) -> Optional[str]:
                                        # the account or is off: it is left out by one of the two)
         other = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
         if other is not None and getattr(other, "state", None) == "enabled":
-            name = (getattr(other, "name", None) or "").strip() or (getattr(other, "label", None) or "").strip()
+            name = _button_name(other)
             if name:
                 others.append((name.lower(), name, other))
     if not others:
@@ -262,16 +276,18 @@ def another_way_in(db, found: Deadline) -> Optional[str]:
 
 def way_in_text(db, found: Deadline) -> str:
     """What a person is told at a door that goes through no provider while :func:`held_to_a_provider` holds their
-    account: the provider by name and how to reach it; where it cannot be reached or has refused them, another
-    provider of theirs that lets them in (:func:`another_way_in`), or to ask an administrator when there is none.
-    Said only after the proof at that door was good."""
+    account: the provider as its button names it, and how to reach it; where it cannot be reached or has refused
+    them, another provider of theirs that lets them in (:func:`another_way_in`), or to ask an administrator when
+    there is none. Said only after the proof at that door was good."""
     from app.core.models import SsoProvider
-    name = found.provider_name
+    name = found.provider_label
     row = None
     try:
         row = db.query(SsoProvider).filter(SsoProvider.id == uuid.UUID(found.provider_id)).first()
     except ValueError:
         row = None
+    if row is not None:
+        name = _button_name(row) or name              # as the button says it now
     if row is None or getattr(row, "state", None) != "enabled":
         other = another_way_in(db, found)
         return (f"Your account signs in only through {name} until it has signed in there again, and {name} is not "
@@ -331,16 +347,17 @@ def after_a_hold_is_lifted(db, user, identity, provider, *, whose: str, now: Opt
     have run out as well: the days went on counting under the hold, and lifting it does not start them again.
     Then the keys stay paused until a sign-in through the provider, and where the provider closes the other ways
     in, and is on, the password and passkeys do too. Told "they work again" in that state, the person found that
-    nothing did."""
+    nothing did. The person reads the provider as its button names it, the administrators by its name."""
     now = now or datetime.utcnow()
     standing = deadline_of(identity, provider)
     if standing is None or standing.refused or standing.due > now:
         return (f"{whose} SSH keys, temporary credentials and devices work again unless another rule pauses them.")
     closed = closes_now(standing, now) and user is not None and closes_the_other_ways_in(db, user, standing)
-    return (f"{whose} time to sign in through {standing.provider_name} has run out as well, so {whose} SSH keys, "
+    named = standing.provider_label if whose == "your" else standing.provider_name
+    return (f"{whose} time to sign in through {named} has run out as well, so {whose} SSH keys, "
             "temporary credentials and devices stay paused"
             + (f", and {whose} password and passkeys sign in to nothing," if closed else "")
-            + f" until a sign-in through {standing.provider_name}.")
+            + f" until a sign-in through {named}.")
 
 
 def due_date(db, user_id) -> Optional[datetime]:
@@ -352,16 +369,18 @@ def due_date(db, user_id) -> Optional[datetime]:
 def refusal_text(found: Deadline, *, sign_in_too: bool = False) -> str:
     """What a person whose deadline is missed is told; ``sign_in_too`` for one whose other ways in closed with it
     (:func:`closes_the_other_ways_in`)."""
-    return (LAPSE_MESSAGE_ALL if sign_in_too else LAPSE_MESSAGE).format(provider=found.provider_name)
+    return (LAPSE_MESSAGE_ALL if sign_in_too else LAPSE_MESSAGE).format(provider=found.provider_label)
 
 
 def warning_text(found: Deadline, when: str, *, sign_in_too: bool = False) -> str:
+    """What the warning email tells the person: the provider as its button names it, and the date."""
+    name = found.provider_label
     if sign_in_too:
-        return (f"Sign in through {found.provider_name} by {when}. If you do not, your password and passkeys stop "
+        return (f"Sign in through {name} by {when}. If you do not, your password and passkeys stop "
                 "signing you in then, your SSH keys, temporary credentials and devices pause, and a sign-in "
-                f"through {found.provider_name} restores them.")
-    return (f"Sign in through {found.provider_name} by {when}. If you do not, your SSH keys, temporary credentials "
-            f"and devices pause then, and a sign-in through {found.provider_name} restores them.")
+                f"through {name} restores them.")
+    return (f"Sign in through {name} by {when}. If you do not, your SSH keys, temporary credentials "
+            f"and devices pause then, and a sign-in through {name} restores them.")
 
 
 def _identities_with_deadlines(db) -> list:
@@ -446,14 +465,15 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
         too = closes_the_other_ways_in(db, user, found)
         details = {"provider_id": found.provider_id, "identity_id": found.identity_id,
                    "expires_at": found.due.isoformat() + "Z", "ends_sign_in": too}
+        name = found.provider_label         # the person knows the provider by its button
         if found.due > now:
             told = api._notify_users(
-                [found.user_id], WARNED, title=f"Sign in through {found.provider_name} by {when}",
+                [found.user_id], WARNED, title=f"Sign in through {name} by {when}",
                 body=((f"Your password and passkeys stop signing you in on {when}, and your SSH keys, temporary "
-                       f"credentials and devices pause, unless you sign in through {found.provider_name} before "
+                       f"credentials and devices pause, unless you sign in through {name} before "
                        "then. Signing in there restores them at any time.") if too else
                       (f"Your SSH keys, temporary credentials and devices pause on {when} unless you sign in through "
-                       f"{found.provider_name} before then. Signing in restores them at any time.")),
+                       f"{name} before then. Signing in restores them at any time.")),
                 target=NOTICE_TARGET, dedup_prefix=f"{WARNED}:{found.identity_id}:{due_day}")
             warned += 1
             identity.freshness_warned_for = found.due
@@ -465,7 +485,7 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
         else:
             api._notify_users(
                 [found.user_id], EXPIRED,
-                title=(f"Sign in through {found.provider_name}: nothing else signs you in now" if too
+                title=(f"Sign in through {name}: nothing else signs you in now" if too
                        else "Your SSH keys and temporary credentials are paused"),
                 body=refusal_text(found, sign_in_too=too), target=NOTICE_TARGET,
                 dedup_prefix=f"{EXPIRED}:{found.identity_id}:{due_day}")

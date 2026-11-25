@@ -29,10 +29,10 @@ def _user(name="alice", **extra):
     return types.SimpleNamespace(**fields)
 
 
-def _provider(days=30, *, name="contoso", state="enabled", **policy):
+def _provider(days=30, *, name="contoso", label=None, state="enabled", **policy):
+    """A provider whose button shows its name unless ``label`` gives the button its own text."""
     stored = {"sso_freshness_days": days, **policy} if days is not None else dict(policy)
-    return types.SimpleNamespace(id=uuid.uuid4(), name=name, label="Sign in with " + name.title(), state=state,
-                                 kind="oidc", policy=stored)
+    return types.SimpleNamespace(id=uuid.uuid4(), name=name, label=label, state=state, kind="oidc", policy=stored)
 
 
 def _identity(user, provider, *, signed_in=None, linked=None, refused=None):
@@ -212,6 +212,40 @@ def test_the_sweep_warns_five_days_before_once_and_tells_once_when_keys_pause(to
     ia.last_sign_in_at = NOW + DAY
     assert F.sweep(db, NOW + 27 * DAY) == {"warned": 1, "lapsed": 1}     # bob lapses meanwhile
     assert told.emails[-1][2]["when"] == (NOW + 31 * DAY).strftime("%d %B %Y, %H:%M UTC")
+
+
+def test_the_person_reads_the_providers_button_text_and_the_administrators_its_name(told):
+    """An administrator names a provider "entra-prod" and gives its button the text "Contoso". The person knows it
+    only by the button: every sentence they read of their deadline, in the app, by email, at the door and when a
+    hold is lifted, says "Contoso". The administrators' list and records keep the name."""
+    admin = _user("root")
+    told.admins.append(admin)
+    alice, bob = _user(), _user("bob")
+    p = _provider(30, name="entra-prod", label="Contoso")
+    ia = _identity(alice, p, signed_in=NOW - 27 * DAY)                 # due in 3 days: warned
+    ib = _identity(bob, p, signed_in=NOW - 31 * DAY)                   # lapsed a day ago
+    db = _db([admin, alice, bob], [p], [ia, ib])
+    assert F.sweep(db, NOW) == {"warned": 1, "lapsed": 1}
+    due_a = (NOW + 3 * DAY).strftime("%d %B %Y, %H:%M UTC")
+    warned, expired, to_the_administrators = told.notices
+    assert warned[2] == f"Sign in through Contoso by {due_a}"
+    assert expired[2].startswith("Sign in through Contoso")
+    change = told.emails[0][2]["change"]
+    found_a, found_b = F.deadlines(db, alice.id)[0], F.deadlines(db, bob.id)[0]
+    to_the_person = [warned[2], warned[3], expired[2], expired[3], change,
+                     F.warning_text(found_a, due_a), F.warning_text(found_a, due_a, sign_in_too=True),
+                     F.refusal_text(found_b), F.refusal_text(found_b, sign_in_too=True), F.way_in_text(db, found_b),
+                     F.after_a_hold_is_lifted(db, bob, ib, p, whose="your", now=NOW)]
+    for text in to_the_person:
+        assert "Contoso" in text and "entra-prod" not in text, text
+    # The administrators: their list, their notice of the lifted hold, and the records, by the provider's name.
+    assert F.standing_of(db, now=NOW)[str(alice.id)]["provider"] == "entra-prod"
+    assert "entra-prod" in F.after_a_hold_is_lifted(db, bob, ib, p, whose="its", now=NOW)
+    assert found_a.provider_name == "entra-prod" and found_a.provider_label == "Contoso"
+    assert to_the_administrators[0] == str(admin.id) and "bob" in to_the_administrators[3]
+    # A provider with no button text of its own: its button shows its name, and so does every sentence.
+    p.label = None
+    assert F.deadlines(db, alice.id)[0].provider_label == "entra-prod"
 
 
 def test_the_sweep_sends_no_email_to_an_account_without_an_address(told):

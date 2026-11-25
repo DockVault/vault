@@ -1321,7 +1321,7 @@ def test_an_identity_whose_provider_refused_or_lapsed_is_not_unlinked_by_its_own
     """Unlinking would end the provider's say over the account's keys and credentials: refused while the provider's
     refusal stands or its window has lapsed, whatever the provider's state; allowed once the person signed in again."""
     from datetime import timedelta
-    alice, p = _user(), _provider(policy=ONE_STEP)
+    alice, p = _user(), _provider(policy=ONE_STEP, label="Contoso")
     identity = _identity(alice, p, refused_at=datetime.utcnow())
     h = Harness(monkeypatch, [alice], [p], identities=[identity])
     for state in ("enabled", "disabled"):
@@ -1335,7 +1335,7 @@ def test_an_identity_whose_provider_refused_or_lapsed_is_not_unlinked_by_its_own
     p.state = "enabled"
     identity.refused_at, identity.last_sign_in_at = None, datetime.utcnow() - timedelta(days=31)
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
-    assert status == 409 and out["detail"]["message"] == "Sign in through contoso again before you unlink it."
+    assert status == 409 and out["detail"]["message"] == "Sign in through Contoso again before you unlink it."
     assert len(h.identities()) == 1
     identity.last_sign_in_at = datetime.utcnow()
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
@@ -1571,21 +1571,22 @@ def test_a_link_from_the_profile_that_meets_the_identity_linked_by_address_makes
 @pytest.mark.parametrize("state, said", [
     ("signed in yesterday", "{whose} SSH keys, temporary credentials and devices work again unless another rule pauses them."),
     ("days run out, the provider on and closing the other ways in",
-     "{whose} time to sign in through contoso has run out as well, so {whose} SSH keys, temporary credentials and "
-     "devices stay paused, and {whose} password and passkeys sign in to nothing, until a sign-in through contoso."),
+     "{whose} time to sign in through {who} has run out as well, so {whose} SSH keys, temporary credentials and "
+     "devices stay paused, and {whose} password and passkeys sign in to nothing, until a sign-in through {who}."),
     ("days run out, the provider off",
-     "{whose} time to sign in through contoso has run out as well, so {whose} SSH keys, temporary credentials and "
-     "devices stay paused until a sign-in through contoso."),
+     "{whose} time to sign in through {who} has run out as well, so {whose} SSH keys, temporary credentials and "
+     "devices stay paused until a sign-in through {who}."),
     ("days run out, the provider pausing keys only",
-     "{whose} time to sign in through contoso has run out as well, so {whose} SSH keys, temporary credentials and "
-     "devices stay paused until a sign-in through contoso."),
+     "{whose} time to sign in through {who} has run out as well, so {whose} SSH keys, temporary credentials and "
+     "devices stay paused until a sign-in through {who}."),
     ("no days asked", "{whose} SSH keys, temporary credentials and devices work again unless another rule pauses them."),
 ])
 def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, state, said):
     """An administrator lifts a hold. The provider's days went on counting under it, and lifting it does not
     start them again: where they have run out, the keys stay paused until a sign-in through the provider (and
     the password too, where the provider closes the other ways in and is on). The person and the administrators
-    were told "they work again" all the same, and nothing did."""
+    were told "they work again" all the same, and nothing did. The person reads the provider as its button names
+    it ("Contoso"), the administrators by its name ("contoso")."""
     from app.api import sso_admin_router as A
     from app.api import sso_providers_router as R
     from app.core import owner_notices
@@ -1596,7 +1597,8 @@ def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, sta
               "days run out, the provider off": {},
               "days run out, the provider pausing keys only": {"sso_lapse_ends_sign_in": False},
               "no days asked": {"sso_freshness_days": 0}}[state]
-    p = _provider(state="disabled" if state == "days run out, the provider off" else "enabled", policy=policy)
+    p = _provider(state="disabled" if state == "days run out, the provider off" else "enabled", policy=policy,
+                  label="Contoso")
     signed_in = yesterday if state == "signed in yesterday" else long_ago
     identity = _identity(alice, p, last_sign_in_at=signed_in, refused_at=datetime.utcnow())
     h = Harness(monkeypatch, [root, alice], [p], identities=[identity])
@@ -1607,8 +1609,9 @@ def test_a_lifted_hold_says_what_still_pauses_the_accounts_keys(monkeypatch, sta
                         lambda db, ids, *, title, body, ntype, target: noticed.append(body))
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
     assert status == 200 and body == {"cleared": True} and identity.refused_at is None
-    assert noticed == ["root lifted the refusal contoso recorded for your account: " + said.format(whose="your")]
-    assert told == ["root lifted the refusal contoso recorded for alice: " + said.format(whose="its")]
+    assert noticed == ["root lifted the refusal Contoso recorded for your account: "
+                       + said.format(whose="your", who="Contoso")]
+    assert told == ["root lifted the refusal contoso recorded for alice: " + said.format(whose="its", who="contoso")]
     # What the sentence says is what holds: the keys are paused exactly where it says they stay paused.
     assert (F.lapsed(h.db, alice.id) is not None) is ("stay paused" in noticed[0])
     assert (F.held_to_a_provider(h.db, alice) is not None) is ("sign in to nothing" in noticed[0])

@@ -287,6 +287,8 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     # provider's own refusal it does not.
     counts_for_a_removal = sso_freshness.lift_the_hold(identity, provider)
     label = ((provider.name or provider.label) if provider is not None else None) or "an identity provider"
+    # The person knows the provider by its button; the name is the administrators'.
+    person_label = ((provider.label or provider.name) if provider is not None else None) or "an identity provider"
     # What the lifting gives back, said as it is: the provider's days may have run out under the hold.
     to_the_person = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="your")
     to_the_administrators = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="its")
@@ -300,7 +302,7 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
         if user is not None:
             owner_notices.notify_in_transaction(
                 db, [user.id], title="An administrator lifted a sign-in refusal",
-                body=(f"{current_user.username} lifted the refusal {label} recorded for your account: "
+                body=(f"{current_user.username} lifted the refusal {person_label} recorded for your account: "
                       + to_the_person),
                 ntype="sso_refusal_cleared", target="#profile")
     except Exception as exc:  # noqa: BLE001 -- the clearing stands without its notice

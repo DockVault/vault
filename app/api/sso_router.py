@@ -1494,7 +1494,7 @@ def _what_unblocks_an_unlink(standing, now: datetime) -> str:
     - It is on, and a hold is on record: a sign-in it admits lifts the hold and gives new days. An
       administrator's lift helps only while the days have not run out as well; where they have, it is not named.
     - It is on and the days have run out: a sign-in through it."""
-    name = standing.provider_name
+    name = standing.provider_label
     if not standing.provider_on:
         return (f"{name} is turned off on this vault, so you cannot sign in through it, and it is not unlinked "
                 "here. Ask an administrator to unlink it for you.")

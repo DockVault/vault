@@ -61,8 +61,9 @@ def db(monkeypatch):
         engine.dispose()
 
 
-def _provider(db, *, name="Contoso", state="enabled", **policy):
-    row = SsoProvider(id=uuid.uuid4(), state=state, kind="oidc", name=name, label="Sign in with " + name,
+def _provider(db, *, name="Contoso", label=None, state="enabled", **policy):
+    """A provider whose button shows its name unless ``label`` gives the button its own text."""
+    row = SsoProvider(id=uuid.uuid4(), state=state, kind="oidc", name=name, label=label,
                       show_on_sign_in=True, policy=dict(policy) or None)
     db.add(row)
     db.commit()
@@ -508,6 +509,18 @@ def test_a_refusal_by_the_provider_is_not_renewed_until_a_later_sign_in_lifts_it
     identity.last_sign_in_at = datetime.utcnow()
     db.commit()
     assert sign_in.renew(db, user, old, client_ip="127.0.0.1").access_token
+
+
+def test_the_person_is_told_the_providers_button_text_not_its_name(db):
+    """The administrators name the provider "entra-prod"; the person knows it by its button, "Contoso"."""
+    p = _provider(db, name="entra-prod", label="Contoso", sso_freshness_days=30)
+    signed_in = datetime.utcnow() - timedelta(hours=2)
+    user, identity, old = _through(db, p, signed_in=signed_in, refused=signed_in + timedelta(hours=1))
+    assert _refused(db, user, old) == "Sign in through Contoso again to stay signed in."
+    p.state = "disabled"
+    db.commit()
+    assert _refused(db, user, old) == ("Signing in through Contoso is turned off. Sign in again another way, or ask "
+                                       "an administrator.")
 
 
 def test_a_refusal_counts_with_the_window_off(db):

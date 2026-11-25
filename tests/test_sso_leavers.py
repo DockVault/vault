@@ -29,7 +29,8 @@ from test_sso_sign_in import DB, _identity, _provider, _user  # noqa: E402
 pytestmark = pytest.mark.unit
 
 LONG_AGO = timedelta(days=40)          # past the thirty days a provider asks for unless it says otherwise
-NOT_AVAILABLE = ("Your account signs in only through Contoso until it has signed in there again, and Contoso is not "
+# Said of the provider as its button names it ({0}).
+NOT_AVAILABLE = ("Your account signs in only through {0} until it has signed in there again, and {0} is not "
                  "available on this vault right now. Ask your administrator.")
 
 
@@ -179,7 +180,7 @@ def test_turning_a_provider_off_hands_nobody_a_password_back():
     assert getattr(j, "refused_at", None) is None
     p.state = "disabled"
     assert F.held_to_a_provider(db, lapsed).refused and F.held_to_a_provider(db, refused_one).refused
-    assert F.way_in_text(db, F.held_to_a_provider(db, lapsed)) == NOT_AVAILABLE
+    assert F.way_in_text(db, F.held_to_a_provider(db, lapsed)) == NOT_AVAILABLE.format("Sign in with Contoso")
     assert F.held_to_a_provider(db, fresh_one) is None
     # Sixty days off: the account that was inside its days is still not held, though its keys have paused.
     later = datetime.utcnow() + timedelta(days=60)
@@ -202,7 +203,8 @@ def test_the_provider_that_holds_the_account_is_the_one_it_is_told_about():
     assert F.lapsed(db, alice.id).provider_id == str(p.id)
     held = F.held_to_a_provider(db, alice)
     assert held.provider_id == str(q.id) and held.provider_name == "Fabrikam"
-    assert F.way_in_text(db, held).startswith("Sign in through Fabrikam: ")
+    assert held.provider_label == "Sign in with Fabrikam"
+    assert F.way_in_text(db, held).startswith("Sign in through Sign in with Fabrikam: ")
     # Of two that hold the account, the one whose days ran out first is named.
     r = _provider(name="Northwind", label="Sign in with Northwind")
     k = _identity(alice, r, subject="subject-3", last_sign_in_at=datetime.utcnow() - timedelta(days=31))
@@ -220,9 +222,9 @@ def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
     alice, p, i, db = _world()
     held = F.held_to_a_provider(db, alice)
     assert F.way_in_text(db, held) == (
-        "Sign in through Contoso: your account has not signed in there within the time your organisation allows, so "
-        "its password and passkeys do not sign it in until it does. Use the “Sign in with Contoso” button on the "
-        "sign-in page.")
+        "Sign in through Sign in with Contoso: your account has not signed in there within the time your "
+        "organisation allows, so its password and passkeys do not sign it in until it does. Use the “Sign in with "
+        "Contoso” button on the sign-in page.")
     p.show_on_sign_in = False
     assert F.way_in_text(db, held).endswith("until it does. Use the sign-in link your organisation gave you.")
     p.show_on_sign_in, p.label = True, ""
@@ -241,19 +243,22 @@ def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
     p.show_on_sign_in = True
     # A provider that is off sends nobody to a button that is not there (an account held before it went off).
     p.state = "disabled"
-    assert F.way_in_text(db, held) == NOT_AVAILABLE and F.way_in_text(db, refused) == NOT_AVAILABLE
+    gone = NOT_AVAILABLE.format("Contoso")              # (its button has shown its name since the label went)
+    assert F.way_in_text(db, held) == gone and F.way_in_text(db, refused) == gone
     p.state = "draft"                                    # nor one that is not finished
-    assert F.way_in_text(db, refused) == NOT_AVAILABLE
-    db.tables[SsoProvider].clear()
-    assert F.way_in_text(db, held) == NOT_AVAILABLE
+    assert F.way_in_text(db, refused) == gone
+    db.tables[SsoProvider].clear()                       # no row to read: the name the deadline carries
+    assert F.way_in_text(db, held) == NOT_AVAILABLE.format(held.provider_label)
 
 
 def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
     """Dana is linked to Contoso, which refused her (or is off), and to Fabrikam, which is on. The door said "ask
     your administrator", though a sign-in through Fabrikam lets her in: a sign-in through any provider the account
     is linked to does. The sentence names that way. Not a provider that is off, one that refused her too, or one
-    she is not linked to; and where the holding provider itself can be reached, it alone is named."""
+    she is not linked to; and where the holding provider itself can be reached, it alone is named. Each is named
+    as its button names it."""
     alice, p, i, db = _world()
+    p.label = ""                                         # Contoso's button shows its name
     fabrikam = _provider(name="Fabrikam", label="Staff sign-in")
     adatum = _provider(name="Adatum", label="")
     fabrikam.id, adatum.id = uuid.uuid4(), uuid.uuid4()
@@ -265,19 +270,19 @@ def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
     assert refused.refused and refused.provider_id == str(p.id)
     assert F.way_in_text(db, refused) == (
         "Your account is held to a sign-in through Contoso: its password and passkeys do not sign it in until "
-        "Contoso admits it. You can sign in through Fabrikam instead: Use the “Staff sign-in” button on the "
+        "Contoso admits it. You can sign in through Staff sign-in instead: Use the “Staff sign-in” button on the "
         "sign-in page.")
     assert F.another_way_in(db, refused) == (
-        "You can sign in through Fabrikam instead: Use the “Staff sign-in” button on the sign-in page.")
+        "You can sign in through Staff sign-in instead: Use the “Staff sign-in” button on the sign-in page.")
     fabrikam.show_on_sign_in = False
     assert F.way_in_text(db, refused).endswith(
-        "You can sign in through Fabrikam instead: Use the sign-in link your organisation gave you.")
+        "You can sign in through Staff sign-in instead: Use the sign-in link your organisation gave you.")
     fabrikam.show_on_sign_in = True
     # The holding provider off: the same way is named in the place of the administrator.
     p.state = "disabled"
     assert F.way_in_text(db, refused) == (
         "Your account signs in only through Contoso until it has signed in there again, and Contoso is not "
-        "available on this vault right now. You can sign in through Fabrikam instead: Use the “Staff sign-in” "
+        "available on this vault right now. You can sign in through Staff sign-in instead: Use the “Staff sign-in” "
         "button on the sign-in page.")
     p.state = "enabled"
     # A provider she is not linked to is no way in, whatever its state and whoever else is linked to it.
@@ -285,14 +290,14 @@ def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
     db.tables[User].append(bob)
     db.tables[ExternalIdentity].append(_identity(bob, adatum, subject="s-bob", last_sign_in_at=datetime.utcnow()))
     assert "Adatum" not in F.way_in_text(db, refused)
-    # Two ways: the first by name, the same each time.
+    # Two ways: the first as their buttons name them, the same each time.
     also = _identity(alice, adatum, subject="s-ada", last_sign_in_at=datetime.utcnow())
     db.tables[ExternalIdentity].append(also)
     assert F.another_way_in(db, refused) == (
         "You can sign in through Adatum instead: Use the “Adatum” button on the sign-in page.")
     # One that is off, or that refused her too, is none.
     adatum.state = "disabled"
-    assert F.another_way_in(db, refused).startswith("You can sign in through Fabrikam instead")
+    assert F.another_way_in(db, refused).startswith("You can sign in through Staff sign-in instead")
     hers.refused_at = datetime.utcnow()
     assert F.another_way_in(db, refused) is None
     assert F.way_in_text(db, refused).endswith("If Contoso does not admit you, ask your administrator.")
@@ -309,7 +314,7 @@ def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
     lapsed = F.held_to_a_provider(db, alice)
     assert lapsed is not None and not lapsed.refused
     said = F.way_in_text(db, lapsed)
-    assert said.startswith("Sign in through Contoso: ") and "Fabrikam" not in said and "Adatum" not in said
+    assert said.startswith("Sign in through Contoso: ") and "Staff sign-in" not in said and "Adatum" not in said
 
 
 # --------------------------------------------------------------------------- the password door

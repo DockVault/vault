@@ -231,7 +231,7 @@ def test_an_account_held_to_its_providers_sign_in_adds_no_other_way_in(db, world
             run_coroutine(route(body=None, request=_request(), current_user=me, db=db, **how))
         assert refused.value.status_code == 409, (route.__name__, refused.value.detail)
         assert refused.value.detail["reason"] == "sso_sign_in_due"
-        assert refused.value.detail["message"].startswith("Sign in through contoso: ")
+        assert refused.value.detail["message"].startswith("Sign in through Contoso: ")       # its button's text
     # Inside its days the account is not refused for that (the link then meets its own checks).
     identity.last_sign_in_at = datetime.utcnow()
     db.commit()

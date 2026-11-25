@@ -469,8 +469,9 @@ def settle_privileged(db) -> list:
 
 def provider_only_message(db, user) -> str:
     """What a person is told when they try to sign in to an account that signs in only through its provider some
-    other way (a passkey): the organisation's provider by name and the button to use, or the link when the provider
-    is not on the sign-in page; when no provider of the account is enabled, to ask an administrator."""
+    other way (a passkey): the organisation's provider as its button names it and the button to use, or the link
+    when the provider is not on the sign-in page; when no provider of the account is enabled, to ask an
+    administrator."""
     names, buttons = _providers_to_name(db, user)
     if not names:
         return NO_PROVIDER_ON
@@ -504,7 +505,9 @@ def another_way_in(db, user, *, without) -> bool:
 
 
 def _providers_to_name(db, user) -> tuple:
-    """(the names, the button labels) of the enabled providers ``user`` is linked to, each once, in the order found."""
+    """(the names to tell the person, the button labels on the sign-in page) of the enabled providers ``user`` is
+    linked to, each once, in the order found. A provider is named to the person as its button names it (its label,
+    else its name): the person knows it by that, and the name is the administrators'."""
     from app.core.models import ExternalIdentity, SsoProvider
     names, buttons = [], []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
@@ -513,8 +516,8 @@ def _providers_to_name(db, user) -> tuple:
             continue
         name = (getattr(row, "name", None) or "").strip()
         label = (getattr(row, "label", None) or "").strip() or name       # the button shows the name when no label
-        if name and name not in names:
-            names.append(name)
+        if label and label not in names:
+            names.append(label)
         if getattr(row, "show_on_sign_in", True):
             if label and label not in buttons:
                 buttons.append(label)

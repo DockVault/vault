@@ -673,7 +673,7 @@ def test_your_account_is_told_for_each_identity_why_its_unlink_would_be_refused(
     monkeypatch.setattr(sso, "unlink_asks_the_provider", lambda db, user, identity, row: False)
     alice = _user()
     fine = _provider(name="fine", label="Fine")
-    lapsed = _provider(name="lapsed", label="Lapsed")
+    lapsed = _provider(name="lapsed", label="Contoso")       # the person knows a provider by its button
     refusing = _provider(name="refusing", label="Refusing")
     made = _provider(name="maker", label="Maker", policy={"sso_jit_password": False})
     rows = {
@@ -690,9 +690,9 @@ def test_your_account_is_told_for_each_identity_why_its_unlink_would_be_refused(
     said = told()
     assert said[str(fine.id)] is None
     assert said[str(lapsed.id)] == {"reason": "sso_freshness_lapsed",
-                                    "message": "Sign in through lapsed again before you unlink it."}
+                                    "message": "Sign in through Contoso again before you unlink it."}
     assert said[str(refusing.id)] == {"reason": "sso_freshness_lapsed", "message": (
-        "Your account is held to a sign-in through refusing: sign in there again, or ask an administrator to lift "
+        "Your account is held to a sign-in through Refusing: sign in there again, or ask an administrator to lift "
         "the hold, before you unlink it.")}
     # What the list says is what the unlink answers.
     for name in ("lapsed", "refusing"):
@@ -703,8 +703,8 @@ def test_your_account_is_told_for_each_identity_why_its_unlink_would_be_refused(
     rows["refusing"].last_sign_in_at = datetime.utcnow() - timedelta(days=40)
     rows["refusing"].refused_at = datetime.utcnow()
     assert told()[str(refusing.id)]["message"] == (
-        "Your account is held to a sign-in through refusing: sign in there again before you unlink it. If "
-        "refusing does not admit you, ask an administrator to unlink it for you.")
+        "Your account is held to a sign-in through Refusing: sign in there again before you unlink it. If "
+        "Refusing does not admit you, ask an administrator to unlink it for you.")
     # The provider is turned off: nobody signs in through it, whatever stands in the way. Sent to "sign in
     # through it again", the person found no button for it; and after a lift, the days.
     for off in (lapsed, refusing):
@@ -712,7 +712,7 @@ def test_your_account_is_told_for_each_identity_why_its_unlink_would_be_refused(
     said = told()
     for off in (lapsed, refusing):
         assert said[str(off.id)] == {"reason": "sso_freshness_lapsed", "message": (
-            f"{off.name} is turned off on this vault, so you cannot sign in through it, and it is not unlinked "
+            f"{off.label} is turned off on this vault, so you cannot sign in through it, and it is not unlinked "
             "here. Ask an administrator to unlink it for you.")}
     for name in ("lapsed", "refusing"):
         status, body, _ = _call(h.S, "DELETE", f"/users/me/identities/{rows[name].id}")
