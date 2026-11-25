@@ -477,23 +477,42 @@ def _audit(db, action: str, *, user=None, ip, details: dict, status_: str = "suc
 # --------------------------------------------------------------------------- the held requests
 
 def requests(db, *, now: Optional[datetime] = None):
-    """(held, decided) requests, newest first; a held one past its time is marked expired here, with its row."""
+    """(held, decided) requests, newest first. A held one past its time is listed with the decided ones, as it
+    stands: reading changes and records nothing, since :func:`expire_due` marks it expired and records it."""
     from app.core.models import SsoAdminRequest
     now = now or datetime.utcnow()
     rows = sorted(db.query(SsoAdminRequest).all(), key=lambda r: r.requested_at or now, reverse=True)
     held, decided = [], []
     for r in rows:
-        if r.state == HELD and r.expires_at <= now:
-            # Guarded by the row's state as the database holds it: a decision landing this second is not overwritten.
-            expired = db.query(SsoAdminRequest).filter(SsoAdminRequest.id == r.id, SsoAdminRequest.state == HELD,
-                                                       SsoAdminRequest.expires_at <= now).update(
-                {"state": EXPIRED, "decided_at": now}, synchronize_session=False)
-            if expired:
-                r.state, r.decided_at = EXPIRED, now
-                _audit(db, "sso_admin_expired", ip=None, resource_type="sso_admin_request", resource_id=str(r.id),
-                       details={"provider_id": str(r.provider_id), "user_id": str(r.user_id)})
-        (held if r.state == HELD else decided).append(r)
+        (held if r.state == HELD and r.expires_at > now else decided).append(r)
     return held, decided
+
+
+def expire_due(db, *, now: Optional[datetime] = None) -> int:
+    """Mark expired each held request whose seven days ran out, at the moment it expired, and record each as the
+    server's (no person, no address, no browser). Run by the periodic cleanup, outside any request; one commit.
+    Returns how many expired."""
+    from app.core.models import SsoAdminRequest, User
+    from app.services.audit_logger import AuditLogger
+    now = now or datetime.utcnow()
+    due = db.query(SsoAdminRequest).filter(SsoAdminRequest.state == HELD, SsoAdminRequest.expires_at <= now).all()
+    expired = []
+    for r in due:
+        # Guarded by the row's state as the database holds it: a decision landing this second is not overwritten.
+        if db.query(SsoAdminRequest).filter(SsoAdminRequest.id == r.id, SsoAdminRequest.state == HELD,
+                                            SsoAdminRequest.expires_at <= now).update(
+                {"state": EXPIRED, "decided_at": r.expires_at}, synchronize_session=False):
+            expired.append(r)
+    if not expired:
+        return 0
+    names = {u.id: u.username for u in db.query(User).filter(User.id.in_([r.user_id for r in expired])).all()}
+    for r in expired:
+        db.add(AuditLogger(db).build_row(
+            action="sso_admin_expired", status="success", resource_type="sso_admin_request", resource_id=str(r.id),
+            details={"provider_id": str(r.provider_id), "user_id": str(r.user_id),
+                     "target_username": names.get(r.user_id), "expires_at": r.expires_at.isoformat() + "Z"}))
+    db.commit()
+    return len(expired)
 
 
 def approver_refusal(db, approver, request) -> Optional[str]:

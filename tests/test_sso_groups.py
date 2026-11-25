@@ -3,7 +3,8 @@ administrator requests (app/api/sso_admin_router.py): joins and leaves per mappi
 alone; a token without group information changing nothing but telling the administrators; a user or external role
 applied once and never demoting an administrator; the administrator request opened once and granted only by another
 administrator's approval through the promotion path under the approver rules; the demotion of an administrator
-made that way who left the group, except the last one able to act; the list and its lazy expiry. Offline."""
+made that way who left the group, except the last one able to act; the list, and the expiry by the periodic
+cleanup. Offline."""
 import types
 import uuid
 from datetime import datetime, timedelta
@@ -333,16 +334,33 @@ def test_an_approvals_grant_stamped_a_second_before_the_decision_is_still_the_ap
     assert bob.role == RoleEnum.USER and len(h.role_sets) == 1
 
 
-def test_the_lazy_expiry_touches_only_a_row_still_held():
+def test_the_expiry_touches_only_a_row_still_held():
     """The memory store runs no two sessions at once: the guard is pinned in the source. The expiry is one UPDATE
     whose WHERE repeats the state and the time, so a decision that landed meanwhile is never overwritten."""
     import inspect
     from app.services import sso_groups
-    source = inspect.getsource(sso_groups.requests)
+    source = inspect.getsource(sso_groups.expire_due)
     update = source[source.index(".update("):]
     where = source[source.index("filter(SsoAdminRequest.id == r.id"):source.index(".update(")]
     assert "SsoAdminRequest.state == HELD" in where and "SsoAdminRequest.expires_at <= now" in where
     assert "synchronize_session=False" in update
+
+
+def test_the_expiry_is_recorded_by_the_periodic_cleanup_as_the_servers_own_row():
+    """No request is served when a held request expires, so its row is the server's: the catalog marks it automatic
+    (the Activity page shows it as the system's), and the periodic cleanup, which runs outside any request, is what
+    expires the requests; the list only shows them."""
+    import inspect
+    from app.core import audit_catalog
+    from app.services import sso_groups
+    assert audit_catalog.lookup("sso_admin_expired").automatic is True
+    from test_sso_sign_in import _api
+    S = _api()
+    cleanup = inspect.getsource(S.cleanup_expired_sessions)
+    assert "sso_groups.expire_due(db)" in cleanup
+    assert cleanup.index("_expire_held_credential_changes(db)") < cleanup.index("sso_groups.expire_due(db)")
+    reading = inspect.getsource(sso_groups.requests)
+    assert ".update(" not in reading and "_audit(" not in reading
 
 
 def test_a_decision_reads_the_request_locked_after_the_step_up():
@@ -401,6 +419,7 @@ def _grant(h, admin, granted_at, lineage=(), granted_by_id=None):
 
 
 def test_the_request_is_decided_by_another_administrator_under_the_approver_rules(monkeypatch):
+    from app.services.audit_logger import AuditLogger as real_logger      # before the harness observes it
     bob, root = _user("bob", password_set_by_other_at=None), _user("root", role="admin", password_set_by_other_at=None)
     p = _provider(policy={"sso_admin_mapping": True})
     h = Grouping(monkeypatch, [bob, root], [p])
@@ -542,11 +561,40 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     assert status == 200 and h.status_notices[-1] == ("carol", "root", ("external", "admin"), ["old-permission"])
     assert ([str(carol.id)], "Your administrator role was not granted") in h.notices
     assert any(a[0] == "sso_admin_denied" and a[1] == "success" for a in h.audits)
-    # Expired: marked as it is read, and undecidable.
+    # Expired: listed as expired and undecidable, but a read changes nothing and records nothing; the reading
+    # administrator's address and browser are not the expiry's.
     stale = _request_for(h, p, carol, requested_at=datetime.utcnow() - timedelta(days=8), expires_at=datetime.utcnow() - timedelta(days=1))
     status, body, _ = _call(S, "GET", "/admin/sso/admin-requests")
-    assert stale.state == "expired" and any(r["id"] == str(stale.id) and r["state"] == "expired" for r in body["decided"])
-    assert any(a[0] == "sso_admin_expired" for a in h.audits)
+    assert status == 200, body
+    (shown,) = [r for r in body["decided"] if r["id"] == str(stale.id)]
+    assert not any(r["id"] == str(stale.id) for r in body["held"])
+    assert shown["state"] == "expired" and shown["you_may_decide"] is False and shown["refusal"] is None
+    assert shown["decided_at"] == stale.expires_at.isoformat() + "Z"
+    assert stale.state == "held" and stale.decided_at is None
+    assert not any(a[0] == "sso_admin_expired" for a in h.audits)
+    status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{stale.id}/approve")
+    assert status == 409 and body["detail"]["reason"] == "expired", body
+    assert stale.state == "held" and not any(a[0] == "sso_admin_expired" for a in h.audits)
+    # The periodic cleanup marks it expired at the moment it expired and records it once, as the server's.
+    from app.services import sso_groups
+    assert sso_groups.expire_due(h.db) == 1
+    assert stale.state == "expired" and stale.decided_at == stale.expires_at
+    expired_rows = [a for a in h.audits if a[0] == "sso_admin_expired"]
+    assert expired_rows == [("sso_admin_expired", "success", {
+        "provider_id": str(p.id), "user_id": str(carol.id), "target_username": "carol",
+        "expires_at": stale.expires_at.isoformat() + "Z"})], expired_rows
+    assert [w for w in h.audit_who if w[0] == "sso_admin_expired"] == [("sso_admin_expired", None)]
+    # What it asked for, as the real logger writes it outside a request: no person, no address, no browser, and
+    # the details kept whole.
+    (asked,) = [r for r in h.db.rows_of(types.SimpleNamespace) if getattr(r, "action", None) == "sso_admin_expired"]
+    asked = dict(vars(asked))
+    assert not {"user", "user_id", "username", "ip_address", "user_agent", "method", "endpoint"} & set(asked), asked
+    written = real_logger(h.db).build_row(**asked)
+    assert written.user_id is None and written.username is None
+    assert written.ip_address is None and written.user_agent is None and written.endpoint is None
+    assert written.details["target_username"] == "carol"
+    assert written.details["expires_at"] == stale.expires_at.isoformat() + "Z"
+    assert sso_groups.expire_due(h.db) == 0 and len([a for a in h.audits if a[0] == "sso_admin_expired"]) == 1
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{stale.id}/approve")
     assert status == 409 and body["detail"]["reason"] == "decided", body
     assert _call(S, "POST", f"/admin/sso/admin-requests/{uuid.uuid4()}/approve")[0] == 404

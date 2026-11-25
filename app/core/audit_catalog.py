@@ -128,7 +128,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("sso_admin_requested", "accounts", "Administrator role requested by a single sign-on group", "notice"),
     AuditAction("sso_admin_approved", "accounts", "Single sign-on administrator request approved", "notice"),
     AuditAction("sso_admin_denied", "accounts", "Single sign-on administrator request denied", "notice"),
-    AuditAction("sso_admin_expired", "accounts", "Single sign-on administrator request expired", "info"),
+    AuditAction("sso_admin_expired", "accounts", "Single sign-on administrator request expired", "info",
+                automatic=True),
     # A second change to someone's sign-in details within 14 days is held for another administrator's
     # approval. Short enough to read whole in a phone's row.
     AuditAction("credential_change_approval_refused", "accounts", "Approval refused (not independent)",

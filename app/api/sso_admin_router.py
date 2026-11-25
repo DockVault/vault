@@ -57,35 +57,41 @@ def _request_or_404(db, request_id, *, lock: bool = False) -> SsoAdminRequest:
     return row
 
 
-def _public(db, row: SsoAdminRequest, approver) -> dict:
+def _public(db, row: SsoAdminRequest, approver, *, now: Optional[datetime] = None) -> dict:
     user = db.query(User).filter(User.id == row.user_id).first()
     provider = db.query(SsoProvider).filter(SsoProvider.id == row.provider_id).first()
+    now = now or datetime.utcnow()
 
     def _t(value):
         return value.isoformat() + "Z" if value else None
+    # A held request past its time is shown as what it is, expired at its end, before the periodic cleanup marks it.
+    lapsed = row.state == sso_groups.HELD and row.expires_at <= now
+    state = sso_groups.EXPIRED if lapsed else row.state
     refusal: Optional[str] = None
-    if row.state == sso_groups.HELD:
-        conflict = sso_groups.decision_refusal(db, row, approver)
+    if state == sso_groups.HELD:
+        conflict = sso_groups.decision_refusal(db, row, approver, now=now)
         refusal = conflict.message if conflict is not None else None
     return {"id": str(row.id), "username": user.username if user is not None else None,
             "provider_id": str(row.provider_id),
             "provider": (provider.label or provider.name) if provider is not None else "a removed provider",
             "provider_group": row.provider_group, "requested_at": _t(row.requested_at), "expires_at": _t(row.expires_at),
-            "state": row.state, "decided_by": row.decided_by_name, "decided_at": _t(row.decided_at),
-            "you_may_decide": row.state == sso_groups.HELD and refusal is None, "refusal": refusal,
+            "state": state, "decided_by": row.decided_by_name,
+            "decided_at": _t(row.expires_at if lapsed else row.decided_at),
+            "you_may_decide": state == sso_groups.HELD and refusal is None, "refusal": refusal,
             # A request that can no longer be approved (its provider off, its group mapped to the role no more)
             # can still be denied by an administrator who may decide it.
-            "you_may_deny": row.state == sso_groups.HELD and sso_groups.denial_refusal(db, row, approver) is None}
+            "you_may_deny": state == sso_groups.HELD and sso_groups.denial_refusal(db, row, approver) is None}
 
 
 @router.get("/admin/sso/admin-requests")
 def list_admin_requests(current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """The requests waiting (with whether the caller may decide each, and why not), and the decided ones (the
-    last fifty). A held request past its seven days is marked expired as it is read."""
-    held, decided = sso_groups.requests(db)
-    db.commit()
-    return {"held": [_public(db, r, current_user) for r in held],
-            "decided": [_public(db, r, current_user) for r in decided[:50]]}
+    last fifty). A held request past its seven days is listed as expired; the periodic cleanup marks it so and
+    records it, so reading the list changes nothing."""
+    now = datetime.utcnow()
+    held, decided = sso_groups.requests(db, now=now)
+    return {"held": [_public(db, r, current_user, now=now) for r in held],
+            "decided": [_public(db, r, current_user, now=now) for r in decided[:50]]}
 
 
 def _decide(db, request_id, current_user, request: Request, *, approve: bool):

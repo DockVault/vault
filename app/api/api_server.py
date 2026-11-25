@@ -28897,6 +28897,17 @@ async def cleanup_expired_sessions():
                     db.commit()
                     print(f"🧹 Cleaned up {len(expired_sessions)} expired session(s)")
 
+                # Administrator requests from a provider group that nobody decided within seven days expire,
+                # each recorded as the server's with the moment it expired. Nothing is granted.
+                try:
+                    from app.services import sso_groups
+                    expired_admin_requests = sso_groups.expire_due(db)
+                    if expired_admin_requests:
+                        print(f"🕒 Expired {expired_admin_requests} single sign-on administrator request(s)")
+                except Exception as e:
+                    db.rollback()
+                    print(f"⚠ sso administrator request expiry failed: {type(e).__name__}")
+
                 # Backstop for the connection-close slot release: a SIGKILLed sync connection leaves
                 # its credential's slot unreleased. Release the slots of credentials past their
                 # VALIDITY window (deactivate_at) -- NEVER keyed on the never-updated last_activity --
