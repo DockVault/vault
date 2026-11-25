@@ -706,3 +706,46 @@ def test_your_account_is_told_for_each_identity_why_its_unlink_would_be_refused(
     # One rule for both: the unlink raises what the list's rule says.
     import inspect
     assert "refusal = owners_unlink_refusal(db, account, identity, row)" in inspect.getsource(sso_router.unlink_my_identity)
+
+
+@pytest.mark.parametrize("claims, policy, shown, recorded", [
+    ({"sub": "another-subject"}, None, "unlink_other_identity", "not_this_account"),
+    ({"auth_time": int(time.time()) - 600}, None, "unlink_stale", "reauth_stale"),
+    ({"amr": ["pwd"]}, {"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]}, "unlink_no_mfa", "reauth_no_mfa"),
+])
+def test_a_provider_that_cannot_confirm_this_person_says_who_can_unlink_for_them(monkeypatch, claims, policy, shown,
+                                                                                recorded):
+    """Carol's account at the provider was made anew with another subject, or signs in there without the second
+    factor the vault trusts. The fresh sign-in for her unlink is refused every time; told only to start again,
+    she never learns that an administrator can unlink it. The refusal says so, in a reason of its own; the
+    record keeps the refusal's reason. A step-up refused the same way keeps its own words."""
+    sso = _sso()
+    carol = _user("carol")
+    p = _provider(last_test=TESTED, policy=policy)
+    identity = _identity(carol, p, last_sign_in_at=datetime.utcnow())
+    h = Reauth(monkeypatch, [carol], [p], identities=[identity])
+    status, out = h.start_reauth(p, action=sso.UNLINK_CONFIRMATION)
+    assert status == 200, out
+    state, _record = h.state_of(out["authorization_url"])
+    h.claims_override = {"auth_time": int(time.time()) - 5, **claims}
+    status, location, _ = h.callback(p, state)
+    assert (status, location) == (302, "/#sso-error=" + shown), location
+    assert [a[2]["reason"] for a in h.audits if a[0] == "sso_sign_in_refused"][-1] == recorded
+    said = _call(h.S, "GET", "/auth/sso/reasons")[1]["reasons"][shown]
+    assert said.endswith("ask an administrator to unlink it for you.") and "does not confirm the unlink" in said
+    assert not _staged(h) and h.identities() == [identity]
+    assert sso.said_for_an_unlink(recorded) == shown and sso.said_for_an_unlink("provider_error") == "provider_error"
+
+
+def test_a_step_up_refused_at_the_provider_keeps_its_own_words(monkeypatch):
+    sso = _sso()
+    dana = _user("dana", sso_only=True)
+    p = _provider(last_test=TESTED)
+    h = Reauth(monkeypatch, [dana], [p], identities=[_identity(dana, p)])
+    h.current_user = dana
+    status, out = h.start_reauth(p)
+    assert status == 200, out
+    state, _record = h.state_of(out["authorization_url"])
+    h.claims_override = {"auth_time": int(time.time()) - 600}
+    status, location, _ = h.callback(p, state)
+    assert location == "/#sso-error=" + sso.REAUTH_STALE, location

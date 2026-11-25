@@ -633,7 +633,11 @@ async def sign_in_callback(
         except sso.Refusal as exc:
             _audit(db, "sso_sign_in_refused", user=user, ip=client_ip, status_="failure",
                    details={**details, "reason": exc.code, "step_up": login.step_up_action})
-            return _refused_at_the_callback(db, login, row, exc.code)
+            # Where it was to confirm an unlink, the person is told what to do when the provider cannot confirm
+            # them at all (the record keeps the refusal's own reason).
+            shown = (sso.said_for_an_unlink(exc.code) if login.step_up_action == sso.UNLINK_CONFIRMATION
+                     else exc.code)
+            return _refused_at_the_callback(db, login, row, shown)
         if not login.step_up_action:
             return _refused_at_the_callback(db, login, row, sso.PURPOSE_NOT_READY)
     if login.purpose == sso_state.LINK:

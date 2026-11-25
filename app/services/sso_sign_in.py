@@ -60,6 +60,9 @@ USERNAME_UNAVAILABLE = "username_unavailable"
 USERNAME_MIN, USERNAME_MAX = 3, 50          # the account rules (the creation and invitation schemas)
 
 # What a person is told for each reason, in words (the admin page and the sign-in page show these).
+# A fresh sign-in that was to confirm an unlink and did not: said with what to do when it cannot.
+UNLINK_OTHER_IDENTITY, UNLINK_NO_MFA, UNLINK_STALE = "unlink_other_identity", "unlink_no_mfa", "unlink_stale"
+
 # The vault's own account was busy (its turn was held by a change of it): nothing of the provider's.
 BUSY = "busy"
 
@@ -99,6 +102,16 @@ REASON_TEXTS = {
     PRIVILEGED_ON_PASSWORD_LESS: ("An administrator's or auditor's account keeps a local password, so it cannot be linked "
                                   "to a provider whose people sign in without one."),
     REAUTH_NO_MFA: "Your organisation's sign-in did not confirm you with a second factor. Start again.",
+    # The same three refusals where the fresh sign-in was to confirm an unlink (:func:`said_for_an_unlink`). A
+    # person whose provider can no longer confirm them (their account there was made anew, or signs in without
+    # the second factor the vault trusts) would start again for ever: they are told who can unlink it for them.
+    UNLINK_OTHER_IDENTITY: ("Your organisation's sign-in came back as another identity than the one linked to "
+                            "your account, so it does not confirm the unlink. If you cannot sign in there as the "
+                            "linked identity, ask an administrator to unlink it for you."),
+    UNLINK_NO_MFA: ("Your organisation's sign-in did not confirm you with a second factor, so it does not confirm "
+                    "the unlink. Start again. If you cannot, ask an administrator to unlink it for you."),
+    UNLINK_STALE: ("Your organisation's sign-in did not ask you to sign in again just now, so it does not confirm "
+                   "the unlink. Start again. If you cannot, ask an administrator to unlink it for you."),
     RESTRICTED: ("Your organisation's sign-in worked, but this vault is not open to your tenant, domain or group. Ask "
                  "your administrator."),
     RESTRICTION_CLAIM_MISSING: ("Your organisation's sign-in did not say which tenant, domain or groups you belong to, "
@@ -1233,6 +1246,13 @@ def provider_mfa_still_counts(db, result) -> bool:
                                                  ExternalIdentity.user_id == result.user.id).first()
     # No identity here: nothing was linked by email to judge (the sign-in is refused where the provider is judged).
     return identity is None or not linked_on_the_providers_word(db, result.user, identity)
+
+
+def said_for_an_unlink(code: str) -> str:
+    """The reason the person is shown when a fresh sign-in that was to confirm an unlink is refused as ``code``:
+    its own reason for the three refusals a person may be unable to get past, the code itself for any other."""
+    return {NOT_THIS_ACCOUNT: UNLINK_OTHER_IDENTITY, REAUTH_NO_MFA: UNLINK_NO_MFA,
+            REAUTH_STALE: UNLINK_STALE}.get(code, code)
 
 
 def reauth_refusal(db, row, user, answer: ProviderAnswer, *, now=None) -> None:
