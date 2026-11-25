@@ -261,6 +261,19 @@ LOCK_WAIT_RAN_OUT = "55P03"          # PostgreSQL's lock_not_available
 BUSY_TRY_AGAIN = "The vault is busy with this right now. Try again in a moment."
 
 
+def _route_for_a_log(request) -> str:
+    """The route a request was for, as a log line may hold it: the route's own pattern ("/reset/{token}"), which
+    carries no value of the path. A reset link's token and an invitation's are path values, and each is the whole
+    secret: printed with the path as it was asked for, a token that was not spent (the request was refused as
+    busy) stood in the container's log for whoever reads it. A request that matched no route is named by its
+    path with what a path may carry of a secret masked (app/core/log_redaction.py)."""
+    from app.core.log_redaction import redact_log_path
+    pattern = getattr((getattr(request, "scope", None) or {}).get("route"), "path", None)
+    if isinstance(pattern, str) and pattern:
+        return pattern
+    return redact_log_path(request.url.path)
+
+
 async def _lock_wait_ran_out_handler(request: StarletteRequest, exc: Exception):
     """A statement that waited for a lock longer than a request waits (the connection's lock_timeout, or a
     shorter wait a path set for itself) and was caught by nothing was answered 500: "Stay signed in", an
@@ -269,12 +282,12 @@ async def _lock_wait_ran_out_handler(request: StarletteRequest, exc: Exception):
     transaction ends with the request, so the answer is the busy one: 503 with the wait, which a client tries
     again. What a request had committed before that statement stays, as it stayed under the 500 (approving a
     held reset link commits the link before it records the approval): the next try is answered as the request
-    then stands. The log has the route, never the statement. Any other database error is not this handler's:
-    raised again, it is the 500 it was."""
+    then stands. The log has the route as its pattern, never a value of the path and never the statement. Any
+    other database error is not this handler's: raised again, it is the 500 it was."""
     if getattr(getattr(exc, "orig", None), "pgcode", None) != LOCK_WAIT_RAN_OUT:
         raise exc
     from app.core import sign_in_lockout
-    print(f"⚠ busy: a lock was held for longer than a request waits ({request.method} {request.url.path})")
+    print(f"⚠ busy: a lock was held for longer than a request waits ({request.method} {_route_for_a_log(request)})")
     return JSONResponse(status_code=503, content={"detail": BUSY_TRY_AGAIN},
                         headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)})
 

@@ -31,8 +31,48 @@ def _the_databases_error(pgcode):
                             types.SimpleNamespace(pgcode=pgcode))
 
 
-def _request(path="/auth/session/extend"):
-    return types.SimpleNamespace(method="POST", url=types.SimpleNamespace(path=path))
+def _request(path="/auth/session/extend", pattern=None):
+    """A request for ``path``; ``pattern`` is the route it matched, as the framework notes it on the request."""
+    scope = {"route": types.SimpleNamespace(path=pattern)} if pattern else {}
+    return types.SimpleNamespace(method="POST", url=types.SimpleNamespace(path=path), scope=scope)
+
+
+TOKEN = "Zm9yLWFsaWNlLW9ubHktYS1yZXNldC10b2tlbg"
+
+
+@pytest.mark.parametrize("path, pattern, logged_as", [
+    (f"/reset/{TOKEN}", "/reset/{token}", "POST /reset/{token}"),
+    (f"/invites/{TOKEN}/accept", "/invites/{token}/accept", "POST /invites/{token}/accept"),
+    # A request that matched no route (none is noted on it): the path, with the secret a path may carry masked.
+    (f"/reset/{TOKEN}", None, "POST /reset/<redacted>"),
+    (f"/invites/{TOKEN}/accept", None, "POST /invites/<redacted>/accept"),
+    (f"/shares/{TOKEN}/claim", None, "POST /shares/<redacted>/claim"),
+    # A path with nothing secret in it is named as it is.
+    ("/auth/session/extend", None, "POST /auth/session/extend"),
+])
+def test_the_busy_line_never_holds_a_token_that_rides_the_path(capsys, path, pattern, logged_as):
+    """A person submits a reset link while a change holds the account's turn for longer than the request waits.
+    The answer is "busy, try again", and the token is not spent. The line the server prints for it named the
+    request by its path: the token, whole and still good, in the container's log, for whoever reads logs to set
+    the person's password with. The same for an invitation. The line names the route by its pattern."""
+    S = _api()
+    answer = run_coroutine(S._lock_wait_ran_out_handler(_request(path, pattern), _the_databases_error("55P03")),
+                           timeout=30)
+    assert answer.status_code == 503
+    logged = capsys.readouterr().out
+    assert TOKEN not in logged, logged
+    assert f"({logged_as})" in logged and logged.count("\n") == 1
+
+
+def test_the_routes_whose_path_is_a_secret_have_a_pattern_that_names_no_value():
+    """The real routes: what the framework notes on a request for a reset link or an invitation is the pattern,
+    with the parameter's name where the token was."""
+    S = _api()
+    patterns = {route.path for route in S.app.routes if hasattr(route, "path")}
+    secret = [p for p in patterns if p.startswith(("/reset/", "/invites/"))]
+    assert secret and all("{" in p.split("/")[2] for p in secret), sorted(secret)
+    for pattern in secret:
+        assert S._route_for_a_log(_request("/reset/" + TOKEN, pattern)) == pattern
 
 
 def test_a_lock_wait_that_ran_out_is_answered_as_busy_with_the_wait(capsys):

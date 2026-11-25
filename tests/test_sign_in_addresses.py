@@ -93,6 +93,8 @@ MAIN_MODULE_READS = {
                                          ["scope.get('headers')"], set()),
     "ClientIPMiddleware.__call__": ("the scheme a trusted proxy reports and the browser's name, from the raw scope",
                                     ["scope.get('headers')", "scope.get('scheme')"], set()),
+    "_route_for_a_log": ("the route the request matched, read from its scope for a log line: the route's own "
+                         "pattern, and nothing the caller sent", ["getattr(request, 'scope', None)"], set()),
 }
 
 
