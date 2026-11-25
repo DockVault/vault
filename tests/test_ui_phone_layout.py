@@ -2,7 +2,9 @@
 
   * unit — the phone stylesheet loads after both skins, and no stylesheet uses the --spacing-* names,
            which are defined nowhere (the toasts lost their padding and gaps to them); a row of text and
-           buttons (passkeys, linked providers, the providers and their linked accounts) wraps.
+           buttons (passkeys, linked providers, the providers and their linked accounts) wraps; a passkey row
+           and a row of the administrator requests card, as the page draws them, are what the phone rules
+           select, so the offline lane checks what the ui tests below measure in a browser.
   * ui   — the sidebar is a drawer behind a menu button; no section is wider than the screen; a file
            row's actions are on screen; the notifications panel stays on screen; a passkey's buttons go
            under its text; a PDF preview says to download it when the browser has no inline PDF viewer;
@@ -12,6 +14,7 @@ The ui tests log in as a THROWAWAY admin: applyServerPreferences() replaces the 
 stored one after login, so a skin chosen against a shared account can be silently discarded. Each test
 re-asserts the skin that applied.
 """
+import json
 import re
 from pathlib import Path
 
@@ -19,6 +22,8 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import unique
+from test_account_passkeys_page import account_node
+from test_users_page_sso_admin_requests import _node as users_page_node
 
 ROOT = Path(__file__).resolve().parent.parent
 PHONE = {"width": 390, "height": 844}
@@ -69,6 +74,96 @@ def test_a_row_of_text_and_buttons_wraps_on_a_phone(row):
         f"{row} does not wrap at phone width: its text column shrinks to a word a line beside its buttons"
     assert any(f"{row} > .flex-1" in sel and decl.get("flex") == "1 1 100%" for sel, decl in rules), \
         f"{row}'s text column does not take the whole line at phone width"
+
+
+# A passkey waiting for its owner's confirmation: the row with the most buttons (the browser test below uses it too).
+PROVISIONAL_KEY = {"id": "k-phone", "label": "Work laptop", "created_at": "2026-11-01T10:00:00Z",
+                   "last_used_at": None, "synced": True, "usable": True, "user_verified": True, "provisional": True,
+                   "confirmable": True, "provisional_until": "2026-12-01T10:00:00Z"}
+PASSKEYS = {"enabled": True, "passkeys": [PROVISIONAL_KEY], "limit": 10, "requirement": {}, "origin": None}
+
+
+def _declared(selector, rules):
+    """What the rules whose selector list names ``selector`` declare, together."""
+    found = {}
+    for selectors, declared in rules:
+        if selector in selectors:
+            found.update(declared)
+    return found
+
+
+@pytest.mark.unit
+def test_a_passkey_row_as_your_account_draws_it_is_the_row_the_phone_rules_wrap():
+    """Your account draws a passkey (static/js/app.js, renderAccountPasskeys) as a .passkey-row whose first child is
+    its name and details (.flex-1) and whose other children are its buttons. The phone rules select exactly that: the
+    row wraps and its text column takes the whole line, so the buttons go on the line under it."""
+    got = account_node(r"""
+answers['GET /users/me/passkeys'] = %s;
+await renderAccountPasskeys();
+out(body.querySelectorAll('.passkey-row').map((row) => ({ classes: row.className.split(' '),
+    children: row.children.map((c) => [c.localName, c.className.split(' '), c.localName === 'button' ? c.textContent : null]) })));
+""" % json.dumps(PASSKEYS))
+    assert len(got) == 1, got
+    row = got[0]
+    assert "passkey-row" in row["classes"], row
+    (tag, classes, _), *buttons = row["children"]
+    assert tag == "div" and "flex-1" in classes, row
+    assert [(tag, label) for tag, _, label in buttons] == [("button", "Confirm"), ("button", "Rename"),
+                                                          ("button", "Remove")], row
+    rules = _phone_rules()
+    assert _declared(".passkey-row", rules).get("flex-wrap") == "wrap"
+    assert _declared(".passkey-row > .flex-1", rules).get("flex") == "1 1 100%"
+
+
+def _skin_rules(sheet):
+    """The rules of a skin's stylesheet outside its @media, @keyframes and other at-rule blocks, each as (its
+    selectors, its declarations): what it lays out at every width."""
+    css = re.sub(r"/\*.*?\*/", "", (ROOT / "static" / "css" / sheet).read_text(encoding="utf-8"), flags=re.S)
+    outside, at = [], 0
+    for block in re.finditer(r"@[a-z-]+[^{};]*\{", css):
+        if block.start() < at:
+            continue
+        outside.append(css[at:block.start()])
+        depth, at = 1, block.end()
+        while depth:
+            depth += {"{": 1, "}": -1}.get(css[at], 0)
+            at += 1
+    outside.append(css[at:])
+    rules = []
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", "".join(outside)):
+        declared = dict((k.strip(), v.strip()) for k, _, v in (d.partition(":") for d in body.split(";")) if v.strip())
+        rules.append(({" ".join(s.split()) for s in selectors.split(",")}, declared))
+    return rules
+
+
+@pytest.mark.unit
+def test_a_row_of_the_administrator_requests_card_is_the_row_the_phone_rules_lay_out():
+    """The Users page draws each request of "Administrator requests from single sign-on" (static/js/app.js,
+    renderSsoAdminRequests) as a .credential-request-row of its text and its actions, Approve and Deny or the reason
+    in their place. In both skins the row wraps and its text may shrink below its words' width; on a phone the
+    actions take a line of their own and their buttons are at least 40px high, large enough to tap."""
+    got = users_page_node(r"""
+answers[PATH] = { held: HELD, decided: [] };
+await loadSsoAdminRequests();
+out(list.querySelectorAll('.credential-request-row').map((row) => ({ classes: row.className.split(' '),
+    children: row.children.map((c) => c.className.split(' ')),
+    buttons: row.querySelectorAll('button').map((b) => [b.parentNode.className, b.className.split(' '), b.textContent]) })));
+""")
+    assert len(got) == 2, got
+    for row in got:
+        assert row["classes"] == ["credential-request-row"], row
+        assert row["children"] == [["credential-request-text"], ["credential-request-actions"]], row
+    assert [(parent, "btn" in classes, label) for parent, classes, label in got[0]["buttons"]] == [
+        ("credential-request-actions", True, "Approve"), ("credential-request-actions", True, "Deny")]
+    assert got[1]["buttons"] == []
+    for sheet in ("redesign.css", "ui-v2.css"):
+        skin = _skin_rules(sheet)
+        assert _declared(".credential-request-row", skin).get("flex-wrap") == "wrap", sheet
+        assert _declared(".credential-request-text", skin).get("min-width") == "0", sheet
+    rules = _phone_rules()
+    assert _declared(".credential-request-actions", rules).get("flex") == "1 1 100%"
+    height = _declared(".credential-request-actions .btn", rules).get("min-height", "")
+    assert re.fullmatch(r"\d+px", height) and int(height[:-2]) >= 40, height
 
 
 # --------------------------------------------------------------------------- ui lane
@@ -227,17 +322,11 @@ def test_the_notifications_panel_stays_on_the_phone_screen(page: Page, phone_adm
 
 
 # A provisional passkey that something older on the account can confirm: its row has Confirm, Rename and Remove.
-PROVISIONAL_KEY = {"id": "k-phone", "label": "Work laptop", "created_at": "2026-11-01T10:00:00Z",
-                   "last_used_at": None, "synced": True, "usable": True, "user_verified": True, "provisional": True,
-                   "confirmable": True, "provisional_until": "2026-12-01T10:00:00Z"}
-
-
 @pytest.mark.ui
 @pytest.mark.parametrize("skin", ["v1", "v2"])
 def test_a_passkey_rows_buttons_go_under_its_text_on_the_phone(page: Page, phone_admin, skin):
     """Squeezed beside three buttons, the passkey's name and details broke after nearly every word."""
-    page.route("**/users/me/passkeys", lambda route: route.fulfill(status=200, json={
-        "enabled": True, "passkeys": [PROVISIONAL_KEY], "limit": 10, "requirement": {}, "origin": None}))
+    page.route("**/users/me/passkeys", lambda route: route.fulfill(status=200, json=PASSKEYS))
     _login(page, phone_admin, skin)
     page.click("#profile-btn")
     page.click("#settings-btn")

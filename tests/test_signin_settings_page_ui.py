@@ -155,8 +155,34 @@ out({ reads: asked.filter((a) => a.path === '/settings/sign-in' && a.method === 
       grace: rowOf('webauthn_enrollment_grace_days').querySelector('input').value });
 """ % (json.dumps(second), json.dumps(saved)))
     assert got["reads"] == 2
-    assert got["verify"].startswith("4 passkeys in use never checked a PIN, fingerprint or face: turned on, ")
+    # No account is left without a passkey that checked: the sentence ends at what turning the rule on does.
+    assert got["verify"] == ("4 passkeys in use never checked a PIN, fingerprint or face: turned on, this makes them "
+                             "count as no second factor and refuses them at any use that does not check one.")
     assert got["grace"] == "30"
+
+
+def test_a_later_read_takes_away_what_an_earlier_one_said():
+    """Opening the tab again reads the page again. What the first read said and the second no longer has a reason for
+    goes: the counts under the rows, the note that no role is chosen, the alert on trust anchors and the list of
+    accounts the requirement was lifted for."""
+    first = _answer({"webauthn_require_uv": True, "webauthn_mode": "required_for_roles",
+                     "webauthn_required_roles": [], "webauthn_attestation": "direct"},
+                    passkeys_without_verification=3, accounts_with_only_a_passkey=2, trust_anchors=0,
+                    requirement_lifted_for=[{"username": "bob", "role": "admin", "lifted_at": "2026-11-21T10:00:00Z"}])
+    second = _answer({"webauthn_require_uv": True, "webauthn_mode": "required_for_roles",
+                      "webauthn_required_roles": ["user"], "webauthn_attestation": "none"})
+    got = _loaded(first, r"""
+const said = () => ({ notes: document.querySelectorAll('#signin-passkey-settings .signin-setting-note').length,
+    roles: document.querySelectorAll('#signin-passkey-settings .signin-roles-note').length,
+    anchors: !!byId('signin-passkey-anchors') && !byId('signin-passkey-anchors').hidden,
+    lifted: !!byId('signin-passkey-lifted') && !byId('signin-passkey-lifted').hidden });
+const before = said();
+answers['/settings/sign-in'] = %s;
+await window.SignInSettings.load();
+out({ before, after: said() });
+""" % json.dumps(second))
+    assert got["before"] == {"notes": 2, "roles": 1, "anchors": True, "lifted": True}
+    assert got["after"] == {"notes": 0, "roles": 0, "anchors": False, "lifted": False}
 
 
 ANCHORS = r"""

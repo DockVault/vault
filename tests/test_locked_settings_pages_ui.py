@@ -11,6 +11,7 @@ and counts neither as an essential setting nor as an advanced one.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -131,7 +132,7 @@ const bar = signin.querySelector(':scope > .settings-level-bar');
 out({ sso: sso.className, mode: mode.className, algs: algs.className,
       summary: fold.querySelector('summary').textContent, hidden: fold.hidden,
       listed: fold.querySelectorAll('.settings-provider-item').map((item) => [item.dataset.foldKey,
-          item.querySelector('strong').textContent]),
+          item.querySelector('strong').textContent, item.querySelector('.settings-provider-value').textContent]),
       toggle: bar.querySelector('.settings-advanced-toggle').textContent,
       allAdvanced: !bar.querySelector('.settings-level-note').hidden });
 """)
@@ -139,6 +140,18 @@ out({ sso: sso.className, mode: mode.className, algs: algs.className,
     assert "setting-folded" not in got["sso"].split() and "setting-level-hidden" not in got["sso"].split()
     assert "setting-folded" in got["mode"].split()
     assert got["hidden"] is False and got["summary"] == "Set by your provider (2)"
-    assert got["listed"] == [["sso", "Single sign-on providers"], ["webauthn_mode", "Passkeys"]]
+    assert got["listed"] == [["sso", "Single sign-on providers", "The providers are kept as they are."],
+                             ["webauthn_mode", "Passkeys", "off"]]
     # Neither locked one is counted: the page's one counted setting is advanced, and the page says so.
     assert got["toggle"] == "Show advanced settings (1)" and got["allAdvanced"] is True
+
+
+def test_the_sign_in_pages_single_sign_on_card_is_marked_as_showing_its_own_lock():
+    """The card the test above draws is the shipped one: static/index.html's single sign-on card, the only container
+    of the lock group sso, carries data-setting-shows-lock. Without it, a lock would hide the card, and with it the
+    list of providers, their test sign-in and the addresses to copy, which stay open under a lock."""
+    html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    tags = re.findall(r'<[a-z]+\b[^>]*\bdata-setting="sso"[^>]*>', html)
+    assert len(tags) == 1, tags
+    assert 'id="signin-sso-card"' in tags[0], tags[0]
+    assert re.search(r"\sdata-setting-shows-lock(?=[\s>=])", tags[0]), tags[0]
