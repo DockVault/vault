@@ -12,8 +12,10 @@ Licensed under **AGPL-3.0** — self-host it freely.
 ## Features
 
 - **Web UI and SFTP** over the same storage — work in the browser or with any SFTP client.
-- **Per-vault encryption** (AES-256-GCM) with per-vault keys; file contents, names, and
-  metadata are encrypted at rest.
+- **Encryption at rest** (AES-256-GCM): each file in a standard vault is encrypted under its own key,
+  derived from the deployment's `ENCRYPTION_KEY`, and file and folder names, MIME types, vault names and note
+  text are sealed too. A vault password decides who may open a vault; it does not change how its files are
+  encrypted.
 - **Zero-knowledge vaults** (optional) — files are encrypted in the browser, so the server
   stores ciphertext it cannot decrypt.
 - **Temporary, scoped credentials** — hand out time-limited, least-privilege access to a
@@ -661,7 +663,7 @@ there.
 ## Data volumes
 
 A deployment keeps its data in five named volumes — `vault_pg_data` (database), `vault_storage`
-(files), `vault_keys` (per-vault key material), `vault_logs`, and `vault_brand`. These volumes **and
+(files), `vault_keys` (the SFTP server's host key and the audit log's chain head), `vault_logs`, and `vault_brand`. These volumes **and
 the `.env` that holds their secrets** are one atomic set: `.env` carries `ENCRYPTION_KEY` (which the
 stored files are encrypted under) and `VAULT_DB_PASSWORD` (which is baked into `vault_pg_data` on
 first init), so a fresh `.env` against existing volumes fails to start — keep them together, and back
@@ -824,10 +826,10 @@ all live at the root.
 
 ## Security model
 
-- **Encryption at rest:** each vault has its own key; contents and file/folder names are
-  sealed with authenticated encryption (AES-256-GCM). Standard vaults are decrypted
-  server-side per request; **zero-knowledge** vaults keep the key in the browser, so the
-  server never sees plaintext.
+- **Encryption at rest:** a standard vault's file contents are sealed with AES-256-GCM under a key per file,
+  derived from `ENCRYPTION_KEY`, and file and folder names are sealed too. Standard vaults are decrypted
+  server-side per request, and a vault password only controls who may open one. **Zero-knowledge** vaults keep
+  the key in the browser, so the server never sees plaintext.
 - **Transport:** run it behind TLS — a reverse proxy, or the included HTTPS deployment
   script. SFTP uses SSH host keys.
 - **Container hardening:** runs as a non-root user on a read-only root filesystem with no

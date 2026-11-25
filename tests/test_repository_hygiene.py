@@ -259,6 +259,19 @@ def test_the_readme_says_which_rollbacks_the_data_mark_protects():
     assert "`ALLOW_START_ON_NEWER_DATA=true`" in readme
 
 
+def test_the_readme_says_what_a_standard_vaults_files_are_encrypted_under():
+    """A standard vault's files are encrypted under a key per file, derived from ENCRYPTION_KEY
+    (app/core/security.py); the key a vault is created with is read by no content path, a vault password only
+    decides who may open it, and the keys volume holds the SFTP host key and the audit chain head. The README
+    said each vault had its own key, which led an operator to think a vault password changes the encryption."""
+    readme = " ".join(_public("README.md").split())
+    for retired in ("per-vault keys", "each vault has its own key", "per-vault key material"):
+        assert retired not in readme, retired
+    assert "derived from the deployment" in readme
+    assert "A vault password decides who may open a vault; it does not change how its files are encrypted." in readme
+    assert "`vault_keys` (the SFTP server's host key and the audit log's chain head)" in readme
+
+
 def test_the_supply_chain_document_describes_the_moving_tags_and_the_codeql_workflow():
     evidence = _public("docs/supply-chain-controls.md")
     assert "Both release tags must resolve to one registry digest" not in evidence
