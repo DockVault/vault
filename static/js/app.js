@@ -7057,6 +7057,8 @@ async function loadUsers() {
         // the prior value is kept, and the button gate is fail-closed (=== true) either way.
         try {
             currentSettings = await apiRequest('/settings', { silent: true });
+            // The notes in the accounts' details say what the settings allow (whether the vault sends email).
+            fillCredentialChangeNotes();
         } catch (_) { /* keep the prior currentSettings */ }
         updateActionButtonPermissions();
         loadInvites();
@@ -7571,8 +7573,14 @@ function fillCredentialChangeNotes() {
             lines.push('Second factor reset: they set up a new one at their next sign-in.');
         }
         if (u && u.email_confirm_wanted) {
-            lines.push('Email address not confirmed: they typed it themselves, so your organisation’s sign-in does '
-                + 'not find this account by it. They can confirm it under Your account, or you can.');
+            // Only administrators read this list, and Confirm address is offered on every such row. Whether the
+            // person can confirm it themselves is whether the vault sends email (GET /settings, read after the
+            // list is drawn: the notes are filled again then).
+            const smtp = currentSettings && currentSettings.smtp_configured;
+            lines.push('Email address not confirmed, so your organisation’s sign-in does not find this account by it.'
+                + (smtp === true ? ' They can confirm it under Your account with a code sent to it, or you can, with Confirm address.'
+                    : smtp === false ? ' This vault sends no email, so they cannot confirm it themselves; you can, with Confirm address.'
+                        : ' You can confirm it with Confirm address.'));
         }
         if (u && u.sign_in_block) {
             const b = u.sign_in_block;
