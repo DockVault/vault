@@ -2763,6 +2763,22 @@ def start_sftp_server():
                    window_seconds=settings.sftp_write_progress_timeout_seconds,
                    floor_bytes=settings.sftp_write_progress_min_bytes)
 
+    # How connections agree their session keys (app/sftp/kex_policy.py). Checked before the port is opened:
+    # under pq-required a server that cannot offer the hybrid exchange would refuse every client with no
+    # word why, so it does not start, and says what to set.
+    from app.sftp import kex_policy
+    try:
+        only_hybrid = bool(kex_policy.disabled_kex(settings.sftp_kex_policy, _Transport))
+    except kex_policy.HybridUnavailable as unavailable:
+        safe_event('kex.policy.hybrid-required-unavailable')
+        raise SystemExit(str(unavailable))
+    if not kex_policy.hybrid_available(_Transport):
+        safe_event('kex.policy.hybrid-unavailable')
+    elif only_hybrid:
+        safe_event('kex.policy.hybrid-only')
+    else:
+        safe_event('kex.policy.hybrid-first')
+
     # Create server socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2885,11 +2901,32 @@ class _Transport(paramiko.Transport):
     # The bound only keeps one connection from holding more than that.
     HELD_RECORDS_MAX = 32
 
+    def _parse_kex_init(self, m):
+        """paramiko's own, which chooses the key exchange both sides offer: what it chose is kept, and said
+        once for the connection. tests/test_sftp_kex_policy.py runs it against paramiko's real transport."""
+        super()._parse_kex_init(m)
+        from app.sftp import kex_policy
+        name = kex_policy.name_of(getattr(self, "kex_engine", None), getattr(self, "_kex_info", None))
+        if name and self.agreed_kex is None:
+            self.agreed_kex = name
+            # One line for the connection: whether its keys were agreed with the hybrid exchange, or with a
+            # classical one (which a recording decrypted later is not safe against).
+            try:
+                if kex_policy.is_hybrid(name):
+                    safe_event('kex.agreed.hybrid', peer=self._peer)
+                else:
+                    safe_event('kex.agreed.classical', peer=self._peer)
+            except Exception:  # noqa: BLE001 -- a log write must not end the session
+                pass
+
     def __init__(self, sock, *args, peer=None, **kwargs):
         # Set before paramiko's own set-up, in case it logs.
         self._held_records = []
         self._held_lock = threading.Lock()
         self._holding = True
+        # The key exchange agreed with the peer (app/sftp/kex_policy.py), kept for the connection's log line:
+        # paramiko holds it only while the exchange runs.
+        self.agreed_kex = None
         super().__init__(sock, *args, **kwargs)
         self._peer = peer
         # The first line the peer sent that was not an SSH identification line. Read only to say what
@@ -3003,12 +3040,17 @@ def handle_sftp_client(
         # MD5/SHA1 (incl. truncated -96) MACs so an active downgrade or a hostile/misconfigured
         # client can't weaken the file-transfer channel; the strong defaults (aes-ctr/gcm +
         # hmac-sha2) are untouched, so conformant clients are unaffected.
+        # The key exchange: the hybrid post-quantum one is offered first by the library; under pq-required
+        # every other one is taken away (app/sftp/kex_policy.py). The server checked at start that it can
+        # offer it then.
+        from app.sftp import kex_policy
         transport = _Transport(
             client_socket,
             disabled_algorithms={
                 'ciphers': ['3des-cbc', 'aes128-cbc', 'aes192-cbc', 'aes256-cbc',
                             'blowfish-cbc', 'cast128-cbc'],
                 'macs': ['hmac-md5', 'hmac-md5-96', 'hmac-sha1', 'hmac-sha1-96'],
+                'kex': kex_policy.disabled_kex(settings.sftp_kex_policy, _Transport),
             },
             peer=client_address,
         )

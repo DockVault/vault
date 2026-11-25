@@ -95,7 +95,7 @@ packaging==26.2
     #   pip-requirements-parser
     #   pytest
     #   wheel
-paramiko==5.0.0
+paramiko==5.1.0
     # via -r tests/requirements-test.txt
 pip-api==0.0.34
     # via pip-audit

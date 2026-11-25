@@ -28,7 +28,7 @@ psycopg2-binary==2.9.12
 redis==8.1.0
 
 # SFTP
-paramiko==5.0.0
+paramiko==5.1.0
 
 # Security / crypto
 # 50.0.0 closes CVE-2026-69247 (Bleichenbacher oracle in PKCS#7 decryption); underpins the Fernet

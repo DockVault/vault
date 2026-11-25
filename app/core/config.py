@@ -112,6 +112,20 @@ class Settings(BaseSettings):
     sftp_max_connections: int = Field(default=100)
     sftp_max_connections_per_ip: int = Field(default=10)
     sftp_auth_grace_seconds: int = Field(default=30)
+    # How an SFTP connection agrees its session keys. File bytes of a Standard vault travel inside SSH, and
+    # what is recorded today can be decrypted later by whoever breaks the classical key exchange: the hybrid
+    # exchange mlkem768x25519-sha256 (ML-KEM-768 with X25519; OpenSSH's default since 10.0) is not broken by
+    # that. "pq-preferred" (the default): the hybrid exchange is chosen with every client that offers it, and a
+    # client that does not still connects with a classical one. "pq-required": only the hybrid exchange is
+    # offered, so a client older than OpenSSH 9.9 (or another without it) can no longer connect. "default":
+    # the SSH library's own order, unchanged. Host and user keys are not part of this: they prove who is
+    # speaking, and are not what a recording decrypts. Any other value is refused at start (the validator
+    # below): a value that only looks like pq-required must not leave the classical exchanges on offer
+    # unseen. pq-preferred is the recommended value: under pq-required a server that cannot offer the hybrid
+    # exchange does not start SFTP, and where the web side and SFTP run in one container (the default shape,
+    # run_combined.py stops the container when either half ends) the whole vault stops with it until the
+    # setting is changed. See app/sftp/kex_policy.py.
+    sftp_kex_policy: str = Field(default="pq-preferred")
     # The per-address cap on AUTHENTICATED sessions, separate from the pre-auth one above: a fleet
     # of devices behind one NAT all authenticate from one address, and with a single per-address cap
     # sized against a flood (10), the tenth device found the door shut by the first nine. The
@@ -581,6 +595,14 @@ class Settings(BaseSettings):
             raise ValueError(f'Log level must be one of {allowed_levels}')
         return v.upper()
     
+    @validator('sftp_kex_policy')
+    def validate_sftp_kex_policy(cls, v):
+        """One of the three policies, in any case: refused at start otherwise (see sftp_kex_policy)."""
+        value = str(v or "").strip().lower()
+        if value not in ("default", "pq-preferred", "pq-required"):
+            raise ValueError('SFTP_KEX_POLICY must be one of default, pq-preferred, pq-required')
+        return value
+
     @validator('zk_envelope_hold_days')
     def validate_envelope_hold_days(cls, v):
         """0 to 14: refused at start otherwise (see zk_envelope_hold_days)."""

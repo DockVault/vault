@@ -1078,6 +1078,11 @@ def build_env_lines(cfg):
     ):
         if sftp_active and cfg.get(_cfg_key) not in (None, "") and int(cfg[_cfg_key]) != _default:
             bare(_env_name, int(cfg[_cfg_key]))
+    # How SFTP agrees its session keys (see .env.example), same rule: authored only when it is not the
+    # default (pq-preferred), so an operator's choice of pq-required or default survives a fresh volume set.
+    _kex_policy = str(cfg.get("sftp_kex_policy") or "").strip().lower()
+    if sftp_active and _kex_policy in ("default", "pq-required"):
+        bare("SFTP_KEX_POLICY", _kex_policy)
     # SFTP streaming upload (default ON): a normal install never mentions it. Author SFTP_STREAMING_UPLOAD
     # only when the operator explicitly DISABLED it (the buffered rollback), preserving that choice
     # across a fresh volume set; the reorder window and the memory ceiling are authored only when they
@@ -2302,6 +2307,8 @@ def new_set_config(current_env, new_prefix, new_id):
         "sftp_max_connections_per_ip": (current_env.get("SFTP_MAX_CONNECTIONS_PER_IP") or "").strip() or None,
         "sftp_max_authenticated_per_ip": (current_env.get("SFTP_MAX_AUTHENTICATED_PER_IP") or "").strip() or None,
         "sftp_auth_grace_seconds": (current_env.get("SFTP_AUTH_GRACE_SECONDS") or "").strip() or None,
+        # ... and how SFTP agrees its session keys.
+        "sftp_kex_policy": (current_env.get("SFTP_KEX_POLICY") or "").strip() or None,
         "sftp_write_progress_timeout_seconds":
             (current_env.get("SFTP_WRITE_PROGRESS_TIMEOUT_SECONDS") or "").strip() or None,
         "sftp_write_progress_min_bytes":
