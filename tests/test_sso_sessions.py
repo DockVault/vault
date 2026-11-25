@@ -489,7 +489,8 @@ def test_a_logout_that_waits_for_an_accounts_turn_holds_up_no_other_request(monk
         assert not logout.done()
         let_go.set()
         return other, await asyncio.wait_for(logout, timeout=10)
-    other, logged_out = asyncio.run(both())
+    from _async_run import run_coroutine
+    other, logged_out = run_coroutine(both(), timeout=30)
     assert (other, logged_out) == (200, 200)
     assert order == ["the logout is at the turn", "another request is answered", "the turn is given"], order
     assert not [s for s in h.active_sessions() if s.is_active and not s.revoked]
