@@ -410,10 +410,25 @@ def test_a_removal_that_is_refused_ends_nobodys_password(monkeypatch):
     assert status == 409 and out["detail"]["reason"] == "days_ran_out", out
     assert out["detail"]["message"] == (
         "1 account has not signed in through this provider within its days, so its SSH keys, temporary credentials "
-        "and devices are paused. Removing the provider would lift that unseen. Turn the provider on so that they can "
-        "sign in through it again. Or turn off “After those days, or a refusal, the account signs in only through a "
-        "provider” for it (Access) and remove it again: it is then held, for you to clear under Identities, and "
-        "nobody's password stops.")
+        "and devices are paused. Removing the provider would lift that unseen. The ways on: turn the provider on so "
+        "that it signs in through it again; unlink it under the provider's Identities; or delete the account. Or "
+        "turn off “After those days, or a refusal, the account signs in only through a provider” for it (Access) "
+        "and remove it again: it is then held, to be lifted under Identities, and nobody's password stops.")
+    # For several accounts it is said in the plural.
+    from app.services import sso_providers
+    also = _identity(bob, row, subject="s-9", last_sign_in_at=now - timedelta(days=40), linked_at=now - timedelta(days=60),
+                     refused_at=None)
+    carol = _user("carol")
+    also.user_id = carol.id
+    from app.core.models import ExternalIdentity
+    h.db.rows_of(ExternalIdentity).append(also)
+    said = str(sso_providers.remove_refusal(h.db, row))
+    assert said.startswith("2 accounts have not signed in through this provider within its days, so their SSH keys")
+    assert "so that they sign in through it again; unlink each under the provider's Identities; or delete the accounts." in said
+    assert "they are then held, to be lifted under Identities" in said
+    # A way it names works: unlinked under Identities, that account no longer stands in the way.
+    h.db.rows_of(ExternalIdentity).remove(also)
+    assert sso_providers.days_ran_out(h.db, row) == 1
     assert lapsed.refused_at is None and inside.refused_at is None and h.rows() == [row] and h.order == []
     after = F.held_to_a_provider(h.db, alice)
     assert after is None or not F.closes_now(after, now)        # her password signs in as before

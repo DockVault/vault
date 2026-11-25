@@ -575,11 +575,14 @@ def remove_refusal(db, row) -> Optional[Conflict]:
         # would give them their paused keys back unseen. The sentence names the two ways on. (Where the days only
         # pause keys, the removal itself holds them, once its step-up has passed: held_by_the_removal.)
         n = lapsed
+        many = n != 1
         return Conflict(DAYS_RAN_OUT, (
-            f"{n} account{'s have' if n != 1 else ' has'} not signed in through this provider within its days, so "
-            f"{'their' if n != 1 else 'its'} SSH keys, temporary credentials and devices are paused. Removing the "
-            "provider would lift that unseen. Turn the provider on so that they can sign in through it again. Or "
-            "turn off “After those days, or a refusal, the account signs in only through a provider” for it "
-            f"(Access) and remove it again: {'they are' if n != 1 else 'it is'} then held, for you to clear under "
-            "Identities, and nobody's password stops."))
+            f"{n} account{'s have' if many else ' has'} not signed in through this provider within its days, so "
+            f"{'their' if many else 'its'} SSH keys, temporary credentials and devices are paused. Removing the "
+            "provider would lift that unseen. The ways on: turn the provider on so that "
+            f"{'they sign' if many else 'it signs'} in through it again; unlink {'each' if many else 'it'} under the "
+            f"provider's Identities; or delete the account{'s' if many else ''}. Or turn off “After those days, or a "
+            "refusal, the account signs in only through a provider” for it (Access) and remove it again: "
+            f"{'they are' if many else 'it is'} then held, to be lifted under Identities, and nobody's password "
+            "stops."))
     return None
