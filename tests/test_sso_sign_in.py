@@ -188,6 +188,9 @@ class Harness:
         self.S = S = _api()
         self.signer = Signer()
         self.redis = FakeRedis()
+        # The store has been up since long before these sign-ins began: its memory of the providers' logouts
+        # covers them (a store emptied while a sign-in is under way is its own case, in test_sso_sessions.py).
+        self.redis.set(sso_state.LOGGED_OUT_REACH_KEY, "0.0")
         self.providers = list(providers)
         self.db = DB({User: list(users), SsoProvider: self.providers, ExternalIdentity: list(identities), PendingLogin: [],
                       ActiveSession: [], SystemSetting: [], SecondFactorEnrollment: [], SecondFactorAction: [],
@@ -359,7 +362,7 @@ def test_a_start_is_refused_for_an_unknown_draft_disabled_or_unconfigured_provid
     for p in (draft, off, saml, bare):
         status, out = h.start(p)
         assert status == 404 and out["detail"]["reason"] == "provider_disabled", (p.name, out)
-    assert h.redis.rows == {}
+    assert not [key for key in h.redis.rows if key.startswith("sso:state:")]      # no state was made
 
 
 # --------------------------------------------------------------------------- the callback: a sign-in

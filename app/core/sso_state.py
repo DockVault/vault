@@ -174,6 +174,8 @@ def begin(*, provider_id: str, purpose: str, source: str, client_ip: Optional[st
         step_up_action=step_up_action, client_ip=client_ip, source=source, started_at=int(now),
         asked_at=float(now), extras=dict(extras or {}))
     try:
+        # The memory of the providers' logouts is whole from this moment at the latest (logout_memory_reaches).
+        r.set(LOGGED_OUT_REACH_KEY, repr(float(now)), nx=True)
         written = r.set(_key(record.state), json.dumps(asdict(record), separators=(",", ":")),
                              ex=STATE_TTL_SECONDS, nx=True)
         if written:
@@ -373,11 +375,39 @@ def note_logged_out(*, scope: str, sid=None, sub=None, at: Optional[float] = Non
     provider's retry notes it."""
     moment = repr(float(time.time() if at is None else at))
     try:
+        r = _redis(redis)
+        r.set(LOGGED_OUT_REACH_KEY, moment, nx=True)      # the memory is whole from its first note at the latest
         for kind, value in (("sid", sid), ("sub", sub)):
             if isinstance(value, str) and value:
-                _redis(redis).set(_logged_out_key(kind, value, scope), moment, ex=LOGGED_OUT_TTL_SECONDS)
+                r.set(_logged_out_key(kind, value, scope), moment, ex=LOGGED_OUT_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         raise Unavailable("the sign-in state store cannot be reached") from exc
+
+
+# From when the store's memory of the providers' logouts is whole. The notes are kept in the store's memory only:
+# a store that was emptied (its container made anew by an update or a restart of the host) has lost every note,
+# and nothing in it says that there ever were any. So the memory says how far back it reaches: this mark is
+# written once, with no end, by whatever touches the memory first (a sign-in that begins, a logout that is
+# noted, a reader that finds it missing), and it goes with the notes when the store is emptied. A sign-in begun
+# before the mark is one the memory does not cover: a logout the vault took meanwhile may be among what was lost.
+LOGGED_OUT_REACH_KEY = "sso:logged-out-since"
+
+
+def logout_memory_reaches(*, redis=None, now: Optional[float] = None) -> float:
+    """From when the memory of the providers' logouts is whole (seconds since the epoch): the mark, written
+    here as this moment when it is missing. A mark that cannot be read counts as written now. Raises
+    :class:`Unavailable` without the store."""
+    moment = float(time.time() if now is None else now)
+    try:
+        r = _redis(redis)
+        r.set(LOGGED_OUT_REACH_KEY, repr(moment), nx=True)
+        raw = r.get(LOGGED_OUT_REACH_KEY)
+    except Exception as exc:  # noqa: BLE001
+        raise Unavailable("the sign-in state store cannot be reached") from exc
+    try:
+        return float(raw.decode("ascii") if isinstance(raw, bytes) else raw)
+    except (TypeError, ValueError, UnicodeDecodeError, AttributeError):
+        return moment
 
 
 def logged_out_since(*, scope: str, sid=None, sub=None, redis=None) -> Optional[float]:

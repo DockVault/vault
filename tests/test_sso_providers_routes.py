@@ -535,7 +535,7 @@ def test_a_test_sign_in_needs_the_connection_and_an_address(monkeypatch):
     monkeypatch.setattr(public_url, "public_base_url", lambda: "")
     status, out = h.call("POST", path, {"verifier_hash": _h("tab")})
     assert status == 409 and out["detail"]["reason"] == "no_public_address"
-    assert h.redis.rows == {} if hasattr(h.redis, "rows") else True      # no state was made
+    assert not [key for key in h.redis.rows if key.startswith("sso:state:")]      # no state was made
 
 
 def test_a_finished_test_keeps_the_connections_fingerprint_with_its_summary(monkeypatch):

@@ -78,6 +78,12 @@ api._fire_action_email = lambda *a, **k: None
 api._force_close_after_commit = lambda *a, **k: None
 sign_in._record = lambda *a, **k: None
 sso_router._audit = lambda *a, **k: None
+# The store's memory of the providers' logouts is whole from before the sign-ins of this scenario: they begin
+# nowhere but here, and a sign-in that begins at the vault marks the memory at its own start
+# (app/core/sso_state.logout_memory_reaches). On a store nothing has touched yet, the first sign-in written here
+# would otherwise count as begun before the memory.
+from app.core import sso_state as _memory
+_memory.logout_memory_reaches()
 # The provider's logout: its token is taken as verified, with the claims the scenario gives it.
 rate_limiter.check_rate_limit = lambda **kw: (True, 0, 0)
 sso_sign_in.provider_config = lambda row: object()

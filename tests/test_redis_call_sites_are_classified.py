@@ -70,12 +70,12 @@ _REGISTRY = {
         "issue": ("B", 1), "take": ("B", 1),     # once, before the socket, while the guard is open
     },
     "core/sso_state.py": {                       # the single sign-on stores: no fallback; the vault's own
-        "begin": ("B", 5), "take": ("B", 2),     # client is handed out behind the outage guard (_redis), so
+        "begin": ("B", 6), "take": ("B", 2),     # client is handed out behind the outage guard (_redis), so
         "store_handover": ("B", 1), "take_handover": ("B", 1),   # each call is refused before the socket
         "abandoned_count": ("B", 1), "stage_reauth": ("B", 1), "take_reauth": ("B", 1),   # while it is open
         "seen_logout_jti": ("B", 1), "forget_logout_jti": ("B", 1),
         "stage_logout_hint": ("B", 1), "read_logout_hint": ("B", 1),
-        "note_logged_out": ("B", 1), "logged_out_since": ("B", 1),
+        "note_logged_out": ("B", 2), "logged_out_since": ("B", 1), "logout_memory_reaches": ("B", 2),
     },
     "core/database.py": {
         "redis_probe_ping": ("E", 1),            # the breaker's own health probe: off-loop, dedicated

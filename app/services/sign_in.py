@@ -644,6 +644,8 @@ PROVIDER_ONLY_REASON = "Account signs in only through its identity provider"
 # account unlinked from it, after the provider answered.
 PROVIDER_GONE_REASON = "The identity provider was turned off or unlinked before the sign-in finished"
 PROVIDER_LOGGED_OUT_REASON = "The identity provider logged the person out before the sign-in finished"
+LOGOUT_MEMORY_REASON = ("The sign-in began before the vault's memory of the provider's logouts does (the store was "
+                        "emptied meanwhile)")
 # The audit's reason for a passkey used by itself on an account whose password nobody knows: the key was set up on
 # the provider's sign-in alone and confirms the person after it.
 KEY_AFTER_THE_PROVIDER_REASON = "Passkey of an account without a password of its own, used without its identity provider"
@@ -759,6 +761,8 @@ def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
             stands = identity is not None and sso_sign_in.same_identity(identity, result.provider_sub)
             if stands and logged_out_at_the_provider(row, result):
                 stands, reason = False, PROVIDER_LOGGED_OUT_REASON
+            elif stands and begun_before_the_logout_memory(row, result):
+                stands, reason = False, LOGOUT_MEMORY_REASON
     except ValueError:
         stands = False                  # not a provider's id at all
     if stands:
@@ -1049,6 +1053,36 @@ def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: O
     refuse_unless_the_account_may_sign_in(db, user, client_ip)
     refuse_without_the_provider(db, held)
     refuse_unless_the_provider_stands(db, held)
+
+
+def begun_before_the_logout_memory(row, result: SignInResult) -> bool:
+    """Whether this sign-in through ``row`` was begun before the vault's memory of the provider's logouts is whole
+    (app/core/sso_state.logout_memory_reaches). The memory lives in the store's own memory: emptied (an update or
+    a restart of the host makes its container anew), it has lost a logout the vault took while the sign-in was
+    held at a step, and the provider does not send it again. Finished all the same, the sign-in made a session
+    for the provider's session that was logged out. So a sign-in the memory does not cover from its start is
+    refused, and the person starts again: the cost of a store emptied while a sign-in was under way. Asked only
+    where the provider's logouts are taken, and of a sign-in that says when it was begun. A store that cannot be
+    reached refuses the sign-in as busy."""
+    pending = result.pending
+    sid = result.provider_sid or getattr(pending, "_provider_sid", None)
+    sub = result.provider_sub or getattr(pending, "_provider_sub", None)
+    if not (isinstance(sid, str) and sid) and not (isinstance(sub, str) and sub):
+        return False
+    from app.core import sso_state
+    from app.services import sso_sign_in
+    if not sso_sign_in.policy_of(row)["sso_backchannel_logout"]:
+        return False
+    begun = result.provider_answered_at
+    if begun is None:
+        begun = getattr(pending, "_provider_answered_at", None)
+    if not isinstance(begun, (int, float)) or isinstance(begun, bool):
+        return False
+    try:
+        return begun < sso_state.logout_memory_reaches()
+    except sso_state.Unavailable:
+        raise HTTPException(status_code=503, detail=(
+            "Signing in through your organisation is busy right now. Try again in a moment.")) from None
 
 
 def complete_sign_in(db, result: SignInResult) -> SignedIn:

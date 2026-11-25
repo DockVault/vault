@@ -61,6 +61,9 @@ class World:
         from app.core import sso_state
         from test_sso_state import FakeRedis
         self.redis = FakeRedis()
+        # The store has been up since long before these sign-ins began: its memory of the providers' logouts
+        # covers them (a store emptied while a sign-in is under way is its own case, in test_sso_sessions.py).
+        self.redis.set(sso_state.LOGGED_OUT_REACH_KEY, "0.0")
         monkeypatch.setattr(sso_state, "_redis", lambda redis: self.redis)
         h.db.tables[ExternalIdentity] = [
             types.SimpleNamespace(id=uuid.uuid4(), user_id=u.id, provider_id=self.provider.id,

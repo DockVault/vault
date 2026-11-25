@@ -1240,3 +1240,98 @@ def test_what_ends_a_providers_sessions_spends_the_sign_ins_under_way_through_on
     assert inspect.getsource(sso_freshness).count(spends) == 1
     for module in (sso_router, sso_freshness):
         assert "PendingLogin.consumed_at:" not in inspect.getsource(module), module.__name__
+
+
+def test_a_store_emptied_between_a_logout_and_the_held_step_does_not_let_the_sign_in_finish(monkeypatch):
+    """The provider logs a session out while the sign-in that came through it waits at the vault. The logout is
+    kept as a note in the store, which holds it in memory only. The store is emptied (an update or a restart of
+    the host makes its container anew): the note is gone, and the provider does not send its logout again.
+    Finished then, the sign-in made a session for the provider's session that was logged out, to live until its
+    time ran out. The memory says from when it is whole, and a sign-in begun before that is refused: the person
+    starts again. The control: with the store as it was, the note itself refuses; and a sign-in begun after the
+    store came back is finished as ever."""
+    from app.core import sso_state
+    from app.services import sign_in
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    waiting, _ = _sign_in(h, p, sid="s-held")
+    control, _ = _sign_in(h, p, sid="s-control")
+    assert h.logout(p, h.logout_token(sid="s-held", sub="subject-1"))[0] == 200
+    assert h.logout(p, h.logout_token(sid="s-control", sub="subject-1"))[0] == 200
+    # The control: the note is there, and refuses.
+    status, body = h.finish(control)
+    assert status == 401 and ("login_failure", alice.username, sign_in.PROVIDER_LOGGED_OUT_REASON) in h.audits
+    # The store is emptied: the note, the mark and every state go; the code the person holds is still theirs to
+    # redeem (kept for the test: it is what a store that kept only that much would hold).
+    kept = {key: value for key, value in h.redis.rows.items() if key.startswith("signin:code:")}
+    h.redis.rows.clear()
+    h.redis.rows.update(kept)
+    assert sso_state.logged_out_since(scope=str(p.id), sid="s-held") is None                 # the logout is forgotten
+    status, body = h.finish(waiting)
+    assert status == 401 and body == {"detail": "This sign-in cannot be completed; start again."}, body
+    assert not h.active_sessions()
+    assert ("login_failure", alice.username, sign_in.LOGOUT_MEMORY_REASON) in h.audits, h.audits
+    # A sign-in begun now, after the store came back, is covered from its start and finishes; and so does one
+    # that is still under way when another person begins theirs.
+    again, _ = _sign_in(h, p, sid="s-held")
+    time.sleep(0.02)
+    later, _ = _sign_in(h, p, sid="s-later")
+    assert h.finish(again)[0] == 200 and h.finish(later)[0] == 200 and len(h.active_sessions()) == 2
+
+
+def test_the_memory_of_logouts_says_from_when_it_is_whole(monkeypatch):
+    """The mark is written once, with no end, by whatever touches the memory first: a sign-in that begins (with
+    that sign-in's own moment, so the sign-in is covered), a logout that is noted, or a reader that finds it
+    missing. It is asked only where the provider's logouts are taken and of a sign-in that says when it began."""
+    import types as _types
+    from fastapi import HTTPException
+    from app.core import sso_state
+    from app.services import sign_in
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    key = sso_state.LOGGED_OUT_REACH_KEY
+    # Found missing by a reader: written as that moment, once.
+    h.redis.rows.pop(key)
+    assert sso_state.logout_memory_reaches(now=100.0) == 100.0
+    assert sso_state.logout_memory_reaches(now=200.0) == 100.0 and h.redis.ttl[key] is None    # once, and no end
+    # A logout noted first marks its own moment.
+    h.redis.rows.pop(key)
+    sso_state.note_logged_out(scope=str(p.id), sid="s-1", at=70.0)
+    assert sso_state.logout_memory_reaches(now=300.0) == 70.0
+    # A sign-in that begins first marks its own moment: it is covered from its start.
+    h.redis.rows.pop(key)
+    began = sso_state.begin(provider_id=str(p.id), purpose=sso_state.SIGN_IN, source="203.0.113.9", verifier_hash="h" * 64,
+                            now=50.0)
+    assert sso_state.logout_memory_reaches(now=400.0) == 50.0 == sso_state.began_at(began)
+    # The next sign-in to begin leaves the mark where it is: moved to its own moment, every sign-in still under
+    # way would count as begun before the memory, and be refused when another person started theirs.
+    sso_state.begin(provider_id=str(p.id), purpose=sso_state.SIGN_IN, source="203.0.113.9", verifier_hash="h" * 64,
+                    now=60.0)
+    sso_state.note_logged_out(scope=str(p.id), sid="s-2", at=65.0)
+    assert sso_state.logout_memory_reaches(now=400.0) == 50.0
+    # A mark that cannot be read counts as written now.
+    h.redis.rows[key] = "not a moment"
+    assert sso_state.logout_memory_reaches(now=500.0) == 500.0
+
+    def held(begun, sid="s-1", **fields):
+        return _types.SimpleNamespace(pending=None, provider_sid=sid, provider_sub=None, provider_answered_at=begun,
+                                      **fields)
+    h.redis.rows[key] = "1000.0"
+    for begun, before in ((999.9, True), (1000.0, False), (1000.1, False), (None, False), ("999", False), (True, False)):
+        assert sign_in.begun_before_the_logout_memory(p, held(begun)) is before, begun
+    assert sign_in.begun_before_the_logout_memory(p, held(1.0, sid=None)) is False               # names nothing
+    # From the token of a held step, where the result itself says nothing.
+    step = held(None, sid=None)
+    step.pending = _types.SimpleNamespace(_provider_sid="s-1", _provider_sub=None, _provider_answered_at=999.0)
+    assert sign_in.begun_before_the_logout_memory(p, step) is True
+    # Not asked where the provider's logouts are not taken: nothing is read, and nothing written.
+    off = _provider(policy={"sso_backchannel_logout": False})
+    h.redis.rows.pop(key)
+    assert sign_in.begun_before_the_logout_memory(off, held(1.0)) is False and key not in h.redis.rows
+    # A store that cannot be reached refuses the sign-in as busy.
+    def down(**kw):
+        raise sso_state.Unavailable("down")
+    monkeypatch.setattr(sso_state, "logout_memory_reaches", down)
+    with pytest.raises(HTTPException) as busy:
+        sign_in.begun_before_the_logout_memory(p, held(1.0))
+    assert busy.value.status_code == 503 and "busy" in busy.value.detail
