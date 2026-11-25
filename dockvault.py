@@ -1582,6 +1582,19 @@ CERTS_FILE_SETTINGS = (
 )
 
 
+def certs_file_name(value):
+    """The name inside certs/ of the file ``value`` names as the container sees it (the HTTPS compose mounts certs/ at
+    /app/certs, and the server's working directory is /app), or None when it names no file there. Pure."""
+    import posixpath
+    text = str(value or "").strip().strip("'\"").strip()
+    if not text:
+        return None
+    path = posixpath.normpath(posixpath.join("/app", text))
+    if not path.startswith("/app/certs/"):
+        return None
+    return path[len("/app/certs/"):]
+
+
 def certs_file_problem(env_key, value, cert_dir):
     """What is wrong with the file ``value`` names for the server to read from certs/, as a sentence, or None when
     nothing is (or no file is named). ``value`` is the path the container sees: the HTTPS compose mounts the certs/
@@ -1589,15 +1602,13 @@ def certs_file_problem(env_key, value, cert_dir):
     is read from there. A file named outside that folder never comes from this host; one inside it is looked for in
     ``cert_dir``, and must hold a PEM certificate. A file this user cannot read is not judged. Pure but for reading
     ``cert_dir``."""
-    import posixpath
     text = str(value or "").strip().strip("'\"").strip()
     if not text:
         return None
-    path = posixpath.normpath(posixpath.join("/app", text))
-    if not path.startswith("/app/certs/"):
+    inside = certs_file_name(text)
+    if inside is None:
         return ("%s names %s, outside /app/certs: the HTTPS compose mounts only the certs/ folder beside .env, at "
                 "/app/certs, so no file of yours reaches that path." % (env_key, text))
-    inside = path[len("/app/certs/"):]
     local = os.path.join(cert_dir, *inside.split("/"))
     if not os.path.isfile(local):
         return ("%s names %s, and certs/%s does not exist (a backup does not carry certs/): copy the file there."
@@ -1859,17 +1870,30 @@ def _cert_mount(cert_dir):
     return os.path.abspath(cert_dir).replace("\\", "/")
 
 
-def cert_readable_by_app_uid(cert_dir, run=subprocess.run):
+def _certs_names(extra):
+    """The files ``extra`` names inside certs/ (as certs_files_named gives them), each as a path the probe and the
+    repair containers see, quoted for their shell; a name that is not a plain relative path is left out."""
+    names = []
+    for name in extra or ():
+        name = str(name)
+        if re.fullmatch(r"[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*", name) and ".." not in name.split("/"):
+            names.append(shlex.quote("/certs/" + name))
+    return names
+
+
+def cert_readable_by_app_uid(cert_dir, run=subprocess.run, extra=()):
     """Can the in-container app user (uid APP_UID) actually READ cert.pem AND key.pem through the
     read-only bind mount? True / False / None (couldn't determine: no docker, or the probe itself
     failed). This is the ONLY honest check - host permissions do not predict what the container
     sees (a Docker Desktop bind mount carries POSIX modes written from inside a container, and a
     remapped engine shifts the uid) - and it catches the failure that otherwise surfaces only as
     uvicorn's `PermissionError: [Errno 13]` in an endless restart loop. Reads ONE byte and discards
-    it, so the private key never reaches the host's stdout or a log."""
+    it, so the private key never reaches the host's stdout or a log. ``extra``: other files in certs/ the server
+    reads (certs_files_named), which must be readable as well for a True."""
     if shutil.which("docker") is None:
         return None
-    probe = ("head -c 1 /certs/cert.pem >/dev/null 2>&1 && head -c 1 /certs/key.pem >/dev/null 2>&1")
+    probe = " && ".join("head -c 1 %s >/dev/null 2>&1" % path
+                        for path in ["/certs/cert.pem", "/certs/key.pem"] + _certs_names(extra))
     try:
         r = run(["docker", "run", "--rm", "--user", "%d:%d" % (APP_UID, APP_UID),
                  "-v", "%s:/certs:ro" % _cert_mount(cert_dir), "busybox", "sh", "-c", probe],
@@ -1882,15 +1906,20 @@ def cert_readable_by_app_uid(cert_dir, run=subprocess.run):
     return rc == 0
 
 
-def _chown_certs_in_container(cert_dir, run=subprocess.run):
+def _chown_certs_in_container(cert_dir, run=subprocess.run, extra=()):
     """Set cert ownership + modes from INSIDE a throwaway container. On an engine whose bind mounts
     carry POSIX metadata the host cannot express (Docker Desktop on Windows/macOS), this is the only
     way to hand the key to the app uid: openssl writes key.pem mode 600 owned by uid 0, and host
-    ACLs cannot re-own it. Keeps the key at 600 (owner-only) rather than making it world-readable."""
+    ACLs cannot re-own it. Keeps the key at 600 (owner-only) rather than making it world-readable. ``extra``:
+    other files in certs/ the server reads (certs_files_named), public like the certificate: given to the app uid
+    too, mode 644."""
     if shutil.which("docker") is None:
         return False
     fix = ("chown %d:%d /certs/cert.pem /certs/key.pem && chmod 644 /certs/cert.pem "
            "&& chmod 600 /certs/key.pem" % (APP_UID, APP_UID))
+    others = " ".join(_certs_names(extra))
+    if others:
+        fix += " && chown %d:%d %s && chmod 644 %s" % (APP_UID, APP_UID, others, others)
     try:
         r = run(["docker", "run", "--rm", "-v", "%s:/certs" % _cert_mount(cert_dir),
                  "busybox", "sh", "-c", fix], capture_output=True, text=True, timeout=120)
@@ -1907,7 +1936,7 @@ _CERT_UNKNOWN = ("could not check whether the container can read certs/ (the Doc
                  "running.")
 
 
-def _apply_cert_owner_container(cert_dir, run=subprocess.run):
+def _apply_cert_owner_container(cert_dir, run=subprocess.run, extra=()):
     """The Windows/Docker-Desktop path for apply_cert_owner: re-own the pair to APP_UID from inside
     a container, then VERIFY the app uid can read it. Returns (mode600, message) like its caller.
 
@@ -1916,9 +1945,13 @@ def _apply_cert_owner_container(cert_dir, run=subprocess.run):
     would talk an operator into destroying a bring-your-own or Let's Encrypt pair over a stopped
     daemon."""
     verdict = cert_readable_by_app_uid(cert_dir, run)
+    if verdict is True and extra:
+        # The pair is readable already; the other files are handed over as well. Whether the container can read
+        # them is asked by setup, file by file, so the verdict here stays the pair's.
+        _chown_certs_in_container(cert_dir, run, extra=extra)
     if verdict is True:
         return True, "certs are readable by the container's app user (key mode 600)"
-    if not _chown_certs_in_container(cert_dir, run):
+    if not _chown_certs_in_container(cert_dir, run, extra=extra):
         return False, (_CERT_UNKNOWN if verdict is None else _CERT_DENIED)
     after = cert_readable_by_app_uid(cert_dir, run)
     if after is True:
@@ -1926,7 +1959,7 @@ def _apply_cert_owner_container(cert_dir, run=subprocess.run):
     return False, (_CERT_UNKNOWN if after is None else _CERT_DENIED)
 
 
-def apply_cert_owner(cert_dir, run=subprocess.run):
+def apply_cert_owner(cert_dir, run=subprocess.run, extra=()):
     """Make cert_dir/{cert,key}.pem readable by the in-container app user through the read-only bind
     mount. On a plain rootful engine, chown to APP_UID (10001) keeping the key mode 600.
     On a userns-remap engine, chown to the MAPPED host uid (resolved from /etc/subuid), keeping 600.
@@ -1934,15 +1967,18 @@ def apply_cert_owner(cert_dir, run=subprocess.run):
     resolved), a throwaway container re-owns the pair, keeping 600, and the container's view is
     verified. Only when that fails too does it fall back to a world-readable key (644, single-tenant
     host) so the container CAN read it - NEVER falsely reporting a mode-600 key when it would be
-    unreadable. Returns (mode600, message)."""
+    unreadable. Returns (mode600, message). ``extra``: other files in certs/ the server reads (certs_files_named:
+    an attestation roots file, a provider's certificate authorities), public, so mode 644 and owned as the
+    certificate is; whether the container can read them is not part of the verdict."""
+    extras = [os.path.join(cert_dir, *str(name).split("/")) for name in (extra or ()) if _certs_names((name,))]
     if os.name == "nt":
         # NOT a no-op: a Docker Desktop bind mount carries the POSIX mode of whatever wrote the file,
         # and openssl writes key.pem 0600 owned by uid 0 - unreadable to the app's uid 10001. The host
         # has no chown to fix that, so do it from inside a container and verify.
-        return _apply_cert_owner_container(cert_dir, run)
+        return _apply_cert_owner_container(cert_dir, run, extra=extra)
     key = os.path.join(cert_dir, "key.pem")
     cert = os.path.join(cert_dir, "cert.pem")
-    for path, mode in ((cert_dir, 0o700), (cert, 0o644), (key, 0o600)):
+    for path, mode in [(cert_dir, 0o700), (cert, 0o644), (key, 0o600)] + [(path, 0o644) for path in extras]:
         try:
             os.chmod(path, mode)
         except OSError:
@@ -1965,7 +2001,7 @@ def apply_cert_owner(cert_dir, run=subprocess.run):
             os.chmod(cert_dir, 0o755)
         except OSError:
             pass
-        ok, msg = _apply_cert_owner_container(cert_dir, run)
+        ok, msg = _apply_cert_owner_container(cert_dir, run, extra=extra)
         return (True, msg) if ok else _world_readable(reason)
 
     if _engine_is_remapped(run):
@@ -1979,7 +2015,7 @@ def apply_cert_owner(cert_dir, run=subprocess.run):
     else:
         owner = APP_UID
     try:
-        for path in (cert_dir, cert, key):
+        for path in [cert_dir, cert, key] + extras:
             os.chown(path, owner, owner)
         if os.stat(key).st_uid == owner:
             return True, "certs owned by uid %d (key mode 600, not world-readable)" % owner
@@ -5753,6 +5789,9 @@ class DockVault:
 
         env_path = self._env_path()
         existing = parse_env(open(env_path, encoding="utf-8").read()) if os.path.exists(env_path) else {}
+        # A file of attestation roots given on the command line is checked and copied into certs/ before .env is
+        # written or changed: a file setup cannot use stops it with nothing changed.
+        attestation_roots = self._take_attestation_roots(args)
         reusing = False
         summary = {}
         tracker.show()
@@ -5781,6 +5820,9 @@ class DockVault:
             # bootstrapped deployment the seed is marker-guarded, so this is inert and the value is
             # dropped again after a healthy boot. Not passed -> the existing .env is left untouched.
             existing = self._apply_cli_admin_overrides(env_path, existing, args)
+            if attestation_roots:
+                self._set_env_key(env_path, "WEBAUTHN_ATTESTATION_ROOTS", attestation_roots)
+                print(pal.paint("  Set WEBAUTHN_ATTESTATION_ROOTS=%s in .env." % attestation_roots, "green"))
             summary = {"server_name": existing.get("SERVER_NAME") or _allowed_hosts_name(existing.get("ALLOWED_HOSTS")) or "",
                        "admin_username": existing.get("ADMIN_USERNAME") or "admin",
                        "compose_profiles": migrated,
@@ -5789,6 +5831,8 @@ class DockVault:
                        "sftp_host_port": _port_or(existing.get("SFTP_HOST_PORT"), 2322)}
         else:
             cfg = self._collect_setup_config(args)
+            if attestation_roots:
+                cfg["webauthn_attestation_roots"] = attestation_roots
             tracker.advance(); tracker.show()          # -> Write .env
             if write_env(env_path, build_env_lines(cfg)):
                 print(pal.paint("  Wrote .env (restricted to your user).", "green"))
@@ -5843,9 +5887,14 @@ class DockVault:
         key = os.path.join(cert_dir, "key.pem")
         if os.path.exists(key) and not tighten_secret_file(key) and not _key_already_private(key):
             print(pal.paint("  WARNING: could not restrict the TLS key's permissions.", "yellow"))
-        owner_ok, owner_msg = apply_cert_owner(cert_dir)
+        # The other files .env names in certs/ (attestation roots, a provider's certificate authorities) are handed to
+        # the container's user with the pair; one named that is not there is said as status says it.
+        certs_files, certs_problems = self._certs_files_named(self._load_env(), cert_dir)
+        owner_ok, owner_msg = apply_cert_owner(cert_dir, extra=[name for _key, _label, _follows, name in certs_files])
         if owner_msg:
             print(pal.paint("  " + owner_msg, "green" if owner_ok else "yellow"))
+        for label, problem, follows in certs_problems:
+            print(pal.paint("  %s: %s %s" % (label, problem, follows), "yellow"))
         if no_start:
             print(pal.paint("\n  Setup done (--no-start). Start later with:  python dockvault.py setup\n", "cyan"))
             return
@@ -5862,6 +5911,13 @@ class DockVault:
             self._fail("the vault container (uid %d) cannot read certs/key.pem, so it could never "
                        "serve HTTPS. Delete certs/cert.pem and certs/key.pem and re-run setup to "
                        "regenerate a readable pair." % APP_UID)
+        # The other files the server reads from certs/: the vault serves without them, so one it cannot read is a
+        # warning, with what it stops.
+        for key, label, follows, name in certs_files:
+            if cert_readable_by_app_uid(cert_dir, extra=(name,)) is False:
+                print(pal.paint("  %s: the vault container (uid %d) cannot read certs/%s (%s). %s Make it readable "
+                                "(chmod 644) and restart the vault with python dockvault.py restart."
+                                % (label, APP_UID, name, key, follows), "yellow"))
         # Guardrail: if we're (re)starting on an EXISTING data volume, the current .env's DB password
         # MUST authenticate against it, or the app would loop on a Postgres auth error. Fail closed
         # with a clear diagnosis (the reported "wrong password after re-setup" footgun).
@@ -6185,6 +6241,63 @@ class DockVault:
         if mode and mode not in CERT_MODES:
             self._fail("unknown --cert-mode %r (one of %s)" % (mode, ", ".join(CERT_MODES)))
         return (mode or "selfsigned", email, cpath, kpath)
+
+    def _take_attestation_roots(self, args):
+        """The file --webauthn-attestation-roots names, checked and copied into certs/ (mode 644; setup then hands it
+        to the container's user with the TLS pair): the path the container reads it at (/app/certs/<its name>), for
+        WEBAUTHN_ATTESTATION_ROOTS. None when the flag is not given. A file that is not there, holds no PEM
+        certificate, has the name of the TLS pair's certificate or key, or a name a .env line cannot carry plainly,
+        stops setup before anything is written."""
+        source = getattr(args, "webauthn_attestation_roots", None) if args else None
+        if not source:
+            return None
+        source = os.path.expanduser(str(source))
+        flag = "--webauthn-attestation-roots"
+        if not os.path.isfile(source):
+            self._fail("%s: %s is not a file." % (flag, source))
+        name = os.path.basename(source)
+        if name in ("cert.pem", "key.pem"):
+            self._fail("%s: %s has the name of the TLS pair's certificate or key in certs/; copy it under another "
+                       "name first." % (flag, source))
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            self._fail("%s: the file's name %r has more than letters, digits, dots, hyphens and underscores; copy it "
+                       "under such a name first." % (flag, name))
+        try:
+            with open(source, "rb") as handle:
+                body = handle.read()
+        except OSError as exc:
+            self._fail("%s: %s cannot be read (%s)." % (flag, source, type(exc).__name__))
+        if b"-----BEGIN CERTIFICATE-----" not in body:
+            self._fail("%s: %s holds no PEM certificate." % (flag, source))
+        cert_dir = self._certs_dir()
+        target = os.path.join(cert_dir, name)
+        try:
+            os.makedirs(cert_dir, exist_ok=True)
+            if os.path.abspath(source) != os.path.abspath(target):
+                shutil.copyfile(source, target)
+            os.chmod(target, 0o644)
+        except OSError as exc:
+            self._fail("%s: could not copy %s into certs/ (%s). Copy it there yourself and set "
+                       "WEBAUTHN_ATTESTATION_ROOTS=/app/certs/%s in .env." % (flag, source, type(exc).__name__, name))
+        print(self.pal.paint("  Copied %s to certs/%s. Direct attestation is turned on in Settings -> Sign-in "
+                             "methods." % (source, name), "green"))
+        return "/app/certs/" + name
+
+    @staticmethod
+    def _certs_files_named(env, cert_dir):
+        """The files .env names in certs/ for the server to read (CERTS_FILE_SETTINGS): those that are there, as
+        (setting, label, what follows while the server cannot read it, the name inside certs/), and the problem of
+        each other one named (certs_file_problem), as (label, problem, what follows)."""
+        there, problems = [], []
+        for key, label, follows in CERTS_FILE_SETTINGS:
+            problem = certs_file_problem(key, (env or {}).get(key), cert_dir)
+            if problem:
+                problems.append((label, problem, follows))
+                continue
+            name = certs_file_name((env or {}).get(key))
+            if name and os.path.isfile(os.path.join(cert_dir, *name.split("/"))):
+                there.append((key, label, follows, name))
+        return there, problems
 
     def _set_env_key(self, path, key, value):
         """Replace/append KEY=value in .env (bare value), mode 600. A byte order mark at the start is read past
@@ -10490,6 +10603,10 @@ def build_parser():
     sp.add_argument("--lock-recording-levels", dest="lock_recording_levels", action="store_true",
                     help="make the AUDIT_MAX_* limits also the recording levels, which the panel cannot lower "
                          "(adds audit_levels to SETTINGS_LOCKED_KEYS)")
+    sp.add_argument("--webauthn-attestation-roots", dest="webauthn_attestation_roots",
+                    help="a PEM file of authenticator vendors' attestation root certificates, for direct passkey "
+                         "attestation (turned on in Settings -> Sign-in methods): copied into certs/ and named in "
+                         "WEBAUTHN_ATTESTATION_ROOTS; on a re-run too")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")

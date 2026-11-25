@@ -124,3 +124,168 @@ def test_a_fresh_volume_set_keeps_the_providers_authorities_and_status_says_when
     tool._print_sign_in_lines({"ALLOWED_HOSTS": "vault.example.com", "SSO_CA_BUNDLE": "/app/certs/sso-ca.pem"})
     assert ("  Single sign-on: SSO_CA_BUNDLE names /app/certs/sso-ca.pem, and certs/sso-ca.pem does not exist (a "
             "backup does not carry certs/): copy the file there.") in printed, printed
+
+
+# --------------------------------------------------------------------------- the attestation roots file
+
+PEM = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+
+
+def _reusable_env(tmp_path, **extra):
+    cfg = {"server_name": "vault.example.com", "encryption_key": dv.gen_fernet_key(), "jwt_secret_key": dv.gen_hex(32),
+           "vault_db_password": dv.gen_hex(16), "redis_password": dv.gen_hex(24), "admin_username": "admin",
+           "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234", "compose_profiles": "combined",
+           **extra}
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+
+
+def _quiet_certificate_step(monkeypatch, owned=None):
+    """The certificate step without openssl, chown or Docker: a pair is made by writing two files, and the files
+    handed to the container's user are noted in ``owned``."""
+    def made(cert_dir, *a, **k):
+        os.makedirs(cert_dir, exist_ok=True)
+        for name in ("cert.pem", "key.pem"):
+            with open(os.path.join(cert_dir, name), "w", encoding="utf-8") as fh:
+                fh.write("x\n")
+        return True, "made the pair"
+
+    def owner(cert_dir, **k):
+        if owned is not None:
+            owned.append(tuple(k.get("extra") or ()))
+        return True, ""
+    monkeypatch.setattr(dv, "generate_self_signed_cert", made)
+    monkeypatch.setattr(dv, "apply_cert_owner", owner)
+    monkeypatch.setattr(dv, "refresh_renewal_hook", lambda *a, **k: (None, ""))
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (False, "not in a unit test"))
+
+
+def _setup_args(**kw):
+    base = dict(no_start=True, non_interactive=True, cert_mode="selfsigned")
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_setup_copies_the_attestation_roots_into_certs_and_names_them_in_env(tmp_path, monkeypatch):
+    roots = tmp_path / "vendor-roots.pem"
+    roots.write_bytes(PEM)
+    owned = []
+    _quiet_certificate_step(monkeypatch, owned)
+    root = tmp_path / "deployment"
+    root.mkdir()
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    # A fresh install: the line is in the .env setup writes.
+    tool.setup(_setup_args(server_name="vault.example.com", webauthn_attestation_roots=str(roots)))
+    assert (root / "certs" / "vendor-roots.pem").read_bytes() == PEM
+    assert dv.parse_env((root / ".env").read_text(encoding="utf-8"))["WEBAUTHN_ATTESTATION_ROOTS"] == \
+        "/app/certs/vendor-roots.pem"
+    # The container's user is given the file with the TLS pair.
+    assert owned and "vendor-roots.pem" in owned[-1], owned
+    # A re-run over that .env: another file replaces the line, and the setting is the only one changed.
+    other = tmp_path / "other-roots.pem"
+    other.write_bytes(PEM + PEM)
+    before = dv.parse_env((root / ".env").read_text(encoding="utf-8"))
+    tool.setup(_setup_args(webauthn_attestation_roots=str(other)))
+    after = dv.parse_env((root / ".env").read_text(encoding="utf-8"))
+    assert after["WEBAUTHN_ATTESTATION_ROOTS"] == "/app/certs/other-roots.pem"
+    assert {k: v for k, v in after.items() if k != "WEBAUTHN_ATTESTATION_ROOTS"} == \
+        {k: v for k, v in before.items() if k != "WEBAUTHN_ATTESTATION_ROOTS"}
+    assert (root / "certs" / "other-roots.pem").read_bytes() == PEM + PEM
+    assert "other-roots.pem" in owned[-1], owned
+    # The example file says so beside the line.
+    said = " ".join(_example().split())
+    assert ("# python dockvault.py setup --webauthn-attestation-roots <file> copies a file into certs/ and writes "
+            "# this line; each time setup starts the vault, it says when the vault container cannot read the "
+            "file.") in said
+
+
+@pytest.mark.parametrize("name, body, said", [
+    ("missing.pem", None, "is not a file"),
+    ("roots.pem", b"not a certificate\n", "holds no PEM certificate"),
+    ("key.pem", PEM, "the name of the TLS pair's"),
+    ("my roots.pem", PEM, "letters, digits"),
+])
+def test_setup_refuses_an_attestation_roots_file_it_cannot_use_and_changes_nothing(tmp_path, monkeypatch, capsys,
+                                                                                   name, body, said):
+    source = tmp_path / "given" / name
+    source.parent.mkdir()
+    if body is not None:
+        source.write_bytes(body)
+    _quiet_certificate_step(monkeypatch)
+    root = tmp_path / "deployment"
+    root.mkdir()
+    _reusable_env(root)
+    env_before = (root / ".env").read_text(encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    with pytest.raises(SystemExit):
+        tool.setup(_setup_args(webauthn_attestation_roots=str(source)))
+    assert said in capsys.readouterr().out
+    assert (root / ".env").read_text(encoding="utf-8") == env_before
+    assert not (root / "certs" / name).exists()
+
+
+def test_the_readability_probe_names_each_file_it_is_given(monkeypatch):
+    seen = {}
+
+    class Proc:
+        returncode = 0
+
+    monkeypatch.setattr(dv.shutil, "which", lambda *_a: "docker")
+    assert dv.cert_readable_by_app_uid("/c", run=lambda cmd, **k: seen.update(cmd=cmd) or Proc(),
+                                       extra=("roots.pem",)) is True
+    script = seen["cmd"][-1]
+    assert "head -c 1 /certs/cert.pem >/dev/null 2>&1" in script and "head -c 1 /certs/key.pem >/dev/null 2>&1" in script
+    assert "head -c 1 /certs/roots.pem >/dev/null 2>&1" in script
+    # Without one, the probe reads the pair alone, as it always did.
+    dv.cert_readable_by_app_uid("/c", run=lambda cmd, **k: seen.update(cmd=cmd) or Proc())
+    assert "roots.pem" not in seen["cmd"][-1]
+
+
+def _start_ready(tool, monkeypatch):
+    """Setup's start, up to and past the start itself, with nothing run."""
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "refresh_renewal_hook", lambda *a, **k: (None, ""))
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "port_free", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: True)
+    monkeypatch.setattr(tool, "_note_host_log_driver", lambda: None)
+    monkeypatch.setattr(tool, "_resolve_rerun_image_source", lambda *a, **k: None)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_strip_spent_admin_password", lambda *a, **k: None)
+    monkeypatch.setattr(tool, "_passkey_addresses", lambda: None)
+    started = []
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: started.append(1) or True)
+    return started
+
+
+def test_setup_warns_and_starts_when_the_container_cannot_read_only_the_attestation_roots(tmp_path, monkeypatch,
+                                                                                          capsys):
+    _reusable_env(tmp_path, webauthn_attestation_roots="/app/certs/roots.pem")
+    (tmp_path / "certs").mkdir()
+    (tmp_path / "certs" / "roots.pem").write_bytes(PEM)
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    started = _start_ready(tool, monkeypatch)
+    probed = []
+
+    def probe(cert_dir, run=None, extra=()):
+        probed.append(tuple(extra))
+        return not extra
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", probe)
+    tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    out = " ".join(capsys.readouterr().out.split())
+    assert ("Passkeys: the vault container (uid 10001) cannot read certs/roots.pem (WEBAUTHN_ATTESTATION_ROOTS). Until "
+            "the server can read it, every new passkey is refused while attestation is direct. Make it readable "
+            "(chmod 644) and restart the vault with python dockvault.py restart.") in out, out
+    assert ("roots.pem",) in probed and started == [1]
+    # Readable: nothing is said.
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda cert_dir, run=None, extra=(): True)
+    tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    assert "cannot read certs/roots.pem" not in capsys.readouterr().out
+    # A file not in certs/ is said as status says it, and the container is not asked about it.
+    (tmp_path / "certs" / "roots.pem").unlink()
+    probed.clear()
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", probe)
+    tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Passkeys: WEBAUTHN_ATTESTATION_ROOTS names /app/certs/roots.pem, and certs/roots.pem does not exist" in out
+    assert probed == [()], probed
