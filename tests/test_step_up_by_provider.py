@@ -132,6 +132,33 @@ out({ seen, asked, body: posted[0].body });
     assert got["body"] == {"action": "compliance.case.request", "method": "totp", "code": "123456", "password": "pw"}
 
 
+def test_a_confirmation_noted_for_the_action_is_not_spent_where_the_server_asks_for_the_password_alone():
+    """The account has a password again, or the provider was turned off, within the two minutes: the step-up of the
+    same action lists the password alone. The tab spends nothing and asks for the password, with no word of the
+    provider."""
+    got = _node(r"""
+_noteProviderConfirmation('vault.delete', 120, 'Contoso');
+requestStepUpReceipt('vault.delete', ['password']);
+await tick(); await tick();
+const error = document.querySelector('#stepup-modal-body .alert-error');
+out({ posted: posted.length, opened, asked, password: !!byId('stepup-password-input'),
+      providers: !!byId('stepup-providers'), confirmed: !!byId('stepup-provider-confirmed'),
+      error: error ? error.textContent : null, buttons: buttons() });
+""")
+    assert got == {"posted": 0, "opened": ["stepup-modal"], "asked": [], "password": True, "providers": False,
+                   "confirmed": False, "error": "", "buttons": ["Cancel", "Confirm"]}
+
+
+def test_signing_out_forgets_the_confirmation_the_tab_holds():
+    """Sign-out (logout) forgets the confirmation with the rest of the session, before anything else it does may stop
+    it: the next person on the tab never spends it."""
+    from _js_source import strip_comments
+    body = _function(strip_comments(APP_JS.read_text(encoding="utf-8")), "logout")
+    before, found, _after = body.partition("\n    _providerConfirmation = null;\n")
+    assert found, "logout does not forget the confirmation at its own level"
+    assert not re.search(r"^    return\b", before, re.M)
+
+
 def test_back_from_the_provider_the_action_done_again_passes_without_a_password_and_once():
     got = _node(r"""
 await _ssoResume({ kind: 'confirmed', action: 'vault.delete', then: 'step-up', label: 'Contoso', expiresIn: 120 });
