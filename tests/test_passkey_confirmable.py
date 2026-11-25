@@ -63,8 +63,10 @@ def test_a_provisional_key_with_nothing_older_is_said_not_confirmable_and_its_co
     # The notice of the added key promises no confirmation: the key becomes ordinary on its own, on its day.
     change = h.emails[-1]["context"]["change"]
     assert "confirm it with an older factor" not in change, change
+    # Then only what to do if the owner did not add it (sso_router.owners_advice, which _passkey_notice adds).
     assert change.endswith("does not count for the actions that need your own factor until "
-                           f"{row.provisional_until.date().isoformat()}."), change
+                           f"{row.provisional_until.date().isoformat()}. If you did not do this, remove it under "
+                           "Your account and change your password."), change
     # A page that still offers the button: refused at once, and a step-up proved for it is left unspent.
     spent = len(h.receipts)
     status, out = _call(h.S, "POST", f"/users/me/passkeys/{row.id}/confirm", None, {"X-Second-Factor": "ok"})
