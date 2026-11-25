@@ -806,12 +806,47 @@ def passkey_host(allowed_hosts):
     return _allowed_hosts_first(allowed_hosts)[1]
 
 
+def _holders_of_passkeys_elsewhere(holders, host):
+    """(accounts, left with none) among the deployment's groups of passkey holders, for ``host``: how many
+    accounts hold a key made at another address, each counted once, and how many of those have no second factor
+    at ``host`` (no authenticator app in use, and no key that is one there). None when the deployment gave no
+    such groups, or gave something that is none: the caller then says less."""
+    if not isinstance(holders, list):
+        return None
+    accounts = without = 0
+    for group in holders:
+        if not isinstance(group, dict) or not isinstance(group.get("made_at"), list):
+            return None
+        usable = group.get("usable_at")
+        try:
+            count = int(group.get("accounts") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(usable, list) or count < 0:
+            return None
+        # With no address a passkey can be made at, every key is one made elsewhere.
+        if count == 0 or (host and not [made for made in group["made_at"] if str(made or "").lower() != host]):
+            continue
+        accounts += count
+        # At an address no passkey can be made at, no key is a factor, whatever address it was made at.
+        usable_here = bool(host) and host in [str(a or "").lower() for a in usable]
+        if group.get("other_factor") is not True and not usable_here:
+            without += count
+    return accounts, without
+
+
 def passkeys_elsewhere_note(answer, host):
     """What setup and status say about the passkeys in use that were made at another address than ``host`` (the
     host name the vault gives out; "" when no passkey can be made there): how many, of how many accounts, where,
     and what follows. A passkey answers only at the address it was made at. ``answer`` is the deployment's own
     account of them (python -m app.core.host_operator passkey-addresses). None when every passkey in use was made
-    at ``host``, when there is none, or when the deployment could not be asked."""
+    at ``host``, when there is none, or when the deployment could not be asked.
+
+    Only an account left with no second factor at ``host`` sets one up again: one that also holds an
+    authenticator app, or a passkey made at ``host``, signs in with that. The deployment's ``holders`` say how
+    many those are and count an account with keys at two other addresses once; an answer without them gets the
+    sum over the addresses and a sentence that claims no number. While passkeys are turned off (``on`` false)
+    none is used at any address, and the note says that instead."""
     if not isinstance(answer, dict) or not isinstance(answer.get("made_at"), list):
         return None
     host = (host or "").lower()
@@ -824,18 +859,41 @@ def passkeys_elsewhere_note(answer, host):
         except (TypeError, ValueError):
             continue
         address = str(entry.get("address") or "")
-        if keys > 0 and address.lower() != host:
+        if keys > 0 and (not host or address.lower() != host):
             elsewhere.append((server_text(address) or "an address that was not recorded", keys, accounts))
     if not elsewhere:
         return None
     keys, accounts = sum(e[1] for e in elsewhere), sum(e[2] for e in elsewhere)
+    counted = _holders_of_passkeys_elsewhere(answer.get("holders"), host)
+    if counted is not None and counted[0] > 0:
+        accounts, without = counted
+    else:
+        without = None                       # not known: an account with keys at two addresses is counted twice
     where = ", ".join(sorted(e[0] for e in elsewhere))
     here = ("at %s" % host) if host else "at the address the vault has now (no passkey can be made there)"
-    return ("%d passkey%s (of %d account%s) %s made at %s and cannot be used %s. Each of those accounts sets a "
-            "second factor up again at its next sign-in: with its password, or through its organisation's sign-in "
-            "where it has none. The passkeys work again if the vault goes back to that address."
+    how = "with the account's password, or through its organisation's sign-in where it has none"
+    if answer.get("on") is False:
+        follows = ("Passkeys are turned off in this vault, so this changes nothing for those accounts now; it will "
+                   "once passkeys are turned on again.")
+    elif without is None:
+        follows = ("An account among them that has no other second factor to use there sets one up again at its "
+                   "next sign-in: %s." % how)
+    elif without == 0:
+        follows = ("None of those accounts has to set a second factor up again: each holds another one to use "
+                   "there (an authenticator app, or a passkey made there).")
+    elif without == accounts:
+        follows = ("%s has no other second factor to use there and sets one up again at its next sign-in: %s."
+                   % ("That account" if accounts == 1 else "Each of those accounts", how))
+    else:
+        follows = ("%d of those accounts %s no other second factor to use there and %s one up again at %s next "
+                   "sign-in: %s. The other%s with another one (an authenticator app, or a passkey made there)."
+                   % (without, "has" if without == 1 else "have", "sets" if without == 1 else "set",
+                      "its" if without == 1 else "their", how,
+                      " signs in" if accounts - without == 1 else "s sign in"))
+    return ("%d passkey%s (of %d account%s) %s made at %s and cannot be used %s. %s The passkeys work again if "
+            "the vault goes back to that address."
             % (keys, "" if keys == 1 else "s", accounts, "" if accounts == 1 else "s",
-               "was" if keys == 1 else "were", where, here))
+               "was" if keys == 1 else "were", where, here, follows))
 
 
 def sign_in_address_note(allowed_hosts):

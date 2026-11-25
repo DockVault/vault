@@ -162,8 +162,10 @@ def test_the_note_about_passkeys_made_at_another_address_counts_those_and_no_oth
     note = dv.passkeys_elsewhere_note(answer, here)
     assert note.startswith("3 passkeys (of 2 accounts) were made at old.example.com, older.example.com and cannot "
                            "be used at vault.example.com."), note
-    assert "sets a second factor up again at its next sign-in" in note
-    assert "with its password, or through its organisation's sign-in where it has none" in note
+    # This answer does not say which accounts hold another factor (no "holders"): no number is claimed.
+    assert ("An account among them that has no other second factor to use there sets one up again at its next "
+            "sign-in: with the account's password, or through its organisation's sign-in where it has none.") in note
+    assert "Each of those accounts" not in note and "of those accounts" not in note
     assert note.endswith("The passkeys work again if the vault goes back to that address.")
     assert "empty.example.com" not in note and "broken.example.com" not in note
     one = dv.passkeys_elsewhere_note({"made_at": [{"address": "old.example.com", "passkeys": 1, "accounts": 1}]}, here)
@@ -269,3 +271,85 @@ def test_the_example_file_says_every_part_of_the_rule_for_the_sign_in_address():
     said = " ".join(line.lstrip("#").strip() for line in example.splitlines())
     assert ("first entry is an https host name (in its xn-- form when it is written in another script, and without "
             "a dot at its end)") in said
+
+
+def _holders(*groups):
+    return [{"made_at": list(made), "usable_at": list(usable), "other_factor": other, "accounts": accounts}
+            for made, usable, other, accounts in groups]
+
+
+def test_the_note_names_only_the_accounts_left_with_no_factor_and_counts_each_account_once():
+    """An account with keys at two other addresses was counted twice, and every account was said to set a second
+    factor up again, also the one that signs in with its authenticator app or with a key made here. The
+    deployment says which accounts are alike; the note counts each once and names the ones left with none."""
+    here, old, older = "vault.example.com", "old.example.com", "older.example.com"
+    made_at = [{"address": old, "passkeys": 3, "accounts": 3}, {"address": older, "passkeys": 1, "accounts": 1},
+               {"address": here, "passkeys": 1, "accounts": 1}]
+    tail = " The passkeys work again if the vault goes back to that address."
+    start = ("4 passkeys (of 3 accounts) were made at old.example.com, older.example.com and cannot be used at "
+             "vault.example.com. ")
+    how = "with the account's password, or through its organisation's sign-in where it has none"
+
+    def said(holders, host=here, **more):
+        return dv.passkeys_elsewhere_note({"made_at": made_at, "holders": holders, **more}, host)
+
+    # One account holds keys at both other addresses: three accounts, not four. One of the three is left with
+    # none; one has an authenticator app; one has a key it can use here.
+    mixed = _holders(((old, older), (old, older), False, 1), ((old,), (old,), True, 1),
+                     ((here, old), (here, old), False, 1))
+    assert said(mixed) == (start + "1 of those accounts has no other second factor to use there and sets one up "
+                           "again at its next sign-in: " + how + ". The others sign in with another one (an "
+                           "authenticator app, or a passkey made there)." + tail)
+    two = _holders(((old, older), (old, older), False, 2), ((old,), (old,), True, 1))
+    assert said(two) == (start + "2 of those accounts have no other second factor to use there and set one up "
+                         "again at their next sign-in: " + how + ". The other signs in with another one (an "
+                         "authenticator app, or a passkey made there)." + tail)
+    # Every one of them is left with none; one account alone; none of them.
+    everyone = _holders(((old, older), (old, older), False, 1), ((old,), (old,), False, 2))
+    assert said(everyone) == (start + "Each of those accounts has no other second factor to use there and sets "
+                              "one up again at its next sign-in: " + how + "." + tail)
+    alone = dv.passkeys_elsewhere_note({"made_at": [{"address": old, "passkeys": 2, "accounts": 1}],
+                                        "holders": _holders(((old,), (old,), False, 1))}, here)
+    assert alone == ("2 passkeys (of 1 account) were made at old.example.com and cannot be used at "
+                     "vault.example.com. That account has no other second factor to use there and sets one up "
+                     "again at its next sign-in: " + how + "." + tail)
+    nobody = _holders(((old, older), (old, older), True, 1), ((here, old), (here,), False, 2))
+    assert said(nobody) == (start + "None of those accounts has to set a second factor up again: each holds "
+                            "another one to use there (an authenticator app, or a passkey made there)." + tail)
+    # A key made here that is no factor (it never verified the person, or its algorithm is accepted no longer)
+    # leaves its account with none: the address in "made_at" is not enough, it has to be in "usable_at".
+    unusable_here = _holders(((here, old), (old,), False, 1), ((old, older), (old, older), True, 2))
+    assert "1 of those accounts has no other second factor" in said(unusable_here)
+    # An account whose keys were all made here is none of "those accounts", whatever it holds.
+    with_one_here = mixed + _holders(((here,), (), False, 5), (("VAULT.Example.COM",), (), False, 7))
+    assert said(with_one_here) == said(mixed)
+    # The host name is one name however it is written, in the answer as in the tool.
+    shouted = _holders(((old.upper(), "VAULT.Example.COM"), ("Vault.Example.Com",), False, 3))
+    assert "None of those accounts has to set a second factor up again" in said(shouted)
+    # At an address no passkey can be made at, no key is a factor: only the authenticator app keeps an account.
+    nowhere = dv.passkeys_elsewhere_note({"made_at": made_at, "holders": mixed}, "")
+    assert nowhere.startswith("5 passkeys (of 3 accounts) were made at old.example.com, older.example.com, "
+                              "vault.example.com and cannot be used at the address the vault has now (no passkey "
+                              "can be made there). 2 of those accounts have no other second factor"), nowhere
+    # A key the deployment reports with no address (it has none itself) is no factor there either, and its
+    # account is one of those.
+    unrecorded = dv.passkeys_elsewhere_note(
+        {"made_at": [{"address": "", "passkeys": 2, "accounts": 2}],
+         "holders": _holders((("",), ("",), False, 1), (("",), ("",), True, 1))}, "")
+    assert unrecorded.startswith("2 passkeys (of 2 accounts) were made at an address that was not recorded and "
+                                 "cannot be used at the address the vault has now (no passkey can be made there). "
+                                 "1 of those accounts has no other second factor"), unrecorded
+    # While passkeys are turned off no passkey is used at any address: the note says that, and names no set-up.
+    off = said(mixed, on=False)
+    assert off == (start + "Passkeys are turned off in this vault, so this changes nothing for those accounts now; "
+                   "it will once passkeys are turned on again." + tail)
+    assert said(mixed, on=True) == said(mixed) and said(mixed, on=None) == said(mixed)
+    # Groups that are none (an older build's answer, or one mangled on the way): the sum, and no number claimed.
+    for broken in (None, "text", [{"made_at": [old]}], [{"made_at": [old], "usable_at": [], "accounts": "many"}],
+                   [{"made_at": [old], "usable_at": [], "accounts": -1}], ["text"], [],
+                   mixed + [{"made_at": [old], "usable_at": [], "accounts": -1}], mixed + ["text"],
+                   _holders(((here,), (here,), False, 4))):
+        note = said(broken)
+        assert note.startswith("4 passkeys (of 4 accounts) were made at old.example.com, older.example.com and "
+                               "cannot be used at vault.example.com. An account among them that has no other "
+                               "second factor to use there sets one up again at its next sign-in: "), (broken, note)

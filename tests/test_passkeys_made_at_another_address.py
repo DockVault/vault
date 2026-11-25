@@ -256,49 +256,155 @@ def test_an_administrators_removal_that_leaves_only_keys_made_elsewhere_leaves_n
     assert result["left_without_a_factor"] is True and carol.second_factor_reset_at is not None
 
 
-def test_the_deployment_says_where_its_passkeys_were_made():
+HERE = "vault.example.test"
+OLDER = "older.example.test"
+
+
+def _the_deployments_account_of_its_passkeys(monkeypatch, *, on=True):
+    """The deployment's answer for seven accounts: ann (a key made here, one made elsewhere), ben and gus (ben
+    one made elsewhere and a retired one, gus two made elsewhere), cy (a key with no address on record), dee (keys at two other
+    addresses, and an authenticator app), eve (a key made here that never verified the person, one made elsewhere
+    that did) and fay (a key made elsewhere, of an algorithm that is accepted no longer)."""
     set_bare_api_env()
     from _kept_db import kept_database
     from app.core import host_operator, webauthn_settings as wss
-    from app.core.models import RoleEnum, User, WebAuthnCredential
-    made = wss.address_now
-    try:
-        wss.address_now = lambda: "vault.example.test"
-        with kept_database() as (make, _engine):
-            with make() as db:
-                people = [User(username=n, email=None, password_hash="x", role=RoleEnum.USER, is_active=True)
-                          for n in ("ann", "ben", "cy")]
-                db.add_all(people)
-                db.flush()
-                for index, (owner, address, retired) in enumerate((
-                        (people[0], "vault.example.test", None), (people[0], ELSEWHERE, None),
-                        (people[1], ELSEWHERE, None), (people[1], ELSEWHERE, datetime(2026, 11, 1)),
-                        (people[2], None, None))):
-                    db.add(WebAuthnCredential(user_id=owner.id, credential_id=bytes([index + 1]) * 8,
-                                              public_key_cose=b"k", cose_alg=-7, rp_id=address, uv_initialized=True, retired_at=retired))
-                db.commit()
-                said = host_operator.passkey_addresses(db)
-    finally:
-        wss.address_now = made
-    assert said == {"here": "vault.example.test", "made_at": [
-        {"address": ELSEWHERE, "passkeys": 2, "accounts": 2},
-        {"address": "vault.example.test", "passkeys": 2, "accounts": 2}]}
+    from app.core.models import RoleEnum, SecondFactorEnrollment, User, WebAuthnCredential
+    monkeypatch.setattr(wss, "address_now", lambda: HERE)
+    monkeypatch.setattr(wss, "require_uv", lambda: True)
+    monkeypatch.setattr(wss, "enabled", lambda: on)
+    monkeypatch.setattr(wss, "allowed_alg_codes", lambda: (-7,))
+    with kept_database() as (make, _engine):
+        with make() as db:
+            who = {n: User(username=n, email=None, password_hash="x", role=RoleEnum.USER, is_active=True)
+                   for n in ("ann", "ben", "cy", "dee", "eve", "fay", "gus")}
+            db.add_all(who.values())
+            db.flush()
+            for index, (owner, address, extra) in enumerate((
+                    ("ann", HERE, {}), ("ann", ELSEWHERE, {}),
+                    ("ben", ELSEWHERE, {}), ("ben", ELSEWHERE, {"retired_at": datetime(2026, 11, 1)}),
+                    ("cy", None, {}),
+                    ("dee", ELSEWHERE, {}), ("dee", OLDER, {}),
+                    ("eve", HERE, {"uv_initialized": False}), ("eve", ELSEWHERE, {}),
+                    ("fay", ELSEWHERE, {"cose_alg": -999}),
+                    ("gus", ELSEWHERE, {}), ("gus", ELSEWHERE, {}))):
+                db.add(WebAuthnCredential(**{**dict(
+                    user_id=who[owner].id, credential_id=bytes([index + 1]) * 8, public_key_cose=b"k", cose_alg=-7,
+                    rp_id=address, uv_initialized=True), **extra}))
+            db.add(SecondFactorEnrollment(user_id=who["dee"].id, method="totp", secret_enc="sealed", status="active"))
+            # An authenticator app that was never confirmed is no factor: gus is left with none all the same.
+            db.add(SecondFactorEnrollment(user_id=who["gus"].id, method="totp", secret_enc="sealed", status="unconfirmed"))
+            db.commit()
+            return host_operator.passkey_addresses(db)
 
 
-def test_the_host_tool_says_how_many_passkeys_stop_working_at_another_address():
+def test_the_deployment_says_where_its_passkeys_were_made(monkeypatch):
+    said = _the_deployments_account_of_its_passkeys(monkeypatch)
+    assert said == {"here": HERE, "on": True, "made_at": [
+        {"address": ELSEWHERE, "passkeys": 7, "accounts": 6},        # gus holds two of them: one account
+        {"address": OLDER, "passkeys": 1, "accounts": 1},
+        {"address": HERE, "passkeys": 3, "accounts": 3}],
+        # The accounts in groups that are alike: where their keys were made, at which of those addresses one of
+        # them would be a factor, and whether they hold an authenticator app. No account is named.
+        "holders": [
+            {"made_at": [ELSEWHERE], "usable_at": [], "other_factor": False, "accounts": 1},                    # fay
+            {"made_at": [ELSEWHERE], "usable_at": [ELSEWHERE], "other_factor": False, "accounts": 2},           # ben, gus
+            {"made_at": [ELSEWHERE, OLDER], "usable_at": [ELSEWHERE, OLDER], "other_factor": True, "accounts": 1},   # dee
+            {"made_at": [ELSEWHERE, HERE], "usable_at": [ELSEWHERE], "other_factor": False, "accounts": 1},     # eve
+            {"made_at": [ELSEWHERE, HERE], "usable_at": [ELSEWHERE, HERE], "other_factor": False, "accounts": 1},   # ann
+            {"made_at": [HERE], "usable_at": [HERE], "other_factor": False, "accounts": 1}]}                    # cy
+    assert _the_deployments_account_of_its_passkeys(monkeypatch, on=False)["on"] is False
+
+
+def _the_host_tool():
     import importlib.util
     from pathlib import Path
     spec = importlib.util.spec_from_file_location("dockvault_tool_for_passkeys",
                                                   Path(__file__).resolve().parents[1] / "dockvault.py")
     tool = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tool)
+    return tool
+
+
+def test_the_host_tool_counts_an_account_once_and_says_which_set_a_factor_up_again(monkeypatch):
+    """The deployment's own answer, read by the tool for the address the vault has and for one setup is about to
+    give it. An account with keys at two other addresses is one account; one that holds an authenticator app, or
+    a key it can use at that address, signs in with that and sets nothing up again; the ones the sentence names
+    are the ones the sign-in holds (the same accounts for which the vault says a factor is to be set up again)."""
+    tool = _the_host_tool()
+    answer = _the_deployments_account_of_its_passkeys(monkeypatch)
+    # Where the vault is: 8 keys made elsewhere, of 6 accounts (dee's two addresses are one account). ann uses the
+    # key made here, dee the authenticator app; ben, gus, fay and eve (whose key made here never verified the
+    # person) are left with none.
+    said = tool.passkeys_elsewhere_note(answer, HERE)
+    assert said == (
+        "8 passkeys (of 6 accounts) were made at %s, %s and cannot be used at %s. 4 of those accounts have no "
+        "other second factor to use there and set one up again at their next sign-in: with the account's "
+        "password, or through its organisation's sign-in where it has none. The others sign in with another one "
+        "(an authenticator app, or a passkey made there). The passkeys work again if the vault goes back to that "
+        "address." % (ELSEWHERE, OLDER, HERE)), said
+    # Setup about to move the vault to the older address: every key but dee's one there stops, of all 7
+    # accounts; dee has the app, the other six are left with none.
+    moved = tool.passkeys_elsewhere_note(answer, OLDER)
+    assert moved.startswith("10 passkeys (of 7 accounts) were made at %s, %s and cannot be used at %s. 6 of those "
+                            "accounts have no other second factor to use there and set one up again at their "
+                            "next sign-in:" % (ELSEWHERE, HERE, OLDER)), moved
+    assert "The other signs in with another one (an authenticator app, or a passkey made there)." in moved
+    # An address no passkey can be made at: no key is a factor there, whatever address it was made at.
+    nowhere = tool.passkeys_elsewhere_note(answer, "")
+    assert nowhere.startswith("11 passkeys (of 7 accounts) were made at %s, %s, %s and cannot be used at the "
+                              "address the vault has now (no passkey can be made there). 6 of those accounts "
+                              % (ELSEWHERE, OLDER, HERE)), nowhere
+
+
+def test_the_vault_holds_at_a_set_up_the_accounts_the_host_tool_names(monkeypatch):
+    """The tool's number is the vault's: an account is among those that "set one up again" exactly when the
+    sign-in would take it through a set-up because its passkeys cannot be used (only_lapsed_passkeys) and it
+    holds no other factor."""
+    set_bare_api_env()
+    from _kept_db import kept_database
+    from app.core import host_operator, webauthn_settings as wss
+    from app.core.active_factors import active_factors
+    from app.core.models import RoleEnum, SecondFactorEnrollment, User, WebAuthnCredential
+    tool = _the_host_tool()
+    monkeypatch.setattr(wss, "address_now", lambda: HERE)
+    monkeypatch.setattr(wss, "require_uv", lambda: True)
+    monkeypatch.setattr(wss, "enabled", lambda: True)
+    monkeypatch.setattr(wss, "allowed_alg_codes", lambda: (-7,))
+    monkeypatch.setattr(wss, "_removed", lambda db: {})
+    with kept_database() as (make, _engine):
+        with make() as db:
+            who = {n: User(username=n, email=None, password_hash="x", role=RoleEnum.USER, is_active=True)
+                   for n in ("ann", "ben", "dee", "eve", "fay")}
+            db.add_all(who.values())
+            db.flush()
+            for index, (owner, address, extra) in enumerate((
+                    ("ann", HERE, {}), ("ann", ELSEWHERE, {}), ("ben", ELSEWHERE, {}),
+                    ("dee", ELSEWHERE, {}), ("dee", OLDER, {}),
+                    ("eve", HERE, {"uv_initialized": False}), ("eve", ELSEWHERE, {}),
+                    ("fay", ELSEWHERE, {"cose_alg": -999}))):
+                db.add(WebAuthnCredential(**{**dict(
+                    user_id=who[owner].id, credential_id=bytes([index + 1]) * 8, public_key_cose=b"k", cose_alg=-7,
+                    rp_id=address, uv_initialized=True), **extra}))
+            db.add(SecondFactorEnrollment(user_id=who["dee"].id, method="totp", secret_enc="sealed", status="active"))
+            db.commit()
+            held = sorted(name for name, user in who.items()
+                          if not active_factors(db, user.id).any and wss.only_lapsed_passkeys(db, user.id))
+            answer = host_operator.passkey_addresses(db)
+    assert held == ["ben", "eve", "fay"]
+    assert tool._holders_of_passkeys_elsewhere(answer["holders"], HERE) == (5, len(held))
+
+
+def test_the_host_tool_says_how_many_passkeys_stop_working_at_another_address():
+    tool = _the_host_tool()
     answer = {"ok": True, "here": "old.example.test", "made_at": [
         {"address": "old.example.test", "passkeys": 3, "accounts": 2}]}
     assert tool.passkeys_elsewhere_note(answer, "old.example.test") is None
     said = tool.passkeys_elsewhere_note(answer, "new.example.test")
     assert said.startswith("3 passkeys (of 2 accounts) were made at old.example.test and cannot be used at "
                            "new.example.test.")
-    assert "sets a second factor up again at its next sign-in" in said and "goes back to that address" in said
+    # The deployment did not say which accounts hold another factor: the sentence claims no number.
+    assert ("An account among them that has no other second factor to use there sets one up again at its next "
+            "sign-in") in said and "goes back to that address" in said
     one = tool.passkeys_elsewhere_note({"made_at": [{"address": "old.example.test", "passkeys": 1, "accounts": 1}]}, "")
     assert one.startswith("1 passkey (of 1 account) was made at old.example.test and cannot be used at the address "
                           "the vault has now (no passkey can be made there).")

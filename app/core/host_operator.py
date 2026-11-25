@@ -124,25 +124,50 @@ def _describe(db, user):
 
 
 def passkey_addresses(db) -> dict:
-    """Where the passkeys in use were made, for the host tool: the address the vault has now (its host name; None
-    when it has none a passkey can be made at) and, for each address a key in use was made at, how many keys and
-    how many accounts. A passkey answers only at the address it was made at, so the ones made elsewhere are no
-    second factor while the vault stays where it is, and their holders set one up again at their next sign-in.
-    A key with no address recorded counts as made here."""
-    from sqlalchemy import func
+    """Where the passkeys in use were made, for the host tool. A passkey answers only at the address it was made
+    at, so the ones made elsewhere are no second factor while the vault stays where it is. A key with no address
+    recorded counts as made here.
+
+    ``here``: the address the vault has now (its host name; None when it has none a passkey can be made at).
+    ``on``: whether passkeys are turned on. ``made_at``: for each address a key in use was made at, how many keys
+    and how many accounts. ``holders``: the accounts that hold a key in use, in groups that are alike in what the
+    tool has to tell apart, so that it can say for ANY address (the one the vault has, or the one setup is about
+    to give it) how many accounts hold a key made elsewhere, each counted once, and how many of them are left
+    with no second factor there. Per group: ``made_at`` (the addresses the account's keys were made at),
+    ``usable_at`` (those at which one of its keys would be a factor: of an algorithm still accepted, and able to
+    meet the rule on verifying the person), ``other_factor`` (an authenticator app in use) and ``accounts``. An
+    account is left with none at an address when it has no other factor and no key usable there: it sets one up
+    again at its next sign-in. No account is named."""
+    from datetime import datetime
     from app.core import webauthn_settings
-    from app.core.models import WebAuthnCredential
+    from app.core.models import SecondFactorEnrollment, WebAuthnCredential
     here = webauthn_settings.address_now() or None
-    rows = (db.query(WebAuthnCredential.rp_id, func.count(WebAuthnCredential.id),
-                     func.count(func.distinct(WebAuthnCredential.user_id)))
-            .filter(WebAuthnCredential.retired_at.is_(None)).group_by(WebAuthnCredential.rp_id).all())
-    made_at = {}
-    for address, keys, accounts in rows:
-        name = address or here or ""
-        entry = made_at.setdefault(name, {"address": name, "passkeys": 0, "accounts": 0})
-        entry["passkeys"] += int(keys)
-        entry["accounts"] += int(accounts)
-    return {"here": here, "made_at": sorted(made_at.values(), key=lambda e: e["address"])}
+    now = datetime.utcnow()
+    with_an_app = {row.user_id for row in db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.status == "active").all()}
+    accepted = {}
+    made_at, of_account = {}, {}
+    for key in db.query(WebAuthnCredential).filter(WebAuthnCredential.retired_at.is_(None)).all():
+        name = getattr(key, "rp_id", None) or here or ""
+        entry = made_at.setdefault(name, {"address": name, "passkeys": 0, "holders": set()})
+        entry["passkeys"] += 1
+        entry["holders"].add(key.user_id)
+        made, usable = of_account.setdefault(key.user_id, (set(), set()))
+        made.add(name)
+        algorithm = getattr(key, "cose_alg", None)
+        if algorithm not in accepted:
+            accepted[algorithm] = webauthn_settings.algorithm_usable(db, algorithm, now=now)[0]
+        if accepted[algorithm] and webauthn_settings.verified_the_person(key):
+            usable.add(name)
+    groups = {}
+    for owner, (made, usable) in of_account.items():
+        alike = (tuple(sorted(made)), tuple(sorted(usable)), owner in with_an_app)
+        groups[alike] = groups.get(alike, 0) + 1
+    return {"here": here, "on": bool(webauthn_settings.enabled()),
+            "made_at": [{"address": e["address"], "passkeys": e["passkeys"], "accounts": len(e["holders"])}
+                        for e in sorted(made_at.values(), key=lambda e: e["address"])],
+            "holders": [{"made_at": list(made), "usable_at": list(usable), "other_factor": other, "accounts": count}
+                        for (made, usable, other), count in sorted(groups.items())]}
 
 
 def user_managers(db):
