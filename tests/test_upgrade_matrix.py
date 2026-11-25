@@ -967,6 +967,113 @@ def test_six_calendar_months_end_on_the_last_day_of_a_shorter_month():
     assert um._add_months(__import__("datetime").date(2026, 12, 10), 6).isoformat() == "2027-06-10"
 
 
+# --- from 0.36 on, one supported line -------------------------------------------------------------
+# .github/SECURITY.md: from 0.36.0 on only the newest line is supported, and when the next minor release
+# ships, the line before it has 30 more days. Here 0.36.0 ships on 2027-02-01, so every line before it
+# ends on 2027-03-03. 0.34.0 and 0.35.0 shipped on 2026-11-09 and 2026-11-17, which had promised 0.33
+# and 0.34 six months, to 2027-05-09 and 2027-05-17.
+
+_ENDS = "2027-03-03"
+
+
+def _one_line(lines, newer=None):
+    """0.33.0, 0.34.0, 0.35.0 and 0.36.0, one release a line, with this `lines` map; `newer` adds
+    releases after them, by version and release day."""
+    days = {"0.33.0": "2026-09-29", "0.34.0": "2026-11-09", "0.35.0": "2026-11-17",
+            "0.36.0": "2027-02-01", **(newer or {})}
+    data = _valid()
+    data["versions"] = {ver: {"released": day, "notes": ver, "support": _support()}
+                        for ver, day in days.items()}
+    data["edges"] = [{"from": a, "to": b, "kind": "direct", "reversible": True,
+                      "requires_backup": False} for a, b in zip(list(days), list(days)[1:])]
+    data["lines"] = {line: {"security_fixes_until": until} for line, until in lines.items()}
+    return data
+
+
+def test_from_0_36_on_every_older_line_ends_30_days_after_the_newest_lines_first_release():
+    assert (um.ONE_LINE_FROM, um.SUPPORT_DAYS) == ("0.36", 30)
+    um.validate_matrix(_one_line({"0.33": _ENDS, "0.34": _ENDS, "0.35": _ENDS, "0.36": None}),
+                       released_ceiling=None)
+
+
+@pytest.mark.parametrize("line", ["0.35", "0.34", "0.33"])
+@pytest.mark.parametrize("date, expected", [
+    ("2027-03-02", "but 0.36.0 was released on 2027-02-01, so the promise of 30 days after it runs to "
+                   "2027-03-03"),                                                      # 29 days after
+    ("2027-03-04", "but from 0.36 on only the newest line is supported: 0.36.0 was released on "
+                   "2027-02-01, so {line} ends 30 days later, on 2027-03-03"),        # 31 days after
+])
+def test_from_0_36_on_a_line_that_ends_a_day_early_or_a_day_late_is_refused(line, date, expected):
+    lines = {"0.33": _ENDS, "0.34": _ENDS, "0.35": _ENDS, "0.36": None}
+    lines[line] = date
+    _reject(_one_line(lines), f"lines[{line}].security_fixes_until is {date}, " + expected.format(line=line))
+
+
+@pytest.mark.parametrize("lines, expected", [
+    ({"0.33": _ENDS, "0.34": _ENDS, "0.35": None, "0.36": None},       # a line before the newest, no date
+     "lines[0.35].security_fixes_until is null, but only the newest line, 0.36, has no end date"),
+    ({"0.33": _ENDS, "0.34": _ENDS, "0.36": None},                      # nor left out
+     "upgrade matrix 'lines' does not list 0.35"),
+    ({"0.33": _ENDS, "0.34": _ENDS, "0.35": _ENDS, "0.36": "2027-08-01"},   # the newest line, a date
+     "lines[0.36].security_fixes_until is 2027-08-01, but 0.36 is the newest line; its end is set when "
+     "the next minor release ships"),
+    ({"0.33": _ENDS, "0.34": _ENDS, "0.35": _ENDS},                     # the newest line left out
+     "upgrade matrix 'lines' does not list 0.36"),
+])
+def test_from_0_36_on_only_the_newest_line_has_no_date(lines, expected):
+    _reject(_one_line(lines), expected)
+
+
+def test_a_matrix_from_before_0_36_keeps_the_six_months_it_promised():
+    # The newest line is 0.35: no line from 0.36 on follows 0.33 or 0.34 yet, so the six months stand.
+    data = _one_line({"0.33": "2027-05-09", "0.34": "2027-05-17", "0.35": None})
+    del data["versions"]["0.36.0"]
+    data["edges"].pop()
+    um.validate_matrix(data, released_ceiling=None)
+    data["lines"]["0.34"]["security_fixes_until"] = "2027-05-16"
+    _reject(data, "lines[0.34].security_fixes_until is 2027-05-16, but 0.35.0 was released on 2026-11-17, "
+                  "so the promise of 6 months after the next minor release runs to 2027-05-17")
+
+
+def test_the_day_a_line_was_given_stays_valid_when_the_next_line_ships():
+    # 0.37.0 ships on 2027-06-01: 0.36 ends 30 days after it, and 0.33 to 0.35 keep the day 0.36.0 gave them.
+    data = _one_line({"0.33": _ENDS, "0.34": _ENDS, "0.35": _ENDS, "0.36": "2027-07-01", "0.37": None},
+                     newer={"0.37.0": "2027-06-01"})
+    um.validate_matrix(data, released_ceiling=None)
+    data["lines"]["0.35"]["security_fixes_until"] = "2027-07-01"
+    _reject(data, "lines[0.35].security_fixes_until is 2027-07-01, but from 0.36 on only the newest line is "
+                  "supported: 0.36.0 was released on 2027-02-01, so 0.35 ends 30 days later, on 2027-03-03")
+    data["lines"]["0.35"]["security_fixes_until"] = _ENDS
+    data["lines"]["0.36"]["security_fixes_until"] = "2027-06-30"
+    _reject(data, "lines[0.36].security_fixes_until is 2027-06-30, but 0.37.0 was released on 2027-06-01, "
+                  "so the promise of 30 days after it runs to 2027-07-01")
+
+
+def test_a_line_whose_six_months_ended_sooner_than_the_30_days_keeps_them():
+    # 0.36.0 ships on 2027-05-01, so the 30 days run to 2027-05-31. 0.33's six months ended on 2027-05-09 and
+    # 0.34's on 2027-05-17, before that, and those days stand; 0.35, the line just before 0.36, gets the 30.
+    data = _one_line({"0.33": "2027-05-09", "0.34": "2027-05-17", "0.35": "2027-05-31", "0.36": None})
+    data["versions"]["0.36.0"]["released"] = "2027-05-01"
+    um.validate_matrix(data, released_ceiling=None)
+    data["lines"]["0.33"]["security_fixes_until"] = "2027-05-08"
+    _reject(data, "lines[0.33].security_fixes_until is 2027-05-08, but 0.34.0 was released on 2026-11-09, "
+                  "so the promise of 6 months after the next minor release runs to 2027-05-09")
+    data["lines"]["0.33"]["security_fixes_until"] = "2027-06-01"
+    _reject(data, "lines[0.33].security_fixes_until is 2027-06-01, but from 0.36 on only the newest line is "
+                  "supported")
+    data["lines"]["0.33"]["security_fixes_until"] = "2027-05-09"
+    data["lines"]["0.35"]["security_fixes_until"] = "2027-05-17"
+    _reject(data, "lines[0.35].security_fixes_until is 2027-05-17, but 0.36.0 was released on 2027-05-01, "
+                  "so the promise of 30 days after it runs to 2027-05-31")
+
+
+def test_the_matrix_about_states_the_promise_the_validator_checks():
+    about = um.load_matrix(MATRIX_PATH)["about"]
+    assert (f"null for the newest line, whose end is set when the next minor release ships: from "
+            f"{um.ONE_LINE_FROM}.0 on, {um.SUPPORT_DAYS} days after that release (.github/SECURITY.md)") in about
+    assert "six months" not in about
+
+
 def _left_unfixed_on_the_older_line(published="2027-01-11", mitigation=None):
     """The advisory fixed only on the 0.34 line, leaving 0.33.2, the newest 0.33, affected."""
     data = _lines(**{"0.33": "2027-06-10", "0.34": None})

@@ -139,14 +139,20 @@ _CONDITION_KEYS = {"id", "summary", "detect", "blocks_rollback"}
 _WAIVER_KEYS = {"version", "reason"}
 _TOP_KEYS = {"schema_version", "about", "kinds", "advisories", "versions", "edges", "waivers",
              "lines"}
-# The optional top-level `lines` map says until when each release line receives security fixes:
-# {"0.33": {"security_fixes_until": "2027-06-26"}, "0.34": {"security_fixes_until": null}}. It is
-# separate from a version's `eol`, which marks the releases an install can no longer move to or from.
-# Lines start at 0.33, the first with a support period (.github/SECURITY.md); older lines are
-# unsupported by definition and are not listed. The newest line's date is null, as its end is not
-# known until the next minor ships; every other listed line has a date at least SUPPORT_MONTHS after
-# the next line's first release, which is the published promise, checked here.
+# The optional top-level `lines` map says until when each release line is supported:
+# {"0.35": {"security_fixes_until": "2026-12-31"}, "0.36": {"security_fixes_until": null}}; the key
+# keeps the name every reader of the file knows. It is separate from a version's `eol`, which marks
+# the releases an install can no longer move to or from. Lines start at 0.33, the first with a
+# support period (.github/SECURITY.md); older lines are unsupported by definition and are not
+# listed. The newest line's date is null, as its end is not known until the next minor ships. Every
+# other listed line's date is the published promise, checked here: from ONE_LINE_FROM on, only the
+# newest line is supported, and a line ends SUPPORT_DAYS days after the first release of the first
+# line from ONE_LINE_FROM on that follows it. Before that, a line was promised at least
+# SUPPORT_MONTHS after the next line's first release; that promise still holds for a line no line
+# from ONE_LINE_FROM on follows yet, so a matrix written under it stays valid.
 _FIRST_SUPPORTED_LINE = "0.33"
+ONE_LINE_FROM = "0.36"
+SUPPORT_DAYS = 30
 SUPPORT_MONTHS = 6
 _LINE_RE = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", re.ASCII)
 _LINE_KEYS = {"security_fixes_until"}
@@ -641,11 +647,16 @@ def _validate_lines(lines: object, versions: dict, advisories: dict) -> None:
     """The support period of each release line, and what it means for an unfixed advisory.
 
     Every line from the first listed one up to the newest declared line is listed. Only the newest
-    has no date. Every other date is at least SUPPORT_MONTHS after the next line's first release,
-    the promise .github/SECURITY.md makes. And an advisory that leaves the newest release of a line
-    affected while that line was still supported (on the advisory's `published` date) must say what
-    to do meanwhile: a supported line is expected to be fixed, and when it is not, the mitigation is
-    all its operators have.
+    has no date. Every other date is the promise .github/SECURITY.md makes. From ONE_LINE_FROM on,
+    only the newest line is supported: a line ends SUPPORT_DAYS days after the first release of the
+    first line from ONE_LINE_FROM on that follows it. Never later, so the line just before that
+    release has those days to upgrade, and no line has more. Never earlier either, except for a line
+    two or more back when the rule began whose earlier promise, SUPPORT_MONTHS after the next line's
+    first release, ended sooner: it ends no earlier than that promise. A line that no line from
+    ONE_LINE_FROM on follows yet keeps the earlier promise. And an advisory that leaves the newest
+    release of a line affected while that line was still supported (on the advisory's `published`
+    date) must say what to do meanwhile: a supported line is expected to be fixed, and when it is
+    not, the mitigation is all its operators have.
     """
     _require(isinstance(lines, dict) and lines, "upgrade matrix 'lines' must be a non-empty object")
     by_line: dict[str, list[str]] = {}
@@ -674,28 +685,48 @@ def _validate_lines(lines: object, versions: dict, advisories: dict) -> None:
             _string(date, f"{where}.security_fixes_until", pattern=_DATE_RE)
             _require(line != newest,
                      f"{where}.security_fixes_until is {date}, but {line} is the newest line; its "
-                     "support ends six months after the next minor release, which has not shipped")
+                     "end is set when the next minor release ships, which has not happened")
         until[line] = date
     first_listed = min(until, key=lambda name: _sort_key(name + ".0"))
     missing = [line for line in declared
                if _sort_key(line + ".0") >= _sort_key(first_listed + ".0") and line not in until]
     _require(not missing, f"upgrade matrix 'lines' does not list {', '.join(missing)}; every line "
                           f"from {first_listed} on states its support period")
+    one_line_from = _sort_key(ONE_LINE_FROM + ".0")
     for line, date in until.items():
         if date is None:
             continue
-        successor = declared[declared.index(line) + 1]
-        start = min(by_line[successor], key=_sort_key)
+        later = declared[declared.index(line) + 1:]
+        one_line = [name for name in later if _sort_key(name + ".0") >= one_line_from]
+        start = min(by_line[later[0]], key=_sort_key)
         released = versions[start]["released"]
         try:
             promised = _add_months(datetime.date.fromisoformat(released), SUPPORT_MONTHS)
             ends = datetime.date.fromisoformat(date)
+            if one_line:
+                first = min(by_line[one_line[0]], key=_sort_key)
+                first_released = versions[first]["released"]
+                cutoff = (datetime.date.fromisoformat(first_released)
+                          + datetime.timedelta(days=SUPPORT_DAYS))
         except ValueError as exc:
             raise UpgradeMatrixError(f"lines[{line}]: {exc}") from exc
-        _require(ends >= promised,
-                 f"lines[{line}].security_fixes_until is {date}, but {start} was released on "
-                 f"{released}, so the promise of {SUPPORT_MONTHS} months after the next minor "
-                 f"release runs to {promised.isoformat()}")
+        months_promise = (f"lines[{line}].security_fixes_until is {date}, but {start} was released on "
+                          f"{released}, so the promise of {SUPPORT_MONTHS} months after the next minor "
+                          f"release runs to {promised.isoformat()}")
+        if not one_line:
+            _require(ends >= promised, months_promise)
+            continue
+        _require(ends <= cutoff,
+                 f"lines[{line}].security_fixes_until is {date}, but from {ONE_LINE_FROM} on only the "
+                 f"newest line is supported: {first} was released on {first_released}, so {line} ends "
+                 f"{SUPPORT_DAYS} days later, on {cutoff.isoformat()}")
+        if one_line[0] != later[0] and promised < cutoff:
+            _require(ends >= promised, months_promise)
+        else:
+            _require(ends >= cutoff,
+                     f"lines[{line}].security_fixes_until is {date}, but {first} was released on "
+                     f"{first_released}, so the promise of {SUPPORT_DAYS} days after it runs to "
+                     f"{cutoff.isoformat()}")
 
     for slug, advisory in advisories.items():
         if advisory["mitigation"] is not None:
