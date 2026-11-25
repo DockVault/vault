@@ -34,7 +34,7 @@ import uuid
 from typing import Optional
 
 from app.core import sso_policy
-from app.services.sso_providers import Conflict, Invalid, _text
+from app.services.sso_providers import Conflict, Invalid
 
 MAX_MAPPINGS = 200                   # for one provider
 GROUP_MAX = 255
@@ -70,7 +70,18 @@ def admin_refusal(row) -> Optional[Conflict]:
 
 
 def _group(value) -> str:
-    return _text("provider_group", value, most=GROUP_MAX)
+    """A group's name or id as a mapping keeps it: letter for letter as it was given, because that is how a
+    sign-in compares it with what the provider sends. Nothing is trimmed and no character is refused but a
+    control character: trimmed, a group the provider sends with a space around it was saved as a name that
+    never matched, with no word of it; and a group whose name holds a no-break space or an invisible mark could
+    not be mapped at all."""
+    import unicodedata
+    if not isinstance(value, str):
+        raise Invalid("provider_group", "A text is expected.")
+    if (not 1 <= len(value) <= GROUP_MAX or not value.strip()
+            or any(unicodedata.category(ch) == "Cc" for ch in value)):
+        raise Invalid("provider_group", f"Between 1 and {GROUP_MAX} characters, without control characters.")
+    return value
 
 
 def _department(db, value):

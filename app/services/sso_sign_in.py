@@ -309,7 +309,15 @@ def verified_answer(row, state: sso_state.LoginState, *, code: str, fetch=None, 
     hosted = claims.get(claim_name(row, "domain", "hd"))
     groups_name = claim_name(row, "groups", "groups")
     raw_groups = claims.get(groups_name)
-    groups = ([str(g)[:255] for g in raw_groups if isinstance(g, (str, int)) and not isinstance(g, bool)]
+    if isinstance(raw_groups, str) and raw_groups:
+        # A provider that sends one value as a text and several as a list (AD FS does): a person in exactly one
+        # group is in that group. Read as "no group information", the mappings were never applied for them, and
+        # the administrators were told each day to check the provider's token.
+        raw_groups = [raw_groups]
+    # Each as it was sent, whole. A name longer than a mapping can hold matches no mapping, and is left out:
+    # cut to that length, it matched a mapped name that was only its beginning.
+    groups = ([str(g) for g in raw_groups if isinstance(g, (str, int)) and not isinstance(g, bool)
+               and len(str(g)) <= GROUP_NAME_MAX]
               if isinstance(raw_groups, list) else None)
     names = claims.get("_claim_names")
     overage = isinstance(names, dict) and groups_name in names     # a marker makes any list beside it partial
@@ -414,6 +422,7 @@ def answer_record(answer: ProviderAnswer) -> dict:
 # kept as "too many to say" (as the provider's own overage marker): the mappings are then not applied, and never
 # read as "member of nothing".
 GROUPS_KEPT = 1000
+GROUP_NAME_MAX = 255                 # what a mapping can hold (sso_group_mappings.GROUP_MAX, the column's width)
 
 
 def held_invitation(row, answer: ProviderAnswer, *, invitation_id, provider_id, client_ip, began_at, verifier_hash,

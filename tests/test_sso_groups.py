@@ -879,3 +879,37 @@ def test_more_groups_than_the_vault_reads_is_no_group_information(monkeypatch):
     # Read whole without it: she leaves, as the mapping says.
     _sign_in(h, p, groups=many[1:-1])
     assert _names(alice.groups) == [] and sso_rules.GROUPS_KEPT == 1000
+
+
+def test_a_group_is_matched_whole_and_as_it_was_sent(monkeypatch):
+    """What a sign-in compares is the group as the provider sent it: with its spaces, and whole. A name longer
+    than a mapping can hold was cut to that length, and then matched a mapped name of exactly that length that
+    was only its beginning: a person in another, longer-named group joined the department."""
+    alice = _user("alice")
+    p = _provider()
+    h = Grouping(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    long_name = "g" * 255
+    exact, spaced = h.department("Exact"), h.department("Spaced")
+    h.mapping(p, long_name, exact)
+    h.mapping(p, "vault-users ", spaced)
+    _sign_in(h, p, groups=[long_name + "-contractors", "vault-users"])
+    assert _names(alice.groups) == []                       # neither is the mapped group
+    _sign_in(h, p, groups=[long_name, "vault-users "])
+    assert _names(alice.groups) == ["Exact", "Spaced"]
+
+
+def test_one_group_sent_as_a_text_is_that_group(monkeypatch):
+    """A provider that sends several groups as a list and a single one as a text. A person in exactly one group
+    had "no group information": the mappings were never applied for them, and the administrators were told to
+    check the provider's token. An empty text names no group, and stays no information."""
+    alice = _user("alice")
+    p = _provider()
+    h = Grouping(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    finance, legal = h.department("Finance"), h.department("Legal", alice)
+    h.mapping(p, "vault-users", finance)
+    h.mapping(p, "legal", legal)
+    _sign_in(h, p, groups="vault-users")
+    assert _names(alice.groups) == ["Finance"]              # joined the one, and left the one the text does not name
+    assert not any(a[0] == "sso_groups_missing" for a in h.audits)
+    _sign_in(h, p, groups="")
+    assert _names(alice.groups) == ["Finance"] and any(a[0] == "sso_groups_missing" for a in h.audits)

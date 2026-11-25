@@ -107,7 +107,7 @@ def test_a_mapping_is_judged_then_stepped_up_then_written_under_the_providers_ro
         assert status == 400 and out["detail"]["reason"] == "invalid", (body, out)
         assert out["detail"]["field"] == field and out["detail"]["message"].endswith(said), (body, out)
     assert h.order == [] and h.stored() == [] and h.told == []          # judged before anything is asked
-    status, out = h.add(provider_group="  Finance-Team ", department_id=str(finance.id), role="external")
+    status, out = h.add(provider_group="Finance-Team", department_id=str(finance.id), role="external")
     assert status == 201, out
     shown = out["mapping"]
     assert shown == {"id": shown["id"], "provider_group": "Finance-Team",
@@ -638,3 +638,25 @@ def test_a_change_that_takes_the_role_from_a_group_ends_its_requests(monkeypatch
     assert waiting.state == ("expired" if ends else "held")
     assert len(h.audit("sso_admin_expired")) == (1 if ends else 0) and len(sent) == (1 if ends else 0)
     assert ("were ended with nothing decided" in h.told[-1][2]) is ends
+
+
+def test_a_groups_name_is_kept_letter_for_letter_as_the_sign_in_compares_it(monkeypatch):
+    """The provider sends a group with a space after its name, another with a no-break space in it, another with
+    an invisible mark. The save trimmed the first, so the stored name never matched what the provider sends, and
+    refused the other two as "control characters". A mapping keeps the name as it was given; only a control
+    character, a name of nothing but spaces, and a name too long are refused."""
+    from app.services import sso_group_mappings as M
+    h = Mappings(monkeypatch)
+    finance = h.department("Finance")
+    kept = ["vault-users ", " leading", "Finance\u00a0Team", "ops\u200b", "r\u00e9sum\u00e9", "x" * 255]
+    assert kept[2][7] == chr(0xA0) and kept[3][-1] == chr(0x200B)
+    for name in kept:
+        assert M._group(name) == name
+        status, out = h.add(provider_group=name, department_id=str(finance.id))
+        assert status == 201 and out["mapping"]["provider_group"] == name, (name, out)
+    assert [stored[0] for stored in h.stored()] == kept
+    for refused in ("", "   ", "\t", "line\nbreak", "bell\x07", "c1\x85", "x" * 256, 7, None, ["a"]):
+        status, out = h.add(provider_group=refused, department_id=str(finance.id))
+        assert status == 400 and out["detail"]["field"] == "provider_group", (refused, out)
+    # The same name with and without the space are two groups, as they are two to the provider.
+    assert h.add(provider_group="vault-users", department_id=str(finance.id))[0] == 201
