@@ -305,3 +305,46 @@ def test_each_release_list_is_headed_in_the_same_words():
     # "What <release> added", in the past, for every release: an operator looks one up by the same words.
     assert not re.findall(r"^## What [0-9.]+ adds$", _text(), re.M)
     assert len(_release_headings(_text())) >= 7
+
+
+# The emails 0.35.2 could send, by their keys in the catalog: a key the catalog has beyond these is one 0.36.0 added.
+_EMAILS_IN_0_35_2 = frozenset({
+    "email_change", "password_reset", "account_invite", "account_welcome", "login_alert", "share_created",
+    "receiver_upload_received", "expiry_reminder", "vault_member_added", "temp_credential_issued",
+    "account_changed_by_admin", "administrator_added", "ssh_keys_adder_left", "auditor_right",
+    "compliance_access_notice", "vault_access_notice", "retention_change", "recorded_values_removal",
+    "encryption_key_release_code", "encryption_key_notice",
+})
+
+
+def _email_rows():
+    """The first cell of each row of the Email table, by the row."""
+    text = _text()
+    assert text.count("\n## Email\n") == 1
+    section = text.split("\n## Email\n", 1)[1].split("\n## ", 1)[0]
+    rows = [line for line in section.splitlines() if line.startswith("| ") and not line.startswith("| Email |")]
+    return [line.split("|")[1].strip() for line in rows if not set(line) <= set("|- ")]
+
+
+def test_each_email_0_36_0_added_has_its_row_marked_new_in_it():
+    # Read from the catalog itself, so an email a later change adds to the release fails here until the table says
+    # whom it goes to and what it holds.
+    from app.core.email_actions import ACTION_CATALOG
+
+    added = [a for a in ACTION_CATALOG if a["key"] not in _EMAILS_IN_0_35_2]
+    assert {a["key"] for a in added} >= {"email_confirm", "sign_in_method_changed", "sso_freshness_warning"}, added
+    firsts = _email_rows()
+    unmarked = [a["name"] for a in added if f"{a['name']} **New in 0.36.0**" not in firsts]
+    assert not unmarked, f"emails 0.36.0 added with no row marked New in 0.36.0 in the Email table: {unmarked}"
+    # And the release's own list names each of them too.
+    release = _text().split("\n## What 0.36.0 added\n", 1)[1].split("\n## ", 1)[0]
+    unlisted = [a["name"] for a in added if f'"{a["name"]}"' not in release]
+    assert not unlisted, f"emails 0.36.0 added that its list at the end does not name: {unlisted}"
+
+
+def test_the_rows_0_36_0_widened_say_so():
+    rows = _text().split("\n## Email\n", 1)[1].split("\n## ", 1)[0].splitlines()
+    (changed,) = [line for line in rows if line.startswith("| Account changed by an administrator ")]
+    assert changed.count("**New in 0.36.0:**") == 1 and "passkey" in changed.split("**New in 0.36.0:**")[1]
+    (notices,) = [line for line in _text().splitlines() if line.startswith("| `notifications` |")]
+    assert notices.count("**New in 0.36.0:**") == 1 and "single sign-on" in notices.split("**New in 0.36.0:**")[1]
