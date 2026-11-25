@@ -98,16 +98,32 @@ def effective(stored) -> dict:
 SINGLE_FACTOR_AMR = frozenset({"pwd", "pin", "kba"})
 
 
+# The ``amr`` value by which a provider says itself that more than one factor was used (RFC 8176).
+MULTIPLE_FACTORS_AMR = "mfa"
+# ``amr`` values that say how or where a sign-in was made, not what the person proved: none is a method that
+# could stand beside another as a second one (RFC 8176: several channels, risk-based, a presence test, a place).
+NOT_A_METHOD_AMR = frozenset({MULTIPLE_FACTORS_AMR, "mca", "rba", "user", "geo"})
+
+
 def mfa_trusted(policy: dict, amr, acr) -> bool:
-    """Whether the token's ``amr`` values or ``acr`` value count as the second factor under this policy: trust on, and
-    an accepted value present. Nothing is trusted by default, and a value that names a single knowledge factor
-    (``pwd``, ``pin``, ``kba``) never counts, also when a stored list holds it."""
+    """Whether the token's ``amr`` values or ``acr`` value count as the second factor under this policy: trust on,
+    and an accepted value present that speaks of a second factor. Nothing is trusted by default.
+
+    A value that names a single knowledge factor (``pwd``, ``pin``, ``kba``) never counts, also when a stored
+    list holds it. An accepted value that names one method (``otp``, ``sms``, ``hwk``, ``swk``) counts only when
+    the token names another method beside it: a provider that also lets people in with that one method alone (a
+    code by text message, say) sends it alone, and that sign-in proved one factor, whoever holds the phone.
+    ``mfa`` is the provider's own word that more than one was used, and counts by itself. So does an accepted
+    ``acr`` value: a level is the provider's statement about the whole sign-in."""
     if not policy["sso_trust_idp_mfa"]:
         return False
     values = {str(v) for v in amr} if isinstance(amr, (list, tuple, set)) else set()
     accepted = {a for a in policy["sso_accepted_amr"] if str(a).strip().lower() not in SINGLE_FACTOR_AMR}
-    if values & accepted:
-        return True
+    methods = {v.strip().lower() for v in values} - NOT_A_METHOD_AMR
+    for value in values & accepted:
+        named = value.strip().lower()
+        if named == MULTIPLE_FACTORS_AMR or methods - {named}:
+            return True
     return isinstance(acr, str) and acr in set(policy["sso_accepted_acr"])
 
 

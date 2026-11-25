@@ -408,7 +408,9 @@
         const acr = area('sso-acr', policy.sso_accepted_acr);
         const asked = input('sso-requested-acr', policy.sso_requested_acr);
         box.appendChild(trust.group);
-        box.appendChild(field('Accepted methods (amr)', amr, 'The last test sign-in carried: ' + ((last.amr || []).join(', ') || 'none') + '.'));
+        box.appendChild(field('Accepted methods (amr)', amr, 'A method listed here counts when the provider names another '
+            + 'method beside it (otp with pwd, say), or says mfa itself; one method alone is one factor. The last test '
+            + 'sign-in carried: ' + ((last.amr || []).join(', ') || 'none') + '.'));
         box.appendChild(field('Accepted levels (acr)', acr, 'The last test sign-in carried: ' + (last.acr || 'none') + '.'));
         box.appendChild(field('Level to ask the provider for (acr_values)', asked, 'Empty: none is asked for.'));
         const said = _el('span', 'text-sm ml-sm sso-said');

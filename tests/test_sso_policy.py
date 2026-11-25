@@ -194,6 +194,21 @@ def test_an_address_is_admitted_only_from_a_listed_domain(stored, email, admitte
     ({"sso_trust_idp_mfa": True, "sso_accepted_acr": ["2"]}, [], "1", False),
     ({"sso_trust_idp_mfa": False, "sso_accepted_amr": ["mfa"]}, ["mfa"], None, False),  # values without trust
     ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]}, "mfa", None, False),      # a string is not a list
+    # One method alone is one factor, whatever a list accepts: a code by text message, a key without a PIN.
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["otp"]}, ["otp"], None, False),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["sms", "hwk", "swk", "otp"]}, ["sms"], None, False),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["hwk"]}, ["hwk", "user"], None, False),   # presence is no method
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["otp"]}, ["otp", "rba", "geo", "mca"], None, False),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["otp"]}, ["otp", "otp"], None, False),
+    # With another method beside it, it is the second factor.
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["otp"]}, ["pwd", "otp"], None, True),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["hwk"]}, ["hwk", "pin"], None, True),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["otp"]}, ["sms", "otp"], None, True),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["otp"]}, ["PWD", " otp"], None, False),   # a value is compared as sent
+    # The provider's own word for several factors counts by itself, and so does an accepted level.
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["mfa"]}, ["mfa"], None, True),
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["otp"]}, ["mfa"], None, False),    # not on the list
+    ({"sso_trust_idp_mfa": True, "sso_accepted_amr": ["otp"], "sso_accepted_acr": ["2"]}, ["otp"], "2", True),
 ])
 def test_the_providers_mfa_counts_only_when_trusted_and_an_accepted_value_is_there(stored, amr, acr, trusted):
     assert P.mfa_trusted(P.effective(stored), amr, acr) is trusted
