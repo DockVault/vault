@@ -490,6 +490,8 @@ def approve(db, grant, *, approver=None, now: Optional[datetime] = None):
     holder = db.get(User, grant.user_id)
     totp = active_totp(db, grant.user_id)
     grant.status = "active"
+    if grant.user_id is not None and getattr(db, "info", None) is not None:
+        after_commit.later(db, _END_SESSIONS, str(grant.user_id))
     grant.second_factor_enrollment_id = totp.id
     grant.approved_credential_ids = passkey_ids(db, grant.user_id)
     grant.confirmed_role = _role(holder)
@@ -903,6 +905,35 @@ def settle(db, now: Optional[datetime] = None) -> int:
             suspend(db, grant, problem, now=now)
             count += 1
     return count
+
+
+# --------------------------------------------------------------------------- the holder's sessions at an approval
+
+# Once a grant is approved its holder always adds the password to a passkey, and reaches the activity of every
+# account. A session made before, with what the account owed then (a passkey by itself, say), would carry the right
+# until it ran out. So the holder's sessions and sign-ins under way end with the approval, and the holder signs in
+# again. Done right after the approval's commit, in a transaction of its own: the approval holds the grant's row,
+# ending sessions takes the account's turn, and a change of the account's sign-in details takes that turn before
+# the grant's row.
+_END_SESSIONS = "auditor_right_ends_sessions"
+
+
+def _end_the_holders_sessions(user_ids) -> None:
+    import logging
+    from app.api import api_server as api
+    from app.core.database import get_db_context
+    from app.services import sign_in
+    for user_id in dict.fromkeys(user_ids):
+        try:
+            with get_db_context() as db:
+                api._revoke_sessions(db, user_id=uuid.UUID(str(user_id)), actor_username="auditor right approved")
+                sign_in.spend_sign_ins_under_way(db, uuid.UUID(str(user_id)))
+        except Exception as exc:  # noqa: BLE001 -- the approval is committed; the sessions run out by themselves
+            logging.getLogger(__name__).warning("an auditor's sessions were not ended at the approval: %s",
+                                                type(exc).__name__)
+
+
+after_commit.handler(_END_SESSIONS, _end_the_holders_sessions)
 
 
 # --------------------------------------------------------------------------- telling people

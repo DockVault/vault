@@ -230,3 +230,40 @@ def test_the_day_a_passkey_requirement_began_is_written_with_the_sign_in_on_a_re
                 first = committed()
                 sign_in.finish(db, sign_in.SignInResult(alice, [sign_in.PASSWORD], "192.0.2.1"))
                 assert committed() == first
+
+
+def test_a_passkey_alone_taken_before_a_promotion_is_refused_in_the_accounts_turn(monkeypatch):
+    """A passkey by itself signs in an account whose role lets one in alone. Taken while the account was a user's
+    and written after it was made an administrator (or given the auditor right), it would be an administrator's
+    session without the password: in the account's turn the rule is asked again of the account as it is."""
+    import uuid
+    from fastapi import HTTPException
+    from app.api import api_server as api
+    from app.services import sign_in
+    alice = types.SimpleNamespace(id=uuid.uuid4(), username="alice", sessions_ended=0)
+    dropped, allowed = [], [False]
+    monkeypatch.setattr(api, "_sessions_turn", lambda db, user_id: None)
+    monkeypatch.setattr(api, "_passkey_passwordless_allowed", lambda db, user: allowed[0])
+    monkeypatch.setattr(sign_in, "drop_the_session_the_proof_made", lambda db, result: dropped.append(result))
+    monkeypatch.setattr(sign_in, "refuse_unless_the_account_may_sign_in", lambda db, user, ip: None)
+    monkeypatch.setattr(sign_in, "write_the_passkey_grace", lambda result: None)
+
+    def taken(methods, **more):
+        return sign_in.SignInResult(alice, list(methods), "192.0.2.1", sessions_ended=0, **more)
+    alone = taken([sign_in.HARDWARE_KEY], passwordless_allowed=True, user_verified=True)
+    with pytest.raises(HTTPException) as refused:
+        sign_in.in_the_accounts_turn(types.SimpleNamespace(), alone)
+    assert refused.value.status_code == 401 and refused.value.detail == sign_in.EXPIRED and dropped == [alone]
+    # Still a role a passkey signs in alone: written.
+    allowed[0] = True
+    sign_in.in_the_accounts_turn(types.SimpleNamespace(), alone)
+    assert dropped == [alone]
+    # With the password, or after a provider, the passkey was not the whole sign-in: nothing more is asked here.
+    allowed[0] = False
+    for other in (taken([sign_in.PASSWORD, sign_in.HARDWARE_KEY], passwordless_allowed=True, user_verified=True),
+                  taken([sign_in.SOFTWARE_KEY], passwordless_allowed=True, provider_id=str(uuid.uuid4())),
+                  taken([sign_in.SOFTWARE_KEY], passwordless_allowed=False), taken([sign_in.PASSWORD])):
+        assert sign_in.a_passkey_alone(other) is False
+        sign_in.in_the_accounts_turn(types.SimpleNamespace(), other)
+    assert sign_in.a_passkey_alone(alone) is True and dropped == [alone]
+

@@ -212,6 +212,40 @@ def test_an_independent_administrator_may_approve(db, people, settings):
     assert [a.username for a in rights.independent_approvers(db, grant)] == ["bob"]
 
 
+def test_an_approval_ends_the_holders_sessions_once_it_is_committed(db, people, settings, monkeypatch):
+    """A session the holder made before, with what the account owed then (a passkey by itself, say), would carry
+    the right until it ran out. The holder's sessions and sign-ins under way end with the approval: right after
+    its commit, in a transaction of their own (the approval holds the grant's row; ending sessions takes the
+    account's turn)."""
+    import contextlib
+    from app.api import api_server as api
+    from app.core import after_commit, database
+    from app.services import sign_in
+    assert after_commit._HANDLERS[rights._END_SESSIONS] is rights._end_the_holders_sessions
+    queued = []
+    monkeypatch.setitem(after_commit._HANDLERS, rights._END_SESSIONS, queued.extend)
+    grant = _proposed(db, people.uma, people.ada)
+    assert queued == [] and after_commit.pending(db, rights._END_SESSIONS) == []
+    rights.approve(db, grant, approver=people.bob)
+    assert grant.status == "active" and after_commit.pending(db, rights._END_SESSIONS) == [str(people.uma.id)]
+    assert queued == []                                          # nothing before the commit
+    db.commit()
+    assert queued == [str(people.uma.id)]
+    # What runs then: each holder once, in a session of its own.
+    done, sessions = [], []
+
+    @contextlib.contextmanager
+    def fresh():
+        sessions.append("opened")
+        yield "a session of its own"
+    monkeypatch.setattr(database, "get_db_context", fresh)
+    monkeypatch.setattr(api, "_revoke_sessions", lambda session, **kw: done.append(("sessions", session, kw["user_id"])))
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda session, user_id: done.append(("sign-ins", session, user_id)))
+    rights._end_the_holders_sessions([str(people.uma.id), str(people.uma.id)])
+    assert sessions == ["opened"] and done == [("sessions", "a session of its own", people.uma.id),
+                                                ("sign-ins", "a session of its own", people.uma.id)]
+
+
 @pytest.mark.parametrize("case", ["one person", "own account", "stand-in admin", "stand-in account", "fresh admin",
                                   "changed before", "changer while it stood", "password not own", "maker of proposer",
                                   "proposer left", "not an administrator"])

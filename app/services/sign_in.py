@@ -389,8 +389,21 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
     if as_read(user) != result.sessions_ended:
         drop_the_session_the_proof_made(db, result)
         raise HTTPException(status_code=401, detail=EXPIRED)
+    if a_passkey_alone(result) and not api._passkey_passwordless_allowed(db, user):
+        # A passkey by itself, taken when the account's role let one in alone. The account as it stands now does
+        # not (made an administrator meanwhile, or given the auditor right): refused as from before a change,
+        # and the person signs in again with what the account now owes.
+        drop_the_session_the_proof_made(db, result)
+        raise HTTPException(status_code=401, detail=EXPIRED)
     refuse_unless_the_account_may_sign_in(db, user, result.client_ip)
     write_the_passkey_grace(result)
+
+
+def a_passkey_alone(result: "SignInResult") -> bool:
+    """Whether ``result`` is a sign-in that a passkey made by itself: no password, no provider, and the account's
+    role let a user-verified passkey be the whole of it when the passkey was taken."""
+    return (bool(result.passwordless_allowed) and not result.provider_id and PASSWORD not in result.methods
+            and bool(set(result.methods) & PASSKEYS))
 
 
 GRACE_BEGINS, GRACE_ENDS = "begins", "ends"

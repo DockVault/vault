@@ -7012,6 +7012,13 @@ def _record_admin_grant(db, user, *, by, by_name=None, inherited=None) -> None:
     refusal = auditor_rights.promotion_refusal(db, user)
     if refusal is not None:
         raise HTTPException(status_code=409, detail=refusal)
+    # The account's sessions, and its sign-ins under way, end with the promotion. Each was made with what a user
+    # owes: a passkey by itself, where the role lets one in alone, or a password with no second factor. An
+    # administrator always gives the password and whatever the administrators' policy asks, and a session from
+    # before would carry the new role without either until it ran out. The person signs in again. (Ending them
+    # also counts on the account, so a sign-in whose proof was read before the promotion is refused in its turn.)
+    _revoke_sessions(db, user_id=user.id, actor_username=by_name or (by.username if by is not None else cc.HOST_OPERATOR))
+    sign_in.spend_sign_ins_under_way(db, user.id)
     admin_grants.record(db, user.id, granted_by_id=by.id if by is not None else None,
                         granted_by_name=by_name or (by.username if by is not None else cc.HOST_OPERATOR),
                         inherited=inherited)

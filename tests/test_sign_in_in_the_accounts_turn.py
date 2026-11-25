@@ -495,9 +495,14 @@ def test_a_promotion_takes_the_accounts_turn_before_it_reads_or_writes_the_accou
     monkeypatch.setattr(auditor_rights, "promotion_refusal", lambda db, user: order.append("asked") or answer[0])
     monkeypatch.setattr(admin_grants, "record", lambda db, user_id, **kw: order.append("recorded"))
     monkeypatch.setattr(api, "_revoke_reset_links_outranked_by", lambda db, user, actor: order.append("links"))
+    from app.services import sign_in
+    monkeypatch.setattr(api, "_revoke_sessions", lambda db, **kw: order.append(("sessions ended", kw["user_id"])))
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db, user_id: order.append(("sign-ins spent", user_id)))
     alice = types.SimpleNamespace(id=uuid.uuid4(), username="alice")
     api._record_admin_grant(types.SimpleNamespace(), alice, by=None)
-    assert order == [("the turn", alice.id), "asked", "recorded", "links"]
+    # The account's sessions and sign-ins under way end with the promotion: none carries the new role.
+    assert order == [("the turn", alice.id), "asked", ("sessions ended", alice.id), ("sign-ins spent", alice.id),
+                     "recorded", "links"]
     del order[:]
     answer[0] = "the account holds the auditor right"
     with pytest.raises(HTTPException) as refused:
