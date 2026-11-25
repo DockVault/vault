@@ -229,8 +229,12 @@ def test_the_security_policy_states_the_lines_the_tags_and_the_support_rule():
             "ships, the line before it has 30 more days to upgrade, and is end-of-life after that.") in policy
     assert "This replaces the six months of security fixes each line from 0.33 on was given before." in policy
     assert "until six\nmonths after the next minor release ships" not in policy
-    assert "release window" not in policy                       # no fix is promised to an older line
-    assert "Low\n  findings are fixed in the next regular release.\n" in policy
+    # Until 0.36.0 ships, the lines before it keep what they were promised: their end is announced without its
+    # day, and a Low finding is still fixed on them. The release of 0.36.0 dates both.
+    assert ("0.34.x and 0.35.x, which are supported side by side, all reach their end 30 days after 0.36.0\n"
+            "ships, instead of 2027-05-09 (0.33.x) and 2027-05-17 (0.34.x).") in policy
+    assert ("Low\n  findings are fixed in the next regular release, and in the supported previous lines in the same\n"
+            "  release window.") in policy
     assert "`ghcr.io/dockvault/vault:vX.Y.Z`, which never changes" in policy
     assert "tagged `:vX.Y` (for example `:v0.33`)" in policy
     assert "so a patch release of an older line never moves them" in policy

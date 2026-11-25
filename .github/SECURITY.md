@@ -18,12 +18,11 @@ gives that day. We made this change to keep security standards high: all our eff
 next releases, with better security and more features.
 
 This replaces the six months of security fixes each line from 0.33 on was given before. 0.33.x,
-0.34.x and 0.35.x, which were supported side by side, all reach their end on 2026-12-31, 30 days
-after 0.36.0 shipped, instead of 2027-05-09 (0.33.x) and 2027-05-17 (0.34.x). An install on one of
-them should move to 0.36.x before that day; `dockvault.py update` plans the route, which runs
-through 0.35.2. 0.32.x and earlier receive no more security fixes and are end-of-life: from a 0.35.0
-checkout, `dockvault.py update` no longer moves to them; an install on one upgrades to a supported
-release.
+0.34.x and 0.35.x, which are supported side by side, all reach their end 30 days after 0.36.0
+ships, instead of 2027-05-09 (0.33.x) and 2027-05-17 (0.34.x). An install on one of them should
+move to 0.36.x before that day; `dockvault.py update` plans the route, which runs through 0.35.2.
+0.32.x and earlier receive no more security fixes and are end-of-life: from a 0.35.0 checkout,
+`dockvault.py update` no longer moves to them; an install on one upgrades to a supported release.
 
 Security fixes ship as patch releases;
 [docs/guides/maintenance-releases.md](../docs/guides/maintenance-releases.md) describes how. Every
@@ -68,7 +67,8 @@ What to expect:
 - a first assessment within 10 business days: whether we can reproduce it, and its severity
   (CVSS v4);
 - a fix within 30 days for Critical and High severity and within 90 days for Medium. Low
-  findings are fixed in the next regular release.
+  findings are fixed in the next regular release, and in the supported previous lines in the same
+  release window.
 
 We will keep you informed, coordinate disclosure with you, and credit you in the release notes
 unless you ask us not to. Please allow us to release a fix before any public disclosure.
