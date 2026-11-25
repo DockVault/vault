@@ -342,6 +342,16 @@ def test_each_email_0_36_0_added_has_its_row_marked_new_in_it():
     assert not unlisted, f"emails 0.36.0 added that its list at the end does not name: {unlisted}"
 
 
+def test_the_sign_in_method_email_row_names_an_authenticator_app_turned_off_too():
+    """Turning the authenticator app off sends the email as setting one up does (DELETE /users/me/second-factor), and
+    Email Studio's description says so: the inventory's row says when the person is emailed, so it names both."""
+    from app.core.email_actions import SPEC_BY_KEY
+    assert "an authenticator app is set up or turned off" in SPEC_BY_KEY["sign_in_method_changed"]["description"]
+    rows = _text().split("\n## Email\n", 1)[1].split("\n## ", 1)[0].splitlines()
+    (row,) = [line for line in rows if line.startswith("| Sign-in method changed ")]
+    assert "an authenticator app set up or turned off;" in row
+
+
 def test_the_rows_0_36_0_widened_say_so():
     rows = _text().split("\n## Email\n", 1)[1].split("\n## ", 1)[0].splitlines()
     (changed,) = [line for line in rows if line.startswith("| Account changed by an administrator ")]
