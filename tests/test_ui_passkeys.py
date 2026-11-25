@@ -537,19 +537,32 @@ WHY_AGAIN = {
                                    "second factor up again here.",
     "passkeys_no_longer_accepted": "Your passkeys are of a kind this vault no longer accepts, so you set a second "
                                    "factor up again here.",
+    "passkeys_without_verification": "Your passkeys that work here have never checked a PIN, a fingerprint or a "
+                                     "face, which this vault now asks for, so you set a second factor up again here.",
+    "passkeys_turned_off": "Passkeys are turned off on this vault, so you set a second factor up again here. Your "
+                           "passkeys are kept, and count again if passkeys are turned back on.",
 }
 
 
 @pytest.mark.parametrize("why", [*WHY_AGAIN, None])
 def test_an_account_that_holds_passkeys_and_sets_a_factor_up_again_is_told_why(page: Page, no_offer, authenticator,
                                                                               fresh_user, why):
-    """The vault moved to another address, or the account's keys are of a kind that was removed: the sign-in is
-    held for a set-up though the account holds passkeys. The card says why, in the server's reason's words; an
-    account that simply owes its first factor is told nothing of the kind."""
+    """The vault moved to another address, the account's keys are of a kind that was removed or never checked the
+    person while the vault asks for that, or passkeys are turned off: the sign-in is held for a set-up though the
+    account holds passkeys. The card says why, in the server's reason's words; an account that simply owes its first
+    factor is told nothing of the kind. With passkeys turned off the server offers no passkey: the authenticator app
+    is what is set up."""
     more = {"set_up_again": why} if why else {}
-    HeldSignIn(page, fresh_user, first=_held("held-1", enrollment_required=True, enrollment_methods=["passkey"], **more))
+    kinds = ["totp"] if why == "passkeys_turned_off" else ["passkey"]
+    HeldSignIn(page, fresh_user, first=_held("held-1", enrollment_required=True, enrollment_methods=kinds, **more))
+    if kinds == ["totp"]:
+        page.route("**/users/me/second-factor/totp/enroll", lambda route: route.fulfill(status=200, json={
+            "secret": "JBSWY3DPEHPK3PXP", "otpauth_uri": "otpauth://totp/x", "qr_svg": ""}))
     _type_the_password(page, fresh_user)
-    expect(page.locator("#sf-passkey-enroll")).to_be_visible(timeout=8000)
+    if kinds == ["totp"]:
+        expect(page.locator("#login-second-factor")).to_contain_text("Scan this QR code", timeout=10000)
+    else:
+        expect(page.locator("#sf-passkey-enroll")).to_be_visible(timeout=8000)
     note = page.locator("#login-second-factor .sf-set-up-again")
     if why:
         expect(note).to_have_text(WHY_AGAIN[why])

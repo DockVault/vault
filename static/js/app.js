@@ -2471,6 +2471,20 @@ async function _sfCancel(preAuthToken) {
     _sfRestoreLoginForm();
 }
 
+// Why an account that holds passkeys sets a second factor up again, for each reason a sign-in held for a set-up
+// may give (set_up_again: the reasons of app/core/webauthn_settings.py, why_none_can_be_used). A reason not here
+// says nothing.
+const _SET_UP_AGAIN = {
+    passkeys_at_another_address: 'Your passkeys cannot be used at the address this vault has now, so you set a second '
+        + 'factor up again here.',
+    passkeys_no_longer_accepted: 'Your passkeys are of a kind this vault no longer accepts, so you set a second factor '
+        + 'up again here.',
+    passkeys_without_verification: 'Your passkeys that work here have never checked a PIN, a fingerprint or a face, '
+        + 'which this vault now asks for, so you set a second factor up again here.',
+    passkeys_turned_off: 'Passkeys are turned off on this vault, so you set a second factor up again here. Your '
+        + 'passkeys are kept, and count again if passkeys are turned back on.',
+};
+
 // Entry point from the login handler when /auth/login returns second_factor_required.
 function beginSecondFactor(data) {
     const form = document.getElementById('login-form');
@@ -2494,11 +2508,9 @@ function beginSecondFactor(data) {
         const kinds = Array.isArray(data.enrollment_methods) && data.enrollment_methods.length ? data.enrollment_methods : ['totp'];
         const canMake = !!window.Passkeys && Passkeys.supported();
         // An account that holds passkeys and sets a factor up all the same is told why.
-        const why = data.set_up_again === 'passkeys_at_another_address'
-            ? 'Your passkeys cannot be used at the address this vault has now, so you set a second factor up again here.'
-            : data.set_up_again === 'passkeys_no_longer_accepted'
-                ? 'Your passkeys are of a kind this vault no longer accepts, so you set a second factor up again here.'
-                : '';
+        const again = data.set_up_again;
+        const why = (typeof again === 'string' && Object.prototype.hasOwnProperty.call(_SET_UP_AGAIN, again))
+            ? _SET_UP_AGAIN[again] : '';
         if (kinds.includes('passkey') && (canMake || !kinds.includes('totp'))) {
             // passkey_required false: no role asks for a passkey, it is one way to set the second factor up.
             renderPasskeyEnrollment(box, { preAuthToken: pre, password: pw, authenticatorToo: kinds.includes('totp'),
