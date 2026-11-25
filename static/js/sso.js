@@ -136,10 +136,12 @@
     // ---------------------------------------------------------------- the sign-in screen
 
     // Start a sign-in at a provider from the sign-in screen. `invitation` is the token of an invitation being
-    // accepted through the provider.
+    // accepted through the provider: the flow notes that there is one (never the token), so that a page the provider
+    // sends back signed in as someone else can say the invitation was not accepted.
     async function startSignIn(providerId, options) {
         const opts = options || {};
-        const hash = await begin('sign_in', { provider: providerId });
+        const hash = await begin('sign_in', Object.assign({ provider: providerId },
+            opts.invitation ? { invitation: true } : {}));
         const body = { verifier_hash: hash };
         if (opts.invitation) body.invitation = opts.invitation;
         if (opts.returnTo) body.return_to = opts.returnTo;

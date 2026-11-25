@@ -68,7 +68,8 @@ SSO_JS = ROOT / "static" / "js" / "sso.js"
 # The sign-in screen's single sign-on, as shipped; a name that is not in app.js is left out (and its test fails on
 # what the page does, not on a missing name).
 _SHIPPED = ("_el", "_showReasonNote", "_showLoginError", "_signInOriginElsewhere", "_addressFixable", "_noteSignInOrigin",
-            "_ssoReturnTo", "_initSsoSignIn", "_ssoStartHandOut", "_ssoOnSignInScreen", "_ssoResume")
+            "_ssoReturnTo", "_initSsoSignIn", "_ssoStartHandOut", "_ssoOnSignInScreen", "_ssoSignInBackToASignedInPage",
+            "_ssoResume")
 _STATE = ("_hashForSignIn", "_passwordStage")
 _CONSTANTS = ("SSO_BACK_SIGNED_OUT", "_SSO_BACK_OF_A_SESSION")
 
@@ -319,16 +320,84 @@ out({ none, refused, sent: sent.filter((s) => s.method === 'POST').length, toast
 
 
 def test_a_sign_in_or_a_refusal_back_to_a_page_with_no_session_is_not_told_its_session_ended():
+    """A stored session refused at the load leaves the sign-in screen up: a sign-in's code or a refusal that came back
+    is taken as the sign-in screen takes it (here a code with no proof in this tab, then a refusal), never as a link,
+    a test or a confirmation the session lost."""
     got = _node(r"""
 answers['GET /api/auth/sso/reasons'] = { status: 200, json: { reasons: REASONS } };
 await _ssoResume(arrive('#sso=abc'));
+const code = note();
 await _ssoResume(arrive('#sso-error=no_account'));
 const resumed = note();
 await _ssoOnSignInScreen(arrive('#sso-error=busy'));
-out({ resumed, refused: note() });
+out({ code, resumed, refused: note(), posts: sent.filter((s) => s.method === 'POST').length });
 """, _server_reasons())
-    assert got["resumed"] == {"text": "", "shown": False}
+    assert got["code"] == {"text": "That sign-in did not come back to the tab that started it. Start again.",
+                           "shown": True}
+    assert got["resumed"] == {"text": _server_reasons()["no_account"], "shown": True}
     assert got["refused"] == {"text": _server_reasons()["busy"], "shown": True}
+    assert got["posts"] == 0
+    assert BACK_SIGNED_OUT not in (got["code"]["text"], got["resumed"]["text"])
+
+
+_START_HERE = r"""
+answers['GET /api/auth/sso/reasons'] = { status: 200, json: { reasons: REASONS } };
+answers['POST /api/auth/sso/p-1/start'] = { status: 200, json: { authorization_url: 'https://idp.example.org/a' } };
+await window.Sso.startSignIn('p-1', INVITED ? { invitation: 'inv-token' } : {});
+const kept = store.dv_sso_flow;
+"""
+
+
+def test_an_invitation_accepted_through_a_provider_where_the_stored_session_was_refused_is_finished():
+    """The invitation page offers its providers whatever session the browser stores. The provider sends the browser
+    back, and the load checks the stored session first: refused (it had run out), the sign-in screen is up, and the
+    sign-in this tab started is finished there with this tab's proof, as on the sign-in screen, so the invited account
+    is made. A refusal the provider's answer brought back is said in the server's words."""
+    got = _node(_START_HERE.replace("INVITED", "true") + r"""
+answers['POST /api/auth/finish'] = { status: 200, json: { access_token: 'new-token' } };
+// The stored session was refused at the load: its sign-out leaves the sign-in screen up, and no session.
+authToken = null; currentUser = null;
+await _ssoResume(arrive('#sso=code-1'));
+const finished = sent.filter((s) => s.method === 'POST' && s.url === '/api/auth/finish').map((s) => s.body);
+await window.Sso.startSignIn('p-1', { invitation: 'inv-token' });
+await _ssoResume(arrive('#sso-error=no_account'));
+out({ finished, kept: JSON.parse(kept), raw: kept, passkey, refused: note(), toasts });
+""", _server_reasons())
+    # The flow names an invitation, never its token.
+    assert got["kept"]["purpose"] == "sign_in" and got["kept"]["invitation"] is True
+    assert "inv-token" not in got["raw"]
+    assert got["finished"] == [{"code": "code-1", "verifier": got["kept"]["verifier"]}]
+    assert "answer:provider" in got["passkey"]
+    assert got["refused"] == {"text": _server_reasons()["no_account"], "shown": True}
+    assert got["toasts"] == []
+
+
+@pytest.mark.parametrize("invited", [True, False])
+def test_a_sign_in_that_comes_back_to_a_page_already_signed_in_says_nothing_was_done(invited):
+    """The stored session is good: the page opens it, and the code that came back is not claimed for the account
+    signed in here (the invitation stays unaccepted, and no account is made). The person is told so, and how to do it
+    again, never left to believe it went through."""
+    got = _node(_START_HERE.replace("INVITED", json.dumps(invited)) + r"""
+authToken = 'stored'; currentUser = { id: 'u-1', username: 'alice' };
+await _ssoResume(arrive('#sso=code-1'));
+out({ posts: sent.filter((s) => s.method === 'POST').map((s) => s.url), toasts, note: note() });
+""", _server_reasons())
+    assert got["posts"] == ["/api/auth/sso/p-1/start"]          # nothing was claimed
+    told = ("Your organisation's sign-in came back to this page, which is already signed in as alice, so "
+            + ("your invitation was not accepted and no account was made. To accept it, choose Logout in your "
+               "profile menu (top-right), then open your invitation link again and accept it through your "
+               "organisation's sign-in." if invited else
+               "nothing was done with it. To sign in as someone else, choose Logout in your profile menu (top-right) "
+               "first, then sign in again."))
+    assert got["toasts"] == [["warning", told]]
+    assert got["note"] == {"text": "", "shown": False}
+
+
+def test_the_boot_hands_what_came_back_to_the_session_check_and_then_to_the_resume():
+    """With a stored session the load checks it first, then hands what came back to _ssoResume, whichever way the
+    check went: a refused session leaves the sign-in screen up, where a sign-in this tab started is finished."""
+    js = APP_JS.read_text(encoding="utf-8")
+    assert "enterAuthedSession().then(() => _ssoResume(ssoBack))" in js
 
 
 # --------------------------------------------------------------------------- a page opened at another address

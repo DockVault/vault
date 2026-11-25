@@ -2097,13 +2097,36 @@ async function _ssoOnSignInScreen(back) {
     }
 }
 
+// What the page says when a sign-in's code comes back to a page that is signed in (the invitation page offers its
+// providers whatever session the browser stores, and another tab may sign in meanwhile): the code is not claimed
+// for the account signed in here, so nothing was done with it, and an invitation was not accepted.
+function _ssoSignInBackToASignedInPage(back) {
+    const who = (currentUser && currentUser.username) || 'another account';
+    const invited = !!(back && back.flow && back.flow.purpose === 'sign_in' && back.flow.invitation);
+    return 'Your organisation\'s sign-in came back to this page, which is already signed in as ' + who + ', so '
+        + (invited
+            ? 'your invitation was not accepted and no account was made. To accept it, choose Logout in your profile '
+                + 'menu (top-right), then open your invitation link again and accept it through your organisation\'s '
+                + 'sign-in.'
+            : 'nothing was done with it. To sign in as someone else, choose Logout in your profile menu (top-right) '
+                + 'first, then sign in again.');
+}
+
 // The page came back from a provider while signed in: a link, an administrator's test or a confirmation is claimed
 // with this tab's verifier, and the person is told what happened.
 async function _ssoResume(back) {
     if (!back || !window.Sso) return;
     if (!authToken || !currentUser) {
-        // The session stored for the page was refused at the load: the sign-in screen is up, with no word of why.
+        // The session stored for the page was refused at the load: the sign-in screen is up. A link, a test or a
+        // confirmation was that session's, and nothing was done. A sign-in this tab started (from the invitation
+        // page, say, which offers its providers whatever the browser stores) is finished there with this tab's
+        // proof, and a refusal is said, as on the sign-in screen.
         if (_SSO_BACK_OF_A_SESSION.includes(back.kind)) _showReasonNote(SSO_BACK_SIGNED_OUT);
+        else await _ssoOnSignInScreen(back);
+        return;
+    }
+    if (back.kind === 'sso') {
+        showToast(_ssoSignInBackToASignedInPage(back), 'warning', 20000);
         return;
     }
     const out = await Sso.resume(back);
