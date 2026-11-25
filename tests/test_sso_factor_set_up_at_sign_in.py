@@ -613,3 +613,77 @@ def test_a_factor_set_up_at_a_providers_held_sign_in_holds_the_providers_row_bef
     with pytest.raises(sign_in.ProviderOnly):
         sign_in.refuse_a_factor_the_sign_in_could_not_finish(w.db, dana, other, IP)
     assert order == [("turn", str(dana.id))], order
+
+
+@pytest.mark.parametrize("changed", ["made provider-only", "turned off", "locked", "nothing"])
+def test_a_factor_at_a_held_sign_in_is_judged_on_the_account_as_it_is_committed(monkeypatch, changed):
+    """Whoever holds an account's password is held at a set-up. In that moment an administrator's save makes the
+    account sign in only through its provider: it ends the sessions a password made and spends no sign-in under
+    way. The factor's write then took the account's turn and judged the account as it had been loaded before the
+    turn: the factor was stored, the sign-in itself was refused afterwards, and the factor stayed. The account is
+    read again in the turn. On real rows: the request's session holds the account as it loaded it, the change is
+    committed through another."""
+    from datetime import datetime, timedelta
+    import sqlalchemy as sa
+    from fastapi import HTTPException
+    from _bare_api_env import set_bare_api_env
+    set_bare_api_env()
+    from _kept_db import kept_database
+    from app.api import api_server as api
+    from app.core.models import PendingLogin, RoleEnum, User
+    from app.services import sign_in
+    took, the_save = [], []
+
+    def the_turn_comes_after_the_save(db, user_id):
+        # The save held the account's turn first: the factor's write gets it once the save has committed.
+        took.append("the turn")
+        for commit_it in the_save:
+            commit_it()
+    monkeypatch.setattr(api, "_sessions_turn", the_turn_comes_after_the_save)
+    monkeypatch.setattr(api.AuditLogger, "log_login_failure", lambda self, *a, **k: None)
+    with kept_database() as (make, _engine):
+        with make() as request, make() as elsewhere:
+            alice = User(username="alice", email=None, password_hash="x", role=RoleEnum.USER, is_active=True,
+                         is_locked=False, sso_only=False)
+            request.add(alice)
+            request.flush()
+            held = PendingLogin(user_id=alice.id, client_ip=IP, enrollment_required=True,
+                                expires_at=datetime.utcnow() + timedelta(minutes=5))
+            request.add(held)
+            request.commit()
+            alice, held = request.get(User, alice.id), request.get(PendingLogin, held.id)
+            assert alice.sso_only is False and alice.is_active is True         # as the request loaded it
+            held._methods_so_far, held._sessions_ended = ("pwd",), 0
+            change = {"made provider-only": "sso_only = 1", "turned off": "is_active = 0",
+                      "locked": "is_locked = 1"}.get(changed)
+            if change:
+                def committed():
+                    elsewhere.execute(sa.text(f"UPDATE users SET {change} WHERE id = :id"), {"id": alice.id.hex})
+                    elsewhere.commit()
+                the_save.append(committed)
+
+            def write_the_factor():
+                sign_in.refuse_a_factor_the_sign_in_could_not_finish(request, alice, held, IP)
+            if changed == "nothing":
+                write_the_factor()                                # the factor may be written
+            elif changed == "made provider-only":
+                with pytest.raises(sign_in.ProviderOnly):
+                    write_the_factor()
+            else:
+                with pytest.raises(HTTPException) as refused:
+                    write_the_factor()
+                assert refused.value.status_code in (401, 403), refused.value.detail
+            assert took == ["the turn"]                           # read again in the turn, not before it
+
+
+def test_the_account_is_read_again_after_the_turn_and_before_it_is_judged():
+    import inspect
+    from app.services import sign_in
+    source = inspect.getsource(sign_in.refuse_a_factor_the_sign_in_could_not_finish)
+    steps = ("with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))",
+             "sso_only.read_again(db, user, ACCOUNT_STATE_A_FACTOR_IS_JUDGED_ON)",
+             "refuse_unless_the_account_may_sign_in(db, user, client_ip)",
+             "refuse_without_the_provider(db, held)")
+    order = [source.index(step) for step in steps]
+    assert order == sorted(order), order
+    assert sign_in.ACCOUNT_STATE_A_FACTOR_IS_JUDGED_ON == ("sso_only", "is_active", "is_locked", "locked_until")

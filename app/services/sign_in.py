@@ -1016,6 +1016,10 @@ def refuse_unless_the_account_may_sign_in(db, user, client_ip: Optional[str]) ->
             "Account is locked", locked_until=lock.locked_until, scope=lock.scope))
 
 
+# What of the account the refusals below read: read again in the turn, where a factor is about to be written.
+ACCOUNT_STATE_A_FACTOR_IS_JUDGED_ON = ("sso_only", "is_active", "is_locked", "locked_until")
+
+
 def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: Optional[str]) -> None:
     """On a held sign-in, before a factor is stored or made active for the account: refuse what :func:`finish`
     refuses. It is asked there only after the factor stands, and a factor outlives the sign-in it was set up at:
@@ -1058,6 +1062,13 @@ def refuse_a_factor_the_sign_in_could_not_finish(db, user, pending, client_ip: O
     on_record = db.query(PendingLogin.consumed_at).filter(PendingLogin.id == pending.id).first()
     if on_record is None or on_record[0] is not None:
         raise HTTPException(status_code=401, detail="This login attempt has expired; start again.")
+    # The account as it is committed, read in the turn. A lock or a turning-off spends the held sign-in, which
+    # the read above sees. A provider's save that makes the account sign in only through the provider ends the
+    # sessions a password made and spends no sign-in under way: judged on the account as it was loaded before
+    # the turn, a factor was stored at a password's hold of an account made provider-only in that moment, and
+    # stayed on it after the sign-in itself was refused.
+    from app.core import sso_only
+    sso_only.read_again(db, user, ACCOUNT_STATE_A_FACTOR_IS_JUDGED_ON)
     refuse_unless_the_account_may_sign_in(db, user, client_ip)
     refuse_without_the_provider(db, held)
     refuse_unless_the_provider_stands(db, held)
