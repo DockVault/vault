@@ -134,6 +134,9 @@ out({ lines: lines(), asked: asked.map((a) => a.path) });
 # --------------------------------------------------------------------------- the passkey requirement lifted
 
 def test_an_account_the_passkey_requirement_was_lifted_for_says_so_and_when_it_ends():
+    """The mark stands until the account adds a passkey, its role changes or the operator puts it back; a change of
+    the passkey settings leaves it. The note says what the mark does, which stays true then, and never that the
+    role must hold a passkey now: after Passkeys is set to Optional, no setting requires one."""
     got = _node(r"""
 globalThis.iconSvg = () => ''; globalThis.escapeHtml = (s) => String(s); globalThis.groupChip = () => '';
 globalThis.People = { placeholder: () => '', whenPlaceholder: () => '' };
@@ -146,8 +149,10 @@ out({ before, lines: lines(), badge: renderUserRow(carol).includes('Passkey requ
       "renderUserDetail", "renderUserRow"))
     assert got["before"] == {"lines": None, "badge": False}
     assert got["lines"] == [f"The server’s operator lifted the passkey requirement for this account on {got['day']}: it "
-                            "signs in without a passkey although its role must hold one. That ends when the account "
-                            "adds a passkey, when its role changes, or when the server’s operator puts it back."]
+                            "is not asked for a passkey, even while its role is listed in “Roles that must have a "
+                            "passkey” (Settings, Sign-in). That ends when the account adds a passkey, when its role "
+                            "changes, or when the server’s operator puts it back."]
+    assert "must hold one" not in got["lines"][0]
     assert got["badge"] is True
 
 

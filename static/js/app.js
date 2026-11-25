@@ -7780,11 +7780,12 @@ function fillCredentialChangeNotes() {
         const standing = _ssoStandingNote(u);
         if (standing) lines.push(standing);
         if (u && u.passkey_requirement_cleared_at) {
-            // Lifted on the host (dockvault.py accounts); it ends by itself with a passkey or a new role.
+            // Lifted on the host (dockvault.py accounts); it ends by itself with a passkey or a new role. A change of
+            // the passkey settings leaves it, so the note says what it does and not that the role requires one now.
             lines.push('The server’s operator lifted the passkey requirement for this account on '
-                + formatDayMonth(u.passkey_requirement_cleared_at) + ': it signs in without a passkey although its '
-                + 'role must hold one. That ends when the account adds a passkey, when its role changes, or when the '
-                + 'server’s operator puts it back.');
+                + formatDayMonth(u.passkey_requirement_cleared_at) + ': it is not asked for a passkey, even while its '
+                + 'role is listed in “Roles that must have a passkey” (Settings, Sign-in). That ends when the account '
+                + 'adds a passkey, when its role changes, or when the server’s operator puts it back.');
         }
         note.replaceChildren(...lines.map(t => _el('div', null, t)));
         note.hidden = lines.length === 0;
