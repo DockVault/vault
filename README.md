@@ -706,6 +706,11 @@ bundle really is the one those volumes were created with. **Restore** verifies t
 recreates the volumes, and installs the paired `.env`; it refuses a bundle whose `.env` doesn't match
 its volumes, and won't overwrite existing volumes unless you pass `--force`.
 
+`certs/` is not in a backup: keep your own copy of the TLS pair and of the attestation roots file,
+and put them back in `certs/` after a restore on another machine. A restore, and
+`python dockvault.py status`, say when `.env` names an attestation roots file
+(`WEBAUTHN_ATTESTATION_ROOTS`) that is not in `certs/`.
+
 Each backup is a folder of its own that only you can open: mode `0700` on Linux and macOS, and on
 Windows an ACL for your user, SYSTEM and Administrators only, set before anything is written into it
 (a folder on a second drive otherwise commonly lets every signed-in user in). Your account is named

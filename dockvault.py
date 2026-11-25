@@ -1524,6 +1524,45 @@ SELF_SIGNED_PASSKEY_NOTE = (
     "trust this certificate on every device that opens the vault.")
 
 
+# The settings in .env that name a file the server reads from certs/, which the HTTPS compose mounts read-only at
+# /app/certs and a backup does not carry: (the setting, the word status and restore put before what is wrong with
+# it, what follows while the server cannot read it).
+CERTS_FILE_SETTINGS = (
+    ("WEBAUTHN_ATTESTATION_ROOTS", "Passkeys",
+     "Until the server can read it, every new passkey is refused while attestation is direct."),
+)
+
+
+def certs_file_problem(env_key, value, cert_dir):
+    """What is wrong with the file ``value`` names for the server to read from certs/, as a sentence, or None when
+    nothing is (or no file is named). ``value`` is the path the container sees: the HTTPS compose mounts the certs/
+    folder beside .env (``cert_dir``) at /app/certs, and the server's working directory is /app, so a relative path
+    is read from there. A file named outside that folder never comes from this host; one inside it is looked for in
+    ``cert_dir``, and must hold a PEM certificate. A file this user cannot read is not judged. Pure but for reading
+    ``cert_dir``."""
+    import posixpath
+    text = str(value or "").strip().strip("'\"").strip()
+    if not text:
+        return None
+    path = posixpath.normpath(posixpath.join("/app", text))
+    if not path.startswith("/app/certs/"):
+        return ("%s names %s, outside /app/certs: the HTTPS compose mounts only the certs/ folder beside .env, at "
+                "/app/certs, so no file of yours reaches that path." % (env_key, text))
+    inside = path[len("/app/certs/"):]
+    local = os.path.join(cert_dir, *inside.split("/"))
+    if not os.path.isfile(local):
+        return ("%s names %s, and certs/%s does not exist (a backup does not carry certs/): copy the file there."
+                % (env_key, text, inside))
+    try:
+        with open(local, "rb") as handle:
+            body = handle.read()
+    except OSError:
+        return None
+    if b"-----BEGIN CERTIFICATE-----" not in body:
+        return "%s names %s, and certs/%s holds no PEM certificate." % (env_key, text, inside)
+    return None
+
+
 def install_byo_cert(cert_dir, cert_path, key_path, run=subprocess.run):
     """Install a bring-your-own fullchain cert + key into cert_dir/{cert,key}.pem. Rejects a
     passphrase-encrypted key and a mismatched pair. Returns (ok, message)."""
@@ -1812,8 +1851,8 @@ def _chown_certs_in_container(cert_dir, run=subprocess.run):
 
 
 _CERT_DENIED = ("the container's app user (uid %d) cannot read certs/key.pem - the vault would fail "
-                "to start with 'PermissionError: [Errno 13]'. Re-install the pair, or delete the "
-                "certs/ directory and re-run setup to regenerate a self-signed one." % APP_UID)
+                "to start with 'PermissionError: [Errno 13]'. Re-install the pair, or delete certs/cert.pem "
+                "and certs/key.pem and re-run setup to regenerate a self-signed one." % APP_UID)
 _CERT_UNKNOWN = ("could not check whether the container can read certs/ (the Docker engine did not "
                  "answer) - the certificates themselves are untouched. Re-run setup once Docker is "
                  "running.")
@@ -5612,7 +5651,8 @@ class DockVault:
     def _print_sign_in_lines(self, env):
         """What `status` says about signing in at this deployment, and a healthy update says after it: only the lines
         that say something needs doing (an address no passkey can be made at, passkeys made at another address, a
-        self-signed certificate where passkeys could be made, a first address on another port than the web UI's).
+        self-signed certificate where passkeys could be made, a file .env names in certs/ that is not there, a first
+        address on another port than the web UI's).
         ``env`` is the parsed .env; with none, nothing is said. The running deployment is asked for a warning only,
         so nothing here fails the command that prints it."""
         if not env:
@@ -5630,6 +5670,10 @@ class DockVault:
         # Only a certificate that issued itself: one from a private authority the devices trust says nothing here.
         if host and cert_self_issued(os.path.join(self._certs_dir(), "cert.pem")) is True:
             print(pal.paint("  Passkeys: " + SELF_SIGNED_PASSKEY_NOTE, "yellow"))
+        for key, label, _follows in CERTS_FILE_SETTINGS:
+            problem = certs_file_problem(key, env.get(key), self._certs_dir())
+            if problem:
+                print(pal.paint("  %s: %s" % (label, problem), "yellow"))
         port_note = allowed_hosts_port_note(allowed, env.get("WEB_HOST_PORT"))
         if port_note:
             print(pal.paint("  Address: " + port_note, "yellow"))
@@ -5760,8 +5804,8 @@ class DockVault:
         # only symptom is uvicorn's "PermissionError: [Errno 13]" buried in the logs.
         if cert_readable_by_app_uid(cert_dir) is False:
             self._fail("the vault container (uid %d) cannot read certs/key.pem, so it could never "
-                       "serve HTTPS. Delete the certs/ directory and re-run setup to regenerate a "
-                       "readable pair." % APP_UID)
+                       "serve HTTPS. Delete certs/cert.pem and certs/key.pem and re-run setup to "
+                       "regenerate a readable pair." % APP_UID)
         # Guardrail: if we're (re)starting on an EXISTING data volume, the current .env's DB password
         # MUST authenticate against it, or the app would loop on a Postgres auth error. Fail closed
         # with a clear diagnosis (the reported "wrong password after re-setup" footgun).
@@ -7911,6 +7955,12 @@ class DockVault:
                             "is there, %s)." % (restore_incomplete_path(self.root, prefix),
                                                 restore_incomplete_refusers("set '%s'" % prefix)), "red"))
         print(pal.paint("\n  Restored set '%s' (%d volume(s)) + its .env." % (prefix, len(plan)), "green"))
+        # A backup does not carry certs/: a file the restored .env names there may be missing on this host.
+        restored_env = self._load_env()
+        for key, label, follows in CERTS_FILE_SETTINGS:
+            problem = certs_file_problem(key, restored_env.get(key), self._certs_dir())
+            if problem:
+                print(pal.paint("  %s: %s %s" % (label, problem, follows), "yellow"))
         self._say_what_the_restore_kept(kept_env, current_prefix, prefix)
         finish = "python dockvault.py audit accept-restore"
         rekey = "python dockvault.py audit rekey --old-key-file %s" % kept_here
