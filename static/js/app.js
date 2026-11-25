@@ -2827,6 +2827,7 @@ function renderEnrollmentWizard(box, opts) {
 
 let _stepUpResolve = null;
 let _stepUpDrawn = 0;      // which drawing of the dialog is on screen: an answer that comes later draws nothing
+let _stepUpAsks = 0;       // which step-up was asked for last: one asked for earlier and still waiting gives way to it
 
 function _stepUpSettle(receipt) {
     const r = _stepUpResolve;
@@ -2880,6 +2881,7 @@ async function _stepUpByProvider(payload) {
 // from the gated 403 (e.g. ['totp','recovery'] and/or ['password'], or ['idp_reauth', 'password']).
 async function requestStepUpReceipt(action, methods) {
     _stepUpSettle(null);   // abandon any prior pending step-up
+    const asked = ++_stepUpAsks;
     const list = (Array.isArray(methods) && methods.length) ? methods : ['totp', 'recovery'];
     let said = '';
     // Back from the organisation's sign-in for this very action, with nothing to type here: the confirmation is
@@ -2889,6 +2891,9 @@ async function requestStepUpReceipt(action, methods) {
         const tried = await _stepUpByProvider({ action });
         _providerConfirmation = null;
         if (tried.receipt) return tried.receipt;
+        // Another step-up was asked for while the server answered: its dialog stays on screen, and this one gives
+        // way, as one asked for earlier always does.
+        if (asked !== _stepUpAsks) return null;
         said = tried.message;
     }
     return new Promise((resolve) => {

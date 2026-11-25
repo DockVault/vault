@@ -25,7 +25,7 @@ APP_JS = ROOT / "static" / "js" / "app.js"
 _SHIPPED = ("_el", "_sfError", "_stepUpSettle", "_noteProviderConfirmation", "_providerConfirmationFor",
             "_stepUpMeetsFactor", "_stepUpByProvider", "requestStepUpReceipt", "_buildProviderStepUp",
             "_buildStepUpBody", "_ssoResume")
-_STATE = ("_stepUpResolve", "_stepUpDrawn", "_providerConfirmation")
+_STATE = ("_stepUpResolve", "_stepUpDrawn", "_stepUpAsks", "_providerConfirmation")
 
 
 def _function(js, name):
@@ -281,3 +281,34 @@ await _ssoResume({ kind: 'confirmed', action: 'sso.identity.unlink', then: 'unli
 out({ left: _providerConfirmation, toasts });
 """)
     assert got == {"left": None, "toasts": []}
+
+
+def test_a_step_up_asked_for_while_a_confirmation_is_spent_keeps_its_dialog_and_both_settle():
+    """The confirmation is being spent at the server when another gated action asks for its own step-up. The server
+    turns the confirmation down: the later dialog stays on screen and settles when the person closes it, and the
+    earlier one gives way at once. Neither is left waiting for ever."""
+    got = _node(r"""
+_noteProviderConfirmation('vault.delete', 120, 'Contoso');
+let release;
+global.fetch = (url, options) => {
+    posted.push({ url, body: JSON.parse((options || {}).body || 'null') });
+    return new Promise((resolve) => { release = () => resolve({ ok: false, json: async () => ({
+        detail: "Confirm with your organisation's sign-in first, then try again." }) }); });
+};
+const settled = { a: 'waiting', b: 'waiting' };
+requestStepUpReceipt('vault.delete', ['idp_reauth', 'password']).then((r) => { settled.a = r; });
+await tick();
+requestStepUpReceipt('share.create', ['totp', 'recovery']).then((r) => { settled.b = r; });
+await tick(); await tick();
+release();
+await tick(); await tick(); await tick();
+const after = { a: settled.a, b: settled.b, code: !!byId('stepup-code-input'), providers: !!byId('stepup-providers'),
+                opened: opened.slice() };
+closeModal();
+await tick();
+out({ after, closed: { a: settled.a, b: settled.b }, posted: posted.map((p) => p.body) });
+""")
+    assert got["after"] == {"a": None, "b": "waiting", "code": True, "providers": False,
+                            "opened": ["stepup-modal"]}
+    assert got["closed"] == {"a": None, "b": None}
+    assert got["posted"] == [{"action": "vault.delete", "password_method": "idp_reauth"}]
