@@ -2934,7 +2934,7 @@ function _buildProviderStepUp(body, action, methods, said) {
     footer.appendChild(cancel);
     body.appendChild(footer);
     Sso.confirmers().then((providers) => {
-        if (drawn !== _stepUpDrawn) return;                     // the dialog was drawn again, or closed, meanwhile
+        if (drawn !== _stepUpDrawn) return;                     // the dialog was drawn again meanwhile
         box.replaceChildren();
         if (!providers.length) {
             box.appendChild(_el('p', 'text-secondary text-sm', 'Your organisation\'s sign-in cannot confirm you right '
@@ -2969,7 +2969,7 @@ function _buildStepUpBody(action, methods, said) {
     // The password part met by a fresh sign-in at the organisation's provider: until this tab holds a confirmation
     // for this action, the dialog offers the provider; once it does, the password field is not shown (the account
     // has none anybody can type) and the confirmation is named in its place.
-    const byProvider = methods.includes('idp_reauth') && !!window.Sso;
+    const byProvider = methods.includes('idp_reauth') && !!window.Sso && typeof Sso.confirmers === 'function';
     const confirmed = byProvider ? _providerConfirmationFor(action) : null;
     if (byProvider && !confirmed) { _buildProviderStepUp(body, action, methods, said); return; }
 
