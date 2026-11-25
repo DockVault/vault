@@ -256,6 +256,24 @@ def test_a_locked_entry_says_its_value_and_why_in_public_words(monkeypatch):
     assert rows["session_records_days"]["locked"] is False           # fixed: the lock does not reach it
 
 
+def test_a_locked_setting_no_env_line_sets_says_it_keeps_its_default(monkeypatch):
+    """Attestation and the allowed authenticator makes take no .env value: a lock holds their defaults, and the
+    reason says so instead of sending anyone to change a value that no line sets. A passkey setting .env sets
+    reads as every other locked setting with a line of its own."""
+    settings = reg._deployment_settings()
+    monkeypatch.setattr(settings, "settings_locked_keys", "webauthn", raising=False)
+    rows = {r["key"]: r for r in catalogue.entries(current="0.36.0")}
+    for key in ("webauthn_attestation", "webauthn_allowed_aaguids"):
+        row = rows[key]
+        assert row["locked"] is True, key
+        assert "keeps its default" in row["reason"] and "SETTINGS_LOCKED_KEYS" in row["reason"], row["reason"]
+        assert "changes it there" not in row["reason"] and "lift the lock" in row["reason"], row["reason"]
+    assert rows["webauthn_attestation"]["value"] == "none" and rows["webauthn_allowed_aaguids"]["value"] == "none"
+    mode = rows["webauthn_mode"]
+    assert mode["locked"] is True and mode["reason"].startswith("Set by your provider")
+    assert "WEBAUTHN_MODE" in mode["reason"] and "keeps its default" not in mode["reason"]
+
+
 # --------------------------------------------------------------------------- the pages' markup
 
 _VOID = {"input", "img", "br", "hr", "meta", "link", "source", "area", "base", "col", "embed", "param", "track", "wbr"}

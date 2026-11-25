@@ -117,9 +117,11 @@
         item.appendChild(actions);
 
         if (row.locked) {
-            // Set in the deployment: shown, never changed here (the levels list it under "Set by your provider").
+            // Locked by the deployment: shown, never changed here (the levels list it under "Set by your provider").
+            // A setting no .env line sets keeps its default under the lock.
             item.querySelectorAll('input, select, textarea, button').forEach((n) => { n.disabled = true; });
-            said.textContent = 'Set by your provider.';
+            said.textContent = row.env ? 'Set by your provider.'
+                : 'Kept at its default by your provider (locked): it cannot be changed here.';
             return item;
         }
         const changed = () => { save.disabled = same(field.read(), row.value); said.textContent = ''; };
