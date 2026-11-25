@@ -556,10 +556,17 @@ def lift_requirement(user, *, now: Optional[datetime] = None) -> None:
 
 
 def end_lifting(user) -> bool:
-    """The requirement applies to ``user`` again, in the caller's transaction; whether anything changed."""
+    """The requirement applies to ``user`` again, in the caller's transaction; whether anything changed.
+
+    The account's time to add a passkey starts again at its next sign-in under the requirement, as the person
+    is told ("the usual time, from your next sign-in"). The day the requirement first applied is from before the
+    lifting, and nothing moved it meanwhile; the requirement is lifted for people whose time had run out. Counted
+    from that day, the account was past its time the moment the requirement came back: the next sign-in stopped
+    at the passkey it was to add, and a person whose browser still could not make one did not get in at all."""
     if getattr(user, "passkey_requirement_cleared_at", None) is None:
         return False
     user.passkey_requirement_cleared_at = None
+    user.passkey_required_since = None
     return True
 
 

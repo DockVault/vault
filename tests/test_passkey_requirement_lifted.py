@@ -59,6 +59,36 @@ def test_only_a_requirement_that_names_the_accounts_role_is_lifted_and_it_can_be
     assert datetime.utcnow() - alice.passkey_requirement_cleared_at < timedelta(seconds=5)
 
 
+@pytest.mark.parametrize("role", ["user", "admin"])
+def test_a_requirement_that_is_put_back_gives_the_account_its_time_again(monkeypatch, role):
+    """The requirement was lifted for an account whose 14 days had run out a month before. Put back, the person
+    is told they have the usual time from their next sign-in. The day the requirement first applied was left on
+    the account, so that sign-in found the time long over and stopped at the passkey: for a person whose browser
+    still cannot make one, and for an administrator the vault depends on, that is no way in at all."""
+    registry, wss = _mod()
+    from app.core.models import User, WebAuthnCredential
+    alice = _person("alice", role=role)
+    db = MemoryDB({User: [alice], WebAuthnCredential: []})
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: [role], wss.GRACE_DAYS: 14})
+    now = datetime.utcnow()
+    alice.passkey_required_since = now - timedelta(days=45)
+    assert wss.requirement(db, alice, now=now).overdue is True
+    wss.lift_requirement(alice, now=now - timedelta(days=30))
+    assert wss.requirement(db, alice, now=now).required is False
+    assert wss.end_lifting(alice) is True
+    assert alice.passkey_required_since is None
+    back = wss.requirement(db, alice, now=now)
+    assert back.required is True and back.overdue is False and back.since is None and back.due is None
+    # The time runs from the sign-in that marks it, as for an account the requirement is new to.
+    alice.passkey_required_since = now
+    later = wss.requirement(db, alice, now=now + timedelta(days=13))
+    assert later.required is True and later.overdue is False
+    assert wss.requirement(db, alice, now=now + timedelta(days=15)).overdue is True
+    # An account nothing was lifted for keeps its day: a role change asks this of every account, and must not
+    # give one that is running out of time its time again.
+    assert wss.end_lifting(alice) is False and alice.passkey_required_since == now
+
+
 def test_the_lifting_ends_with_the_role_it_was_for(monkeypatch):
     """A user the operator exempted is made an administrator: what was lifted was the users' requirement, and
     the administrators' applies to the account like to any other."""
