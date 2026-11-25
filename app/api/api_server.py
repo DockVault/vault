@@ -267,8 +267,10 @@ async def _lock_wait_ran_out_handler(request: StarletteRequest, exc: Exception):
     administrator's change of an account's sign-in details, whatever takes an account's turn at its sessions
     while a change that settles many accounts holds it. The statement failed and wrote nothing, and the request's
     transaction ends with the request, so the answer is the busy one: 503 with the wait, which a client tries
-    again. The log has the route, never the statement. Any other database error is not this handler's: raised
-    again, it is the 500 it was."""
+    again. What a request had committed before that statement stays, as it stayed under the 500 (approving a
+    held reset link commits the link before it records the approval): the next try is answered as the request
+    then stands. The log has the route, never the statement. Any other database error is not this handler's:
+    raised again, it is the 500 it was."""
     if getattr(getattr(exc, "orig", None), "pgcode", None) != LOCK_WAIT_RAN_OUT:
         raise exc
     from app.core import sign_in_lockout
