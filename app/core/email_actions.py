@@ -320,6 +320,20 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),
     },
+    "sign_in_policy_change": {
+        "name": "How people sign in",
+        "subject": "A change to how people sign in to {{vault.name}}",
+        "body_html": (
+            "<h2>A change to how people sign in</h2>"
+            "<p>Hi {{user.username}},</p>"
+            "<p>{{action.change}}</p>"
+            "<p>When: {{action.when}}</p>"
+            "<p>By: {{action.by}}</p>"
+            "<p>If you did not expect this, check Settings, Sign-in methods at once.</p>"
+            "<hr>"
+            "<p><small>Sent by {{vault.name}}.</small></p>"
+        ),
+    },
     "recorded_values_removal": {
         "name": "Removal of recorded values",
         "subject": "A removal of recorded values in the {{vault.name}} audit log",
@@ -428,6 +442,12 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Sent to every administrator when a setting for how long records are kept changes, when a change "
      "that deletes records sooner is asked for, cancelled or takes effect — says what, when and by whom.",
      SYSTEM),
+    ("sign_in_policy_change", "How people sign in",
+     "Sent to every administrator when a passkey setting changes, when a single sign-on provider or one of its "
+     "group mappings is added, changed, turned on or off or removed, when a sign-in refusal or hold is lifted, when "
+     "an administrator unlinks an identity, when an account's owner unlinks an identity whose provider could hold "
+     "the account to its own sign-in, and when the vault gives privileged accounts their password sign-in back -- "
+     "says what, when and by whom.", SYSTEM),
     ("recorded_values_removal", "Removal of recorded values",
      "Sent to every administrator when a removal of the values the audit log recorded under earlier "
      "recording levels is asked for, cancelled or completed — says what, when and by whom.", SYSTEM),

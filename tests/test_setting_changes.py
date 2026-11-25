@@ -386,6 +386,49 @@ def test_applying_and_cancelling_tell_every_administrator(env, factory, told):
     assert [e[0] for e in told["emails"]] == ["retention_change"]
 
 
+def test_a_records_setting_changed_at_once_is_told_as_a_records_change(env, factory, told):
+    db = factory()
+    alice = _user(db, "alice")
+    sc.announce(sc.CHANGED_AT_ONCE, {"key": "keep_days", "old": 90, "new": 365}, "alice")
+    ((ids, ntype, title, body, target),) = told["notices"]
+    assert ids == [str(alice.id)] and (ntype, target) == ("retention_change", "#settings")
+    assert title == "A setting for how long records are kept was changed"
+    assert body == "alice changed “Keep records for” from 90 days to 365 days."
+    assert [e[0] for e in told["emails"]] == ["retention_change"]
+
+
+def test_a_passkey_setting_is_told_as_a_change_to_how_people_sign_in(factory, told):
+    # The real passkey setting, on the Sign-in page: never the notice and the email about how long records are
+    # kept, whose advice (a change that deletes records sooner waits) does not apply to it.
+    assert reg.spec_for("webauthn_mode").page == "signin"
+    db = factory()
+    alice = _user(db, "alice")
+    details = {"key": "webauthn_mode", "old": "optional", "new": "required_for_roles"}
+    sc.announce(sc.CHANGED_AT_ONCE, details, "alice")
+    ((ids, ntype, title, body, target),) = told["notices"]
+    assert ids == [str(alice.id)]
+    assert (ntype, target) == ("sign_in_policy_change", "#settings/signin")
+    assert title == "A sign-in setting was changed"
+    assert body == "alice changed “Passkeys” from optional to required_for_roles."
+    ((key, recipients, ctx),) = told["emails"]
+    assert key == "sign_in_policy_change" and recipients == [("alice@example.com", "alice")]
+    assert ctx["change"] == body and ctx["by"] == "alice"
+    assert sc.notice_text(sc.KEPT, details, "bob") == (
+        "A waiting change was cancelled",
+        "bob kept “Passkeys” at optional, which cancels the waiting change to required_for_roles.")
+
+
+def test_the_sign_in_email_is_a_system_email_about_how_people_sign_in():
+    from app.core import email_actions
+    spec = email_actions.SPEC_BY_KEY["sign_in_policy_change"]
+    assert spec["category"] == email_actions.SYSTEM and spec["name"] == "How people sign in"
+    assert "records" not in spec["default_subject"] + spec["default_body_html"]
+    assert "{{action.change}}" in spec["default_body_html"] and "{{action.by}}" in spec["default_body_html"]
+    assert "Settings, Sign-in methods" in spec["default_body_html"]
+    # The catalog's description is stored in a column of 500 characters.
+    assert all(len(a["description"]) <= 500 for a in email_actions.ACTION_CATALOG)
+
+
 def test_a_notice_that_cannot_be_sent_never_undoes_the_change(env, factory, monkeypatch, capsys):
     import app.core.database as database
 

@@ -27,6 +27,7 @@ _REQUIRED_TOKEN = {"email_change": "action.code",
                    "administrator_added": "action.change",
                    "ssh_keys_adder_left": "action.link",
                    "retention_change": "action.change",
+                   "sign_in_policy_change": "action.change",
                    "auditor_right": "action.change",
                    "recorded_values_removal": "action.change"}
 # The actions whose body needs more than one of them, each kept or the built-in body is used.

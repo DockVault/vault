@@ -63,6 +63,12 @@ CROSS_CHECKS: list = []
 # The in-app notice's type, and the system email every administrator is sent.
 NOTICE_TYPE = "retention_change"
 EMAIL_ACTION = "retention_change"
+# The same for a setting on the Sign-in methods page (the passkey settings), where nothing deletes records sooner:
+# its own notice type and system email, and the notice opens that page. The single sign-on providers tell the
+# administrators of their changes with these too.
+SIGN_IN_NOTICE_TYPE = "sign_in_policy_change"
+SIGN_IN_EMAIL_ACTION = "sign_in_policy_change"
+SIGN_IN_TARGET = "#settings/signin"
 
 
 def utcnow() -> datetime:
@@ -341,11 +347,19 @@ def _date(value) -> str:
     return value.strftime("%d %B %Y, %H:%M UTC").lstrip("0") if value else ""
 
 
+def _is_sign_in(details) -> bool:
+    """Whether the change is of a setting on the Sign-in methods page, which no records setting is."""
+    spec = registry.spec_for(details.get("key", ""))
+    return spec is not None and spec.page == "signin"
+
+
 def notice_text(event: str, details: dict, by: Optional[str] = None) -> tuple:
     """(title, body) of the notice every administrator gets for ``event``."""
     label, old, new = _words(details)
     by = by or "An administrator"
     if event == CHANGED_AT_ONCE:
+        if _is_sign_in(details):
+            return ("A sign-in setting was changed", f"{by} changed “{label}” from {old} to {new}.")
         return ("A setting for how long records are kept was changed",
                 f"{by} changed “{label}” from {old} to {new}.")
     if event == ASKED:
@@ -378,18 +392,21 @@ def notice_text(event: str, details: dict, by: Optional[str] = None) -> tuple:
 
 def announce(event: str, details: dict, by: Optional[str] = None) -> None:
     """Tell every active administrator, in the app and by email, after the commit. Never raises: a notice
-    never undoes the change."""
+    never undoes the change. A sign-in setting is told as a change to how people sign in, with its own email;
+    every other setting as a change to how long records are kept."""
     try:
         from app.api import api_server as api
         from app.core.database import get_db_context
         from app.core.models import RoleEnum, User
         title, body = notice_text(event, details, by)
+        sign_in = _is_sign_in(details)
+        ntype, action, target = ((SIGN_IN_NOTICE_TYPE, SIGN_IN_EMAIL_ACTION, SIGN_IN_TARGET) if sign_in
+                                 else (NOTICE_TYPE, EMAIL_ACTION, "#settings"))
         with get_db_context() as db:
             admins = db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
             recipients = [(a.email, a.username) for a in admins]
-            api._notify_users([str(a.id) for a in admins], NOTICE_TYPE, title=title, body=body,
-                              target="#settings")
-            api._fire_action_email_bulk(db, EMAIL_ACTION, recipients,
+            api._notify_users([str(a.id) for a in admins], ntype, title=title, body=body, target=target)
+            api._fire_action_email_bulk(db, action, recipients,
                                         {"change": body, "by": by or "", "when": api._change_time_text()})
     except Exception as exc:  # noqa: BLE001
         registry._say(f"Warning: the administrators were not told of a settings change ({type(exc).__name__})")
