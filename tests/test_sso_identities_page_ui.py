@@ -549,6 +549,7 @@ await tick(); await tick();
 const on = { end: byId('sso-end-sessions') !== null, line: byId('sso-sessions-standing') !== null };
 byId('sso-toggle').click();
 await tick(); await tick(); await tick();
+answers['/admin/sso/providers/p-1'] = { provider: OFF };         // read again, it is off
 const line = () => byId('sso-sessions-standing');
 const end = byId('sso-end-sessions');
 const off = { toast: toasts[toasts.length - 1], line: line() && [line().textContent, line().className],
@@ -576,6 +577,37 @@ out({ on, off, again, nothing: toasts[toasts.length - 1], line: line() !== null,
     assert got["again"] == {"toast": ["2 session(s) that came through it were ended.", "success"], "line": False}
     assert got["nothing"] == ["No session that came through it still stands.", "success"] and got["line"] is False
     assert got["sent"] == [["POST", {"state": "disabled"}]] * 3
+
+
+def test_turn_off_again_on_a_provider_turned_on_meanwhile_sends_nothing_and_shows_it_on():
+    """"Turn off again" is for a provider that is off, and the server turns off one that is on when asked so, without
+    the question "Turn off" asks first about the accounts it leaves no way to sign in. So the dialog reads the provider
+    again before it sends anything: turned on meanwhile, nothing is sent, and the dialog shows it on, with "Turn off",
+    and says so."""
+    got = _node(r"""
+const OFF = Object.assign({}, PROVIDER, { state: 'disabled', only_way_in_accounts: 2 });
+const ON = Object.assign({}, PROVIDER, { state: 'enabled', only_way_in_accounts: 2 });
+const STATE = '/admin/sso/providers/p-1/state';
+answers['/admin/sso/providers/p-1'] = { provider: OFF };
+answers[STATE] = { provider: OFF, changed: true, sessions_ended: 4, sessions_not_ended: 0, held: 0 };
+await window.SsoSettings.load();
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+const offered = byId('sso-end-sessions') !== null;
+answers['/admin/sso/providers/p-1'] = { provider: ON };          // another administrator turned it on since
+byId('sso-end-sessions').focus();
+byId('sso-end-sessions').click();
+await tick(); await tick(); await tick();
+out({ offered, toast: toasts[toasts.length - 1], confirms, sent: asked.filter((a) => a.path === STATE).length,
+      state: byId('sso-provider-state').textContent, toggle: byId('sso-toggle').textContent,
+      end: byId('sso-end-sessions') !== null, focus: document.activeElement.id });
+""")
+    assert got["offered"] is True
+    assert got["sent"] == 0 and got["confirms"] == []
+    assert got["toast"] == ["The provider was turned on meanwhile, so nothing was turned off and no session was ended. "
+                            "To turn it off, use Turn off.", "warning"]
+    assert got["state"] == "On" and got["toggle"] == "Turn off" and got["end"] is False
+    assert got["focus"] == "sso-toggle"
 
 
 def test_a_turn_off_whose_sessions_could_not_be_counted_says_so():

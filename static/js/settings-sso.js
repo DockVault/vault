@@ -1226,13 +1226,27 @@
 
     // "Turn off again": a provider that is off is asked again to end the sessions that came through it and still
     // stand. The server answers changed:false, with what it ended, or with nothing when none stood (and then asked
-    // for no step-up). Turned on by somebody meanwhile, the provider is turned off, and that is said.
+    // for no step-up). The provider is read again first: the server turns off one that is on when asked so, without
+    // the question "Turn off" asks about the accounts that would have no way in, so one turned on meanwhile is sent
+    // nothing, and the dialog shows it on, with "Turn off". Turned on between that read and the request, the
+    // provider is turned off, and that is said.
     async function endSessions() {
         if (lockedNow() || !open) return;
         const asked = open.id;
         const button = byId('sso-end-sessions');
         if (button) button.disabled = true;
         try {
+            const read = await apiRequest(`/admin/sso/providers/${encodeURIComponent(asked)}`, { silent: true });
+            if (read && read.provider && read.provider.state === 'enabled') {
+                delete standing[asked];                                // as after a turn-on
+                if (!open || open.id !== asked) { load(); return; }
+                open = read.provider;
+                showToast('The provider was turned on meanwhile, so nothing was turned off and no session was ended. '
+                    + 'To turn it off, use Turn off.', 'warning');
+                drawDialog({ focus: 'sso-toggle' });
+                load();
+                return;
+            }
             const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(asked)}/state`, {
                 method: 'POST', body: JSON.stringify({ state: 'disabled' }), silent: true,
             });
