@@ -11,7 +11,7 @@ import pytest
 
 from _bare_api_env import set_bare_api_env
 from test_sso_resolution import Resolving, _sign_in
-from test_sso_sign_in import _call, _identity, _provider, _user
+from test_sso_sign_in import ONE_STEP, _call, _identity, _provider, _user
 
 pytestmark = pytest.mark.unit
 
@@ -464,9 +464,10 @@ def test_the_flag_follows_the_providers_an_account_is_still_linked_to(monkeypatc
     from app.core import security
     monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
     alice = _user("alice", sso_only=True)
-    a = _provider(name="a", label="A", policy={"sso_password_login": "disabled"})
-    b = _provider(name="b", label="B")
-    c = _provider(name="c", label="C", policy={"sso_password_login": "disabled"})
+    # Providers whose unlink is one step (they only pause keys): the flag is this test's subject.
+    a = _provider(name="a", label="A", policy={"sso_password_login": "disabled", **ONE_STEP})
+    b = _provider(name="b", label="B", policy=ONE_STEP)
+    c = _provider(name="c", label="C", policy={"sso_password_login": "disabled", **ONE_STEP})
     on_a, on_b = _identity(alice, a, subject="s-a"), _identity(alice, b, subject="s-b")
     h = Resolving(monkeypatch, [alice], [a, b, c], identities=[on_a, on_b])
     assert sso_only.should_be_sso_only(h.db, alice) is True

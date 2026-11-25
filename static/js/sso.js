@@ -236,6 +236,18 @@
         }
     }
 
+    // The name a fresh sign-in is staged under to confirm an unlink (app/services/sso_sign_in.py).
+    const UNLINK_CONFIRMATION = 'sso.identity.unlink';
+
+    // The unlink of an identity, once the person is back from confirming it at the provider.
+    async function unlinkConfirmed(identityId) {
+        try {
+            await apiRequest('/users/me/identities/' + encodeURIComponent(identityId), { method: 'DELETE' });
+            showSuccess('Unlinked.');
+        } catch (e) { showError((e && e.message) || 'It was not unlinked.'); }
+        renderAccount();
+    }
+
     // ---------------------------------------------------------------- Your account
 
     function when(iso) {
@@ -278,7 +290,24 @@
             unlink.type = 'button';
             unlink.setAttribute('aria-label', 'Unlink ' + (identity.provider || 'this provider'));
             unlink.addEventListener('click', async () => {
-                const ok = await showConfirm('Unlink ' + (identity.provider || 'this provider') + '? You will no longer '
+                const name = identity.provider || 'this provider';
+                if (identity.unlink_asks_provider) {
+                    // The provider confirms the unlink with a fresh sign-in there: the page goes to the provider
+                    // and unlinks once it is back (app.js, resume).
+                    if (!identity.provider_can_confirm) {
+                        showError(name + ' cannot confirm you right now, so it is not unlinked here. Ask an administrator.');
+                        return;
+                    }
+                    const go = await showConfirm('Unlink ' + name + '? You will no longer sign in through it. To '
+                        + 'confirm it is you, ' + name + ' asks you to sign in there once more first.',
+                        'Unlink single sign-on', null, 'Continue');
+                    if (!go) return;
+                    unlink.disabled = true;
+                    try { await startConfirm(identity.provider_id, UNLINK_CONFIRMATION, 'unlink:' + identity.id); }
+                    catch (e) { unlink.disabled = false; showError((e && e.message) || 'It could not be started.'); }
+                    return;
+                }
+                const ok = await showConfirm('Unlink ' + name + '? You will no longer '
                     + 'sign in through it.', 'Unlink single sign-on', null, 'Unlink');
                 if (!ok) return;
                 try {
@@ -391,7 +420,7 @@
     }
 
     window.Sso = {
-        available, takeReturn, reasonText, renderButtons, startSignIn, startLink, startTest, startConfirm, resume,
+        available, takeReturn, reasonText, renderButtons, startSignIn, startLink, startTest, startConfirm, resume, unlinkConfirmed,
         renderAccount, reset, leaveToSignOut,
     };
 })();

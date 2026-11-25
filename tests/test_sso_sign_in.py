@@ -149,6 +149,12 @@ def _provider(**extra):
     return types.SimpleNamespace(**fields)
 
 
+# A provider whose unlink is one step: it only pauses keys when a person stops signing in there. Where a provider
+# closes the account's other ways in then, the owner's unlink asks for a fresh sign-in through it
+# (tests/test_sso_unlink_asks_the_provider.py); the tests of the unlink's other rules use this one.
+ONE_STEP = {"sso_lapse_ends_sign_in": False}
+
+
 def _identity(user, provider, subject="subject-1", **extra):
     fields = dict(id=uuid.uuid4(), user_id=user.id, provider_id=provider.id, issuer=ISSUER, subject=subject,
                   subject_source="oidc:sub", tenant_id=None, email_at_link=None, display_name=None,
@@ -604,7 +610,7 @@ def test_an_identity_already_on_another_account_is_not_linked_twice(monkeypatch)
 
 
 def test_an_unlink_is_the_owners_and_keeps_the_last_way_in_of_an_sso_only_account(monkeypatch):
-    alice, bob, p = _user(sso_only=True), _user("bob"), _provider()
+    alice, bob, p = _user(sso_only=True), _user("bob"), _provider(policy=ONE_STEP)
     identity, bobs = _identity(alice, p), _identity(bob, p, subject="bob-subject")
     h = Harness(monkeypatch, [alice, bob], [p], identities=[identity, bobs])
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
@@ -617,7 +623,7 @@ def test_an_unlink_is_the_owners_and_keeps_the_last_way_in_of_an_sso_only_accoun
     # one through another identity of the provider, not one of another provider), and the account's sign-ins under
     # way (and nobody else's).
     from app.core.models import ActiveSession, PendingLogin, SsoSession
-    q = _provider(name="Fabrikam")
+    q = _provider(name="Fabrikam", policy=ONE_STEP)
     through, bobs_own, elsewhere = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     h.db.rows_of(ActiveSession).extend([types.SimpleNamespace(id=through, user_id=alice.id),
                                          types.SimpleNamespace(id=bobs_own, user_id=bob.id),
@@ -1187,7 +1193,8 @@ def test_an_account_with_no_password_it_can_type_does_not_unlink_its_only_way_in
     account that signs in only through single sign-on, and says what to do first; with another provider that is
     on, or once the account has a password of its own, it goes through."""
     from app.core import password_origin
-    dana, p, q = _user("dana", sso_only=False), _provider(), _provider(name="Fabrikam")
+    dana, p, q = (_user("dana", sso_only=False), _provider(policy=ONE_STEP),
+                  _provider(name="Fabrikam", policy=ONE_STEP))
     dana.password_nobody_knows = None
     if kind == "it has no password at all":
         dana.password_hash = None
@@ -1235,7 +1242,7 @@ def test_an_identity_whose_provider_refused_or_lapsed_is_not_unlinked_by_its_own
     """Unlinking would end the provider's say over the account's keys and credentials: refused while the provider's
     refusal stands or its window has lapsed, whatever the provider's state; allowed once the person signed in again."""
     from datetime import timedelta
-    alice, p = _user(), _provider()
+    alice, p = _user(), _provider(policy=ONE_STEP)
     identity = _identity(alice, p, refused_at=datetime.utcnow())
     h = Harness(monkeypatch, [alice], [p], identities=[identity])
     for state in ("enabled", "disabled"):

@@ -208,7 +208,7 @@ def test_the_identity_an_account_was_made_with_is_not_unlinked_by_its_owner_whil
     db.rollback()
     assert _as_left(db, alice) == (True, 2)
     # The provider lets the accounts it makes set a password, and its save has settled this one.
-    provider.policy, me.sso_only = {"sso_jit_password": True}, None
+    provider.policy, me.sso_only = {"sso_jit_password": True, "sso_lapse_ends_sign_in": False}, None
     db.commit()
     run_coroutine(sso_router.unlink_my_identity(identity_id=identity.id, request=_request(), current_user=me, db=db))
     assert _as_left(db, alice) == (False, 1)

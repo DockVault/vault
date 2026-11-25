@@ -264,6 +264,9 @@ CHANGES_AN_ACCOUNT = {
     ("PATCH", "/admin/sso/providers/{provider_id}"),
     ("POST", "/admin/sso/providers/{provider_id}/state"),
     ("DELETE", "/admin/sso/providers/{provider_id}"),
+    # One identity of somebody's account, unlinked for them: the account's flag follows the providers it is still
+    # linked to, and the sessions that came through the identity end. An interactive administrator only.
+    ("DELETE", "/admin/sso/identities/{identity_id}"),
 }
 
 # Routes that name an account, or look as if they change one, but change something else, with the reason.

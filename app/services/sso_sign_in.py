@@ -1140,6 +1140,30 @@ def reauth_providers(db, user) -> list:
     return sorted(found, key=lambda p: (getattr(p, "sort_order", 0) or 0, (p.label or p.name or "").lower()))
 
 
+# The name a fresh sign-in at a provider is staged under to confirm the owner's unlink of their identity there
+# (app/api/sso_router.py unlink_my_identity). It is no step-up action: no step-up takes what is staged under it,
+# and what is staged for a step-up does not confirm an unlink.
+UNLINK_CONFIRMATION = "sso.identity.unlink"
+
+
+def unlink_asks_the_provider(db, user, identity, row) -> bool:
+    """Whether the owner's unlink of ``identity`` asks for a fresh sign-in through its provider ``row`` first.
+
+    Where the provider closes the account's other ways in once the person has stopped signing in there
+    (``sso_lapse_ends_sign_in``), unlinking it would end that for good: an account with no identity has no days
+    to run out. A person the provider no longer signs in could unlink it on the day before, and keep the password.
+    So the unlink is confirmed by what such a person cannot give: a sign-in through the provider, made now. Not
+    for an identity the provider itself put on the account by a verified address (the owner's answer to a link
+    they did not make stays one click), and not for an account the rule never holds (an administrator, a holder
+    of the auditor right)."""
+    from app.core import privileged_accounts
+    if row is None or not policy_of(row)["sso_lapse_ends_sign_in"]:
+        return False
+    if getattr(identity, "linked_by", None) == LINKED_BY_EMAIL:
+        return False
+    return privileged_accounts.kind(db, user) is None
+
+
 def reauth_offered(row) -> bool:
     last_test = getattr(row, "last_test", None) or {}
     return (getattr(row, "state", None) == "enabled" and getattr(row, "kind", None) == "oidc"

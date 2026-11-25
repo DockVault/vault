@@ -797,11 +797,14 @@ async def start_reauth(
     from app.core import second_factor_actions as acts
     api = _api()
     _refuse_temp(current_user)
-    if not acts.is_step_up_action(body.action):
+    # The confirmation of an unlink is staged the same way and stands in for no password: any account with an
+    # identity on the provider may give it.
+    confirms_unlink = body.action == sso.UNLINK_CONFIRMATION
+    if not confirms_unlink and not acts.is_step_up_action(body.action):
         raise HTTPException(status_code=404, detail="Unknown action.")
     client_ip = api.get_client_ip(request)
     _limit_start(client_ip)
-    if not sso.reauth_permitted(db, current_user, body.action):
+    if not confirms_unlink and not sso.reauth_permitted(db, current_user, body.action):
         # Nothing is started and no state is made for a step this account answers with its own password.
         raise HTTPException(status_code=403, detail={"reason": "password_required", "message": sso.REAUTH_NOT_FOR_THIS})
     row = _provider(db, provider_id)
@@ -841,7 +844,7 @@ async def finish_reauth(
     action = record.get("step_up_action")
     if not isinstance(action, str) or not action:
         raise HTTPException(status_code=401, detail="This code is not valid for this tab; start again.")
-    if not sso.reauth_permitted(db, current_user, action):
+    if action != sso.UNLINK_CONFIRMATION and not sso.reauth_permitted(db, current_user, action):
         raise HTTPException(status_code=403, detail={"reason": "password_required", "message": sso.REAUTH_NOT_FOR_THIS})
     if not sso.reauth_stands(db, current_user, record["provider_id"], record.get("subject")):
         # Turned off, or the account unlinked from it, while the person was at the provider.
@@ -1158,7 +1161,15 @@ async def list_my_identities(
                if sso.usable_for(p, sso_state.LINK) is None and (p.show_on_sign_in or key in linked)]
     offered.sort(key=lambda p: (p.sort_order or 0, (p.label or p.name or "").lower(), str(p.id)))
     may_confirm = sso.reauth_allowed(db, current_user)        # a provider confirms only an account with no password
-    return {"identities": [_identity_public(i, providers.get(str(i.provider_id))) for i in rows],
+
+    def shown(identity):
+        row = providers.get(str(identity.provider_id))
+        out = _identity_public(identity, row)
+        # Whether unlinking it asks for a fresh sign-in there first, and whether the provider can give one now.
+        out["unlink_asks_provider"] = sso.unlink_asks_the_provider(db, current_user, identity, row)
+        out["provider_can_confirm"] = row is not None and sso.reauth_offered(row)
+        return out
+    return {"identities": [shown(i) for i in rows],
             "providers": [{"id": str(p.id), "label": p.label or p.name, "icon": p.icon or "generic",
                            "linked": str(p.id) in linked,
                            # Linking it ends the account's password: the page says so before it starts the link.
@@ -1299,6 +1310,25 @@ async def unlink_my_identity(
             f"{standing.provider_name} refused your account; an administrator must clear that before you can unlink it."
             if standing.refused else
             f"Sign in through {standing.provider_name} again before you unlink it.")})
+    # Where the provider closes the account's other ways in, the unlink is confirmed by a fresh sign-in through
+    # it, staged by this session a moment ago (sso.unlink_asks_the_provider). Asked last, so that a confirmation
+    # is not spent on an unlink that is refused for another reason.
+    asked = sso.unlink_asks_the_provider(db, account, identity, row)
+    if asked:
+        label = row.label or row.name
+        try:
+            staged = sso_state.take_reauth(api._current_session_hash(request), sso.UNLINK_CONFIRMATION)
+        except sso_state.Unavailable:
+            raise HTTPException(status_code=503, detail="Sign-in is temporarily unavailable. Try again in a moment.")
+        if not (staged and str(staged[0]) == str(identity.provider_id) and sso.reauth_stands(db, account, *staged)):
+            if sso.reauth_offered(row):
+                raise HTTPException(status_code=403, detail={
+                    "reason": "provider_confirmation_required", "action": sso.UNLINK_CONFIRMATION,
+                    "provider": {"id": str(row.id), "label": label},
+                    "message": f"Sign in through {label} once more to confirm it is you, then unlink it."})
+            raise HTTPException(status_code=409, detail={
+                "reason": "provider_cannot_confirm", "provider": {"id": str(row.id), "label": label},
+                "message": f"{label} cannot confirm you right now, so it is not unlinked here. Ask an administrator."})
     provider_id = str(identity.provider_id)
     # The flag follows the providers the account is still linked to: unlinking the one that held it to no password
     # lets it hold one again (nothing is minted), in the same transaction as the unlink.
@@ -1312,9 +1342,22 @@ async def unlink_my_identity(
     db.commit()
     _audit(db, "sso_identity_unlinked", user=current_user, ip=api.get_client_ip(request),
            details={"provider_id": provider_id, "identity_id": str(identity_id), "linked_by": "self",
-                    "sessions": ended})
+                    "sessions": ended, "confirmed_at_provider": bool(asked)})
     label = (row.label or row.name) if row is not None else "an organisation provider"
     may_set_password = settled == sso_only.RESTORED
+    # Every unlink by its owner is told to the administrators: from now on the provider says nothing about the
+    # account, and nothing of the account waits for a sign-in there any more.
+    try:
+        admins = [str(a.id) for a in api._active_admins(db) if str(a.id) != str(current_user.id)]
+        api._notify_users(admins, "account_changed", title=f"{current_user.username} unlinked {label}",
+                          body=(f"{current_user.username} removed {label} from the ways their account signs in"
+                                + (f", after a fresh sign-in through {label}" if asked else "")
+                                + f". From now on {label} says nothing about this account: its password, its passkeys "
+                                "and its SSH keys no longer wait for a sign-in there. Check the Users page if you "
+                                "did not expect this."),
+                          target="#users")
+    except Exception as exc:  # noqa: BLE001 -- the unlink stands without its notice
+        log.info("sso unlink notice to administrators skipped: %s", type(exc).__name__)
     _tell_owner(db, current_user, row, "A sign-in method was removed from your account",
                 f"You unlinked your account from {label}: it can no longer sign in through it."
                 + (" Your account may hold a password again and has none yet: set one with \"Forgot password\" on the "
