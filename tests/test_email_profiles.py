@@ -114,13 +114,37 @@ def test_test_send_wont_pair_stored_password_with_a_new_host(admin, clean_profil
     r = admin.post("/email/profiles/test", json={
         "profile_id": p["id"], "smtp_server": "attacker.example", "to_addr": "x@example.com"})
     assert r.status_code == 400, r.text
-    assert "re-enter" in (r.json().get("detail") or "").lower()
+    assert r.json()["detail"]["reason"] == "smtp_password_required", r.text
+    assert "re-enter" in r.json()["detail"]["message"].lower()
+    # Turning the certificate check off over the stored password is refused the same way.
+    r = admin.post("/email/profiles/test", json={
+        "profile_id": p["id"], "smtp_allow_insecure_tls": True, "to_addr": "x@example.com"})
+    assert r.status_code == 400 and r.json()["detail"]["reason"] == "smtp_password_required", r.text
     # Supplying a FRESH password passes the guard (then fails later as an ordinary transport error,
     # never the re-enter guard) — so a legitimate "test against a different server" still works.
     r2 = admin.post("/email/profiles/test", json={
         "profile_id": p["id"], "smtp_server": "attacker.invalid", "smtp_password": "fresh-pw",
         "to_addr": "x@example.com"})
-    assert "re-enter" not in (r2.json().get("detail") or "").lower()
+    assert "smtp_password_required" not in r2.text, r2.text
+
+
+def test_a_save_wont_point_the_stored_password_at_a_new_host(admin, clean_profiles):
+    """Saving a profile with another server, port or username keeps the stored password only when the save
+    carries the password: otherwise the next send would hand the stored password to the new server."""
+    p = admin.post("/email/profiles", json=_valid_profile(
+        smtp_server="smtp.example.com", smtp_username="u@example.com", smtp_password="Stored-SMTP-Pw-99")).json()
+    r = admin.put(f"/email/profiles/{p['id']}", json=_valid_profile(
+        name=p["name"], smtp_server="attacker.example", smtp_username="u@example.com"))
+    assert r.status_code == 400 and r.json()["detail"]["reason"] == "smtp_password_required", r.text
+    kept = next(x for x in admin.get("/email/profiles").json()["profiles"] if x["id"] == p["id"])
+    assert kept["smtp_server"] == "smtp.example.com"
+    # With the password the same save goes through, and a save that changes nothing of the target keeps it.
+    r = admin.put(f"/email/profiles/{p['id']}", json=_valid_profile(
+        name=p["name"], smtp_server="relay.example.com", smtp_username="u@example.com", smtp_password="New-Pw-1"))
+    assert r.status_code == 200 and r.json()["smtp_server"] == "relay.example.com", r.text
+    r = admin.put(f"/email/profiles/{p['id']}", json=_valid_profile(
+        name="Renamed", smtp_server="relay.example.com", smtp_username="u@example.com"))
+    assert r.status_code == 200 and r.json()["has_password"] is True, r.text
 
 
 def test_smtp_password_is_encrypted_at_rest(admin, clean_profiles):

@@ -4805,6 +4805,33 @@ def _loosens_session_limits(stored: dict, payload: dict) -> bool:
     return after[0] > before[0] or after[1] > before[1]
 
 
+from app.core import mail_relay as _mail_relay  # noqa: E402
+from app.core.mail_relay import REFUSED_ACTION as _MAIL_RELAY_CHANGE_REFUSED  # noqa: E402
+
+
+def _mail_relay_moved(stored: dict, payload) -> dict:
+    """What a settings save would move of where the stored SMTP password goes, without carrying the password
+    (app/core/mail_relay.py): empty when the save may go ahead. A save that sends a password, or removes the
+    stored one, keeps nothing that could go elsewhere."""
+    if not isinstance(payload, dict):
+        return {}
+    stored = stored or {}
+    return _mail_relay.refused(_mail_relay.of(stored), _mail_relay.of({**stored, **payload}),
+                               password_stored=bool(stored.get(_mail_relay.PASSWORD)),
+                               password_kept=_mail_relay.PASSWORD not in payload)
+
+
+def _refuse_mail_relay_change(db: Session, user, request: Request, surface: str, moved: dict) -> None:
+    """Record a request refused by the mail relay rule, and refuse it (400): nothing is saved or sent."""
+    try:
+        AuditLogger(db).log_action(action=_MAIL_RELAY_CHANGE_REFUSED, status="failure", user=user,
+                                   ip_address=get_client_ip(request), details={"surface": surface, "changes": moved})
+    except Exception:  # noqa: BLE001 -- the refusal stands without its row
+        db.rollback()
+    raise HTTPException(status_code=400, detail={"reason": _mail_relay.REASON,
+                                                 "message": _mail_relay.REENTER_PASSWORD})
+
+
 @app.put("/settings")
 async def update_settings(
     payload: dict,
@@ -4813,7 +4840,9 @@ async def update_settings(
     db: Session = Depends(get_db),
 ):
     """Persist global settings. Merges with the stored value so an omitted
-    sensitive field (e.g. smtp_password) keeps its existing value.
+    sensitive field (e.g. smtp_password) keeps its existing value, except that a save which points the
+    stored SMTP password at another server, port or username, or turns its certificate check off, must
+    carry the password (app/core/mail_relay.py).
 
     Gated by require_interactive_admin (NOT plain require_admin): a temporary credential —
     even one minted from an admin — must not rewrite the deployment's org policy
@@ -4834,6 +4863,11 @@ async def update_settings(
     if changes_second_factor and loosens_sessions:
         raise HTTPException(status_code=400, detail=(
             "Save the second-factor policy and the session limits separately: each needs its own confirmation."))
+    # The stored SMTP password goes to no other server, and loses no certificate check, unless the save carries
+    # it (app/core/mail_relay.py). Refused before any step-up is spent.
+    relay_moved = _mail_relay_moved(stored_settings, payload)
+    if relay_moved:
+        _refuse_mail_relay_change(db, current_user, request, "settings", relay_moved)
     if changes_second_factor:
         _enforce_step_up(db, current_user, request, "account.second_factor")
     elif loosens_sessions:
@@ -4979,7 +5013,9 @@ async def send_test_email(
     """Send a test email to the requesting admin using the stored SMTP settings, to verify the
     Settings -> Email configuration end to end. Fails cleanly (not a 500) when SMTP isn't
     configured, and never echoes the stored SMTP password. The server's TLS certificate is checked
-    exactly as system mail checks it for these settings, before the password is sent."""
+    exactly as system mail checks it for these settings, before the password is sent. It takes no body:
+    it sends with the stored settings alone, whose server, port and username PUT /settings changes only
+    with the password (app/core/mail_relay.py), so the stored password goes only where it was entered for."""
     import smtplib
     import ssl
     from email.message import EmailMessage

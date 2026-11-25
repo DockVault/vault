@@ -30,8 +30,10 @@ ACCOUNT_KEYS = ("email_requirement", "invite_enabled", "invite_ttl_hours", "sign
 PASSWORD_KEYS = ("password_min_length", "require_uppercase", "require_lowercase",
                  "require_numbers", "require_special")
 # The mail settings the public-policy test fills in. Left behind, they make the next start import them as the
-# deployment's sending profile, and every later test then runs with mail configured.
-SMTP_KEYS = ("smtp_server", "from_email")
+# deployment's sending profile, and every later test then runs with mail configured. The password is emptied
+# with them, since a stored one may not follow the relay to the test's server unless it is entered again; no
+# GET returns it, so the restore removes it.
+SMTP_KEYS = ("smtp_server", "from_email", "smtp_password")
 SNAPSHOT_KEYS = ACCOUNT_KEYS + PASSWORD_KEYS + SMTP_KEYS
 
 STRONG_PW = "S1gnup-Passw0rd!"
@@ -148,7 +150,7 @@ def test_auth_policy_minimal_keys_and_no_leak(admin, restore_settings):
     _set(admin, signup_enabled=True, login_identifier="either", email_requirement="required",
          invite_enabled=True, invite_ttl_hours=72,
          signup_email_domain_mode="denylist", signup_email_domains=["evil.com"],
-         smtp_server="mail.example.com", from_email="vault@example.com")
+         smtp_server="mail.example.com", from_email="vault@example.com", smtp_password="")
 
     r = admin.clone_anonymous().get("/auth/policy")
     assert r.status_code == 200, r.text

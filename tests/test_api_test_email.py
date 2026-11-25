@@ -35,7 +35,9 @@ def test_test_email_never_echoes_smtp_password(admin):
         assert r.status_code in (400, 502), r.text
         assert secret not in r.text                   # the SMTP password must never be echoed
     finally:
-        admin.put("/settings", json={"smtp_server": ""})  # clear the bogus host for other tests
+        # Clear the bogus host and its password for other tests: a password left stored could not be pointed
+        # at another server by a later test without re-entering it.
+        admin.put("/settings", json={"smtp_server": "", "smtp_password": ""})
 
 
 def test_test_email_malformed_from_is_clean_error_not_500(admin):
@@ -44,6 +46,7 @@ def test_test_email_malformed_from_is_clean_error_not_500(admin):
     admin.put("/settings", json={
         "smtp_server": "127.0.0.1", "smtp_port": 1,
         "from_email": "noreply@example.com", "from_name": "Ops\r\nBcc: attacker@evil.example",
+        "smtp_password": "",   # no stored password follows the relay to this host
     })
     try:
         r = admin.post("/settings/test-email")

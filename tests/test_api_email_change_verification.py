@@ -94,7 +94,7 @@ def _enable(admin, *, smtp="127.0.0.1", port="1"):
     tests that need to CONFIRM seed the code directly rather than receiving it. Two PUTs on purpose:
     the policy can only be turned ON once SMTP is already stored (the same-PUT enable is refused)."""
     r = admin.put("/settings", json={"smtp_server": smtp, "from_email": "vault@example.com",
-                                     "smtp_port": port})
+                                     "smtp_port": port, "smtp_password": ""})
     assert r.status_code == 200, r.text
     r = admin.put("/settings", json={"email_change_requires_verification": True})
     assert r.status_code == 200, r.text

@@ -54,7 +54,8 @@ def test_direct_email_change_when_unrestricted(page: Page, admin, restore_settin
 
 def test_verification_required_switches_to_the_code_step(page: Page, admin, restore_settings):
     # enable the policy (two PUTs: SMTP must be stored before the flag can be turned on)
-    admin.put("/settings", json={"smtp_server": "127.0.0.1", "from_email": "vault@example.com", "smtp_port": "1"})
+    admin.put("/settings", json={"smtp_server": "127.0.0.1", "from_email": "vault@example.com", "smtp_port": "1",
+                                 "smtp_password": ""})
     admin.put("/settings", json={"email_change_requires_verification": True})
     in_use = admin.get("/users/me").json()["email"]            # the admin's address is definitely in use
     u = admin.create_user(role="user")

@@ -25,7 +25,8 @@ from sqlalchemy.orm import Session, defer, joinedload
 
 from app.core.database import get_db
 from app.core.models import EmailAction, EmailProfile, EmailResource, EmailTemplate, RoleEnum, User
-from app.core import email_sanitize, email_send
+from app.core import email_sanitize, email_send, mail_relay
+from app.core.mail_relay import REFUSED_ACTION as RELAY_CHANGE_REFUSED
 from app.core.email_actions import LOCKED, SPEC_BY_KEY
 from app.core.security import decrypt_secret, encrypt_secret
 from app.core.rate_limiter import rate_limiter as _rate_limiter, RateLimiterUnavailable, retry_after_seconds
@@ -192,12 +193,22 @@ def _client_ip(request: Request) -> Optional[str]:
     return get_client_ip(request)
 
 
-def _audit(db: Session, request: Request, user: User, action: str, **details) -> None:
+def _audit(db: Session, request: Request, user: User, action: str, status: str = "success", **details) -> None:
     try:
-        AuditLogger(db).log_action(action=action, status="success", user=user,
+        AuditLogger(db).log_action(action=action, status=status, user=user,
                                    ip_address=_client_ip(request), details=details or None)
     except Exception:
         pass  # never fail the operation because the audit write did
+
+
+def _refuse_relay_change(db: Session, request: Request, admin: User, surface: str, moved: dict,
+                         profile_id=None) -> None:
+    """Record a request that would send a profile's stored password elsewhere without carrying it, and refuse
+    it (app/core/mail_relay.py): nothing is saved or sent."""
+    _audit(db, request, admin, RELAY_CHANGE_REFUSED, "failure", surface=surface,
+           profile_id=str(profile_id) if profile_id else None, changes=moved)
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={"reason": mail_relay.REASON, "message": mail_relay.REENTER_PASSWORD})
 
 
 def _rate_limit(admin_id, *, limit: int, window: int, prefix: str, detail: str) -> None:
@@ -269,6 +280,18 @@ async def update_profile(profile_id: uuid.UUID, payload: ProfileIn, request: Req
     if p is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
     _validate_profile_fields(payload)
+    # Where the stored password would go after this save: a new target, or the certificate check turned off,
+    # needs the password in this request (an empty one keeps the stored password).
+    before = mail_relay.of_profile(p)
+    after = mail_relay.relay(payload.smtp_server, payload.smtp_port, payload.smtp_username,
+                             payload.smtp_allow_insecure_tls)
+    moved = mail_relay.refused(before, after, password_stored=bool(p.smtp_password),
+                               password_kept=not payload.smtp_password)
+    if moved:
+        _refuse_relay_change(db, request, admin, "profile_update", moved, profile_id=p.id)
+    relay_changes = mail_relay.changes(before, after)
+    if payload.smtp_password:
+        relay_changes[mail_relay.PASSWORD] = {"old": "(set)" if p.smtp_password else None, "new": "(set)"}
     p.name = payload.name.strip()
     p.description = (payload.description or "").strip() or None
     p.smtp_server = payload.smtp_server.strip()
@@ -294,7 +317,8 @@ async def update_profile(profile_id: uuid.UUID, payload: ProfileIn, request: Req
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail="Another default profile was set at the same time; please retry.")
     db.refresh(p)
-    _audit(db, request, admin, "email_profile_updated", profile_id=str(p.id), name=p.name)
+    _audit(db, request, admin, "email_profile_updated", profile_id=str(p.id), name=p.name,
+           changes=relay_changes or None)
     return _profile_out(p)
 
 
@@ -347,12 +371,12 @@ async def test_profile(payload: ProfileTestIn, request: Request,
                "smtp_username": p.smtp_username or "", "smtp_password": decrypt_secret(p.smtp_password),
                "from_email": p.from_email, "from_name": p.from_name or "",
                "smtp_allow_insecure_tls": bool(p.smtp_allow_insecure_tls)}
-        stored_target = ((p.smtp_server or ""), int(p.smtp_port or 587), (p.smtp_username or ""))
+        stored = mail_relay.of_profile(p)
         stored_has_password = bool(p.smtp_password)
     else:
         cfg = {"smtp_server": "", "smtp_port": 587, "smtp_username": "",
                "smtp_password": "", "from_email": "", "from_name": "", "smtp_allow_insecure_tls": False}
-        stored_target = None
+        stored = None
         stored_has_password = False
     # Overlay any fields the caller provided (edited-but-unsaved values); password only when non-empty.
     for field in ("smtp_server", "smtp_port", "smtp_username", "from_email", "from_name"):
@@ -364,20 +388,16 @@ async def test_profile(payload: ProfileTestIn, request: Request,
     if payload.smtp_password:
         cfg["smtp_password"] = payload.smtp_password
 
-    # SECURITY: never pair the STORED (write-only) SMTP password with a caller-CHANGED connection
-    # target. Overlaying only smtp_server/port/username while reusing the saved password would let an
-    # admin exfiltrate the profile's password (which no GET ever returns) to an attacker-chosen host.
-    # If the target changed and no fresh password was supplied, refuse — the tester must re-enter it.
-    if stored_target is not None and stored_has_password and not payload.smtp_password:
-        try:
-            eff_port = int(cfg.get("smtp_port") or 587)
-        except (TypeError, ValueError):
-            eff_port = 587
-        eff_target = ((cfg.get("smtp_server") or ""), eff_port, (cfg.get("smtp_username") or ""))
-        if eff_target != stored_target:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Re-enter the SMTP password to test against a different server, port, or username.")
+    # Never pair the STORED (write-only) SMTP password with a target the caller changed, or with the certificate
+    # check the caller turned off: the stored password, which no route returns, would go to a server of the
+    # caller's choosing. The tester re-enters the password for that (app/core/mail_relay.py).
+    used = mail_relay.of(cfg)
+    relay_changes = mail_relay.changes(stored, used) if stored is not None else {}
+    if stored is not None:
+        moved = mail_relay.refused(stored, used, password_stored=stored_has_password,
+                                   password_kept=not payload.smtp_password)
+        if moved:
+            _refuse_relay_change(db, request, admin, "profile_test", moved, profile_id=payload.profile_id)
 
     to_addr = (payload.to_addr or "").strip() or (admin.email or "").strip() or (cfg.get("from_email") or "").strip()
     if not to_addr:
@@ -400,7 +420,7 @@ async def test_profile(payload: ProfileTestIn, request: Request,
         code = status.HTTP_400_BAD_REQUEST if e.category == "config" else status.HTTP_502_BAD_GATEWAY
         raise HTTPException(status_code=code, detail=e.message)
     _audit(db, request, admin, "email_profile_test_sent", to=to_addr,
-           profile_id=str(payload.profile_id) if payload.profile_id else None)
+           profile_id=str(payload.profile_id) if payload.profile_id else None, changes=relay_changes or None)
     return {"message": f"Test email sent to {to_addr}"}
 
 

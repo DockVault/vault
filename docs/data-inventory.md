@@ -705,3 +705,12 @@ Passkeys and single sign-on:
   (`sso_group_mappings`, no person named) and the administrator requests a provider group raises
   (`sso_admin_requests`, with who decided each). An account that signs in only through its provider carries
   `users.sso_only`.
+
+The stored SMTP password:
+
+- A sending profile's save or test send, or a save of the older SMTP settings in the general settings, that
+  would send the stored password to another server, port or username, or with the server's certificate no
+  longer checked, must carry the password itself. A refused one is recorded as `mail_relay_change_refused`,
+  naming where (`surface`), the profile's id, and the server, port, username or certificate check it would have
+  changed, before and after; `email_profile_updated` and `email_profile_test_sent` name the same fields when a
+  save or a test send changes them, and whether a save replaced the password (never the password itself).

@@ -123,7 +123,8 @@ def test_email_change_verification_gated_on_smtp(admin, restore_settings):
     assert r.status_code == 400, r.text
     assert _s(admin)["email_change_requires_verification"] is False
     # once SMTP is configured, enabling is allowed
-    admin.put("/settings", json={"smtp_server": "mail.example.com", "from_email": "vault@example.com"})
+    admin.put("/settings", json={"smtp_server": "mail.example.com", "from_email": "vault@example.com",
+                                 "smtp_password": ""})
     r = admin.put("/settings", json={"email_change_requires_verification": True})
     assert r.status_code == 200, r.text
     assert _s(admin)["email_change_requires_verification"] is True

@@ -391,6 +391,10 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("device_secret_reuse_suspend", "security", "Old device key reused, device suspended", "warning"),
     AuditAction("endpoint_permission_denied", "security", "Action refused for lack of permission", "warning"),
     AuditAction("id_scope_denied", "security", "File or folder outside the granted scope refused", "warning"),
+    # A save or a test send that would send the stored SMTP password to another server, or with the certificate
+    # check turned off, without carrying the password: refused, nothing saved or sent (app/core/mail_relay.py).
+    AuditAction("mail_relay_change_refused", "security", "Mail server change without its password refused",
+                "warning"),
     # A reset link someone made for another account, used when its maker could no longer make it (demoted,
     # deactivated, locked, deleted, the permission taken away, or the account made an administrator):
     # refused like an unknown link, and revoked (app/core/account_authority.py, link_refusal).

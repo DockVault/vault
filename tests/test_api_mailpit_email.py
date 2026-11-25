@@ -69,6 +69,7 @@ def smtp_to_mailpit(admin):
         "smtp_username": "",
         "from_email": "vault@example.com",
         "from_name": "DockVault Test",
+        "smtp_password": "",   # Mailpit takes no password, and none stored follows the relay here
     })
     assert r.status_code == 200, r.text
     yield
