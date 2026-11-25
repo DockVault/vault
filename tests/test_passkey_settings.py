@@ -62,6 +62,9 @@ def test_the_nine_settings_live_on_the_sign_in_page_with_their_defaults():
     assert registry.check_value(specs[wss.ALLOWED_ALGS], []) and registry.check_value(specs[wss.ALLOWED_ALGS], ["MD5"])
     assert registry.check_value(specs[wss.ALLOWED_AAGUIDS], ["not-a-uuid"]) and registry.check_value(specs[wss.ALLOWED_AAGUIDS], [str(uuid.uuid4())]) is None
     assert "signin" in registry.PAGES
+    # Who types the password after a passkey whatever the list says: administrators, and a holder of the auditor
+    # right (in force or suspended), as the sign-in decides it.
+    assert "auditor right" in specs[wss.SIGN_IN_ROLES].help and "not only proposed" in specs[wss.SIGN_IN_ROLES].help
 
 
 def test_the_policy_is_built_from_the_settings(monkeypatch):
