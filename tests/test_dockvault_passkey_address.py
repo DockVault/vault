@@ -68,8 +68,10 @@ AS_THE_VAULT_SAYS = {None: "ok", "none": "no_public_host", "http": "address_not_
     ("https://-bad-.example", "unusable"), ("https://vault.example.com:99999", "unusable"),
     ("vault.example.com:99999", "unusable"), ("https://vault.example.com:0", "unusable"),
     ("2001:db8::1", "unusable"), ("https://vault.example.com:notaport", "unusable"),
-    # And what it does: a path after an origin is dropped by the vault, a trailing dot is a name.
-    ("https://vault.example.com/some/page", None), ("vault.example.com/x", None), ("vault.example.com.", None),
+    # A name written with a dot at its end: another address to a browser, and the vault builds sign-in on neither.
+    ("vault.example.com.", "dot"), ("https://vault.example.com.:8443", "dot"),
+    # And what it does: a path after an origin is dropped by the vault.
+    ("https://vault.example.com/some/page", None), ("vault.example.com/x", None),
     ("xn--bcher-kva.example", None),
 ])
 def test_the_tool_and_the_vault_judge_an_address_alike(written, reason, monkeypatch):
