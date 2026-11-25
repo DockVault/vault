@@ -1781,6 +1781,16 @@
         return d && typeof d === 'object' && d.vault_id ? String(d.vault_id) : null;
     }
 
+    // What the drawer names under Affected: the kind and the id, and for a row about an account that recorded
+    // the account's name (an administrator's change to somebody else's account), that name first.
+    function affectedText(ev) {
+        const kind = `${ev.resource_type} ${ev.resource_id || ''}`.trim();
+        const d = ev.details;
+        const name = ev.resource_type === 'user' && d && typeof d === 'object'
+            && typeof d.target_username === 'string' ? d.target_username : '';
+        return name ? `${name} (${kind})` : kind;
+    }
+
     // The names a row can carry, as the details drawer labels them.
     const NAME_KEY_LABELS = {
         vault_name: 'Vault name', file_name: 'File name', folder_name: 'Folder name',
@@ -1930,7 +1940,7 @@
         }
         if (S.auditor && vid) field(what.dl, 'Compliance', auditorActions(ev, vid, names));
         if (ev.resource_type) {
-            const text = `${ev.resource_type} ${ev.resource_id || ''}`.trim();
+            const text = affectedText(ev);
             const copy = button('act-d-filter', null, { 'aria-label': 'Copy', title: 'Copy' });
             copy.appendChild(icon('copy'));
             copy.addEventListener('click', async () => { if (await copyText(ev.resource_id || text)) showSuccess('Copied.'); });
