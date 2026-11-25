@@ -113,7 +113,7 @@ updates:
           - "*"
 
   # ---- Maintenance lines ------------------------------------------------------------------------
-  # Each older line that still gets security fixes (`lines` in docs/upgrade-matrix.json) gets its own
+  # Each older line that is still supported (`lines` in docs/upgrade-matrix.json) gets its own
   # entries, aimed at its release/X.Y branch. A line takes only what a patch release may carry:
   # patch updates of the Python packages and of the base image's interpreter, patch and minor updates
   # of the Compose images (a postgres or redis minor is how they ship fixes), and the pinned actions.

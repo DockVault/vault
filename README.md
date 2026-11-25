@@ -604,21 +604,22 @@ it is **secure** (free of known unpatched vulnerabilities), and — for an end-o
 extended support — the dates its code fixes and its (usually longer) security-only support run until.
 `dockvault.py update` hides end-of-life releases from the list, refuses to upgrade or downgrade to
 one, and warns before moving to a version with known unpatched vulnerabilities. A release it lists is
-called supported only while its line still receives security fixes, as `.github/SECURITY.md` defines
-support; one on a line that does not says so.
+called supported only while its line is supported, as `.github/SECURITY.md` defines support; one on a
+line that is not says so.
 
 End-of-life is not the end of security support. It marks the releases an install can no longer move
 to in place; an install on one can still upgrade to a supported release (see below). Which release
-lines still receive security fixes, and until when, is stated in
-[`.github/SECURITY.md`](.github/SECURITY.md): each line from 0.33 on is supported until six months
-after the next minor release ships. The matrix states the same in its top-level `lines` map: each
-line from 0.33 on with the day its security fixes end (`security_fixes_until`), null for the newest
-line, whose end is not known until the next minor release ships. The validator checks each date
-against that promise, and requires a mitigation on an advisory that leaves the newest release of a
-line affected while the line is supported. A release of a line from 0.33 on whose period has ended
-is not marked end-of-life by that alone, so a move within its line, or back to it, still works; it
-is marked not secure as soon as an advisory affects it. How a fix reaches an older line that is
-still supported is described in [`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md).
+lines are supported, and until when, is stated in [`.github/SECURITY.md`](.github/SECURITY.md). From
+0.36.0 on, only the newest line receives security fixes, and when the next minor release ships, the
+line before it has 30 more days to upgrade. The matrix states the same in its top-level `lines` map:
+each line from 0.33 on with the last day it is supported (`security_fixes_until`), null for the
+newest line, whose end is not known until the next minor release ships. The validator checks each
+date against that promise, and requires a mitigation on an advisory that leaves the newest release
+of a line affected while the line is supported. A release of a line from 0.33 on whose period has
+ended is not marked end-of-life by that alone, so a move within its line, or back to it, still
+works; it is marked not secure as soon as an advisory affects it. How a fix is released on a line
+that is no longer the newest is described in
+[`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md).
 
 When a version is not secure, the matrix says why. Each vulnerability is recorded once, in the
 top-level `advisories`: a title and description, its **impact** (what it let someone do), its

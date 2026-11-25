@@ -1,9 +1,9 @@
 # Maintenance releases
 
-DockVault supports more than one release line at a time: each minor line from 0.33 on receives
-security fixes until six months after the next minor release ships ([SECURITY.md](../../.github/SECURITY.md)).
+Which release lines are supported, and until when, is set by [SECURITY.md](../../.github/SECURITY.md):
+from 0.36.0 on, the newest line, and for 30 days after a minor release ships, the line before it.
 This guide says what that means for an install, and how the maintainers release a fix on a line that
-is no longer the newest.
+is no longer the newest, as they did for the 0.33 and 0.34 lines.
 
 ## Release lines
 
@@ -36,8 +36,8 @@ the version the tag holds now and refuses to move it backwards.
 ## For an install on an older line
 
 - `dockvault.py update` lists the published releases and what each move involves, from the upgrade
-  matrix (`docs/upgrade-matrix.json`). It names your release line, until when it gets security
-  fixes, and its newest published release, with what that release fixes in yours. A patch release
+  matrix (`docs/upgrade-matrix.json`). It names your release line, until when it is supported,
+  and its newest published release, with what that release fixes in yours. A patch release
   on your own line is normally the smallest move that fixes a vulnerability, and the tool points to
   it before a release on another line; moving to the newer line works too, and the matrix says
   whether that move needs a backup or cannot be undone. A move is described from the target

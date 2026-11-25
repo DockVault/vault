@@ -211,25 +211,43 @@ def _public(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
 
 
-def test_the_security_policy_states_the_lines_the_tags_and_the_backport_rule():
+def test_the_security_policy_states_the_lines_the_tags_and_the_support_rule():
     policy = _public(".github/SECURITY.md")
     # The newest line of the upgrade matrix's `lines` is the latest, and each line before it has its row with the
-    # day the matrix gives its security fixes.
+    # last day the matrix gives it.
     lines = json.loads(_public("docs/upgrade-matrix.json"))["lines"]
     newest = max(lines, key=lambda line: tuple(int(part) for part in line.split(".")))
+    assert "| Release line | Supported |" in policy
     assert f"| {newest}.x, the latest line | Yes |" in policy
     for line, entry in lines.items():
         if line != newest:
             assert f"| {line}.x | Yes, until {entry['security_fixes_until']} |" in policy, line
     # The row it replaces read "The minor line before the latest, 0.33.x and later lines only".
     assert "0.33.x and later lines only" not in policy
-    assert "until six\nmonths after the next minor release ships" in policy
-    assert ("Low\n  findings are fixed in the next regular release, and in the supported previous "
-            "lines in the same\n  release window.") in policy
+    # One sentence states the rule; the matrix's dates, the validator and the host tool follow it.
+    assert ("From 0.36.0 on, only the latest release line receives security fixes: when the next minor release\n"
+            "ships, the line before it has 30 more days to upgrade, and is end-of-life after that.") in policy
+    assert "This replaces the six months of security fixes each line from 0.33 on was given before." in policy
+    assert "until six\nmonths after the next minor release ships" not in policy
+    assert "release window" not in policy                       # no fix is promised to an older line
+    assert "Low\n  findings are fixed in the next regular release.\n" in policy
     assert "`ghcr.io/dockvault/vault:vX.Y.Z`, which never changes" in policy
     assert "tagged `:vX.Y` (for example `:v0.33`)" in policy
     assert "so a patch release of an older line never moves them" in policy
+    assert "A line that has reached its end keeps its\nimages and tags: nothing is removed" in policy
     assert "](../docs/guides/maintenance-releases.md)" in policy
+
+
+def test_the_readme_and_the_maintenance_guide_state_the_support_rule_once():
+    # The README states the rule in one sentence beside its pointer to the security policy, and the guide only
+    # points there, so a change of the rule is one sentence each in the policy, the README and the host tool.
+    readme = _public("README.md")
+    guide = _public("docs/guides/maintenance-releases.md")
+    assert ("From\n0.36.0 on, only the newest line receives security fixes, and when the next minor release ships, "
+            "the\nline before it has 30 more days to upgrade.") in readme
+    assert "six months" not in readme and "six months" not in guide
+    assert "security fixes" not in guide.split("## Release lines", 1)[0]
+    assert "is set by [SECURITY.md](../../.github/SECURITY.md)" in guide
 
 
 def test_the_security_policy_and_readme_publish_the_accepted_approval_residuals():

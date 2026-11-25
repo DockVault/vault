@@ -27,7 +27,7 @@ proof of a hosted setting.
 - Release OCI metadata includes the public source URL, semantic version, tested revision, and
   `AGPL-3.0-only` license identifier.
 - Dependabot covers the production and test Python manifests, the Dockerfile, both Compose
-  variants under `deploy/`, and GitHub Actions. Each older line that still gets security fixes
+  variants under `deploy/`, and GitHub Actions. Each older line that is still supported
   (`lines` in `docs/upgrade-matrix.json`) has its own entries aimed at its `release/X.Y` branch,
   limited to what a patch release may carry: patch updates of the Python packages and the base
   image, patch and minor updates of the Compose images, and the pinned actions. A test holds these

@@ -5,33 +5,40 @@ project — and of everyone who self-hosts it — seriously.
 
 ## Supported versions
 
-| Release line | Security fixes |
+| Release line | Supported |
 |---|---|
 | 0.35.x, the latest line | Yes |
 | 0.34.x | Yes, until 2027-05-17 |
 | 0.33.x | Yes, until 2027-05-09 |
 | 0.32.x and earlier | No. Upgrade to the latest release. |
 
-Each minor release line from 0.33 on (0.33.x, 0.34.x, ...) receives security fixes until six
-months after the next minor release ships. The table gives that day for each line before the
-latest, so more than one line is supported at a time: until 2027-05-09, three lines are. 0.32.x
-and earlier receive no more security fixes and are end-of-life: from a 0.35.0 checkout,
-`dockvault.py update` no longer moves to them; an install on one upgrades to a supported release.
+From 0.36.0 on, only the latest release line receives security fixes: when the next minor release
+ships, the line before it has 30 more days to upgrade, and is end-of-life after that. The table
+gives that day. We made this change to keep security standards high: all our effort goes into the
+next releases, with better security and more features.
 
-Security fixes ship as patch releases. Once a newer line exists, a fix for an older line that is
-still supported is released from that line's `release/X.Y` branch, in the same release window as
-the fix for the latest line; [docs/guides/maintenance-releases.md](../docs/guides/maintenance-releases.md)
-describes how. Every fixed vulnerability is published as an advisory, with a CVSS v4 score, in the
-upgrade matrix (`docs/upgrade-matrix.json`), which marks each release that has a known advisory as
-not secure. `dockvault.py update`, the in-app update notice and the upgrades page of the
-documentation site read that matrix.
+This replaces the six months of security fixes each line from 0.33 on was given before. 0.33.x,
+0.34.x and 0.35.x, which were supported side by side, all reach their end on 2026-12-31, 30 days
+after 0.36.0 shipped, instead of 2027-05-09 (0.33.x) and 2027-05-17 (0.34.x). An install on one of
+them should move to 0.36.x before that day; `dockvault.py update` plans the route, which runs
+through 0.35.2. 0.32.x and earlier receive no more security fixes and are end-of-life: from a 0.35.0
+checkout, `dockvault.py update` no longer moves to them; an install on one upgrades to a supported
+release.
+
+Security fixes ship as patch releases;
+[docs/guides/maintenance-releases.md](../docs/guides/maintenance-releases.md) describes how. Every
+fixed vulnerability is published as an advisory, with a CVSS v4 score, in the upgrade matrix
+(`docs/upgrade-matrix.json`), which marks each release that has a known advisory as not secure.
+`dockvault.py update`, the in-app update notice and the upgrades page of the documentation site
+read that matrix.
 
 ### Release images
 
 Every release is published as `ghcr.io/dockvault/vault:vX.Y.Z`, which never changes. The newest
 release of each line is also tagged `:vX.Y` (for example `:v0.33`), which moves to each new patch
 release of that line. `:latest`, and GitHub's "latest release", name the highest version released,
-so a patch release of an older line never moves them.
+so a patch release of an older line never moves them. A line that has reached its end keeps its
+images and tags: nothing is removed, and no new release is made from it.
 
 ### Accepted residuals
 
@@ -61,8 +68,7 @@ What to expect:
 - a first assessment within 10 business days: whether we can reproduce it, and its severity
   (CVSS v4);
 - a fix within 30 days for Critical and High severity and within 90 days for Medium. Low
-  findings are fixed in the next regular release, and in the supported previous lines in the same
-  release window.
+  findings are fixed in the next regular release.
 
 We will keep you informed, coordinate disclosure with you, and credit you in the release notes
 unless you ask us not to. Please allow us to release a fix before any public disclosure.
