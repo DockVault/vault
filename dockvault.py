@@ -6126,6 +6126,13 @@ class DockVault:
                                        pal, "").strip() or None
                 sftp_public_port = _port_or(ask("Port SFTP clients connect to", pal, str(sftp_port)),
                                             sftp_port)
+            # How SFTP agrees the keys that encrypt a connection (SFTP_KEX_POLICY): the default, pq-preferred,
+            # is written nowhere.
+            kex_policy = a("sftp_kex_policy")
+            if (enable_sftp or split) and kex_policy is None and confirm(
+                    "Refuse SFTP clients that cannot use the post-quantum key exchange (OpenSSH before 9.9 and "
+                    "many older SFTP programs)?", pal, default=False):
+                kex_policy = "pq-required"
             update_check = confirm("Enable the opt-in 'update available' check (asks GitHub, no telemetry)?", pal, default=False)
             log_pull = confirm("Enable the authenticated log-pull endpoint (sets a pepper; still off until a component is ticked)?", pal, default=False)
         else:
@@ -6134,6 +6141,7 @@ class DockVault:
             sftp_port = _port_or(a("sftp_port"), 2322)
             sftp_public_host = (a("sftp_public_host") or "").strip() or None
             sftp_public_port = a("sftp_public_port")
+            kex_policy = a("sftp_kex_policy")
             update_check, log_pull = bool(a("update_check")), bool(a("enable_log_pull"))
         # What the audit log may record of personal data at most (RECORDING_PRESETS).
         preset, lock_levels = a("recording_preset"), bool(a("lock_recording_levels"))
@@ -6202,6 +6210,8 @@ class DockVault:
             "web_public_address": web_public,
             "sftp_public_host": sftp_public_host,
             "sftp_public_port": sftp_public_port,
+            # build_env_lines writes it only when SFTP runs and it is not the default (pq-preferred).
+            "sftp_kex_policy": kex_policy,
             # SFTP staging tmpfs size — install-time only (a deploy-time infra knob, not a live
             # limit, so it is not in the Limits menu). --sftp-staging-tmpfs-mb or hand-edit .env.
             "sftp_staging_tmpfs_mb": (getattr(args, "sftp_staging_tmpfs_mb", None) if args else None),
@@ -10613,6 +10623,11 @@ def build_parser():
                          "false (streaming, the default, never stages); then it also caps the SFTP upload "
                          "size and counts toward the SFTP container's memory limit")
     sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP")
+    sp.add_argument("--sftp-kex-policy", dest="sftp_kex_policy", choices=("pq-preferred", "pq-required", "default"),
+                    help="how SFTP agrees the keys that encrypt a connection: pq-preferred (the default) uses the "
+                         "hybrid post-quantum exchange with clients that offer it; pq-required refuses clients "
+                         "without it (OpenSSH before 9.9, many older SFTP programs); default takes the SSH "
+                         "library's own order")
     sp.add_argument("--split", dest="split", action="store_true", help="two containers (vault-api + vault-sftp)")
     sp.add_argument("--image-source", dest="image_source", choices=("release", "build"),
                     help="release = pull the published GHCR image | build = build this checkout. "

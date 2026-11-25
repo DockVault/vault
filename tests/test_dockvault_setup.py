@@ -331,3 +331,61 @@ def test_setup_hands_the_summary_the_first_allowed_hosts_entry(tmp_path, monkeyp
                         lambda summary, healthy, logs_shown=False: summaries.append(dict(summary)))
     tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
     assert summaries and summaries[-1]["open_at"] == "https://vault.example.com", summaries
+
+
+# --------------------------------------------------------------------------- how SFTP agrees a connection's keys
+
+def _first_setup_config(monkeypatch, argv):
+    """The configuration a first setup collects from ``argv`` (setup's command line), unattended."""
+    args = dv.build_parser().parse_args(["setup", "--non-interactive", "--server-name", "vault.example.com"] + argv)
+    tool = dv.DockVault(dv.Palette(False), root=".")
+    monkeypatch.setattr(tool, "_resolve_setup_image", lambda *a, **k: "")
+    return tool._collect_setup_config(args)
+
+
+def test_setup_takes_the_sftp_key_exchange_policy_and_writes_it_only_when_it_is_not_the_default(monkeypatch):
+    required = _lines(_first_setup_config(monkeypatch, ["--enable-sftp", "--sftp-kex-policy", "pq-required"]))
+    assert "SFTP_KEX_POLICY=pq-required" in required, required
+    classical = _lines(_first_setup_config(monkeypatch, ["--enable-sftp", "--sftp-kex-policy", "default"]))
+    assert "SFTP_KEX_POLICY=default" in classical
+    for argv in (["--enable-sftp"], ["--enable-sftp", "--sftp-kex-policy", "pq-preferred"]):
+        lines = _lines(_first_setup_config(monkeypatch, argv))
+        assert not [line for line in lines if line.startswith("SFTP_KEX_POLICY")], (argv, lines)
+
+
+def test_the_example_file_says_how_setup_sets_the_key_exchange_policy():
+    before = _example().split("\nSFTP_KEX_POLICY=")[0]
+    said = " ".join(" ".join(line.lstrip("#").strip() for line in before.splitlines()[-12:]).split())
+    assert ("A first python dockvault.py setup that turns SFTP on asks whether to refuse clients without the hybrid "
+            "exchange, or takes --sftp-kex-policy, and writes this line only for pq-required or default.") in said
+
+
+def test_a_misspelt_key_exchange_policy_is_refused_by_the_command_line(capsys):
+    with pytest.raises(SystemExit) as refused:
+        dv.build_parser().parse_args(["setup", "--sftp-kex-policy", "pq-requried"])
+    assert refused.value.code == 2
+    assert "pq-preferred" in capsys.readouterr().err
+
+
+def test_an_interactive_setup_asks_whether_to_refuse_clients_without_the_post_quantum_exchange(monkeypatch):
+    tool = dv.DockVault(dv.Palette(False), root=".")
+    monkeypatch.setattr(tool, "_resolve_setup_image", lambda *a, **k: "")
+    monkeypatch.setattr(dv, "port_free", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "ask", lambda prompt, pal, default=None: {
+        "Public DNS name or IP clients will use (e.g. vault.example.com)": "vault.example.com",
+        "Recording preset (full / standard / minimal)": "full"}.get(prompt, default or ""))
+    monkeypatch.setattr(dv, "ask_secret", lambda prompt, pal: "")
+    question = ("Refuse SFTP clients that cannot use the post-quantum key exchange (OpenSSH before 9.9 and many older "
+                "SFTP programs)?")
+    for sftp, answer, written in ((True, True, "pq-required"), (True, False, None), (False, True, None)):
+        asked = []
+
+        def confirm(prompt, pal, default=True, sftp=sftp, answer=answer):
+            asked.append(prompt)
+            if prompt.startswith("Enable SFTP"):
+                return sftp
+            return answer if prompt == question else False
+        monkeypatch.setattr(dv, "confirm", confirm)
+        cfg = tool._collect_setup_config(argparse.Namespace(non_interactive=False))
+        assert (question in asked) is sftp, (sftp, asked)
+        assert cfg.get("sftp_kex_policy") == written, (sftp, answer, cfg.get("sftp_kex_policy"))
