@@ -8302,6 +8302,22 @@ function renderUserPasskeys(userId, keys, root = document) {
     });
 }
 
+// What a change to someone's sign-in details does to their zero-knowledge vaults, as a confirmation says it: the key
+// that opens them is held for up to 14 days, and a code emailed to the account's address releases it sooner. That
+// code is sent only where the vault sends email (GET /settings smtp_configured, unknown until read) and the account
+// has an address; elsewhere only the person who runs the server releases the key before its days are over.
+function _zkKeyHoldSays(u) {
+    const hold = 'for as long as this vault holds keys after such a change, 14 days at most';
+    const smtp = currentSettings && currentSettings.smtp_configured;
+    if (smtp === false || !(u && u.email)) {
+        const why = smtp === false ? 'this vault sends no email' : 'their account has no email address to send a code to';
+        return 'if they use zero-knowledge vaults, the key that opens those stays locked ' + hold + ': ' + why
+            + ', so only the person who runs the server can release it sooner.';
+    }
+    return 'if they use zero-knowledge vaults, those ask for a code sent to their email address ' + hold
+        + (smtp === true ? '.' : ' (where this vault sends no email, only the person who runs the server can lift that).');
+}
+
 async function removeUserPasskey(userId, key, btn) {
     const u = (usersView.users || []).find(x => x.id === userId);
     const name = u ? u.username : 'this user';
@@ -8310,9 +8326,7 @@ async function removeUserPasskey(userId, key, btn) {
         'Remove ' + which + ' from ' + name + '’s account? It no longer signs them in or confirms it is them. All of '
         + name + '’s sessions end, everywhere, and they sign in again with what their account still has; if it was '
         + 'the last second factor it held, they set one up again at their next sign-in. It counts as a change to their '
-        + 'sign-in details: for 14 days another change needs a second administrator, and their zero-knowledge vaults '
-        + 'ask for a code sent to their email address for as long as this vault holds keys after such a change, 14 '
-        + 'days at most.',
+        + 'sign-in details: for 14 days another change needs a second administrator, and, ' + _zkKeyHoldSays(u),
         'Remove the passkey?')) return;
     if (btn) btn.disabled = true;
     try {

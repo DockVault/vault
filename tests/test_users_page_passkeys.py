@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 APP_JS = ROOT / "static" / "js" / "app.js"
 _SHIPPED = ("_el", "parseServerTime", "formatDayMonth", "_changedBy", "pendingApproval", "confirmCredentialChange",
             "_passkeysShownFor", "loadUserPasskeys", "renderUserPasskeys", "_passkeyWhen", "_passkeyStateText",
-            "removeUserPasskey", "_passkeysHeld", "renderUserDetail")
+            "_zkKeyHoldSays", "removeUserPasskey", "_passkeysHeld", "renderUserDetail")
 
 
 def _function(js, name):
@@ -52,6 +52,7 @@ const dom = require('./tests/js/mini_dom.js');
 const { document } = dom.install();
 var currentUser = { id: 'me', username: 'alice', role: 'admin' };
 var isScopedTemp = false;
+var currentSettings = {};
 const asked = [], confirms = [], toasts = [], reloads = [];
 let answers = {};
 let confirmAnswer = true;
@@ -180,6 +181,43 @@ out({ declined, confirm: confirms[1], deletes: asked.filter((a) => a.method === 
     assert got["deletes"] == ["/users/u-carol/passkeys/k-1"]
     assert got["toasts"] == [["success", "Passkey removed. carol was signed out everywhere."]]
     assert got["reloads"] == 1
+
+
+def test_a_removal_promises_an_emailed_code_only_where_the_vault_can_send_one():
+    """A removal holds the key to the account's zero-knowledge vaults for up to 14 days. A code sent by email
+    releases it sooner, but only where the vault sends email and the account has an address to send it to;
+    elsewhere only the person who runs the server releases it, and the confirmation says so."""
+    got = _node(r"""
+answers['/users/u-carol/passkeys'] = KEYS;
+answers['/users/u-carol/passkeys/k-1'] = { removed: true };
+const said = async (smtp, email) => {
+    currentSettings = smtp === undefined ? {} : { smtp_configured: smtp };
+    carol.email = email;
+    confirms.length = 0;
+    confirmAnswer = false;
+    await loadUserPasskeys('u-carol');
+    host.querySelector('.user-passkey-remove-btn').click();
+    await tick(); await tick();
+    return confirms[0][0];
+};
+out({ mail: await said(true, 'carol@example.test'), noMail: await said(false, 'carol@example.test'),
+      noAddress: await said(true, null), unknown: await said(undefined, 'carol@example.test'),
+      unknownNoAddress: await said(undefined, '') });
+""")
+    hold = "for as long as this vault holds keys after such a change, 14 days at most"
+    first = "for 14 days another change needs a second administrator, and, if they use zero-knowledge vaults, "
+    assert got["mail"].endswith(first + "those ask for a code sent to their email address " + hold + ".")
+    assert got["noMail"].endswith(first + "the key that opens those stays locked " + hold + ": this vault sends "
+                                  "no email, so only the person who runs the server can release it sooner.")
+    for no_address in ("noAddress", "unknownNoAddress"):
+        assert got[no_address].endswith(first + "the key that opens those stays locked " + hold + ": their account "
+                                        "has no email address to send a code to, so only the person who runs the "
+                                        "server can release it sooner."), got[no_address]
+    # Before the settings are read, whether the vault sends email is not known: the promise carries its condition.
+    assert got["unknown"].endswith(first + "those ask for a code sent to their email address " + hold + " (where "
+                                   "this vault sends no email, only the person who runs the server can lift that).")
+    for message in got.values():
+        assert "code sent to their email address" not in message or "no email address" not in message
 
 
 def test_a_removal_that_will_wait_for_another_administrator_says_so_first_and_after():
