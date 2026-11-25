@@ -90,6 +90,12 @@ def sign_in_after_the_approval(user, client, codes):
     return signed_in_with_code(user, codes, client=client)
 
 
+def holder_signs_in_again(user_id):
+    """For a right approved another way than :func:`grant_right` (by the server's operator, say): the holder
+    that :func:`new_auditor_account` made signs in again, its sessions having ended with the approval."""
+    return sign_in_after_the_approval(*_HOLDERS[str(user_id)])
+
+
 def grant_right(admins, user_id):
     """Propose the right for ``user_id`` as ada and approve it as bob. Returns the grant's id."""
     ada, ada_c, ada_codes = admins["ada"]

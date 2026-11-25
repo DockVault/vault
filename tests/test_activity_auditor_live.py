@@ -18,7 +18,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from _account_change_helpers import own_password, psql, signed_in
-from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
+from _auditor_helpers import (forget_grants, grant_right, new_auditor_account, sign_in_after_the_approval,
+                              two_admins)
 from _owner_notice_helpers import approved_case, forget_cases, owner_with_vault, wait_for
 from _sf_helpers import enroll_totp
 from conftest import ApiClient, unique
@@ -289,6 +290,7 @@ def test_an_administrators_own_unlock_is_kept_with_their_case_selected(world):
     dan_c = signed_in(dan)
     _secret, codes = enroll_totp(dan, dan_c)
     grant_right(world["admins"], dan["id"])
+    sign_in_after_the_approval(dan, dan_c, codes)        # the approval ended the sessions dan had before it
     password = "Vault-Pass-2026!"
     pv = olga_c.create_vault(name=unique("shared"), password=password)["id"]
     sent = {"X-Vault-Password": password}

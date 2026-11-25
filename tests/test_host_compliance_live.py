@@ -22,7 +22,8 @@ import pytest
 
 from conftest import skip_if_container_absent
 from _account_change_helpers import API, psql
-from _auditor_helpers import audit_rows, compliance_receipt, forget_grants, new_auditor_account, two_admins
+from _auditor_helpers import (audit_rows, compliance_receipt, forget_grants, holder_signs_in_again,
+                              new_auditor_account, two_admins)
 
 pytestmark = pytest.mark.integration
 
@@ -87,6 +88,7 @@ def test_the_host_approves_a_right_only_when_no_administrator_can(admin, propose
                 f"WHERE id='{grant}'") == f"t|t|{HOST}"
     rows = audit_rows(admin, "auditor_granted", uma["id"])
     assert rows and rows[0]["username"] == HOST and rows[0]["details"]["by"] == "host operator"
+    holder_signs_in_again(uma["id"])                     # the approval ended the sessions the holder had
     assert proposed["uma_c"].get("/compliance/me").json()["grant"]["live"] is True
 
     answer = tool("revoke-auditor", "--username", uma["_username"], "--confirm-username", uma["_username"])
