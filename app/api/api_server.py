@@ -1102,7 +1102,11 @@ class UserResponse(BaseModel):
     # An administrator reset the second factor and the user has not set it up again yet: the next
     # sign-in asks them to. Filled in by the admin users list.
     second_factor_reset_pending: bool = False
-    passkey_count: int = 0             # the passkeys the account holds (retired ones not counted)
+    # The passkeys the account can sign in with now, and the ones it holds that are no factor now (made at
+    # another address than the vault has, of an algorithm no longer accepted, or never verified the person while
+    # the vault asks for that). Retired ones are in neither; with passkeys turned off both are 0.
+    passkey_count: int = 0
+    passkey_unusable_count: int = 0
     # When the server's operator lifted the role's passkey requirement for this account (None: it applies).
     passkey_requirement_cleared_at: Optional[datetime] = None
     # New sign-ins to this account are paused by failed ones ({scope: "address" | "account",
@@ -10787,8 +10791,8 @@ async def list_users(
     List all users (admin only).
     """
     users = db.query(User).all()
-    # The passkeys each account holds, in one query (the list's sign-in methods column).
-    passkey_counts = _passkey_counts(db, [u.id for u in users])
+    # The passkeys each account can use and the ones it cannot, in one query (the list's sign-in methods column).
+    passkey_tally = _passkey_tally(db, [u.id for u in users])
     # Batch the "has an active second factor?" lookup so the list stays one extra query, not one
     # per row. A user with any active TOTP enrollment shows MFA On in the accounts table.
     mfa_user_ids = {
@@ -10811,7 +10815,7 @@ async def list_users(
         item = UserResponse.model_validate(user)
         item.second_factor_enabled = user.id in mfa_user_ids
         item.second_factor_reset_pending = user.second_factor_reset_at is not None
-        item.passkey_count = passkey_counts.get(user.id, 0)
+        item.passkey_count, item.passkey_unusable_count = passkey_tally.get(user.id, (0, 0))
         block = blocks.get(user.id)
         if block is not None:
             item.sign_in_block = {"scope": block["scope"], "addresses": block["addresses"],
@@ -11647,11 +11651,19 @@ def _passkey_time(value) -> Optional[str]:
     return value.isoformat() + "Z" if value else None
 
 
-def _passkey_public(row, now=None) -> dict:
-    """The shape the profile and the Users page show. Never the public key or the credential id."""
+def _passkey_public(db, row, now=None) -> dict:
+    """The shape the profile and the Users page show. Never the public key or the credential id, and not the
+    address the key was made at. ``usable`` says whether the key is a factor now; ``not_usable_because`` why not
+    (passkeys_turned_off, passkeys_at_another_address, passkeys_no_longer_accepted,
+    passkeys_without_verification), None for a usable one: a key the account holds in name only is shown as
+    that, to its owner and to the administrator who is asked why the account cannot sign in with it."""
+    from app.core import webauthn_settings
     now = now or datetime.utcnow()
     provisional = bool(row.provisional_until and row.provisional_until > now)
+    why_not = (webauthn_settings.PASSKEYS_TURNED_OFF if not webauthn_settings.enabled()
+               else webauthn_settings.why_a_key_is_no_factor(db, row, now=now))
     return {"id": str(row.id), "label": row.label or "", "created_at": _passkey_time(row.created_at),
+            "usable": why_not is None, "not_usable_because": why_not,
             "last_used_at": _passkey_time(row.last_used_at), "synced": bool(row.backup_eligible),
             "transports": list(row.transports or []), "algorithm": _PASSKEY_ALG_NAMES.get(row.cose_alg, str(row.cose_alg)),
             "attested": bool(getattr(row, "attested", False)),
@@ -11675,21 +11687,37 @@ def _passkeys_of(db, user_id, *, include_retired: bool = False) -> list:
     return q.order_by(WebAuthnCredential.created_at.asc()).all()
 
 
-def _passkey_counts(db, user_ids) -> dict:
-    """How many passkeys each of ``user_ids`` holds, in one query; retired ones are not counted and an account
-    with none is absent. An account holds twenty at most, so the rows are counted here. With passkeys turned off
-    none is a way to sign in, and none is counted (the rows stay); a database without the table holds none."""
+def _passkey_tally(db, user_ids) -> dict:
+    """For each of ``user_ids`` that holds a passkey: (how many it can sign in with now, how many it holds that
+    are no factor now), in one query. Retired ones are in neither and an account with none is absent. A key
+    made at another address than the vault has, of an algorithm no longer accepted, or one that never verified
+    the person while the vault asks for that is on the account in name only (webauthn_settings
+    .why_a_key_is_no_factor): counted as a way to sign in, it made the list show a passkey for an account held at
+    a set-up because it has none. An account holds twenty at most, so the rows are counted here. With passkeys
+    turned off none is a way to sign in, and none is counted (the rows stay); a database without the table holds
+    none."""
     from app.core import webauthn_settings
     from app.core.models import WebAuthnCredential
     from app.core.table_presence import has_table
     ids = list(user_ids)
     if not ids or not webauthn_settings.enabled() or not has_table(db, WebAuthnCredential.__tablename__):
         return {}
-    counts = {}
-    for (user_id,) in (db.query(WebAuthnCredential.user_id)
-                       .filter(WebAuthnCredential.user_id.in_(ids), WebAuthnCredential.retired_at.is_(None)).all()):
-        counts[user_id] = counts.get(user_id, 0) + 1
-    return counts
+    now, here, accepted, tally = datetime.utcnow(), webauthn_settings.address_now(), {}, {}
+    for key in (db.query(WebAuthnCredential)
+                .filter(WebAuthnCredential.user_id.in_(ids), WebAuthnCredential.retired_at.is_(None)).all()):
+        usable, not_usable = tally.get(key.user_id, (0, 0))
+        if webauthn_settings.why_a_key_is_no_factor(db, key, now=now, here=here, accepted=accepted) is None:
+            usable += 1
+        else:
+            not_usable += 1
+        tally[key.user_id] = (usable, not_usable)
+    return tally
+
+
+def _passkey_counts(db, user_ids) -> dict:
+    """How many passkeys each of ``user_ids`` can sign in with now (:func:`_passkey_tally`); an account with
+    none is absent."""
+    return {user_id: usable for user_id, (usable, _not) in _passkey_tally(db, user_ids).items() if usable}
 
 
 def _passkey_of(db, user_id, passkey_id):
@@ -11941,7 +11969,7 @@ async def passkey_register_verify(
     # no longer needed: the account meets the requirement like anyone, and owes it again should the key go.
     webauthn_settings.end_lifting(user)
     db.commit()
-    shown = _passkey_public(row, now)
+    shown = _passkey_public(db, row, now)
     _passkey_audit(db, user, request, "passkey_registered",
                    {"passkey_id": str(row.id), "provisional": shown["provisional"]})
     named = f"the passkey \"{shown['label']}\"" if shown["label"] else "a passkey"
@@ -11977,7 +12005,7 @@ async def list_my_passkeys(
     _passkey_refuse_temp(current_user)
     now = datetime.utcnow()
     from app.core import public_url
-    return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT,
+    return {"passkeys": [_passkey_public(db, r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT,
             "require_user_verification": webauthn_settings.require_uv(),
             "attestation": webauthn_settings.attestation(), "origin": public_url.expected_origin() or None,
             "enabled": _passkeys_enabled(db),
@@ -12001,7 +12029,7 @@ async def rename_my_passkey(
     row.label = label
     db.commit()
     _passkey_audit(db, current_user, request, "passkey_renamed", {"passkey_id": str(row.id)})
-    return _passkey_public(row)
+    return _passkey_public(db, row)
 
 
 @app.delete("/users/me/passkeys/{passkey_id}")
@@ -12048,7 +12076,7 @@ async def confirm_my_passkey(
     row = _passkey_of(db, current_user.id, passkey_id)
     now = datetime.utcnow()
     if not (row.provisional_until and row.provisional_until > now):
-        return _passkey_public(row, now)
+        return _passkey_public(db, row, now)
     req, has_active = _sf_requirement_for(db, current_user, "account.second_factor")
     if req["must_enroll"]:
         raise HTTPException(status_code=403, detail={
@@ -12079,7 +12107,7 @@ async def confirm_my_passkey(
     row.provisional_until = None
     db.commit()
     _passkey_audit(db, current_user, request, "passkey_confirmed", {"passkey_id": str(row.id)})
-    return _passkey_public(row, now)
+    return _passkey_public(db, row, now)
 
 
 @app.get("/users/{user_id}/passkeys")
@@ -12096,7 +12124,7 @@ async def admin_list_passkeys(
         raise HTTPException(status_code=404, detail="User not found")
     now = datetime.utcnow()
     from app.core import webauthn_settings
-    return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, target.id)], "limit": PASSKEY_LIMIT,
+    return {"passkeys": [_passkey_public(db, r, now) for r in _passkeys_of(db, target.id)], "limit": PASSKEY_LIMIT,
             "require_user_verification": webauthn_settings.require_uv()}
 
 

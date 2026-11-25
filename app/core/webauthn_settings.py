@@ -346,15 +346,40 @@ def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None
                                                WebAuthnCredential.retired_at.is_(None)).all()
     here = address_now()
     return sum(1 for key in keys
-               if getattr(key, "id", None) != without and at_this_address(key, here)
-               and algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0]
-               and verified_the_person(key, verification))
+               if getattr(key, "id", None) != without
+               and why_a_key_is_no_factor(db, key, now=now, here=here, verification=verification) is None)
 
 
 PASSKEYS_AT_ANOTHER_ADDRESS = "passkeys_at_another_address"
 PASSKEYS_NO_LONGER_ACCEPTED = "passkeys_no_longer_accepted"
 PASSKEYS_WITHOUT_VERIFICATION = "passkeys_without_verification"
 PASSKEYS_TURNED_OFF = "passkeys_turned_off"
+
+
+def why_a_key_is_no_factor(db, key, *, now: Optional[datetime] = None, here: Optional[str] = None,
+                           verification: Optional[bool] = None, accepted: Optional[dict] = None) -> Optional[str]:
+    """Why ``key`` (one that was not retired) is no factor the account can give at the address ``here`` (the
+    vault's as it is now, when not given), or None when it is one. The one rule for a single key, read by
+    everything that counts keys or shows one: ``passkeys_at_another_address`` (:func:`at_this_address`),
+    ``passkeys_no_longer_accepted`` (its algorithm was removed and its 30 days are over: :func:`algorithm_usable`),
+    ``passkeys_without_verification`` (:func:`verified_the_person`), in that order, which is the order
+    :func:`why_none_can_be_used` gives an account's reason in. The switch is not read here: turned off, no
+    passkey is a factor whatever the key is, and the one who asks says so. ``accepted`` is a dict the caller keeps
+    over many keys, so that each algorithm is looked up once."""
+    if not at_this_address(key, address_now() if here is None else here):
+        return PASSKEYS_AT_ANOTHER_ADDRESS
+    algorithm = getattr(key, "cose_alg", None)
+    if accepted is None:
+        usable = algorithm_usable(db, algorithm, now=now)[0]
+    else:
+        if algorithm not in accepted:
+            accepted[algorithm] = algorithm_usable(db, algorithm, now=now)[0]
+        usable = accepted[algorithm]
+    if not usable:
+        return PASSKEYS_NO_LONGER_ACCEPTED
+    if not verified_the_person(key, verification):
+        return PASSKEYS_WITHOUT_VERIFICATION
+    return None
 
 
 def why_none_can_be_used(db, user_id, *, now: Optional[datetime] = None) -> Optional[str]:

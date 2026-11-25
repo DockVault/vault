@@ -463,3 +463,42 @@ def test_the_start_fills_the_addresses_in_a_step_of_its_own_after_the_column_is_
     column = source.index('"ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS rp_id VARCHAR(253)"')
     filled = source.index("_passkey_settings.fill_the_addresses_not_recorded(db)")
     assert column < source.index("for stmt in statements:") < filled
+
+
+def test_the_lookup_says_how_many_of_an_accounts_passkeys_it_can_sign_in_with(monkeypatch):
+    """The host operator who looks an account up after a move saw "passkeys: 2" for an account with no key it can
+    use. The deployment says how many are a factor now, and the tool says it beside the number."""
+    set_bare_api_env()
+    from _kept_db import kept_database
+    from app.core import host_operator, webauthn_settings as wss
+    from app.core.models import RoleEnum, User, WebAuthnCredential
+    tool = _the_host_tool()
+    monkeypatch.setattr(wss, "address_now", lambda: HERE)
+    monkeypatch.setattr(wss, "require_uv", lambda: True)
+    monkeypatch.setattr(wss, "allowed_alg_codes", lambda: (-7,))
+    on = [True]
+    monkeypatch.setattr(wss, "enabled", lambda: on[0])
+    with kept_database() as (make, _engine):
+        with make() as db:
+            who = {n: User(username=n, email=None, password_hash="x", role=RoleEnum.USER, is_active=True)
+                   for n in ("moved", "stranded", "fine", "none")}
+            db.add_all(who.values())
+            db.flush()
+            for index, (owner, address, extra) in enumerate((
+                    ("moved", HERE, {}), ("moved", ELSEWHERE, {}), ("moved", HERE, {"uv_initialized": False}),
+                    ("stranded", ELSEWHERE, {}), ("stranded", ELSEWHERE, {"retired_at": datetime(2026, 11, 1)}),
+                    ("fine", HERE, {}), ("fine", None, {}))):
+                db.add(WebAuthnCredential(**{**dict(
+                    user_id=who[owner].id, credential_id=bytes([index + 1]) * 8, public_key_cose=b"k", cose_alg=-7,
+                    rp_id=address, uv_initialized=True), **extra}))
+            db.commit()
+            said = {n: host_operator._describe(db, u) for n, u in who.items()}
+            on[0] = False
+            off = host_operator._describe(db, who["fine"])
+    counts = {n: (a["passkeys"], a["passkeys_usable"]) for n, a in said.items()}
+    assert counts == {"moved": (3, 1), "stranded": (1, 0), "fine": (2, 2), "none": (0, 0)}
+    assert (off["passkeys"], off["passkeys_usable"]) == (2, 0)          # turned off: held, and none is a factor
+    notes = {n: tool.passkeys_usable_note(a) for n, a in said.items()}
+    assert notes == {"moved": " (it can sign in with 1 of them now)", "stranded": " (it cannot sign in with it now)",
+                     "fine": "", "none": ""}
+    assert tool.passkeys_usable_note(off) == " (it can sign in with none of them now)"

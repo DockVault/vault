@@ -798,6 +798,20 @@ def sign_in_address_reason(allowed_hosts):
     return "ip"
 
 
+def passkeys_usable_note(account):
+    """What `account` adds beside the number of passkeys an account holds, when it cannot sign in with every one
+    of them now, or "": the deployment says how many are a factor (a key made at another address than the vault
+    has, of an algorithm no longer accepted, or one that never verified the person while the vault asks for that
+    is none; nor is any while passkeys are turned off). An answer that does not say (an older image) adds
+    nothing."""
+    held, usable = account.get("passkeys"), account.get("passkeys_usable")
+    if type(held) is not int or type(usable) is not int or held <= 0 or not 0 <= usable < held:
+        return ""
+    if usable == 0:
+        return " (it can sign in with none of them now)" if held > 1 else " (it cannot sign in with it now)"
+    return " (it can sign in with %d of them now)" % usable
+
+
 def passkey_host(allowed_hosts):
     """The host name passkeys are made for at the address ALLOWED_HOSTS gives out, or "" when none can be made
     there (see sign_in_address_reason)."""
@@ -9097,8 +9111,9 @@ class DockVault:
         if account.get("passkeys") is not None:
             lifted = account.get("passkey_requirement_cleared_at") or (
                 "yes" if account.get("passkey_requirement_cleared") else "")
-            print("  passkeys:      %s%s" % (server_text(str(account.get("passkeys"))), (
-                "  (the role's requirement lifted by the host operator: %s)" % server_text(lifted)) if lifted else ""))
+            print("  passkeys:      %s%s%s" % (
+                server_text(str(account.get("passkeys"))), passkeys_usable_note(account), (
+                    "  (the role's requirement lifted by the host operator: %s)" % server_text(lifted)) if lifted else ""))
 
     def audit(self, args=None):
         """Verify the audit log's integrity chain in the running web container, and print every finding and

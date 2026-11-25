@@ -279,9 +279,10 @@ def test_the_user_list_gives_each_account_its_count():
     source = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
     listing = source[source.index("async def list_users("):]
     listing = listing[:listing.index("\n@app.")]
-    assert listing.count("_passkey_counts(db, [u.id for u in users])") == 1
-    assert "item.passkey_count = passkey_counts.get(user.id, 0)" in listing
-    assert "passkey_count: int = 0" in source[source.index("class UserResponse("):source.index("class UserResponse(") + 4000]
+    assert listing.count("_passkey_tally(db, [u.id for u in users])") == 1
+    assert "item.passkey_count, item.passkey_unusable_count = passkey_tally.get(user.id, (0, 0))" in listing
+    answer = source[source.index("class UserResponse("):source.index("class UserResponse(") + 4500]
+    assert "passkey_count: int = 0" in answer and "passkey_unusable_count: int = 0" in answer
 
 
 def _page_words(accounts: list) -> list:
@@ -315,3 +316,118 @@ def test_the_page_names_the_ways_an_account_signs_in():
     for row in rows:
         assert row["escaped"] == row["words"]
         assert row["badges"] == "".join(f'<span class="badge badge-secondary">{w}</span>' for w in row["words"])
+
+
+ELSEWHERE = "old.example.test"
+
+
+def _key(db, user, **extra):
+    from app.core.models import WebAuthnCredential
+    row = WebAuthnCredential(**{**dict(user_id=user.id, credential_id=uuid.uuid4().bytes, public_key_cose=b"key",
+                                       cose_alg=-7, uv_initialized=True, rp_id="vault.example.test"), **extra})
+    db.add(row)
+    db.commit()
+    return row
+
+
+def _the_rules(monkeypatch, *, verification=True):
+    from app.core import webauthn_settings as wss
+    monkeypatch.setattr(wss, "require_uv", lambda: verification)
+    monkeypatch.setattr(wss, "allowed_alg_codes", lambda: (-7,))
+    return wss
+
+
+def test_a_key_that_is_no_factor_now_is_not_counted_as_a_way_to_sign_in(S, db, monkeypatch):
+    """After the vault moved to another address the list showed a passkey beside an account that is held at a
+    set-up because it has none it can use. A key made at another address, of an algorithm no longer accepted, or
+    one that never verified the person while the vault asks for that is counted apart: held, and no way in."""
+    wss = _the_rules(monkeypatch)
+    here, moved, stranded, lapsed, unverified, none = (
+        _user(db, n) for n in ("here", "moved", "stranded", "lapsed", "unverified", "none"))
+    _key(db, here)
+    _key(db, here, rp_id=None)                         # no address on record: taken as made here
+    _key(db, moved)
+    _key(db, moved, rp_id=ELSEWHERE)
+    _key(db, stranded, rp_id=ELSEWHERE)
+    _key(db, stranded, rp_id=ELSEWHERE)
+    _key(db, stranded, rp_id=ELSEWHERE, retired_at=datetime(2026, 11, 1))
+    _key(db, lapsed, cose_alg=-999)
+    _key(db, unverified, uv_initialized=False)
+    everyone = [u.id for u in (here, moved, stranded, lapsed, unverified, none)]
+    tally = S._passkey_tally(db, everyone)
+    assert tally == {here.id: (2, 0), moved.id: (1, 1), stranded.id: (0, 2), lapsed.id: (0, 1), unverified.id: (0, 1)}
+    assert S._passkey_counts(db, everyone) == {here.id: 2, moved.id: 1}
+    # The list's number is the sign-in's: what the account can give as a factor.
+    for user in (here, moved, stranded, lapsed, unverified, none):
+        assert tally.get(user.id, (0, 0))[0] == wss.usable_passkeys(db, user.id), user.username
+    # A key that never verified the person counts again when the vault stops asking for that.
+    _the_rules(monkeypatch, verification=False)
+    assert S._passkey_tally(db, [unverified.id]) == {unverified.id: (1, 0)}
+    # At an address no passkey can be made at, none is a way in.
+    from app.services import webauthn_service as ws
+    monkeypatch.setattr(ws, "relying_party", lambda name: None)
+    assert S._passkey_tally(db, [here.id, moved.id]) == {here.id: (0, 2), moved.id: (0, 2)}
+    assert S._passkey_counts(db, [here.id, moved.id]) == {}
+
+
+def test_the_users_list_gives_both_numbers_to_the_page(S):
+    """The answer's row carries the number the page writes as the ways to sign in, and the number held in name
+    only beside it; an account with no passkey has 0 and 0."""
+    fields = S.UserResponse.model_fields
+    assert fields["passkey_count"].default == 0 and fields["passkey_unusable_count"].default == 0
+    assert fields["passkey_count"].annotation is int and fields["passkey_unusable_count"].annotation is int
+
+
+def test_a_shown_passkey_says_whether_it_is_a_factor_now_and_why_not(S, db, monkeypatch):
+    """The profile and the administrator's list show every key the account holds. One that cannot be used says
+    so, with the reason, and never the address it was made at."""
+    wss = _the_rules(monkeypatch)
+    owner = _user(db, "owner")
+    fine = _key(db, owner)
+    elsewhere = _key(db, owner, rp_id=ELSEWHERE)
+    lapsed = _key(db, owner, cose_alg=-999)
+    unverified = _key(db, owner, uv_initialized=False)
+    both = _key(db, owner, rp_id=ELSEWHERE, cose_alg=-999, uv_initialized=False)     # the address is said first
+    alg_and_uv = _key(db, owner, cose_alg=-999, uv_initialized=False)                # then the algorithm
+
+    def shown(row):
+        public = S._passkey_public(db, row)
+        assert "rp_id" not in public and ELSEWHERE not in str(public) and "vault.example.test" not in str(public)
+        return public["usable"], public["not_usable_because"]
+
+    assert shown(fine) == (True, None)
+    assert shown(elsewhere) == (False, "passkeys_at_another_address") == (False, wss.PASSKEYS_AT_ANOTHER_ADDRESS)
+    assert shown(lapsed) == (False, "passkeys_no_longer_accepted") == (False, wss.PASSKEYS_NO_LONGER_ACCEPTED)
+    assert shown(unverified) == (False, "passkeys_without_verification") == (False, wss.PASSKEYS_WITHOUT_VERIFICATION)
+    assert shown(both) == (False, "passkeys_at_another_address")
+    assert shown(alg_and_uv) == (False, "passkeys_no_longer_accepted")
+    # The key's reason and the account's are one rule: an account whose every key has one reason gives that one.
+    for row, reason in ((elsewhere, wss.PASSKEYS_AT_ANOTHER_ADDRESS), (lapsed, wss.PASSKEYS_NO_LONGER_ACCEPTED),
+                        (unverified, wss.PASSKEYS_WITHOUT_VERIFICATION)):
+        alone = _user(db, "alone-" + reason)
+        _key(db, alone, rp_id=row.rp_id, cose_alg=row.cose_alg, uv_initialized=row.uv_initialized)
+        assert wss.why_none_can_be_used(db, alone.id) == reason == wss.why_a_key_is_no_factor(db, row)
+    # Turned off, no passkey is a factor whatever the key is.
+    monkeypatch.setattr(wss, "enabled", lambda: False)
+    for row in (fine, elsewhere, lapsed, unverified):
+        assert shown(row) == (False, "passkeys_turned_off") == (False, wss.PASSKEYS_TURNED_OFF)
+    # Every answer that shows a key is made by the one function, with the database it reads the rules from.
+    source = (Path(__file__).resolve().parents[1] / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    assert source.count("_passkey_public(db, ") == 7 and source.count("_passkey_public(") == 7
+
+
+def test_an_algorithm_is_looked_up_once_for_a_whole_list(S, db, monkeypatch):
+    wss = _the_rules(monkeypatch)
+    asked = []
+    real = wss.algorithm_usable
+    monkeypatch.setattr(wss, "algorithm_usable", lambda db, alg, **kw: (asked.append(alg), real(db, alg, **kw))[1])
+    people = [_user(db, f"user{n}") for n in range(4)]
+    for person in people:
+        _key(db, person)
+        _key(db, person, cose_alg=-999)
+    assert S._passkey_tally(db, [p.id for p in people]) == {p.id: (1, 1) for p in people}
+    assert sorted(asked) == [-999, -7]
+    # A key made at another address is said so before its algorithm is looked at.
+    asked.clear()
+    assert wss.why_a_key_is_no_factor(db, _key(db, people[0], rp_id=ELSEWHERE, cose_alg=-8)) == wss.PASSKEYS_AT_ANOTHER_ADDRESS
+    assert asked == []

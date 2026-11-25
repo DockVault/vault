@@ -353,3 +353,32 @@ def test_the_note_names_only_the_accounts_left_with_no_factor_and_counts_each_ac
         assert note.startswith("4 passkeys (of 4 accounts) were made at old.example.com, older.example.com and "
                                "cannot be used at vault.example.com. An account among them that has no other "
                                "second factor to use there sets one up again at its next sign-in: "), (broken, note)
+
+
+def test_the_looked_up_account_says_which_of_its_passkeys_it_can_sign_in_with(capsys):
+    """Beside the number of passkeys an account holds, `account` says how many it can sign in with when that is
+    not all of them. An answer that does not say (an older image), or says something that is no number, adds
+    nothing: the line reads as it did."""
+    note = dv.passkeys_usable_note
+    assert note({"passkeys": 2, "passkeys_usable": 2}) == "" and note({"passkeys": 0, "passkeys_usable": 0}) == ""
+    assert note({"passkeys": 2, "passkeys_usable": 0}) == " (it can sign in with none of them now)"
+    assert note({"passkeys": 1, "passkeys_usable": 0}) == " (it cannot sign in with it now)"
+    assert note({"passkeys": 3, "passkeys_usable": 1}) == " (it can sign in with 1 of them now)"
+    assert note({"passkeys": 20, "passkeys_usable": 19}) == " (it can sign in with 19 of them now)"
+    for unsaid in ({"passkeys": 2}, {"passkeys": 2, "passkeys_usable": None}, {"passkeys": 2, "passkeys_usable": "0"},
+                   {"passkeys": 2, "passkeys_usable": True}, {"passkeys": "2", "passkeys_usable": 0},
+                   {"passkeys": 2, "passkeys_usable": 3}, {"passkeys": 2, "passkeys_usable": -1},
+                   {"passkeys": True, "passkeys_usable": False}, {"passkeys": True, "passkeys_usable": 0},
+                   {"passkeys_usable": 0}, {}):
+        assert note(unsaid) == "", unsaid
+    Tool = next(c for c in vars(dv).values() if isinstance(c, type) and hasattr(c, "_show_account"))
+    plain = types.SimpleNamespace(pal=types.SimpleNamespace(paint=lambda text, colour: text))
+    account = {"username": "ann", "email": None, "role": "user", "active": True, "last_login": None,
+               "second_factor": False, "passkeys": 2, "passkeys_usable": 0}
+    Tool._show_account(plain, account)
+    assert "  passkeys:      2 (it can sign in with none of them now)\n" in capsys.readouterr().out
+    Tool._show_account(plain, {**account, "passkeys_usable": 1, "passkey_requirement_cleared_at": "2026-11-20T10:00:00Z"})
+    assert ("  passkeys:      2 (it can sign in with 1 of them now)  (the role's requirement lifted by the host "
+            "operator: 2026-11-20T10:00:00Z)\n") in capsys.readouterr().out
+    Tool._show_account(plain, {k: v for k, v in account.items() if k != "passkeys_usable"})
+    assert "  passkeys:      2\n" in capsys.readouterr().out

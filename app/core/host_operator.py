@@ -105,6 +105,7 @@ def _describe(db, user):
     from app.core.models import SecondFactorEnrollment
     has_factor = db.query(SecondFactorEnrollment.id).filter(
         SecondFactorEnrollment.user_id == user.id, SecondFactorEnrollment.status == "active").first() is not None
+    from app.core import webauthn_settings
     from app.core.models import WebAuthnCredential
     passkeys = db.query(WebAuthnCredential.id).filter(WebAuthnCredential.user_id == user.id,
                                                       WebAuthnCredential.retired_at.is_(None)).count()
@@ -116,7 +117,11 @@ def _describe(db, user):
         "locked_by_administrator": bool(user.is_locked) and user.locked_until is None,
         "last_login": user.last_login.isoformat() + "Z" if user.last_login else None,
         "second_factor": has_factor,
+        # The passkeys the account holds, and how many of them it can sign in with now: one made at another
+        # address than the vault has, of an algorithm no longer accepted, or that never verified the person while
+        # the vault asks for that is held in name only, and none is a factor while passkeys are turned off.
         "passkeys": passkeys,
+        "passkeys_usable": webauthn_settings.usable_passkeys(db, user.id),
         "passkey_requirement_cleared": getattr(user, "passkey_requirement_cleared_at", None) is not None,
         "passkey_requirement_cleared_at": (user.passkey_requirement_cleared_at.isoformat() + "Z"
                                            if getattr(user, "passkey_requirement_cleared_at", None) else None),
@@ -154,10 +159,8 @@ def passkey_addresses(db) -> dict:
         entry["holders"].add(key.user_id)
         made, usable = of_account.setdefault(key.user_id, (set(), set()))
         made.add(name)
-        algorithm = getattr(key, "cose_alg", None)
-        if algorithm not in accepted:
-            accepted[algorithm] = webauthn_settings.algorithm_usable(db, algorithm, now=now)[0]
-        if accepted[algorithm] and webauthn_settings.verified_the_person(key):
+        # A factor at the address it was made at: the one rule for a key, asked for that address.
+        if webauthn_settings.why_a_key_is_no_factor(db, key, now=now, here=name, accepted=accepted) is None:
             usable.add(name)
     groups = {}
     for owner, (made, usable) in of_account.items():
