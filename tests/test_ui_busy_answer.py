@@ -274,8 +274,8 @@ async function applyServerPreferences() { return true; }      // the page reload
 (async () => {{
     globalThis.fetch = async (url) => {{ sent.push({{ url }}); return {{ status: {status}, ok: {str(200 <= status < 300).lower()},
         headers: {{ get: () => null }}, json: async () => {{ const b = {json.dumps(body)}; if (b === null) throw new SyntaxError('html'); return b; }} }}; }};
-    await enterAuthedSession();
-    out({{ toasts, sent: sent.length }});
+    const fell = await enterAuthedSession();
+    out({{ toasts, sent: sent.length, fell: fell === undefined ? null : fell }});
 }})();
 """
     done = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=60,
@@ -285,12 +285,16 @@ async function applyServerPreferences() { return true; }      // the page reload
 
 
 def test_a_busy_sign_in_check_at_the_load_signs_this_tab_out_with_the_servers_sentence():
+    # The check says why it fell to the sign-in screen: what a provider's answer that came back with the load is then
+    # told turns on it (a session refused ended; one the check could not answer did not).
     got = _sign_in_check(503, {"detail": BUSY})
-    assert got == {"toasts": [["signed out", "this-tab", BUSY]], "sent": 1}, got
+    assert got == {"toasts": [["signed out", "this-tab", BUSY]], "sent": 1, "fell": "unanswered"}, got
     # A 503 that is not the vault's (a proxy's page while it restarts) has no sentence: none is shown, as before.
-    assert _sign_in_check(503, None) == {"toasts": [["signed out", "this-tab", None]], "sent": 1}
+    assert _sign_in_check(503, None) == {"toasts": [["signed out", "this-tab", None]], "sent": 1, "fell": "unanswered"}
+    assert _sign_in_check(500, None) == {"toasts": [["signed out", "this-tab", None]], "sent": 1, "fell": "unanswered"}
     # A refusal of the session is as before.
-    assert _sign_in_check(401, {"detail": "Session expired"}) == {"toasts": [["signed out", None, None]], "sent": 1}
+    assert _sign_in_check(401, {"detail": "Session expired"}) == {"toasts": [["signed out", None, None]], "sent": 1,
+                                                                   "fell": "refused"}
 
 
 # --------------------------------------------------------------------------- nothing waits and sends again by itself

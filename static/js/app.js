@@ -2055,6 +2055,10 @@ function _ssoStartHandOut(providerId) {
 // session that started it, and nothing is linked, tested or confirmed until it is; a new sign-in cannot claim it.
 const SSO_BACK_SIGNED_OUT = 'Your session ended while you were at your organisation\'s sign-in, so nothing was '
     + 'linked, tested or confirmed. Sign in and start again.';
+// The same, where the session check at the load was answered busy or not at all: this tab is signed out, but the
+// session did not end. Said after what the sign-out showed (the server's sentence, when it gave one).
+const SSO_BACK_NOT_CHECKED = 'The page could not check your session as it came back from your organisation\'s '
+    + 'sign-in, so nothing was linked, tested or confirmed. Sign in and start again.';
 const _SSO_BACK_OF_A_SESSION = ['sso-linked', 'sso-test', 'sso-stepup'];
 
 // The page came back from a provider to the sign-in screen: a refusal is said in the server's words for its
@@ -2113,16 +2117,27 @@ function _ssoSignInBackToASignedInPage(back) {
 }
 
 // The page came back from a provider while signed in: a link, an administrator's test or a confirmation is claimed
-// with this tab's verifier, and the person is told what happened.
-async function _ssoResume(back) {
+// with this tab's verifier, and the person is told what happened. `fell`: why the session check at the load fell to
+// the sign-in screen (enterAuthedSession), when it did.
+async function _ssoResume(back, fell) {
     if (!back || !window.Sso) return;
     if (!authToken || !currentUser) {
-        // The session stored for the page was refused at the load: the sign-in screen is up. A link, a test or a
-        // confirmation was that session's, and nothing was done. A sign-in this tab started (from the invitation
-        // page, say, which offers its providers whatever the browser stores) is finished there with this tab's
-        // proof, and a refusal is said, as on the sign-in screen.
-        if (_SSO_BACK_OF_A_SESSION.includes(back.kind)) _showReasonNote(SSO_BACK_SIGNED_OUT);
-        else await _ssoOnSignInScreen(back);
+        // The session stored for the page did not survive the load: the sign-in screen is up. A link, a test or a
+        // confirmation was that session's, and nothing was done: the session ended (refused), or the check went
+        // unanswered (busy, or not reached), when the sentence the sign-out showed stays and this follows it. A
+        // sign-in this tab started (from the invitation page, say, which offers its providers whatever the browser
+        // stores) is finished there with this tab's proof, and a refusal is said, as on the sign-in screen.
+        if (_SSO_BACK_OF_A_SESSION.includes(back.kind)) {
+            if (fell === 'unanswered') {
+                const shown = document.getElementById('login-error');
+                const before = shown && shown.style.display !== 'none' ? String(shown.textContent || '').trim() : '';
+                _showReasonNote((before ? before + ' ' : '') + SSO_BACK_NOT_CHECKED);
+            } else {
+                _showReasonNote(SSO_BACK_SIGNED_OUT);
+            }
+        } else {
+            await _ssoOnSignInScreen(back);
+        }
         return;
     }
     if (back.kind === 'sso') {
@@ -25855,7 +25870,8 @@ async function _refusesTheSession(resp) {
 
 // Verify a cached session token with the server, then reveal the dashboard. Runs
 // while the pre-paint boot splash (auth-boot.js) is showing, so an EXPIRED token
-// bounces straight to login without ever flashing the app shell.
+// bounces straight to login without ever flashing the app shell. Where it signs this tab out it says why:
+// 'refused' (the session ended) or 'unanswered' (busy, another error, or not reached: the session did not end).
 async function enterAuthedSession() {
     // A session ended while this waited (a sign-out in another tab, a refusal): its answers write nothing back.
     const asked = _sessionsEnded;
@@ -25878,10 +25894,11 @@ async function enterAuthedSession() {
                 } catch (_) { said = undefined; }
                 if (asked !== _sessionsEnded) return;
                 logout(SIGN_OUT_THIS_TAB, said);
-                return;
+                return 'unanswered';
             }
-            logout(await _refusesTheSession(resp) ? undefined : SIGN_OUT_THIS_TAB);
-            return;
+            const refused = await _refusesTheSession(resp);
+            logout(refused ? undefined : SIGN_OUT_THIS_TAB);
+            return refused ? 'refused' : 'unanswered';
         }
         const user = await resp.json();
         if (asked !== _sessionsEnded) return;
@@ -25893,7 +25910,7 @@ async function enterAuthedSession() {
         // half-loaded app on a dead/expired session. That is no refusal of the session: this tab only.
         console.error('Session verification failed:', e);
         logout(SIGN_OUT_THIS_TAB);
-        return;
+        return 'unanswered';
     }
 
     console.log('Restoring session for:', currentUser.username);
@@ -26146,7 +26163,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // The pre-paint splash (auth-boot.js) is up. VERIFY the cached token with the
         // server before revealing anything, so an expired token routes to login
         // instead of flashing the dashboard shell.
-        enterAuthedSession().then(() => _ssoResume(ssoBack)).catch(() => {});
+        enterAuthedSession().then((fell) => _ssoResume(ssoBack, fell)).catch(() => {});
     } else {
         // No session — release the boot splash (if any) and show login.
         document.documentElement.removeAttribute('data-auth');

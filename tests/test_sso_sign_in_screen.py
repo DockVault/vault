@@ -71,7 +71,7 @@ _SHIPPED = ("_el", "_showReasonNote", "_showLoginError", "_signInOriginElsewhere
             "_ssoReturnTo", "_initSsoSignIn", "_ssoStartHandOut", "_ssoOnSignInScreen", "_ssoSignInBackToASignedInPage",
             "_ssoResume")
 _STATE = ("_hashForSignIn", "_passwordStage")
-_CONSTANTS = ("SSO_BACK_SIGNED_OUT", "_SSO_BACK_OF_A_SESSION")
+_CONSTANTS = ("SSO_BACK_SIGNED_OUT", "SSO_BACK_NOT_CHECKED", "_SSO_BACK_OF_A_SESSION")
 
 
 def _function(js, name):
@@ -319,6 +319,39 @@ out({ none, refused, sent: sent.filter((s) => s.method === 'POST').length, toast
     assert got["sent"] == 0 and got["toasts"] == []
 
 
+NOT_CHECKED = ("The page could not check your session as it came back from your organisation's sign-in, so nothing "
+               "was linked, tested or confirmed. Sign in and start again.")
+BUSY = "The vault is busy with this right now. Try again in a moment."
+
+
+@pytest.mark.parametrize("fragment", ["#sso-linked=abc", "#sso-test=abc", "#sso-stepup=abc"])
+def test_a_link_test_or_confirmation_back_to_a_page_whose_session_check_went_unanswered_keeps_the_servers_sentence(
+        fragment):
+    """The session check at the load was answered busy, or not at all: this tab is signed out, but the session did
+    not end. The sentence the sign-out showed (the server's, when it gave one) stays, and what came back is said after
+    it, without saying the session ended. A session the check refused did end, and is told so."""
+    got = _node(r"""
+answers['GET /api/auth/sso/reasons'] = { status: 200, json: { reasons: REASONS } };
+authToken = null; currentUser = null;
+// Answered busy: the sign-out showed the server's sentence.
+_showReasonNote(BUSY);
+await _ssoResume(arrive(FRAGMENT), 'unanswered');
+const busy = note();
+// Not reached at all: the sign-out showed nothing.
+loginError.textContent = ''; loginError.style.display = 'none';
+await _ssoResume(arrive(FRAGMENT), 'unanswered');
+const unreached = note();
+loginError.textContent = ''; loginError.style.display = 'none';
+await _ssoResume(arrive(FRAGMENT), 'refused');
+out({ busy, unreached, refused: note(), sent: sent.filter((s) => s.method === 'POST').length, toasts });
+""".replace("FRAGMENT", json.dumps(fragment)).replace("BUSY", json.dumps(BUSY)), _server_reasons())
+    assert got["busy"] == {"text": BUSY + " " + NOT_CHECKED, "shown": True}, got
+    assert got["unreached"] == {"text": NOT_CHECKED, "shown": True}, got
+    assert got["refused"] == {"text": BACK_SIGNED_OUT, "shown": True}, got
+    assert "session ended" not in got["busy"]["text"] and "session ended" not in got["unreached"]["text"]
+    assert got["sent"] == 0 and got["toasts"] == []
+
+
 def test_a_sign_in_or_a_refusal_back_to_a_page_with_no_session_is_not_told_its_session_ended():
     """A stored session refused at the load leaves the sign-in screen up: a sign-in's code or a refusal that came back
     is taken as the sign-in screen takes it (here a code with no proof in this tab, then a refusal), never as a link,
@@ -395,9 +428,10 @@ out({ posts: sent.filter((s) => s.method === 'POST').map((s) => s.url), toasts, 
 
 def test_the_boot_hands_what_came_back_to_the_session_check_and_then_to_the_resume():
     """With a stored session the load checks it first, then hands what came back to _ssoResume, whichever way the
-    check went: a refused session leaves the sign-in screen up, where a sign-in this tab started is finished."""
+    check went, with why it fell to the sign-in screen: a refused session leaves the sign-in screen up, where a
+    sign-in this tab started is finished."""
     js = APP_JS.read_text(encoding="utf-8")
-    assert "enterAuthedSession().then(() => _ssoResume(ssoBack))" in js
+    assert "enterAuthedSession().then((fell) => _ssoResume(ssoBack, fell))" in js
 
 
 # --------------------------------------------------------------------------- a page opened at another address
