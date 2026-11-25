@@ -7,6 +7,7 @@ no personal data are named too, under "Other tables"), every setting it tells an
 be a real one, and the README and the security policy must point to it.
 """
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -138,28 +139,133 @@ def test_no_row_says_from_0_35_0_in_other_words():
     assert not [line for line in _text().splitlines() if line.startswith("| ") and "from 0.35.0" in line]
 
 
-# The columns of `users` the row describes in words rather than by name, with the words it uses for each.
-_USERS_IN_WORDS = {
-    "id": "| `users` |", "username": "Username", "email": "email (optional)", "password_hash": "password hash",
-    "role": "role", "is_active": "active and locked state", "is_locked": "active and locked state",
-    "locked_until": "active and locked state", "failed_login_attempts": "failed sign-in count",
-    "last_login": "last sign-in", "created_at": "creation time and creator", "created_by": "creation time and creator",
-    "updated_at": "time of the last change", "storage_quota_bytes": "storage quota",
-    "sftp_enabled": "SFTP settings", "sftp_password_auth": "SFTP settings",
+# The columns a row describes in words rather than by name, with the words its first column (what is kept) uses for
+# each. A table's primary key is the row itself. A key ending in "_" stands for every column that begins with it.
+_IN_WORDS = {
+    "users": {
+        "username": "Username", "email": "email (optional)", "password_hash": "password hash", "role": "role",
+        "is_active": "active and locked state", "is_locked": "active and locked state",
+        "locked_until": "active and locked state", "failed_login_attempts": "failed sign-in count",
+        "last_login": "last sign-in", "created_at": "creation time and creator",
+        "created_by": "creation time and creator", "updated_at": "time of the last change",
+        "storage_quota_bytes": "storage quota", "sftp_enabled": "SFTP settings", "sftp_password_auth": "SFTP settings",
+    },
+    "webauthn_credentials": {
+        "user_id": "Each passkey the person registered", "credential_id": "its id as the authenticator made them",
+        "public_key_cose": "its public key", "cose_alg": "the signature algorithm", "sign_count": "the sign count",
+        "transports": "how it connects", "aaguid": "the authenticator make's identifier",
+        "backup_eligible": "whether the key is synced between devices",
+        "backup_state": "whether the key is synced between devices",
+        "uv_initialized": "whether the person was verified when it was made",
+        "label": "the name the person gave it", "created_at": "when it was made and last used",
+        "last_used_at": "when it was made and last used", "created_by_session": "a hash of the session that made it",
+        "provisional_until": "whether it was made within 14 days after an administrator changed",
+        "retired_at": "retired it",
+    },
+    "sso_providers": {
+        "state": "whether it is on", "kind": "its kind", "name": "name, label and icon",
+        "label": "name, label and icon", "icon": "name, label and icon",
+        "sort_order": "where its button stands on the sign-in page", "show_on_sign_in": "whether it shows there",
+        "issuer": "its addresses", "discovery_url": "its addresses",
+        "private_network": "whether it may be reached on a private network", "client_id": "client id",
+        "client_secret_enc": "its client secret (encrypted", "token_auth": "how the vault proves itself to it",
+        "scopes": "the scopes it asks for", "claims": "the claim or attribute names it maps",
+        "policy": "its per-provider policy", "saml_": "its SAML settings",
+        "saml_idp_certs": "the provider's signing certificates", "created_at": "when it was made and last changed",
+        "updated_at": "when it was made and last changed", "created_by": "who made it (the administrator's id",
+        "created_by_name": "(the administrator's id and username)",
+        "last_test": "the summary of its last test sign-in",
+    },
+    "external_identities": {
+        "user_id": "For each account linked to a provider", "provider_id": "the provider, the issuer",
+        "issuer": "the provider, the issuer", "subject": "the provider's identifier for the person",
+        "subject_source": "where it came from", "tenant_id": "the tenant",
+        "email_at_link": "the email address and display name the provider sent",
+        "display_name": "the email address and display name the provider sent",
+        "linked_by": "how the link was made", "linked_at": "when, and when the person last signed in",
+        "last_sign_in_at": "when the person last signed in through it",
+    },
+    "sso_sessions": {
+        "provider_id": "the provider,", "idp_sid": "the provider's session identifier",
+        "idp_sub": "its identifier for the person", "auth_time": "when the provider signed them in",
+        "id_token_enc": "the provider's ID token, encrypted",
+    },
+    "sso_group_mappings": {
+        "provider_id": "A provider's group", "provider_group": "group identifier or name",
+        "department_id": "a department", "role": "a role",
+    },
+    "sso_admin_requests": {
+        "user_id": "the account", "provider_id": "the provider and group", "provider_group": "the provider and group",
+        "requested_at": "when it was asked", "expires_at": "when it expires", "state": "its state",
+        "decided_by": "who decided it (the administrator's id", "decided_by_name": "(the administrator's id and username)",
+        "decided_at": "(the administrator's id and username) and when",
+    },
 }
+
+
+def _row_of(table):
+    (row,) = [line for line in _text().splitlines() if re.match(rf"\| `{table}`( \*\*New in [0-9.]+\*\*)? \|", line)]
+    return row
+
+
+def _undescribed(table):
+    """The columns of ``table`` in the model that its row neither names nor describes in the words given above."""
+    from app.core.models import Base
+
+    kept = _row_of(table).split("|")[2]
+    named = set(re.findall(r"`([a-z_]+)`", kept))
+    words = _IN_WORDS.get(table, {})
+    model = Base.metadata.tables[table]
+
+    def described(column):
+        said = words.get(column) or next((w for k, w in words.items() if k.endswith("_") and column.startswith(k)), None)
+        return said is not None and said in kept
+
+    keys = {c.name for c in model.primary_key.columns}
+    return [c.name for c in model.c if c.name not in keys and c.name not in named and not described(c.name)]
+
+
+def _new_in_0_36_0():
+    return re.findall(r"^\| `([a-z_]+)` \*\*New in 0\.36\.0\*\* \|", _text(), re.M)
 
 
 def test_every_column_of_users_is_in_its_row():
     # Compared with the model itself, not with a list kept by hand: a column a release adds to `users` fails here
     # until the row names it (or says it in words, as for the columns the row began with).
-    from app.core.models import User
-
-    (row,) = [line for line in _text().splitlines() if line.startswith("| `users` |")]
-    named = set(re.findall(r"`([a-z_]+)`", row.split("|", 2)[2]))
-    missing = [c.name for c in User.__table__.c
-               if c.name not in named and not (c.name in _USERS_IN_WORDS and _USERS_IN_WORDS[c.name] in row)]
+    missing = _undescribed("users")
     assert not missing, f"the users row says nothing of these columns of the model: {missing}"
-    assert not [c for c in _USERS_IN_WORDS if c not in User.__table__.c], "a column described in words is gone"
+
+
+def test_every_column_of_each_table_new_in_0_36_0_is_in_its_row():
+    # A table the release adds is described by its row as a whole; each of its columns is named there, or said in
+    # the words given above, so a column added to it later fails here until the row says what it keeps.
+    tables = _new_in_0_36_0()
+    assert set(tables) >= {"webauthn_credentials", "sso_providers", "external_identities", "sso_sessions",
+                           "sso_group_mappings", "sso_admin_requests"}, tables
+    missing = {table: _undescribed(table) for table in tables}
+    assert not any(missing.values()), f"these rows say nothing of these columns of the model: {missing}"
+
+
+def test_the_check_finds_a_column_a_row_leaves_out(monkeypatch):
+    # The check itself, on the inventory with one name taken out of a row: that column, and only that one, is found.
+    text = _text()
+    row = _row_of("external_identities")
+    assert row.count("`refused_at`") == 1
+    monkeypatch.setattr(sys.modules[__name__], "_text",
+                        lambda: text.replace(row, row.replace("`refused_at`", "the date")))
+    assert _undescribed("external_identities") == ["refused_at"]
+
+
+def test_the_words_given_for_a_column_are_for_a_column_there_is():
+    from app.core.models import Base
+
+    for table, words in _IN_WORDS.items():
+        columns = [c.name for c in Base.metadata.tables[table].c]
+        gone = [k for k in words if not (k in columns or (k.endswith("_") and any(c.startswith(k) for c in columns)))]
+        assert not gone, f"{table}: a column described in words is gone: {gone}"
+        kept = _row_of(table).split("|")[2]
+        unsaid = [k for k, said in words.items() if said not in kept]
+        assert not unsaid, f"{table}: the row no longer says these in the words given: {unsaid}"
 
 
 def test_what_0_36_0_adds_to_the_users_row_is_marked_as_new_in_it():
