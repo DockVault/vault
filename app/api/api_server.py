@@ -12248,6 +12248,16 @@ def _passkey_passwordless_allowed(db, user) -> bool:
     return grant is None or getattr(grant, "status", None) == "proposed"
 
 
+def _passkey_signs_in_alone(db, user, row) -> bool:
+    """Whether the passkey ``row`` may be the whole sign-in for ``user``: the account's role lets a passkey in
+    alone (:func:`_passkey_passwordless_allowed`), and the key is not one the browser said is not discoverable
+    when it was registered. Such a key is a second factor after the password, as the setting's help says. That
+    was left to the browser, which offers no such key at a sign-in with no name: but whoever holds the key, its
+    PIN and its id can ask the authenticator for it directly and write the account into the answer's user
+    handle, which the signature does not cover. A key the browser said nothing about is taken as offered."""
+    return _passkey_passwordless_allowed(db, user) and getattr(row, "discoverable", None) is not False
+
+
 def _passkey_b64url_decode(text) -> Optional[bytes]:
     """The bytes behind a base64url text the browser (or the challenge store) sent, or None when it is not one."""
     import base64
@@ -12405,7 +12415,7 @@ async def passkey_sign_in_verify(
     _passkey_verified_the_person(row, assertion)
     method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
     result = sign_in.SignInResult(user, [method], client_ip, user_verified=assertion.uv,
-                                  passwordless_allowed=_passkey_passwordless_allowed(db, user),
+                                  passwordless_allowed=_passkey_signs_in_alone(db, user, row),
                                   sessions_ended=ended)
     try:
         outcome = sign_in.finish(db, result)

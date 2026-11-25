@@ -255,6 +255,31 @@ def test_a_user_verified_passkey_of_a_user_is_the_whole_sign_in(monkeypatch):
     assert status == 200 and _claims(body["access_token"])["amr"] == ["hwk"] and row2.sign_count == 7
 
 
+@pytest.mark.parametrize("discoverable, alone", [(False, False), (True, True), (None, True)])
+def test_a_passkey_the_browser_said_is_not_discoverable_does_not_sign_in_alone(monkeypatch, discoverable, alone):
+    """The setting promises that only a discoverable passkey signs in alone. The vault stored what the browser
+    said of each key and never read it: the rule was the browser's, which offers no such key where no name is
+    typed. Whoever holds a security key that is not discoverable, its PIN and its id can ask the authenticator for
+    it directly and write the account into the user handle, which the signature does not cover. The server
+    holds the rule now: such a key is asked for the password and serves as the second factor after it. A key
+    the browser said nothing about is taken as it was offered."""
+    alice = _user()
+    h = Harness(monkeypatch, [alice])
+    auth, row = h.enroll(alice)
+    row.discoverable = discoverable
+    status, body = h.sign_in(auth, username="alice")
+    assert status == 200, body
+    if alone:
+        assert "access_token" in body and _claims(body["access_token"])["amr"] == ["hwk"]
+    else:
+        assert body["access_token"] is None and body["stage"] == "password" and body["second_factor_required"] is True
+        assert body["username"] == "alice" and all(a[0] != "success" for a in h.audits)
+    assert h.S._passkey_signs_in_alone(h.db, alice, row) is alone
+    # A role the setting does not let in alone is not let in by a discoverable key either.
+    monkeypatch.setattr(h.S, "_passkey_passwordless_allowed", lambda db, user: False)
+    assert h.S._passkey_signs_in_alone(h.db, alice, row) is False
+
+
 def test_an_administrator_always_adds_the_password(monkeypatch):
     root = _user("root", role="admin")
     h = Harness(monkeypatch, [root])

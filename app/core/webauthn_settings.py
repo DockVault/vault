@@ -91,8 +91,8 @@ _spec(GRACE_DAYS, "int", 14, "Days to set a required passkey up", minimum=1, max
 _spec(SIGN_IN_ROLES, "list", ["user", "external"], "Roles a passkey signs in alone", choices=SIGN_IN_CHOICES,
       help="A user-verified passkey is the whole sign-in for these roles. Administrators always type their "
            "password after a passkey; other roles not listed do too. Only a discoverable passkey (one the device or "
-           "key keeps with the account) signs in alone; one that is not still serves as the second factor after the "
-           "password.")
+           "key keeps with the account) signs in alone; one the browser reported as not discoverable when it was "
+           "added is asked for the password too, and still serves as the second factor after it.")
 _spec(REQUIRE_UV, "bool", True, "The authenticator must verify the person",
       help="Off, a passkey that did not check a PIN, fingerprint or face is one possession factor: the "
            "password always follows it, and it never counts for a compliance step-up. Turned on again, a passkey "
