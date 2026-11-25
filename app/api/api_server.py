@@ -12467,14 +12467,21 @@ async def passkey_register_options(
         raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
     now = datetime.utcnow()
     try:
-        # A key that never verified the person, while the vault asks for that, may be added again: its owner
-        # sets a PIN on it and registers it anew. Named among the keys not to repeat, the authenticator would
-        # answer that it is already registered, and the account would be left with a key it cannot use.
+        # Named among the keys a registration may not repeat are the keys the account can go on using: a factor
+        # now, of an algorithm the vault still accepts. A key that is to be replaced may be added again on the
+        # same authenticator: one that never verified the person while the vault asks for that (its owner sets a
+        # PIN on it and registers it anew), and one of an algorithm an administrator removed, whose owner is told
+        # to register a new passkey before its 30 days are over. Named, the authenticator answered that it is
+        # already registered: the owner could not replace the key on that device, and where the role must hold
+        # a passkey could not remove it either.
         from app.core import webauthn_settings
+        accepted, still_allowed = {}, set(webauthn_settings.allowed_alg_codes())
         options = ws.registration_options(rp, policy, challenge=challenge.challenge_bytes, user_id=ws.user_handle_for(user.id),
                                           username=user.username, display_name=None,
                                           existing=[(c.credential_id, tuple(c.transports or ())) for c in existing
-                                                    if webauthn_settings.verified_the_person(c)])
+                                                    if c.cose_alg in still_allowed
+                                                    and webauthn_settings.why_a_key_is_no_factor(
+                                                        db, c, now=now, accepted=accepted) is None])
     except ws.Refused as refused:
         raise HTTPException(status_code=400, detail={
             "reason": refused.code,

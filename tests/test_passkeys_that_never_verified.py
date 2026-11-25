@@ -341,3 +341,40 @@ def test_a_key_that_never_verified_may_be_added_again_and_is_shown_as_what_it_is
     status, body, _auth = h.register(authenticator=SoftAuthenticator(), flags=FLAG.UP)
     assert status == 201 and h.rows()[0].uv_initialized is False, body
     assert _rcall(h.S, "GET", "/users/me/passkeys")[1]["passkeys"][0]["user_verified"] is False
+
+
+def test_a_key_of_a_removed_algorithm_may_be_replaced_on_the_same_authenticator(monkeypatch):
+    """A Windows Hello key was made as RS256. An administrator removes RS256: the key is accepted for 30 more
+    days, and its owner is told to register a new passkey before then. On the same device that was refused: the
+    old key was named among the keys the registration may not repeat, so the authenticator answered "already
+    registered". Named are the keys the account goes on using."""
+    registry, wss = _mod()
+    alice = _user()
+    h = RouteHarness(monkeypatch, alice)
+    now = datetime.utcnow()
+
+    def row(credential_id, **what):
+        fields = dict(id=uuid.uuid4(), user_id=alice.id, credential_id=credential_id, retired_at=None,
+                      provisional_until=None, created_at=now, transports=["internal"], label="k", backup_eligible=False,
+                      cose_alg=-7, last_used_at=None, rp_id=None, uv_initialized=True, attested=False)
+        fields.update(what)
+        return types.SimpleNamespace(**fields)
+    kept, to_replace = row(b"es256-kept"), row(b"rs256-removed", cose_alg=-257)
+    elsewhere = row(b"made-elsewhere", rp_id="another.example.test")
+    h.rows().extend([kept, to_replace, elsewhere])
+    from app.services import webauthn_service as ws
+
+    def excluded():
+        status, body = _rcall(h.S, "POST", "/users/me/passkeys/register/options", {}, {"X-Second-Factor": "ok"})
+        assert status == 200, body
+        return {entry["id"] for entry in body["options"]["publicKey"]["excludeCredentials"]}
+    # Every algorithm accepted: both keys made here are named (the one made at another address is no factor here).
+    assert excluded() == {ws.b64url(b"es256-kept"), ws.b64url(b"rs256-removed")}
+    # RS256 removed a moment ago: its key is still a factor for its 30 days, and may be replaced already.
+    _resolving(monkeypatch, registry, {wss.ALLOWED_ALGS: ["ES256"]})
+    monkeypatch.setattr(wss, "algorithm_usable", lambda db, cose_alg, now=None: (True, cose_alg != -7))
+    assert wss.usable_passkeys(h.db, alice.id) == 2                    # both are factors still
+    assert excluded() == {ws.b64url(b"es256-kept")}
+    # Its 30 days over: no factor any more, and still not named.
+    monkeypatch.setattr(wss, "algorithm_usable", lambda db, cose_alg, now=None: (cose_alg == -7, False))
+    assert wss.usable_passkeys(h.db, alice.id) == 1 and excluded() == {ws.b64url(b"es256-kept")}
