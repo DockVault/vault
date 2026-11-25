@@ -459,6 +459,14 @@
             + 'wrote on their own account links nothing; a test sign-in says what would happen. Only for a provider that '
             + 'says who may sign in, and never for an administrator, an auditor, or an account that set up its own '
             + 'second factor: its owner links the provider under Your account.');
+        // A group mapped to the administrator role raises a request only while this is on (app/services/sso_groups.py),
+        // and such a mapping is saved only then (app/services/sso_group_mappings.py, admin_refusal).
+        const adminMap = tick('sso-admin-mapping', 'Administrator group: a group mapped to the administrator role may ask for it',
+            policy.sso_admin_mapping,
+            'A sign-in never makes anyone an administrator. With this on, a person in a group mapped to the '
+            + 'administrator role (this provider\'s Groups page) raises a request another administrator decides within '
+            + '7 days. Off, such a mapping raises no request, a request it raised can no longer be approved, and no new '
+            + 'one can be added. Only for a provider whose people may hold a password (Password sign-in, below).');
         const password = choice('sso-password', [['allowed', 'Linked accounts keep their password'],
             ['disabled', 'Linked accounts sign in only through this provider']], policy.sso_password_login);
         const madeHere = tick('sso-jit-password', 'An account made at a first sign-in may set a password', policy.sso_jit_password,
@@ -476,6 +484,7 @@
         box.appendChild(field('Accounts', creation));
         box.appendChild(field('Role of the accounts made', role));
         box.appendChild(byEmail.group);
+        box.appendChild(adminMap.group);
         box.appendChild(field('Password sign-in', password,
             `${provider.sso_only_accounts} of ${provider.identities} linked account(s) sign in only through a provider now. `
             + 'An administrator or an auditor always keeps a password.'));
@@ -486,8 +495,8 @@
                 sso_allowed_tenants: lines(tenants.value), sso_allowed_domains: lines(domains.value),
                 sso_required_groups: groupLines(groups.value), sso_use_signup_domains: signup.box.checked,
                 sso_account_creation: creation.value, sso_default_role: role.value,
-                sso_link_by_email: byEmail.box.checked, sso_password_login: password.value,
-                sso_jit_password: madeHere.box.checked,
+                sso_link_by_email: byEmail.box.checked, sso_admin_mapping: adminMap.box.checked,
+                sso_password_login: password.value, sso_jit_password: madeHere.box.checked,
             };
             const part = changed(now, policy);
             return Object.keys(part).length ? { policy: part } : {};

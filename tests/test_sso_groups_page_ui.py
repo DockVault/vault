@@ -418,3 +418,52 @@ await settle();
 out({ before, after: rows().map((r) => r.group), count: byId('sso-groups-count').textContent });
 """)
     assert got == {"before": ["Vault Admins"], "after": ["Vault Admins"], "count": "1 of at most 200 mappings."}
+
+
+ADMIN_GROUP_HELP = ("A sign-in never makes anyone an administrator. With this on, a person in a group mapped to the "
+                    "administrator role (this provider's Groups page) raises a request another administrator decides "
+                    "within 7 days. Off, such a mapping raises no request, a request it raised can no longer be "
+                    "approved, and no new one can be added. Only for a provider whose people may hold a password "
+                    "(Password sign-in, below).")
+
+
+def test_the_access_page_has_the_administrator_group_switch_and_its_save_sends_only_it():
+    """The switch the Groups page and the server's refusal name ("Administrator group", on the Access page): shown
+    as the policy holds it, and saved on its own."""
+    got = _node(r"""
+answers['/admin/sso/providers/p-1'] = () => {
+    const last = asked[asked.length - 1];
+    if (last.method === 'PATCH') PROVIDER.policy = Object.assign({}, PROVIDER.policy, JSON.parse(last.body).policy);
+    return { provider: PROVIDER };
+};
+await window.SsoSettings.load();
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+byId('sso-tab-access').click();
+await tick();
+const box = byId('sso-admin-mapping');
+const group = box.closest('.form-group');
+const shown = { checked: !!box.checked, label: group.querySelector('label').textContent,
+                help: group.querySelector('p').textContent };
+box.checked = true;
+byId('sso-save').click();
+await settle();
+out({ shown, patches: sent('PATCH'), after: !!byId('sso-admin-mapping').checked });
+""")
+    assert got["shown"] == {"checked": False, "help": ADMIN_GROUP_HELP,
+                            "label": " Administrator group: a group mapped to the administrator role may ask for it"}
+    assert got["patches"] == [["/admin/sso/providers/p-1", {"policy": {"sso_admin_mapping": True}}]]
+    assert got["after"] is True                       # drawn again as the server keeps it
+
+
+def test_the_administrator_group_switch_shows_the_policy_as_it_is():
+    got = _node(r"""
+POLICY.sso_admin_mapping = true;
+await window.SsoSettings.load();
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+byId('sso-tab-access').click();
+await tick();
+out(!!byId('sso-admin-mapping').checked);
+""")
+    assert got is True
