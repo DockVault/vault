@@ -188,6 +188,23 @@ out({ withNote, without: shown(), open: document.getElementById('change-password
     assert got["open"] is True
 
 
+def test_the_new_password_field_is_described_by_the_note_and_the_password_rule():
+    """The dialog puts the keyboard in New Password when it opens (static/js/dialogs.js), so a screen reader says that
+    field and what describes it, not the lines above it. The note on what a password means for an account that never
+    had one, and the password rule under the field, describe it. The note is emptied for any other account (the test
+    above), so there it adds nothing."""
+    html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    start = html.index('id="change-password-modal"')
+    dialog = html[start:html.index("</form>", start)]
+    field = re.search(r'<input\b[^>]*\bid="change-password-new"[^>]*>', dialog)
+    assert field, "the Change Password dialog has no New Password field"
+    described = re.search(r'\baria-describedby="([^"]*)"', field.group(0))
+    assert described, field.group(0)
+    assert described.group(1).split() == ["change-password-note", "change-password-hint"]
+    for name in described.group(1).split():
+        assert f'id="{name}"' in dialog, name
+
+
 def test_a_reset_link_for_an_account_that_never_had_a_password_says_what_the_password_it_sets_means():
     got = _node(r"""
 carol.password_set_note = '""" + NEVER + r"""';
