@@ -32,6 +32,12 @@ before it, and the sign-in is refused:
   link; decided on the flag read before, it wrote the chosen password onto an account that holds none. The
   reset first: the save finds an account with a password of its own and leaves it.
 
+- an identity unlinked, by an administrator or by its owner, while a sign-in through it is written. The unlink
+  ends the sessions that came through the identity, and it reads them before it removes it: read while the
+  sign-in's session was not committed yet, there was none to end, and the session then stood through an identity
+  that was gone. Both take the account's turn: the unlink waits for the sign-in and ends its session, and a
+  sign-in that comes after the unlink finds no identity and writes nothing.
+
 - a provider's row held for longer than a sign-in waits where it is written (a save that settles many accounts):
   the sign-in is answered as busy after its own short wait, with nothing written. The routes that finish a
   sign-in are answered on the server's one loop, where the connection's five seconds would be everybody's.
@@ -80,10 +86,10 @@ logout_claims = {}
 oc.verify_logout_token = lambda provider, discovery, token, fetch=None, seen_jti=None: dict(logout_claims)
 
 
-def account(name):
+def account(name, role=RoleEnum.USER):
     with SessionLocal() as s:
         u = User(username=name + "-" + uuid.uuid4().hex[:6], email=None, password_hash=hash_password("Old-Password-8x!"),
-                 role=RoleEnum.USER, is_active=True, is_locked=False)
+                 role=role, is_active=True, is_locked=False)
         s.add(u)
         s.commit()
         return u.id
@@ -313,6 +319,34 @@ def a_reset_link_of_its_own(uid, pause=0.0):
     return run
 
 
+def identity_of(uid, pid):
+    with SessionLocal() as s:
+        return s.query(ExternalIdentity).filter(ExternalIdentity.user_id == uid,
+                                                ExternalIdentity.provider_id == pid).first().id
+
+
+def an_unlink(identity_id, by, as_administrator):
+    """The route itself: DELETE /admin/sso/identities/{id} as an administrator, DELETE /users/me/identities/{id}
+    as the identity's owner. What is not the database stands still."""
+    from app.api import sso_admin_router as A
+    A._step_up = lambda *a, **k: None
+    A._audit = lambda *a, **k: None
+    R._tell_administrators = lambda *a, **k: None
+    sso_router._tell_owner = lambda *a, **k: None
+    api._enforce_step_up = lambda *a, **k: None
+    api._notify_users = lambda *a, **k: []
+
+    def run():
+        with SessionLocal() as s:
+            who = s.get(User, by)
+            if as_administrator:
+                return A.unlink_identity(identity_id=str(identity_id), request=REQUEST, current_user=who,
+                                         db=s)["sessions_ended"]
+            return asyncio.run(sso_router.unlink_my_identity(identity_id=identity_id, request=REQUEST,
+                                                             current_user=who, db=s))["sessions_ended"]
+    return run
+
+
 def password_of(uid):
     with SessionLocal() as s:
         u = s.get(User, uid)
@@ -429,6 +463,16 @@ elif pair == "a link while the account's turn is held":
             s.rollback()
             return "let go"
     out = together(holder=hold_the_turn, writer=after_the_turn_is_held(link_to(alice, fabrikam)))
+elif pair.startswith("unlinked by "):
+    by_an_administrator = "an administrator" in pair
+    unlink = an_unlink(identity_of(alice, contoso), account("root", RoleEnum.ADMIN) if by_an_administrator else alice,
+                       by_an_administrator)
+    if pair.endswith("while a sign-in is written"):
+        out = together(writer=through_the_provider(alice, contoso, "s-1", pause=1.6),
+                       ender=after_the_turn_is_held(unlink))
+    else:
+        out = {"ender": ["ok", unlink()]}
+        out.update(together(writer=through_the_provider(alice, contoso, "s-1")))
 elif pair == "a row held for longer than a sign-in waits":
     def hold_the_row():
         with SessionLocal() as s:
@@ -540,3 +584,21 @@ def test_a_save_that_comes_while_a_reset_link_is_used_waits_and_leaves_the_passw
     assert out["the turn was held"] is True and out["ender seconds"] >= 1.0, out     # the save waited for the turn
     assert out["the account"] == {"sso only": False, "nobody knows": False, "the chosen one": True,
                                   "links left": 1}, out
+
+
+@pytest.mark.parametrize("by", ["an administrator", "its owner"])
+def test_an_identity_unlinked_while_a_sign_in_through_it_is_written_waits_and_ends_its_session(db_name, by):
+    out = run_in(db_name, SCENARIO, env={"PAIR": f"unlinked by {by} while a sign-in is written"})
+    assert out["writer"] == ["ok", "signed in"], out
+    assert out["ender"] == ["ok", 1], out                    # the session the sign-in wrote, ended by the unlink
+    assert out["the turn was held"] is True and out["ender seconds"] >= 1.0, out      # it waited for the turn
+    after = out["after"]
+    assert after["links"] == 0 and after["sessions"] == [[False, True]], out
+
+
+@pytest.mark.parametrize("by", ["an administrator", "its owner"])
+def test_a_sign_in_through_an_identity_that_was_unlinked_is_refused_and_writes_nothing(db_name, by):
+    out = run_in(db_name, SCENARIO, env={"PAIR": f"unlinked by {by} before a sign-in"})
+    assert out["ender"] == ["ok", 0] and out["writer"][:3] == ["error", "HTTPException", "401"], out
+    after = out["after"]
+    assert after["links"] == 0 and after["sessions"] == [] and after["provider sessions"] == 0, out

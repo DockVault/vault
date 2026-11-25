@@ -6,6 +6,8 @@ the day before and keep the password for good. The unlink is confirmed by what s
 through the provider, made now, staged for this session and for the unlink alone. The administrators are told of
 every owner's unlink, and an administrator can unlink for somebody whose provider cannot confirm them. Offline."""
 import time
+import types
+import uuid
 from datetime import datetime, timedelta
 
 import pytest
@@ -279,3 +281,78 @@ def test_the_owners_own_link_and_unlink_record_what_they_did_to_the_password(mon
     at_sign_in = inspect.getsource(sso_router._record_resolution)
     assert '"identity_id": str(getattr(found.identity, "id", "") or "")' in at_sign_in
     assert '"made_sso_only": bool(found.password_stopped)' in at_sign_in
+
+
+def test_an_administrators_unlink_takes_the_turn_locks_the_identity_and_ends_what_came_through_it(monkeypatch):
+    """The administrator's door does what the owner's does, in the same order: the account's turn at its sessions
+    before any of its rows, the identity read again under a lock, and the sessions that came through the identity
+    ended in the transaction that removes it. Without the turn, a sign-in through the identity that was being
+    written kept its session after the identity was gone."""
+    from app.api import sso_admin_router as A
+    from app.api import sso_providers_router as R
+    from app.api import sso_router
+    from app.core.models import ExternalIdentity
+    root, alice, p = _user("root", role="admin"), _user(), _provider()
+    identity = _identity(alice, p, last_sign_in_at=datetime.utcnow())
+    h = Harness(monkeypatch, [root, alice], [p], identities=[identity])
+    order, told = [], []
+    monkeypatch.setattr(A, "_step_up", lambda db, user, request: order.append("step up"))
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: order.append(("the turn", str(owner))))
+    monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: told.append(body))
+    monkeypatch.setattr(sso_router, "_tell_owner", lambda db, user, row, title, change: None)
+
+    def ended(db, user, linked):
+        # By now the identity is held: the lock was taken after the turn, and before anything is ended.
+        order.append(("ended", user.username, str(linked.id)))
+        assert [step for step in h.db.log if step[:2] == ("lock", ExternalIdentity)], h.db.log
+        return 2
+    monkeypatch.setattr(sso_router, "_end_what_came_through", ended)
+    del h.db.log[:]
+    status, body, _ = _call(h.S, "DELETE", f"/admin/sso/identities/{identity.id}")
+    assert status == 200 and body == {"removed": True, "sessions_ended": 2, "held": False}, body
+    assert order == ["step up", ("the turn", str(alice.id)), ("ended", "alice", str(identity.id))]
+    locks = [i for i, step in enumerate(h.db.log) if step[:2] == ("lock", ExternalIdentity)]
+    assert len(locks) == 1 and locks[0] < h.db.log.index(("commit",))
+    assert [a[2]["sessions"] for a in h.audits if a[0] == "sso_identity_unlinked"] == [2]
+
+
+def test_what_came_through_an_identity_ends_with_it(monkeypatch):
+    """The sessions a sign-in through the identity made are ended by the unlink, each owner's turn first, and the
+    sign-ins of the account under way are spent; a session that came through another identity stays."""
+    from app.api import sso_router
+    from app.core.models import SsoSession
+    from app.services import sign_in
+    alice, p = _user(), _provider()
+    identity = _identity(alice, p, subject="subject-1")
+    h = Harness(monkeypatch, [alice], [p], identities=[identity])
+    mine = [types.SimpleNamespace(session_id=uuid.uuid4(), provider_id=p.id, idp_sub="subject-1") for _ in range(2)]
+    other = types.SimpleNamespace(session_id=uuid.uuid4(), provider_id=p.id, idp_sub="subject-2")
+    h.db.tables.setdefault(SsoSession, []).extend(mine + [other])
+    order = []
+    monkeypatch.setattr(sso_router, "_owners_of", lambda db, ids: order.append(("owners", sorted(map(str, ids)))) or [alice.id])
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: order.append(("turn", str(owner))))
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, session_ids=None, actor_username=None, durable=False: (
+        order.append(("revoke", sorted(map(str, session_ids)), actor_username, durable)) or len(session_ids)))
+    monkeypatch.setattr(sign_in, "spend_sign_ins_under_way", lambda db, user_id: order.append(("spent", str(user_id))))
+    wanted = sorted(str(s.session_id) for s in mine)
+    assert sso_router._end_what_came_through(h.db, alice, identity) == 2
+    assert order == [("owners", wanted), ("turn", str(alice.id)), ("revoke", wanted, "alice", True),
+                     ("spent", str(alice.id))]
+    # None came through it: nothing to end, and the sign-ins under way are spent all the same.
+    del order[:]
+    h.db.tables[SsoSession][:] = [other]
+    assert sso_router._end_what_came_through(h.db, alice, identity) == 0 and order == [("spent", str(alice.id))]
+
+
+def test_an_administrator_who_unlinks_their_own_identity_is_not_told_of_it_as_an_administrator(monkeypatch):
+    """Every unlink by its owner is told to the administrators. The owner who is one reads their own notice as
+    the owner, and not a second one that says somebody unlinked."""
+    ada, root, p = _user("ada", role="admin"), _user("root", role="admin"), _provider()
+    identity = _identity(ada, p, last_sign_in_at=datetime.utcnow())
+    h = Harness(monkeypatch, [ada, root], [p], identities=[identity])
+    h.current_user = ada
+    monkeypatch.setattr(h.S, "_active_admins", lambda db: [ada, root])
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
+    assert status == 200 and out["removed"] is True, out
+    to_administrators = [ids for ids, title in h.notices if title == "ada unlinked " + (p.label or p.name)]
+    assert to_administrators == [[str(root.id)]], h.notices
