@@ -47,6 +47,13 @@ def problem(value: Optional[str]) -> Optional[str]:
     a port outside 1-65535, plain http for any other host, and a host name written in another script: the browser
     writes such a name in its ``xn--`` form, and the conversions differ (the one at hand turns a sharp s into
     ``ss``, a different name from the one the browser asks for), so the name is taken only as the browser writes it.
+
+    Nor a host name written with a dot at its end. The name with the dot and the name without are one host and two
+    spellings, and the parts of a sign-in do not agree on one: the check of a request's host admits the spelling
+    that was written and refuses the other, a browser at the dotted name writes the dot into the origin it signs,
+    and a provider is given the address without it. A passkey made at one spelling is refused at the other, and a
+    provider's answer comes back to a name the vault refuses. So nothing is built on it: the address is written
+    without the dot.
     """
     raw = (value or "").strip()
     if not raw:
@@ -70,6 +77,8 @@ def problem(value: Optional[str]) -> Optional[str]:
     if not host.isascii():
         return (f"{_NAME} has a host name written in another script: write it in its xn-- form, as the browser's "
                 "address bar shows it")
+    if host.endswith("."):
+        return f"{_NAME} has a host name written with a dot at its end: write it without that dot"
     if _host_problem(host):
         return f"{_NAME} has a host name no browser accepts (letters, digits, hyphens and dots, or an IP address)"
     if port is not None and not (1 <= port <= 65535):

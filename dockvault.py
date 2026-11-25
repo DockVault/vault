@@ -566,8 +566,9 @@ def _port_or(value, default):
 
 def validate_server_name(name):
     """True if `name` is a plain host name / IP (letters, digits, dots, hyphens only) — the charset
-    the setup scripts enforce before it flows into .env, the TLS cert subject, and docker args."""
-    return bool(name) and re.match(r"^[A-Za-z0-9.-]+$", name) is not None
+    the setup scripts enforce before it flows into .env, the TLS cert subject, and docker args. Not a name
+    written with a dot at its end: the vault builds no sign-in on that spelling (app/core/public_url.py)."""
+    return bool(name) and re.match(r"^[A-Za-z0-9.-]+$", name) is not None and not name.endswith(".")
 
 
 def is_ipv4(name):
@@ -691,8 +692,8 @@ def public_web_address(value):
     rest = rest.rstrip("/")
     host, _, port = rest.partition(":")
     if not validate_server_name(host):          # a path fails here or as the port
-        raise ValueError("an address is a name or an IPv4 address (letters, digits, dots, hyphens), with an optional "
-                         "port, and no path")
+        raise ValueError("an address is a name or an IPv4 address (letters, digits, dots, hyphens; no dot at its "
+                         "end), with an optional port, and no path")
     if port and not (port.isdigit() and 1 <= int(port) <= 65535):
         raise ValueError("a port is a number from 1 to 65535")
     host = host.lower()

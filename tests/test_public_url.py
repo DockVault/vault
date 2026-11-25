@@ -82,7 +82,27 @@ def test_a_name_in_another_script_is_taken_only_as_the_browser_writes_it():
     assert pu.problem("https://xn--bcher-kva.example") is None
     assert pu.normalize("https://XN--Bcher-KVA.example:8443") == "https://xn--bcher-kva.example:8443"
     assert pu.normalize("https://xn--strae-oqa.example") == "https://xn--strae-oqa.example"      # never strasse
-    assert pu.normalize("https://vault.example.com.") == "https://vault.example.com"
+
+
+def test_a_host_name_written_with_a_dot_at_its_end_is_no_address_sign_in_is_built_on(monkeypatch):
+    """One host, two spellings, and the parts of a sign-in do not agree on one (the host check admits what was
+    written, a browser there signs an origin with the dot, a provider is sent back without it). The address is
+    refused in words that never repeat it, so no passkey is made or counted there, a requirement waits, and
+    single sign-on says why."""
+    pu = _pu()
+    for written in ("https://vault.example.com.", "https://Vault.Example.COM.:8443", "https://xn--bcher-kva.example./",
+                    "http://localhost.", "https://203.0.113.9."):
+        why = pu.problem(written)
+        assert why and "a dot at its end" in why and "example" not in why and "203" not in why, (written, why)
+        assert pu.normalize(written) == "", written
+    assert pu.problem("https://vault.example.com") is None
+    monkeypatch.setattr(pu, "link_base", lambda: "https://vault.example.com.")
+    assert pu.readiness() == {"usable": False, "rp_id": "", "origin": "", "reason": pu.ADDRESS_NOT_USABLE}
+    assert pu.public_base_url() == "" and pu.expected_origin() == "" and pu.rp_id() == ""
+    assert "a dot at its end" in pu.why_not_usable() and "ALLOWED_HOSTS" in pu.why_not_usable()
+    assert "a dot at its end" in pu.why_no_passkeys()
+    monkeypatch.setattr(pu, "link_base", lambda: "https://vault.example.com")
+    assert pu.readiness()["usable"] is True and pu.rp_id() == "vault.example.com"
 
 
 def test_normalization_writes_the_address_as_a_browser_writes_an_origin():

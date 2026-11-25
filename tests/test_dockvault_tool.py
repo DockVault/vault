@@ -201,6 +201,7 @@ def test_validate_server_name():
     assert dv.validate_server_name("vault.example.com")
     assert dv.validate_server_name("10.0.0.5")
     assert not dv.validate_server_name("")
+    assert not dv.validate_server_name("vault.example.com.")    # a dot at its end: no sign-in is built on it
     assert not dv.validate_server_name("bad name")          # space
     assert not dv.validate_server_name("a;b")               # metachar
 
