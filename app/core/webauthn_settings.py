@@ -1,7 +1,10 @@
 """The passkey settings: what an administrator tunes on Settings → Sign-in, and the rules that read them.
 
 Registered in the settings registry (group ``webauthn``, page ``signin``, lockable by the deployment) so the
-panel lists them with the value in force and ``SETTINGS_LOCKED_KEYS`` can name them; every write goes through
+panel lists them with the value in force and ``SETTINGS_LOCKED_KEYS`` can name them. All but attestation and
+the allowed makes take a .env value under their own name (``WEBAUTHN_MODE`` and so on), so a lock holds the
+deployment's value; those two depend on the trust anchors' file and take none, so a lock holds them at their
+defaults (none, an empty list). Every write goes through
 the sign-in settings routes under the fixed step-up ``admin.auth_policy.write``. The service's policy
 (app/services/webauthn_service.PasskeyPolicy) is built from them here, so the routes never read a setting by
 name.
@@ -77,29 +80,31 @@ def _spec(key: str, kind: str, default, label: str, help: str = "", level: str =
         help=help, since=SINCE, level=level, page=PAGE, **kw))
 
 
-_spec(MODE, "enum", OPTIONAL, "Passkeys", choices=(OFF, OPTIONAL, REQUIRED_FOR_ROLES),
+_spec(MODE, "enum", OPTIONAL, "Passkeys", choices=(OFF, OPTIONAL, REQUIRED_FOR_ROLES), env=MODE,
       help="Off keeps every registered passkey but accepts none: an account whose only second factor is a "
            "passkey sets an authenticator app up at its next sign-in, and its passkeys count again when passkeys "
            "are turned back on. Optional lets people add one. Required for roles makes the roles below set one "
            "up, after a grace period.")
 _spec(REQUIRED_ROLES, "list", [], "Roles that must have a passkey", choices=ROLES, level=registry.ADVANCED,
+      env=REQUIRED_ROLES,
       help="Applies with the mode 'required for roles'. No save-time check can know whether every person's "
            "browser can make a passkey: the grace period and the host tool are the safety net.")
 _spec(GRACE_DAYS, "int", 14, "Days to set a required passkey up", minimum=1, maximum=90, unit="days",
-      level=registry.ADVANCED,
+      level=registry.ADVANCED, env=GRACE_DAYS,
       help="From the first sign-in under the requirement; the person is warned with the date until then.")
 _spec(SIGN_IN_ROLES, "list", ["user", "external"], "Roles a passkey signs in alone", choices=SIGN_IN_CHOICES,
+      env=SIGN_IN_ROLES,
       help="A user-verified passkey is the whole sign-in for these roles. Administrators always type their "
            "password after a passkey; other roles not listed do too. Only a discoverable passkey (one the device or "
            "key keeps with the account) signs in alone; one the browser reported as not discoverable when it was "
            "added is asked for the password too, and still serves as the second factor after it.")
-_spec(REQUIRE_UV, "bool", True, "The authenticator must verify the person",
+_spec(REQUIRE_UV, "bool", True, "The authenticator must verify the person", env=REQUIRE_UV,
       help="Off, a passkey that did not check a PIN, fingerprint or face is one possession factor: the "
            "password always follows it, and it never counts for a compliance step-up. Turned on again, a passkey "
            "that was added while it was off and has never checked one is refused at every use and no longer "
            "counts: an account left with only such passkeys sets a second factor up again at its next sign-in.")
 _spec(ALLOWED_ALGS, "list", ["ES256", "RS256", "EdDSA"], "Signature algorithms", choices=tuple(ALG_CODES),
-      level=registry.ADVANCED,
+      level=registry.ADVANCED, env=ALLOWED_ALGS,
       validate=lambda v: f"{ALLOWED_ALGS} needs at least one algorithm" if not v else None,
       help="Removing one leaves existing keys of it usable for 30 days. Their owners are told when it is removed, "
            "and again when they use such a key; their list of passkeys shows the date.")
@@ -113,7 +118,7 @@ _spec(ALLOWED_AAGUIDS, "list", [], "Allowed authenticator makes", level=registry
            "proves a compliance step-up. While attestation is not direct the list is kept and applies to "
            "nothing.")
 _spec(DEVICE_BOUND_ROLES, "list", [], "Roles whose passkeys must be device-bound", choices=ROLES,
-      level=registry.ADVANCED,
+      level=registry.ADVANCED, env=DEVICE_BOUND_ROLES,
       help="A synced passkey (one copied between devices) is refused for these roles at registration and in "
            "a compliance step-up. Without direct attestation the authenticator's own word is taken for whether "
            "it is synced.")

@@ -419,6 +419,16 @@ class Settings(BaseSettings):
     # A PEM bundle of root certificates for direct passkey attestation (app/core/webauthn_settings.py); empty: direct
     # attestation cannot be turned on.
     webauthn_attestation_roots: str = Field(default="")
+    # The passkey settings' deployment values (app/core/webauthn_settings.py): what Settings -> Sign-in starts from,
+    # and what SETTINGS_LOCKED_KEYS (naming a key, webauthn or *) holds. A list is written comma-separated. An
+    # administrator's saved value wins while nothing locks them.
+    webauthn_mode: str = Field(default="optional")                    # off, optional or required_for_roles
+    webauthn_required_roles: str = Field(default="")                  # among user, external, admin
+    webauthn_enrollment_grace_days: int = Field(default=14)           # 1 to 90
+    webauthn_sign_in: str = Field(default="user,external")            # among user, external (never admin)
+    webauthn_require_uv: bool = Field(default=True)
+    webauthn_allowed_algs: str = Field(default="ES256,RS256,EdDSA")   # at least one of ES256, RS256, EdDSA
+    webauthn_device_bound_roles: str = Field(default="")              # among user, external, admin
     rate_limit_vault_attempts: int = Field(default=5)  # Regular users
     rate_limit_vault_attempts_admin: int = Field(default=20)  # Admins get higher limit
     rate_limit_vault_window_seconds: int = Field(default=300)  # 5 minutes
