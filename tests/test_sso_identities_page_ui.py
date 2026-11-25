@@ -51,7 +51,7 @@ answers['/admin/sso/providers'] = { providers: [PROVIDER], presets: [], icons: [
                                     address: { usable: true, base: 'https://vault.example.test' } };
 answers['/admin/sso/providers/p-1'] = { provider: PROVIDER };
 global.apiRequest = async (path, options) => {
-    asked.push({ path, method: (options || {}).method || 'GET' });
+    asked.push({ path, method: (options || {}).method || 'GET', body: (options || {}).body });
     const answer = Object.prototype.hasOwnProperty.call(answers, path) ? answers[path] : new Error('Not arranged: ' + path);
     if (answer instanceof Error) throw answer;
     return typeof answer === 'function' ? answer() : answer;
@@ -389,8 +389,8 @@ LOCKED = ("Single sign-on is locked in this deployment (SETTINGS_LOCKED_KEYS): t
 @pytest.mark.parametrize("locked", [True, False])
 def test_under_the_lock_the_card_and_the_dialog_say_so_and_offer_no_change(locked):
     """SETTINGS_LOCKED_KEYS naming sso: the card says so in the server's words and offers no "Add a provider"; a
-    provider still opens, its dialog says so first and offers no Turn on or off, Remove or Save, and its fields are
-    read-only. What changes nothing stays: Open, the test sign-in, the addresses to copy; and the Identities page's
+    provider still opens, its dialog says so first and offers no Turn on or off, Turn off again, Remove or Save, and
+    its fields are read-only. What changes nothing stays: Open, the test sign-in, the addresses to copy; and the Identities page's
     Lift and Unlink, whose routes the lock does not stop. Without the lock all of it is offered."""
     got = _node(r"""
 const LOCK = %s;
@@ -410,6 +410,7 @@ const said = byId('sso-locked-line');
 const fields = byId('sso-page-connection').querySelectorAll('input, select, textarea');
 const dialog = { toggle: !!byId('sso-toggle').disabled, save: !!byId('sso-save').disabled,
                  remove: !!byId('sso-remove').disabled, test: !!byId('sso-test').disabled,
+                 end: !!byId('sso-end-sessions').disabled,
                  line: said ? said.textContent : null, first: byId('sso-provider-body').children[0] === said,
                  editable: fields.filter((n) => !n.readOnly).every((n) => !!n.disabled),
                  copies: fields.filter((n) => n.readOnly).map((n) => !!n.disabled),
@@ -432,12 +433,12 @@ out({ card, dialog, patches, lift, unlink, wizardAdd: !!byId('sso-new-add').disa
     assert dialog["copies"] == [False] * 4 and dialog["copyButtons"] == [False] * 4
     if locked:
         assert card["add"] is True and card["line"] == [LOCKED, "alert alert-info mb-md", "status"]
-        assert dialog["toggle"] is True and dialog["save"] is True and dialog["remove"] is True
+        assert dialog["toggle"] is True and dialog["save"] is True and dialog["remove"] is True and dialog["end"] is True
         assert dialog["line"] == LOCKED and dialog["first"] is True and dialog["editable"] is True
         assert got["patches"] == 0 and got["wizardAdd"] is True
     else:
         assert card["add"] is False and card["line"] is None
-        assert dialog["toggle"] is False and dialog["save"] is False and dialog["remove"] is False
+        assert dialog["toggle"] is False and dialog["save"] is False and dialog["remove"] is False and dialog["end"] is False
         assert dialog["line"] is None and dialog["editable"] is False
         assert got["patches"] == 1 and got["wizardAdd"] is False
 
@@ -525,3 +526,102 @@ def test_the_removal_confirmation_names_the_group_mappings_removed_with_the_prov
                           json.dumps("still_on")))
     message, title, label = got["confirm"]
     assert message == said and title == "Remove the provider" and label == "Remove"
+
+
+STANDS = ("{n} that came through {it} could not be ended and stand until they run out: use \"Turn off again\" to end "
+          "them, or end its linked accounts' sessions with \"Terminate Sessions\" on the Users page.")
+
+
+def test_a_turn_off_says_what_it_ended_held_and_left_standing_and_turn_off_again_ends_what_stands():
+    """POST .../state disabled answers how many sessions that came through the provider it ended, how many still stand
+    (they could not be ended), and how many accounts whose days had run out stay held. The dialog says what still
+    stands until it is ended, and "Turn off again" asks the server to end it (an off provider answers changed:false)."""
+    got = _node(r"""
+const OFF = Object.assign({}, PROVIDER, { state: 'disabled' });
+const STATE = '/admin/sso/providers/p-1/state';
+answers[STATE] = { provider: OFF, changed: true, sessions_ended: 3, sessions_not_ended: 2, held: 1 };
+await window.SsoSettings.load();
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+const on = { end: byId('sso-end-sessions') !== null, line: byId('sso-sessions-standing') !== null };
+byId('sso-toggle').click();
+await tick(); await tick(); await tick();
+const line = () => byId('sso-sessions-standing');
+const end = byId('sso-end-sessions');
+const off = { toast: toasts[toasts.length - 1], line: line() && [line().textContent, line().className],
+              aboveTabs: line() && line().nextElementSibling.getAttribute('role') === 'tablist',
+              end: end && [end.textContent, end.getAttribute('aria-label'), !!end.disabled] };
+answers[STATE] = { provider: OFF, changed: false, sessions_ended: 2, sessions_not_ended: 0 };
+byId('sso-end-sessions').click();
+await tick(); await tick(); await tick();
+const again = { toast: toasts[toasts.length - 1], line: line() !== null };
+answers[STATE] = { provider: OFF, changed: false };
+byId('sso-end-sessions').click();
+await tick(); await tick(); await tick();
+out({ on, off, again, nothing: toasts[toasts.length - 1], line: line() !== null,
+      sent: asked.filter((a) => a.path === STATE).map((a) => [a.method, JSON.parse(a.body)]) });
+""")
+    assert got["on"] == {"end": False, "line": False}                 # a provider that is on offers no "Turn off again"
+    toast, kind = got["off"]["toast"]
+    assert kind == "warning"
+    assert toast == ("The provider is off. 3 session(s) that came through it were ended. 1 account(s) whose days there "
+                     "had run out stay held: lift each on the Identities page when it should have its keys back. "
+                     + STANDS.format(n="2 session(s)", it="it"))
+    assert got["off"]["line"] == [STANDS.format(n="2 session(s)", it="this provider"), "alert alert-warning mb-md"]
+    assert got["off"]["aboveTabs"] is True
+    assert got["off"]["end"] == ["Turn off again", "Turn Contoso off again to end the sessions that still stand", False]
+    assert got["again"] == {"toast": ["2 session(s) that came through it were ended.", "success"], "line": False}
+    assert got["nothing"] == ["No session that came through it still stands.", "success"] and got["line"] is False
+    assert got["sent"] == [["POST", {"state": "disabled"}]] * 3
+
+
+def test_a_turn_off_whose_sessions_could_not_be_counted_says_so():
+    got = _node(r"""
+answers['/admin/sso/providers/p-1/state'] = { provider: Object.assign({}, PROVIDER, { state: 'disabled' }),
+                                             changed: true, sessions_ended: 0, sessions_not_ended: null, held: 0 };
+await window.SsoSettings.load();
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+byId('sso-toggle').click();
+await tick(); await tick(); await tick();
+out({ toast: toasts[toasts.length - 1], line: byId('sso-sessions-standing').textContent });
+""")
+    assert got["toast"] == ["The provider is off. " + STANDS.format(n="Sessions", it="it"), "warning"]
+    assert got["line"] == STANDS.format(n="Sessions", it="this provider")
+
+
+def test_a_turn_on_says_whom_its_days_hold_and_a_state_already_reached_says_so():
+    """POST .../state enabled answers how many linked accounts its days hold to a sign-in through it. A turn-off of a
+    provider somebody else turned off meanwhile changes nothing, and is said so. "Turn off again" is offered for a
+    provider that is off, not for one that is on, nor for a draft that never was."""
+    got = _node(r"""
+PROVIDER.state = 'disabled';
+const ON = Object.assign({}, PROVIDER, { state: 'enabled' });
+const STATE = '/admin/sso/providers/p-1/state';
+answers['/admin/sso/providers'].providers = [PROVIDER, { id: 'p-2', name: 'draft', label: null, state: 'disabled',
+    configured: false, tested: false, identities: 0, issuer: null }];
+answers['/admin/sso/providers/p-2'] = { provider: Object.assign({}, PROVIDER, { id: 'p-2', name: 'draft', label: null,
+    configured: false, tested: false, identities: 0, issuer: null }) };
+answers[STATE] = { provider: ON, changed: true, due: 4 };
+await window.SsoSettings.load();
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+const offered = byId('sso-end-sessions') !== null;
+byId('sso-toggle').click();
+await tick(); await tick(); await tick();
+const on = { toast: toasts[toasts.length - 1], end: byId('sso-end-sessions') !== null };
+answers[STATE] = { provider: PROVIDER, changed: false };
+byId('sso-toggle').click();
+await tick(); await tick(); await tick();
+const already = { toast: toasts[toasts.length - 1], end: byId('sso-end-sessions') !== null,
+                  line: byId('sso-sessions-standing') !== null };
+document.querySelectorAll('.sso-provider-row button')[1].click();
+await tick(); await tick();
+out({ offered, on, already, draft: byId('sso-end-sessions') !== null, title: byId('sso-provider-title').textContent });
+""")
+    assert got["offered"] is True
+    assert got["on"] == {"toast": ["The provider is on. 4 linked account(s) have not signed in through it within its "
+                                   "days: their password and passkeys do not sign them in until they have.", "success"],
+                         "end": False}
+    assert got["already"] == {"toast": ["It was already off.", "success"], "end": True, "line": False}
+    assert got["title"] == "draft" and got["draft"] is False

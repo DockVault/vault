@@ -12,12 +12,14 @@
  * its own words. The client secret is typed, sent, and never shown again. A fifth page, Identities, lists the
  * accounts linked to the provider (GET /admin/sso/providers/{id}/identities) and where each stands, lifts a
  * refusal or a hold (POST /admin/sso/identities/{id}/clear-refusal) and unlinks an account (DELETE
- * /admin/sso/identities/{id}), each under the same step-up as a change.
+ * /admin/sso/identities/{id}), each under the same step-up as a change. A turn-on or a turn-off says what it did
+ * to the sessions and the accounts linked to the provider, as the server answers it; sessions a turn-off could not
+ * end are said on the dialog until "Turn off again" (a provider that is off) has ended them.
  *
  * When the deployment locks single sign-on (SETTINGS_LOCKED_KEYS naming sso or *), the server refuses every change
  * to a provider, and the card and the dialog say so in the server's words (`locked_message`) and offer none: no "Add
- * a provider", Turn on or off, Remove or Save, and a provider's fields are read-only. Open, the test sign-in, the
- * addresses to copy and the Identities page's Lift and Unlink stay, as their routes do.
+ * a provider", Turn on or off, Turn off again, Remove or Save, and a provider's fields are read-only. Open, the test
+ * sign-in, the addresses to copy and the Identities page's Lift and Unlink stay, as their routes do.
  *
  * Uses app.js's apiRequest, openModal, closeModal, showConfirm, showToast and _el, and sso.js's Sso.startTest.
  * Builds everything with createElement and textContent.
@@ -35,6 +37,7 @@
     let identitiesFrom = 0;     // where the Identities page starts in the provider's list of accounts
     let identityReads = 0;      // only the latest read of that list draws it
     let identitiesNote = null;  // a refused removal's sentence, said once at the top of the Identities page
+    let standing = {};          // by provider: sessions a turn-off could not end (a number; null: not counted)
 
     const ICON_NAMES = { generic: 'Plain', microsoft: 'Microsoft', google: 'Google', okta: 'Okta', keycloak: 'Keycloak', authentik: 'Authentik' };
     const PAGES = [['connection', 'Connection'], ['access', 'Access'], ['factor', 'Second factor'], ['sessions', 'Sessions'],
@@ -724,6 +727,44 @@
 
     // ---------------------------------------------------------------- the dialog
 
+    // Sessions that came through a provider and could not be ended when it was turned off stand until they run out.
+    // The server's sentence for them (_said_of_sessions_standing in app/api/sso_providers_router.py), with what this
+    // page offers to end them; `through` is 'it' after the provider was named, 'this provider' on its own. Empty
+    // when none stands: `n` is how many stand, or null when they could not be counted.
+    function standingSaid(n, through) {
+        if (n !== null && !(n > 0)) return '';
+        const many = n === null ? 'Sessions' : `${n} session(s)`;
+        return `${many} that came through ${through} could not be ended and stand until they run out: use "Turn off `
+            + 'again" to end them, or end its linked accounts\' sessions with "Terminate Sessions" on the Users page.';
+    }
+
+    const standsIn = (out) => !!out && (out.sessions_not_ended === null || out.sessions_not_ended > 0);
+    const stands = (id) => Object.prototype.hasOwnProperty.call(standing, id)
+        && standsIn({ sessions_not_ended: standing[id] });
+
+    // What a turn-on or a turn-off did, as POST .../state answers it.
+    function stateSaid(state, out) {
+        const ended = out.sessions_ended ? ` ${out.sessions_ended} session(s) that came through it were ended.` : '';
+        const left = standingSaid(out.sessions_not_ended, 'it');
+        const still = left ? ' ' + left : '';
+        if (!out.changed) {
+            // Somebody else had turned it so meanwhile. An off provider whose sessions still stood ended them.
+            return `It was already ${state === 'enabled' ? 'on' : 'off'}.` + ended + still;
+        }
+        if (state === 'enabled') {
+            return 'The provider is on.' + (out.due ? ` ${out.due} linked account(s) have not signed in through it `
+                + 'within its days: their password and passkeys do not sign them in until they have.' : '');
+        }
+        return 'The provider is off.' + ended + (out.held ? ` ${out.held} account(s) whose days there had run out stay `
+            + 'held: lift each on the Identities page when it should have its keys back.' : '') + still;
+    }
+
+    // What the server said of a provider's sessions, kept for its dialog: a turn-on leaves nothing to say.
+    function noteStanding(id, state, out) {
+        if (state === 'enabled' && out.changed) delete standing[id];
+        else if (Object.prototype.hasOwnProperty.call(out, 'sessions_not_ended')) standing[id] = out.sessions_not_ended;
+    }
+
     async function setState(state) {
         if (state === 'disabled' && open.only_way_in_accounts) {
             const ok = await showConfirm(`${open.only_way_in_accounts} account(s) linked to this provider have no other way `
@@ -736,12 +777,50 @@
             const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(asked)}/state`, {
                 method: 'POST', body: JSON.stringify({ state }), silent: true,
             });
+            noteStanding(asked, state, out);
             if (!open || open.id !== asked) { load(); return; }       // as after a save
             open = out.provider;
-            showToast(state === 'enabled' ? 'The provider is on.' : 'The provider is off.', 'success');
+            showToast(stateSaid(state, out), standsIn(out) ? 'warning' : 'success');
             drawDialog({ focus: 'sso-toggle' });
             load();
         } catch (e) { showToast(e.message || 'The provider was not changed.', 'error'); }
+    }
+
+    // "Turn off again": a provider that is off is asked again to end the sessions that came through it and still
+    // stand. The server answers changed:false, with what it ended, or with nothing when none stood (and then asked
+    // for no step-up). Turned on by somebody meanwhile, the provider is turned off, and that is said.
+    async function endSessions() {
+        if (lockedNow() || !open) return;
+        const asked = open.id;
+        const button = byId('sso-end-sessions');
+        if (button) button.disabled = true;
+        try {
+            const out = await apiRequest(`/admin/sso/providers/${encodeURIComponent(asked)}/state`, {
+                method: 'POST', body: JSON.stringify({ state: 'disabled' }), silent: true,
+            });
+            let said;
+            if (out.changed) {
+                noteStanding(asked, 'disabled', out);
+                said = stateSaid('disabled', out);
+            } else if (!Object.prototype.hasOwnProperty.call(out, 'sessions_ended')
+                    && !Object.prototype.hasOwnProperty.call(out, 'sessions_not_ended')) {
+                standing[asked] = 0;
+                said = 'No session that came through it still stands.';
+            } else {
+                noteStanding(asked, 'disabled', out);
+                said = ((out.sessions_ended ? `${out.sessions_ended} session(s) that came through it were ended. ` : '')
+                    + standingSaid(out.sessions_not_ended, 'it')).trim()
+                    || 'No session that came through it still stands.';
+            }
+            if (!open || open.id !== asked) { load(); return; }       // as after a save
+            open = out.provider;
+            showToast(said, standsIn(out) ? 'warning' : 'success');
+            drawDialog({ focus: 'sso-end-sessions' });
+            load();
+        } catch (e) {
+            showToast(e.message || 'The sessions were not ended.', 'error');
+            if (button) button.disabled = false;
+        }
     }
 
     // The refusals whose sentence sends the administrator to the provider's Identities page: accounts held by it
@@ -861,7 +940,7 @@
             said.id = 'sso-locked-line';
             body.appendChild(said);
         }
-        const head = _el('div', 'flex items-center gap-sm mb-md');
+        const head = _el('div', 'flex flex-wrap items-center gap-sm mb-md');
         const [word, badge] = status(open);
         const mark = _el('span', 'badge ' + badge, word);
         mark.id = 'sso-provider-state';
@@ -880,7 +959,24 @@
             gone.addEventListener('click', remove);
             head.appendChild(gone);
         }
+        // A provider that is off may still have sessions that came through it (a turn-off could not end them):
+        // turning it off again ends them. Not offered for a draft that was never on.
+        if (open.state === 'disabled' && (open.configured || open.identities > 0 || stands(open.id))) {
+            const again = _el('button', 'btn btn-secondary btn-sm', 'Turn off again');
+            again.type = 'button';
+            again.id = 'sso-end-sessions';
+            again.disabled = locked;
+            again.setAttribute('aria-label',
+                `Turn ${open.label || open.name} off again to end the sessions that still stand`);
+            again.addEventListener('click', endSessions);
+            head.appendChild(again);
+        }
         body.appendChild(head);
+        if (open.state === 'disabled' && stands(open.id)) {
+            const left = _el('div', 'alert alert-warning mb-md', standingSaid(standing[open.id], 'this provider'));
+            left.id = 'sso-sessions-standing';
+            body.appendChild(left);
+        }
         const tabs = _el('div', 'sso-tabs flex gap-sm mb-md');
         tabs.setAttribute('role', 'tablist');
         PAGES.forEach(([key, text]) => {
@@ -1016,6 +1112,7 @@
         identityReads += 1;
         identitiesFrom = 0;
         identitiesNote = null;
+        standing = {};
         data = null;
         open = null;
         forgetDrafts();
