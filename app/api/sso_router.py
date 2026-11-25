@@ -679,6 +679,20 @@ def _end_what_came_through(db, account, identity) -> int:
     return ended
 
 
+def _sessions_by_owner(db, session_ids, owners) -> dict:
+    """How many of ``session_ids`` are each account's and not ended yet (what the logout is about to end), as
+    ``{account id: count}``; every account in ``owners`` is there, with 0 when the token named the person and none
+    of their sessions was open. A session a renewal has replaced is ended already, and is not counted."""
+    counts = {str(owner): 0 for owner in owners}
+    if session_ids:
+        from app.core.models import ActiveSession
+        for row in db.query(ActiveSession).filter(ActiveSession.id.in_(list(session_ids))).all():
+            counts.setdefault(str(row.user_id), 0)
+            if not getattr(row, "revoked", False):
+                counts[str(row.user_id)] += 1
+    return counts
+
+
 def _owners_of(db, session_ids) -> list:
     """The accounts the given sessions belong to, in one order always (two logouts that name the same accounts take
     their turns the same way round)."""
@@ -741,6 +755,8 @@ def _end_what_a_logout_names(db, row_id, scope, claims, client_ip):
         for owner in sorted(owners):
             api._sessions_turn(db, owner)
         session_ids = [s.session_id for s in query.all()]
+        # Whose each of them is, for the record: read while the turns are held, like the sessions themselves.
+        sessions_of = _sessions_by_owner(db, session_ids, owners)
         ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout",
                                      durable=True) if session_ids else 0
     except Exception as exc:  # noqa: BLE001 -- nothing was applied: the token is not spent, so the provider's retry works
@@ -763,7 +779,17 @@ def _end_what_a_logout_names(db, row_id, scope, claims, client_ip):
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
                details={"provider_id": scope, "reason": "revocation_failed"})
         return failed
-    _audit(db, "sso_backchannel_logout", ip=client_ip, details={"provider_id": scope, "by": by, "sessions": ended})
+    # Recorded for each account the token named, with how many of its sessions ended: an administrator who looks
+    # for the person finds that their provider signed them out. One row said only how many sessions ended, of
+    # nobody's. A token that named nobody here leaves that one row.
+    accounts = {str(u.id): u for u in db.query(User).filter(User.id.in_([uuid.UUID(o) for o in sessions_of])).all()} \
+        if sessions_of else {}
+    for owner, count in sorted(sessions_of.items()):
+        if owner in accounts:
+            _audit(db, "sso_backchannel_logout", user=accounts[owner], ip=client_ip,
+                   details={"provider_id": scope, "by": by, "sessions": count})
+    if not accounts:
+        _audit(db, "sso_backchannel_logout", ip=client_ip, details={"provider_id": scope, "by": by, "sessions": ended})
     return JSONResponse(status_code=200, content={})
 
 

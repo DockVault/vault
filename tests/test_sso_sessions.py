@@ -542,6 +542,52 @@ def test_a_providers_logouts_are_not_cut_off_by_the_sign_in_forms_limit(monkeypa
     assert rate_limiter.classify_api_rate_limit("POST", f"/auth/sso/{p.id}/start") == "auth"
 
 
+def test_a_providers_logout_is_recorded_for_each_account_it_names(monkeypatch):
+    """Activity showed "Provider signed the person out" for nobody: the row carried how many sessions ended and no
+    account. It is written for each account the token named, with that account's count, also where the token
+    named the person and none of their sessions was open; a token that named nobody here leaves one row, of
+    nobody's."""
+    from app.api import sso_router
+    alice, bob, p = _user(), _user("bob"), _provider()
+    h = Sessions(monkeypatch, [alice, bob], [p], identities=[_identity(alice, p), _identity(bob, p, subject="subject-bob")])
+    for sid in ("s-1", "s-2"):
+        waiting, _ = _sign_in(h, p, sid=sid)
+        assert h.finish(waiting)[0] == 200
+    written = []
+    monkeypatch.setattr(sso_router, "_audit", lambda db, action, *, user=None, ip, details, status_="success", **kw: (
+        written.append((action, getattr(user, "username", None), status_, dict(details)))))
+    # By the person: both of Alice's sessions, in one row that is hers.
+    assert h.logout(p, h.logout_token(sub="subject-1"))[0] == 200
+    assert written == [("sso_backchannel_logout", "alice", "success", {"provider_id": str(p.id), "by": "sub", "sessions": 2})]
+    # A person with no session open is named all the same: their sign-ins under way end with this.
+    del written[:]
+    assert h.logout(p, h.logout_token(sub="subject-bob"))[0] == 200
+    assert written == [("sso_backchannel_logout", "bob", "success", {"provider_id": str(p.id), "by": "sub", "sessions": 0})]
+    # A session nobody here has: one row, of nobody's.
+    del written[:]
+    assert h.logout(p, h.logout_token(sid="s-unknown"))[0] == 200
+    assert written == [("sso_backchannel_logout", None, "success", {"provider_id": str(p.id), "by": "sid", "sessions": 0})]
+    # By the provider's session: the one account it belongs to, and that session only.
+    waiting, _ = _sign_in(h, p, sid="s-3")
+    assert h.finish(waiting)[0] == 200
+    other, _ = _sign_in(h, p, sid="s-4", sub="subject-bob", email="bob@example.test")
+    assert h.finish(other)[0] == 200
+    del written[:]
+    assert h.logout(p, h.logout_token(sid="s-3"))[0] == 200
+    assert written == [("sso_backchannel_logout", "alice", "success", {"provider_id": str(p.id), "by": "sid", "sessions": 1})]
+    # Should one provider session ever stand on two accounts, each row says that account's own count.
+    waiting, _ = _sign_in(h, p, sid="s-5")
+    assert h.finish(waiting)[0] == 200
+    for record in h.sso_sessions():
+        if record.idp_sid == "s-4":
+            record.idp_sid = "s-5"
+    del written[:]
+    assert h.logout(p, h.logout_token(sid="s-5"))[0] == 200
+    assert sorted(written) == [
+        ("sso_backchannel_logout", "alice", "success", {"provider_id": str(p.id), "by": "sid", "sessions": 1}),
+        ("sso_backchannel_logout", "bob", "success", {"provider_id": str(p.id), "by": "sid", "sessions": 1})]
+
+
 def test_a_logout_waits_for_a_slot_that_frees_up(monkeypatch):
     """Every slot in use, then one freed within the wait: the logout is verified, not refused."""
     import asyncio
