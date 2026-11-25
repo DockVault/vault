@@ -416,3 +416,69 @@ def test_the_looked_up_account_says_which_of_its_passkeys_it_can_sign_in_with(ca
             "operator: 2026-11-20T10:00:00Z)\n") in capsys.readouterr().out
     Tool._show_account(plain, {k: v for k, v in account.items() if k != "passkeys_usable"})
     assert "  passkeys:      2\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("allowed, port, opened", [
+    ("vault.example.com", "8443", "https://vault.example.com:8443"),
+    ("https://vault.example.com", "8443", "https://vault.example.com:8443"),
+    ("vault.example.com:9443", "8443", "https://vault.example.com:8443"),
+    ("https://vault.example.com:8443", "443", "https://vault.example.com"),
+    # Plain http is port 80: the web UI is published on 443 with https.
+    ("http://vault.example.com", "443", "https://vault.example.com"),
+    ("https://[2001:db8::1]", "8443", "https://[2001:db8::1]:8443"),
+])
+def test_a_first_address_on_another_port_than_the_published_one_is_said(allowed, port, opened):
+    note = dv.allowed_hosts_port_note(allowed, port)
+    base = dv._allowed_hosts_link_base(allowed)
+    assert note.startswith("the first address in ALLOWED_HOSTS is %s, and the web UI is published on port %s. "
+                           % (base, port)), note
+    assert ("If people open the vault at %s, put that address first in ALLOWED_HOSTS and run python dockvault.py "
+            "restart: emailed links, passkeys and single sign-on all use the first address." % opened) in note
+    assert note.endswith("Behind a reverse proxy or port forwarding the first address is the proxy's, and this note "
+                         "does not apply.")
+
+
+@pytest.mark.parametrize("allowed, port", [
+    ("https://vault.example.com:8443", "8443"), ("vault.example.com", "443"), ("vault.example.com", None),
+    ("", "8443"), (None, "8443"), ("*.example.com", "8443"), ("vault.example.com:8443", "8443"),
+    ("http://localhost:8080", "8080"),
+    # A port that is none is published on the default, 443, as setup and status read it.
+    ("vault.example.com", "not a port"), ("vault.example.com", "99999"),
+    # An address the vault builds no sign-in on is said by the note on the address itself.
+    ("https://vault.example.com:notaport", "8443"),
+])
+def test_a_first_address_on_the_published_port_or_none_gets_no_note(allowed, port):
+    assert dv.allowed_hosts_port_note(allowed, port) is None
+
+
+def _status_tool(monkeypatch, tmp_path, env):
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    tool = dv.DockVault.__new__(dv.DockVault)
+    tool.pal = types.SimpleNamespace(paint=lambda text, colour=None: text)
+    tool.root = str(tmp_path)
+    (tmp_path / ".env").write_text("ALLOWED_HOSTS=x\n", encoding="utf-8")
+    monkeypatch.setattr(tool, "_load_env", lambda: env)
+    monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: None)
+    monkeypatch.setattr(tool, "_passkey_addresses", lambda: None)
+    monkeypatch.setattr(dv, "docker_available", lambda: (True, ""))
+    return tool, printed
+
+
+def test_status_says_when_the_first_address_names_another_port(monkeypatch, tmp_path):
+    tool, printed = _status_tool(monkeypatch, tmp_path, {"ALLOWED_HOSTS": "vault.example.com", "WEB_HOST_PORT": "8443"})
+    tool._print_status("combined")
+    said = [line for line in printed if line.startswith("  Address: ")]
+    assert said == ["  Address: " + dv.allowed_hosts_port_note("vault.example.com", "8443")], printed
+    # After the lines about passkeys, which an address reached by IP adds.
+    printed.clear()
+    monkeypatch.setattr(tool, "_load_env", lambda: {"ALLOWED_HOSTS": "203.0.113.9", "WEB_HOST_PORT": "8443"})
+    tool._print_status("combined")
+    lines = [line for line in printed if line.startswith(("  Sign-in: ", "  Address: "))]
+    assert [line.split(":")[0] for line in lines] == ["  Sign-in", "  Address"], printed
+    for quiet in ({"ALLOWED_HOSTS": "https://vault.example.com:8443", "WEB_HOST_PORT": "8443"},
+                  {"ALLOWED_HOSTS": "vault.example.com"}):
+        printed.clear()
+        monkeypatch.setattr(tool, "_load_env", lambda env=quiet: env)
+        tool._print_status("combined")
+        assert not [line for line in printed if "Address:" in line], (quiet, printed)

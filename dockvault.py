@@ -1003,6 +1003,35 @@ def sign_in_address_note(allowed_hosts):
     return said + " A passkey requirement set for a role in Settings waits meanwhile, and locks nobody out."
 
 
+def allowed_hosts_port_note(allowed_hosts, web_host_port):
+    """What status and a healthy update say when the address the vault gives out (ALLOWED_HOSTS's first entry that is
+    not a wildcard) names another port than the one the web UI is published on (WEB_HOST_PORT, 443 when unset), or
+    None. The published port is the only one this tool knows: the address people open is not kept in .env, so a
+    reverse proxy or port forwarding in front of the vault is named in the note rather than told apart. An address
+    the vault builds no sign-in on (a port that is none among them) is said by sign_in_address_note instead."""
+    from urllib.parse import urlsplit
+    base = _allowed_hosts_link_base(allowed_hosts)
+    if not base:
+        return None
+    try:
+        parts = urlsplit(base)
+        host = parts.hostname
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        return None
+    if not host:
+        return None
+    published = _port_or(web_host_port, 443)
+    if port == published:
+        return None
+    named = "[%s]" % host if ":" in host else host
+    opened = "https://%s" % named if published == 443 else "https://%s:%d" % (named, published)
+    return ("the first address in ALLOWED_HOSTS is %s, and the web UI is published on port %d. If people open the "
+            "vault at %s, put that address first in ALLOWED_HOSTS and run python dockvault.py restart: emailed links, "
+            "passkeys and single sign-on all use the first address. Behind a reverse proxy or port forwarding the "
+            "first address is the proxy's, and this note does not apply." % (base, published, opened))
+
+
 def build_env_lines(cfg):
     """Build the .env content (list of lines) from a collected-config dict — deterministic + pure
     (it does NOT generate secrets; the caller passes them in). Values are single-quoted, matching
@@ -5550,7 +5579,8 @@ class DockVault:
 
     def _print_sign_in_lines(self, env):
         """What `status` says about signing in at this deployment, and a healthy update says after it: only the lines
-        that say something needs doing (an address no passkey can be made at, passkeys made at another address).
+        that say something needs doing (an address no passkey can be made at, passkeys made at another address, a first
+        address on another port than the web UI's).
         ``env`` is the parsed .env; with none, nothing is said. The running deployment is asked for a warning only,
         so nothing here fails the command that prints it."""
         if not env:
@@ -5564,6 +5594,9 @@ class DockVault:
         elsewhere = passkeys_elsewhere_note(self._passkey_addresses(), passkey_host(allowed))
         if elsewhere:
             print(pal.paint("  Passkeys: %s" % elsewhere, "yellow"))
+        port_note = allowed_hosts_port_note(allowed, env.get("WEB_HOST_PORT"))
+        if port_note:
+            print(pal.paint("  Address: " + port_note, "yellow"))
 
     def setup(self, args=None):
         """Configure + start the standalone HTTPS vault: author (or reuse) .env, provision a TLS
