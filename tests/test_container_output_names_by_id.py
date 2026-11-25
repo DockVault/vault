@@ -21,6 +21,7 @@ The check is a floor, not a proof: a name carried under another name (``who = us
 passes it. The text of an error is another matter (tests/test_error_logs_keep_no_text.py).
 """
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -226,3 +227,42 @@ def test_the_check_finds_each_shape_it_looks_for_and_nothing_else():
         "user.email",
     ]), found
     assert {function for _line, function, _read in finder.found} == {"shapes"}
+
+
+class _Database:
+    """Stands in for the database the start reads: keeps the statements it is sent, and answers the one query with the
+    rows given, as the database answers the shipped one (one row of account ids per address)."""
+
+    def __init__(self, rows):
+        self.sent = []
+        self._rows = rows
+
+    def execute(self, statement):
+        self.sent.append(str(statement))
+        rows = self._rows
+
+        class _Answer:
+            def fetchall(self):
+                return list(rows)
+
+        return _Answer()
+
+
+def test_the_start_lists_the_accounts_that_share_an_address_by_id_only():
+    """A start that finds an address held by accounts differing only in case prints each address's accounts
+    (app/api/api_server.py, the step of the case-insensitive email index). The check above cannot see what that line
+    reads: it prints what find_email_collisions returns, under the name account_ids. So the query is read here: it
+    selects the accounts' ids and nothing else, neither the address nor a user name, and its answer is printed as it
+    came."""
+    from app.core.email_identity import find_email_collisions
+
+    rows = [("0b5e7f2c-1a2b-4c3d-8e9f-0a1b2c3d4e5f, 7d1c2b3a-4e5f-4a6b-9c8d-7e6f5a4b3c2d",),
+            ("1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b, 9a8b7c6d-5e4f-4321-8fed-cba987654321",)]
+    database = _Database(rows)
+    assert find_email_collisions(database) == [rows[0][0], rows[1][0]]
+    (sql,) = database.sent
+    selected = re.search(r"\bSELECT\b(.*?)\bFROM\b", re.sub(r"--[^\n]*", "", sql), re.S | re.I)
+    assert selected, sql
+    names = set(re.findall(r"[a-z_]+", selected.group(1).lower())) - {"string_agg", "text", "order", "by", "as",
+                                                                       "account_ids"}
+    assert names == {"id"}, selected.group(1)

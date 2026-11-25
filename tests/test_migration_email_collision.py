@@ -4,7 +4,8 @@
 today can legitimately hold `Bob@x.com` and `bob@x.com` as two accounts. The case-insensitive
 unique index cannot be built there.
 
-The chosen behaviour is: skip the index, warn naming the accounts, and boot anyway. The rejected
+The chosen behaviour is: skip the index, warn naming the accounts by id (the container output names
+an account by its id, never by its username or address), and boot anyway. The rejected
 alternatives matter as much as the choice —
 
 * **failing boot** would take a self-hosted vault down in the middle of an unattended update and
@@ -86,16 +87,17 @@ def test_a_pre_existing_case_collision_is_survived_not_fatal():
     local = f"collide_{uuid.uuid4().hex[:10]}"
     lower, upper = f"{local}@example.com", f"{local.upper()}@EXAMPLE.COM"
     user_a, user_b = f"{local}_a", f"{local}_b"
+    id_a, id_b = str(uuid.uuid4()), str(uuid.uuid4())
 
     try:
         # Recreate the pre-upgrade world: no case-insensitive index, and two accounts that
         # differ only in case. Both inserts must go in with the index gone, exactly as they
         # would have on a deployment that never had one.
         _psql(f"DROP INDEX IF EXISTS {INDEX}", fetch=False)
-        for username, address in ((user_a, lower), (user_b, upper)):
+        for account_id, username, address in ((id_a, user_a, lower), (id_b, user_b, upper)):
             _psql(
                 "INSERT INTO users (id, username, email, password_hash, role, is_active, "
-                "created_at) VALUES (gen_random_uuid(), "
+                f"created_at) VALUES ('{account_id}', "
                 f"'{username}', '{address}', 'x', 'USER', true, now())",
                 fetch=False,
             )
@@ -113,8 +115,13 @@ def test_a_pre_existing_case_collision_is_survived_not_fatal():
             "boot produced no mention of the skipped index; the operator's only signal that "
             f"uniqueness is degraded is this warning. Logs:\n{logs[-1500:]}"
         )
-        assert user_a in logs and user_b in logs, (
-            "the warning did not NAME the colliding accounts, so an operator cannot act on it. "
+        assert id_a in logs and id_b in logs, (
+            "the warning did not name the colliding accounts by id, so an operator cannot act on it. "
+            f"Logs:\n{logs[-1500:]}"
+        )
+        # Neither username nor either address reaches the container output (both start with `local`).
+        assert local not in logs.lower(), (
+            "the warning named a colliding account by its username or address, not by its id. "
             f"Logs:\n{logs[-1500:]}"
         )
 
