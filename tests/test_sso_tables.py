@@ -107,5 +107,9 @@ def test_the_inventory_the_notice_and_the_erase_know_the_stores():
     notice = {s.key for s in rn.STORES}
     assert {"external_identities", "sso_sessions", "sso_providers", "sso_admin_requests"} <= notice
     assert "encrypted" in next(s for s in rn.STORES if s.key == "sso_sessions").what
+    # The last test's summary names people: who ran it, and the account a sign-in of their identity would reach.
+    providers = next(s for s in rn.STORES if s.key == "sso_providers").what
+    assert ("the summary of its last test sign-in (the tester's username, and the account a sign-in of the tester's "
+            "identity would link or create)") in providers
     # The usernames kept after an account is deleted are replaced by a per-person erase.
     assert "sso_providers" in pe.STORE_KEYS and "sso_admin_requests" in pe.STORE_KEYS

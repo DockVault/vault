@@ -580,3 +580,34 @@ console.log(JSON.stringify({
     assert out["host"]["text"] == "Server operator" and out["host"]["quiet"] is True
     assert "operator@host" in out["host"]["title"]
     assert out["person"] == {"text": "alice", "quiet": False}
+
+
+# ---- the Sign-ins panel ---------------------------------------------------------------------------
+
+SIGN_INS = ("".join(_line(head) for head in ("const $ =", "const SVGNS =", "const nf ="))
+            + "".join(_fn(n) for n in ("el", "icon", "svg", "button", "plural", "panelHead", "plotState", "focusKeyIn",
+                                       "refocus", "roving", "setRoving", "outcomeActions", "outcomeChosen",
+                                       "renderSignInPanel")))
+
+
+def test_each_sign_in_row_says_what_it_counts():
+    """The Sign-ins panel's rows, Signed in, Failed and Locked out, each say on hover what they count: Failed counts
+    sign-ins through a provider that were refused as well as wrong passwords, codes and passkeys."""
+    out = _node("""
+const dom = require('./tests/js/mini_dom.js');
+const { document } = dom.install();
+const panel = document.createElement('div'); panel.id = 'act-p-signin'; document.body.appendChild(panel);
+const panelFiltered = () => false, toggleOutcome = () => {}, loadBand = () => {};
+let S = { band: { sign_ins: { succeeded: 7, failed: 3, locked: 1 } }, f: { act: [] },
+          outcomes: { succeeded: ['login_success'], failed: ['login_failure', 'second_factor_failed', 'sso_sign_in_refused'],
+                      locked: ['account_auto_locked'] } };
+""" + SIGN_INS + """
+renderSignInPanel();
+console.log(JSON.stringify(panel.querySelectorAll('.act-signin-row').map((b) => [b.textContent, b.getAttribute('title')])));
+""")
+    assert out == [
+        ["Signed in7", "Signed in: 7. Click to filter."],
+        ["Failed3", "Failed: 3. Wrong passwords and codes, refused passkeys, refused sign-ins through a provider, and "
+                    "any other refused sign-in. Click to filter."],
+        ["Locked out1", "Automatic lockouts after failed sign-ins, from one address or for the whole account."],
+    ]

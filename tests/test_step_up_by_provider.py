@@ -133,6 +133,26 @@ out({ seen, asked, body: posted[0].body });
     assert got["body"] == {"action": "compliance.case.request", "method": "totp", "code": "123456", "password": "pw"}
 
 
+def test_an_sso_script_from_before_the_provider_list_keeps_the_dialog_to_the_password():
+    """A tab that still holds an sso.js from before the dialog offered the provider (its Sso has no confirmers) draws
+    the dialog that script went with, the password field, instead of breaking on a call the script does not have."""
+    got = _node(r"""
+delete window.Sso.confirmers;
+requestStepUpReceipt('vault.delete', ['idp_reauth', 'password']);
+await tick(); await tick();
+const seen = { opened: opened.slice(), password: !!byId('stepup-password-input'), providers: !!byId('stepup-providers'),
+               buttons: buttons() };
+byId('stepup-password-input').value = 'pw';
+press('Confirm');
+await tick();
+out({ seen, started, body: posted[0].body });
+""")
+    assert got["seen"] == {"opened": ["stepup-modal"], "password": True, "providers": False,
+                           "buttons": ["Cancel", "Confirm"]}
+    assert got["started"] == []
+    assert got["body"] == {"action": "vault.delete", "method": "password", "password": "pw"}
+
+
 def test_a_confirmation_noted_for_the_action_is_not_spent_where_the_server_asks_for_the_password_alone():
     """The account has a password again, or the provider was turned off, within the two minutes: the step-up of the
     same action lists the password alone. The tab spends nothing and asks for the password, with no word of the
