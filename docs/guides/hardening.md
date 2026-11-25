@@ -28,8 +28,9 @@ Treat `.env` and the backups as the most sensitive things you hold.
 - **Publish only what is used:** the web port, and the SFTP port only if SFTP is used. Keep PostgreSQL and Redis on
   the internal network; set `REDIS_PASSWORD` and `ALLOWED_HOSTS`.
 - **Require a second factor for administrators.** Every compliance step asks for the password and an
-  authenticator or recovery code whatever the step-up settings say, but the rest of an administrator's work follows
-  the step-up matrix in Settings. A few changes always ask for the password, and the second factor when the
+  authenticator code, a recovery code or a passkey that verified the person (for an auditor who is not an
+  administrator, only a passkey their auditor right was approved or last reconfirmed with) whatever the step-up
+  settings say, but the rest of an administrator's work follows the step-up matrix in Settings. A few changes always ask for the password, and the second factor when the
   administrator has one, whatever the matrix says: how long records are kept, what the audit log records,
   acknowledging its integrity warnings, letting a sign-in last longer (a longer session timeout or "Stay
   signed in" limit), how people sign in, and changing or testing the mail server settings (a sending profile,
@@ -43,8 +44,68 @@ Treat `.env` and the backups as the most sensitive things you hold.
 - **State a contact** in Settings (the recording notice's contact): it is the address every notice to a vault's
   owner gives for questions and objections.
 - **Lock what must not change from the admin panel** with `SETTINGS_LOCKED_KEYS` (a key, or a group). The
-  compliance settings are set in `.env` only.
+  compliance settings are set in `.env` only. The groups `sso` and `webauthn` act differently: see
+  [Sign-in](#sign-in-passkeys-and-single-sign-on).
 - **Keep the images current** with `dockvault.py update`, and read the upgrade notes of each release.
+
+## Sign-in: passkeys and single sign-on
+
+Both are set under Settings, Sign-in methods. Each change there is saved on its own and asks for the
+administrator's password, and the second factor when they have one. Both work only at the vault's address, the
+first `ALLOWED_HOSTS` entry. Passkeys need an `https` host name (not an address reached by IP) with a certificate
+browsers trust: Chrome and Edge refuse passkeys on a self-signed certificate the device does not trust. Single
+sign-on needs an `https` address, and an IP address serves it where the provider accepts one as a redirect address
+(Google does not). `python dockvault.py status` says whether passkeys can be made at the address, and why not.
+
+- **Require passkeys where you want sign-ins that cannot be phished**, administrators first. Set **Passkeys** to
+  **Required for roles** and choose the roles in **Roles that must have a passkey**, which is empty by default, so
+  the mode alone requires nobody. Each account then has **Days to set a required passkey up** (14 by default),
+  counted from its first sign-in under the requirement. The requirement waits while no passkey can be made at the
+  vault's address. When a person's browser cannot make a passkey, the server's operator lets that one account in
+  without it: `python dockvault.py accounts --action clear-passkey-requirement`, with the account's username typed
+  twice (see the [README](../../README.md#account-changes-from-the-host)).
+- **Keep The authenticator must verify the person on**, as it is by default. Off, a passkey that checked no PIN,
+  fingerprint or face is one factor: the password always follows it, and it never counts for a compliance step-up.
+- **Roles a passkey signs in alone** (user and external by default): for these roles a passkey that verified the
+  person, and that the device keeps with the account, is the whole sign-in. Administrators and holders of the
+  auditor right always type their password too. Empty the list to keep the password for everyone.
+- **Roles whose passkeys must be device-bound** refuses a synced passkey for those roles when one is added and in
+  a compliance step-up. Without direct attestation the authenticator's own word is taken for whether a key is
+  synced.
+- **Attestation** set to **Direct** checks the make of each new passkey against the root certificates in the file
+  `WEBAUTHN_ATTESTATION_ROOTS` names, and **Allowed authenticator makes** can then limit new passkeys to the makes
+  you list. Put only authenticator vendors' attestation roots in that file, never a general-purpose certificate
+  authority. Only the HTTPS compose lets the server read the file. Passkeys added before direct attestation was
+  turned on keep signing in, and no longer prove a compliance step-up.
+- **Restrict every provider** to your organisation on its Access page: **Tenants** (Microsoft Entra ID),
+  **Domains** (Google Workspace), **Required groups**, or the sign-up domain list when it is an allow-list. A
+  provider makes accounts at a first sign-in, or links an existing account by its verified email, only when it
+  says who may sign in. An Entra issuer already names your tenant, so a tenant there keeps nobody out: require a
+  group, and in Entra let only assigned people use the app.
+- **Keep the leaver rules on** (the provider's Sessions page, all on by default): back-channel logout; a refusal
+  by the provider ends access here; the days a person may go without signing in through the provider (30; 0 turns
+  it off), after which their SSH keys, temporary credentials and devices pause; and after those days or a refusal,
+  the account signs in only through a provider (its password on the web and over SFTP, a passkey by itself, and
+  Stay signed in after a sign-in made without a provider are refused). Microsoft Entra ID and Google send no
+  back-channel logout, so for their people the days and the refusal are what end access. Turning a provider off
+  during an incident gives nobody a password back: the accounts it held stay held.
+- **Count a provider's second factor only on purpose** (off by default), and only with the `amr` or `acr` values
+  you list. The Second factor page shows what the last test sign-in carried.
+- **Administrators keep their password.** No administrator or holder of the auditor right is held to a provider.
+  When a provider cannot be reached, an administrator signs in with the password (and the second factor), and can
+  turn the provider off.
+
+**Locking.** `SETTINGS_LOCKED_KEYS=sso` freezes the providers as they are: nothing is added, changed, turned on or
+off, or removed in the panel, while reading them and running a test sign-in stay open. The passkey settings take
+their `WEBAUTHN_*` values in `.env` (their defaults where none is set), and an administrator's change in the panel
+replaces those unless the setting is locked: locking them (the group `webauthn`, `*`, or one key) holds the `.env`
+value. Attestation and the allowed authenticator makes have no `.env` value: locked, they stay at none and any make.
+
+**Going back below 0.36.0** reopens what 0.36.0 closes. People a provider refused, or whose days ran out, get their
+password, SSH keys, temporary credentials and devices back. A passkey or a provider's second factor is no second
+factor there, and a role's passkey requirement is not asked for. First disable the accounts of people who left,
+and have each account whose second factor is a passkey or a provider's add an authenticator app. Each of the
+release's upgrade conditions gives a query that finds them.
 
 ## Compliance access
 
