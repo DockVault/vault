@@ -238,24 +238,42 @@ def test_a_fresh_volume_set_keeps_allowed_hosts_and_reads_the_name_from_it(curre
 
 def test_every_read_of_allowed_hosts_in_setup_takes_its_name_or_keeps_it_whole():
     """The host tool reads ALLOWED_HOSTS at three places for a name (a fresh volume set, a re-run's summary, the
-    certificate's), twice for the status lines about passkeys (where they stay hidden, and which were made at
-    another address), and once to keep it: each name goes through _allowed_hosts_name, the first status line's
-    judgement, which needs the scheme beside the name, through sign_in_address_note, and the host passkeys are made
-    for through passkey_host."""
+    certificate's), and each goes through _allowed_hosts_name. Every other read takes it as the address it is, with
+    its scheme and port: the address setup's summary gives first (_allowed_hosts_link_base), the note an update
+    gives on it (sign_in_address_note), what a setup re-run and a restart say before the vault is recreated there
+    (_say_sign_in_address), and status's sign-in lines, whose every use of it judges it as an address
+    (sign_in_address_note, passkey_host, allowed_hosts_port_note). One read keeps it, whole, for a fresh volume set."""
     import ast
     tree = ast.parse((ROOT / "dockvault.py").read_text(encoding="utf-8"))
     parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     reads = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "get"
              and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value == "ALLOWED_HOSTS"]
-    through = lambda n: getattr(getattr(parents[id(n)], "func", None), "id", None)   # noqa: E731
-    named = [n for n in reads if through(n) == "_allowed_hosts_name"]
-    judged = [n for n in reads if through(n) == "sign_in_address_note"]
-    made_for = [n for n in reads if through(n) == "passkey_host"]
-    assert len(reads) == 6 and len(named) == 3 and len(judged) == 1 and len(made_for) == 1, [
-        ast.unparse(parents[id(n)]) for n in reads]
-    kept = [n for n in reads if n not in named and n not in judged and n not in made_for]
-    assert len(kept) == 1
-    assert ast.unparse(parents[id(parents[id(kept[0])])]) == "(current_env.get('ALLOWED_HOSTS') or '').strip"
+
+    def through(n):
+        func = getattr(parents[id(n)], "func", None)
+        return getattr(func, "id", None) or getattr(func, "attr", None)
+    shown = [ast.unparse(parents[id(n)]) for n in reads]
+    by = {}
+    for n in reads:
+        by.setdefault(through(n), []).append(n)
+    assert {name: len(found) for name, found in by.items()} == {
+        "_allowed_hosts_name": 3, "_allowed_hosts_link_base": 1, "sign_in_address_note": 1,
+        "_say_sign_in_address": 2, None: 2}, shown
+    # The two read for no call: one is kept whole for a fresh volume set, and the other is status's sign-in lines',
+    # every use of which judges it as an address.
+    kept, held = sorted(by[None], key=lambda n: isinstance(parents[id(n)], ast.Assign))
+    assert ast.unparse(parents[id(parents[id(kept)])]) == "(current_env.get('ALLOWED_HOSTS') or '').strip"
+    assign = parents[id(held)]
+    assert isinstance(assign, ast.Assign) and [t.id for t in assign.targets] == ["allowed"]
+    function = assign
+    while not isinstance(function, ast.FunctionDef):
+        function = parents[id(function)]
+    uses = [n for n in ast.walk(function) if isinstance(n, ast.Name) and n.id == "allowed" and isinstance(n.ctx, ast.Load)]
+    assert uses and {through(n) for n in uses} == {"sign_in_address_note", "passkey_host", "allowed_hosts_port_note"}
+    # And what a re-run and a restart say judges it the same two ways.
+    say = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_say_sign_in_address")
+    uses = [n for n in ast.walk(say) if isinstance(n, ast.Name) and n.id == "allowed_hosts" and isinstance(n.ctx, ast.Load)]
+    assert uses and {through(n) for n in uses} == {"sign_in_address_note", "passkey_host"}
 
 
 def test_public_web_address_reads_an_address_as_setup_writes_it():
