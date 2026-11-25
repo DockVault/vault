@@ -765,6 +765,9 @@ def test_your_account_lists_the_providers_it_is_linked_to_or_could_link(monkeypa
     assert status == 200, out
     assert sorted(i["provider"] for i in out["identities"]) == ["a-first", "hidden-linked", "off-linked"]
     assert out["providers"] == [
+        # One without a sign-in button is offered too: the button is about the sign-in page.
+        {"id": str(hidden.id), "label": "Sign in with Contoso", "icon": "generic", "linked": False,
+         "ends_password": False, "reauth": False},
         # An administrator confirms with a password of its own: no provider stands in for it.
         {"id": str(first.id), "label": "a-first", "icon": "generic", "linked": True, "ends_password": False, "reauth": False},
         {"id": str(shown.id), "label": "Company sign-in", "icon": "microsoft", "linked": False, "ends_password": False,
@@ -775,7 +778,7 @@ def test_your_account_lists_the_providers_it_is_linked_to_or_could_link(monkeypa
     shown.policy = {"sso_password_login": "disabled"}
     status, out = h.call("GET", "/users/me/identities")
     assert [(p["label"], p["ends_password"]) for p in out["providers"]] == [
-        ("a-first", False), ("Company sign-in", True), ("hidden-linked", False)]
+        ("Sign in with Contoso", False), ("a-first", False), ("Company sign-in", True), ("hidden-linked", False)]
     shown.policy = None
     # Nothing of a provider's connection rides along.
     assert not {"issuer", "client_id", "name", "state"} & set(out["providers"][0])

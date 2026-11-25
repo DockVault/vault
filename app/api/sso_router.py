@@ -1536,14 +1536,14 @@ async def list_my_identities(
 ):
     """The caller's linked organisation identities (the provider's label, when linked and by what, the last
     sign-in), and the providers the account is linked to or could link: each one that is on and can serve a sign-in
-    now, shown on the sign-in page or already linked, in the sign-in page's order, with whether it is linked and
-    whether it can confirm the person afresh."""
+    now, whether the sign-in page shows its button or not, in the sign-in page's order, with whether it is linked
+    and whether it can confirm the person afresh. The button is about the sign-in page: the texts that send a
+    person here to link a provider are true only if every provider that can be linked is offered here."""
     _refuse_temp(current_user)
     rows = db.query(ExternalIdentity).filter(ExternalIdentity.user_id == current_user.id).all()
     providers = {str(p.id): p for p in db.query(SsoProvider).all()}
     linked = {str(i.provider_id) for i in rows}
-    offered = [p for key, p in providers.items()
-               if sso.usable_for(p, sso_state.LINK) is None and (p.show_on_sign_in or key in linked)]
+    offered = [p for p in providers.values() if sso.usable_for(p, sso_state.LINK) is None]
     offered.sort(key=lambda p: (p.sort_order or 0, (p.label or p.name or "").lower(), str(p.id)))
     may_confirm = sso.reauth_allowed(db, current_user)        # a provider confirms only an account with no password
 
