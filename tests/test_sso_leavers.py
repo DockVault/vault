@@ -488,6 +488,55 @@ def test_the_warning_and_the_notices_say_that_the_password_stops_too_where_it_do
     assert F.warning_text(found, due) != F.warning_text(found, due, sign_in_too=True)
 
 
+def test_the_administrators_are_told_how_many_of_a_wave_lost_their_password_too(told):  # noqa: F811
+    """Three accounts pause in one pass: two users, whose password and passkeys stop with their keys, and an
+    administrator, who keeps a password of their own and loses the keys alone. The administrators' notice counts
+    the first two, not all three: said of all, it told them that an administrator could no longer sign in."""
+    from app.core.models import RoleEnum
+    admin = fresh._user("root")
+    told.admins.append(admin)
+    carol, dave = fresh._user("carol"), fresh._user("dave")
+    boss = fresh._user("boss", role=RoleEnum.ADMIN)
+    p = fresh._provider(30)
+    lapsed = [fresh._identity(who, p, signed_in=NOW - 31 * DAY) for who in (carol, dave, boss)]
+    db = fresh._db([admin, carol, dave, boss], [p], lapsed)
+    assert F.sweep(db, NOW) == {"warned": 0, "lapsed": 3}
+    wave = told.notices[-1]
+    assert wave[2] == "3 account(s) paused for want of a provider sign-in"
+    assert "For 2 of them the password and passkeys no longer sign in either" in wave[3]
+    assert sorted(details["ends_sign_in"] for _, _, details in told.audits) == [False, True, True]
+    # A wave of administrators alone: the sentence about passwords is left out.
+    del told.notices[:], told.audits[:]
+    other = fresh._user("chief", role=RoleEnum.ADMIN)
+    db2 = fresh._db([admin, other], [p], [fresh._identity(other, p, signed_in=NOW - 31 * DAY)])
+    assert F.sweep(db2, NOW) == {"warned": 0, "lapsed": 1}
+    assert "no longer sign in either" not in told.notices[-1][3]
+
+
+def test_the_decision_made_again_in_the_accounts_turn_is_told_of_the_link_being_made(monkeypatch):
+    """A link settles the account before its identity is written: the rule is told of the provider being linked
+    and of how the account came to it. Where a change is to be made the account's turn is taken and the decision
+    made again in it, on the account as it then is. Made again without the provider, or without how the account
+    came, the second decision found the account linked to nothing that holds it and changed nothing: an account
+    made at its first sign-in was left with a password it may set, though its provider lets it set none."""
+    from app.api import api_server as api
+    from app.core import password_origin, privileged_accounts, sso_only
+    monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: None)
+    turns, made = [], []
+    monkeypatch.setattr(api, "_sessions_turn", lambda db, user_id: turns.append(user_id))
+    monkeypatch.setattr(sso_only, "make_sso_only", lambda db, user, **kw: made.append(user.username))
+    for came_by in ("jit", "invitation"):
+        alice, p = _user(password_hash="random-bytes"), _provider()
+        password_origin.mark_nobody_knows(alice)
+        nothing_linked = DB({User: [alice], SsoProvider: [p], ExternalIdentity: []})
+        del turns[:], made[:]
+        assert sso_only.settle(nothing_linked, alice, also=p, also_by=came_by) == sso_only.MADE, came_by
+        assert turns == [alice.id] and made == [alice.username]
+    # An account that linked itself to that provider is not held by it: nothing to change, and no turn taken.
+    del turns[:], made[:]
+    assert sso_only.settle(nothing_linked, alice, also=p, also_by="self") is None and turns == [] and made == []
+
+
 def test_what_the_administrators_are_told_about_the_password_when_a_provider_refuses_a_person(monkeypatch):
     from app.core import auditor_rights
     refused_at = datetime.utcnow() - timedelta(hours=1)
