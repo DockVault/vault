@@ -144,13 +144,21 @@ def _tell_the_accounts_with_only_a_passkey(db) -> None:
     try:
         from datetime import datetime
         from app.api import api_server as api
-        owners = [str(owner) for owner in ws_settings.only_a_passkey(db)["owners"]]
-        if owners:
-            api._notify_users(owners, "security", title="Passkeys were turned off on this vault",
+        from app.services import sign_in
+        owner_ids = list(ws_settings.only_a_passkey(db)["owners"])
+        owners = [str(owner) for owner in owner_ids]
+        # "After your password" is said to an account that has one it can type. One that signs in only through
+        # its provider sets the app up after the provider's sign-in, and was told of a password it does not have.
+        types_one = {str(u.id) for u in db.query(User).filter(User.id.in_(owner_ids)).all()
+                     if sign_in.has_a_password_it_can_type(u)} if owner_ids else set()
+        for after, told in ((", after your password", [o for o in owners if o in types_one]),
+                            ("", [o for o in owners if o not in types_one])):
+            if not told:
+                continue
+            api._notify_users(told, "security", title="Passkeys were turned off on this vault",
                               body=("Your passkey was your only second factor here, and passkeys are no longer "
-                                    "accepted. At your next sign-in you set an authenticator app up, after your "
-                                    "password. Your passkeys are kept, and count again if passkeys are turned "
-                                    "back on."),
+                                    f"accepted. At your next sign-in you set an authenticator app up{after}. Your "
+                                    "passkeys are kept, and count again if passkeys are turned back on."),
                               target="#profile",
                               dedup_prefix=f"passkeys_turned_off:{datetime.utcnow().date().isoformat()}")
     except Exception as exc:  # noqa: BLE001 -- the change is saved; nothing here may undo it

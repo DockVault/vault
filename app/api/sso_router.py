@@ -1295,12 +1295,16 @@ def _tell_of_a_held_account_kept_out(db, row, user, label: str, key: str) -> Non
     holding = held.provider_name if held is not None else "the provider it already uses"
     first = (sso_freshness.way_in_text(db, held) if held is not None else
              "Your account signs in only through the sign-in it already uses, until it has signed in there again.")
+    # "You can link it under Your account" is said to an account that can: a link is started with the account's
+    # password, so one that has none it can type (it signs in only through its provider) never could.
+    from app.services import sign_in as _sign_in
+    can_link = (f" Once your account has signed in there, you can link {label} under Your account."
+                if _sign_in.has_a_password_it_can_type(user) else "")
     api._notify_users([str(user.id)], "account_changed",
                       title=f"A sign-in through {label} with your address was kept out",
                       body=(f"Someone signed in through {label} with your email address. Nobody was signed in to your "
-                            f"account and nothing was linked. {first} Once your account has signed in there, you can "
-                            f"link {label} under Your account. If it was not you, your address at {label} may be in "
-                            "someone else's hands: tell an administrator."),
+                            f"account and nothing was linked. {first}{can_link} If it was not you, your address at "
+                            f"{label} may be in someone else's hands: tell an administrator."),
                       target="#profile", dedup_prefix=key, once=True)
     # (The held account is never one of them: an administrator is not held.)
     admins = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN).all() if a.is_active]

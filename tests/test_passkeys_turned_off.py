@@ -143,3 +143,42 @@ def test_the_switch_says_what_turning_passkeys_off_does_to_such_an_account():
     said = registry.spec_for(wss.MODE).help
     assert "an account whose only second factor is a passkey sets an authenticator app up at its next sign-in" in said
     assert "its passkeys count again when passkeys are turned back on" in said
+
+
+def test_an_account_with_no_password_to_type_is_not_told_after_your_password(monkeypatch):
+    """Passkeys are turned off. An account whose passkey was its only second factor sets an authenticator app up
+    at its next sign-in: "after your password", for an account that has one it can type. One that signs in only
+    through its provider was told the same, of a password it does not have."""
+    import types
+    import uuid
+    from app.api import api_server as api
+    from app.api import sign_in_settings_router as R
+    from app.services import sign_in
+    ann = types.SimpleNamespace(id=uuid.uuid4(), username="ann")
+    cy = types.SimpleNamespace(id=uuid.uuid4(), username="cy")
+    monkeypatch.setattr(R.ws_settings, "only_a_passkey", lambda db: {"owners": [ann.id, cy.id]})
+    monkeypatch.setattr(sign_in, "has_a_password_it_can_type", lambda user: user.username == "ann")
+    told = []
+    monkeypatch.setattr(api, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None,
+                        once=False: told.append((list(ids), body)) or list(ids))
+
+    class DB:
+        def query(self, model):
+            return self
+
+        def filter(self, *a):
+            return self
+
+        def all(self):
+            return [ann, cy]
+    R._tell_the_accounts_with_only_a_passkey(DB())
+    said = {tuple(ids): body for ids, body in told}
+    assert set(said) == {(str(ann.id),), (str(cy.id),)}
+    assert "you set an authenticator app up, after your password. Your passkeys are kept" in said[(str(ann.id),)]
+    assert "you set an authenticator app up. Your passkeys are kept" in said[(str(cy.id),)]
+    assert "password" not in said[(str(cy.id),)]
+    # Nobody held only a passkey: nothing is read or told.
+    del told[:]
+    monkeypatch.setattr(R.ws_settings, "only_a_passkey", lambda db: {"owners": []})
+    R._tell_the_accounts_with_only_a_passkey(object())
+    assert told == []

@@ -1838,3 +1838,25 @@ def test_who_is_told_of_a_turn_offs_hold_and_in_which_words(monkeypatch):
     del told[:]
     R._tell_those_a_turn_off_held(object(), [], set(), "Contoso")
     assert told == []
+
+
+def test_a_removals_hold_tells_of_a_password_only_the_accounts_that_have_one_to_type(monkeypatch):
+    """Carol signs in only through another provider and is linked to Contoso too; her days at Contoso have run
+    out. A removal attempt on Contoso holds her, and told her "Your password signs you in as before": she has
+    none. The sentence is said to the accounts that have a password they can type."""
+    from datetime import datetime, timedelta
+    from app.services import sign_in
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
+    alice, carol = _user("alice"), _user("carol")
+    now = datetime.utcnow()
+    links = [_identity(who, row, subject=f"s-{who.username}", last_sign_in_at=now - timedelta(days=30),
+                       linked_at=now - timedelta(days=60), refused_at=None) for who in (alice, carol)]
+    h = Admin(monkeypatch, [row], users=[alice, carol], identities=links)
+    monkeypatch.setattr(sign_in, "has_a_password_it_can_type", lambda user: user.username != "carol")
+    assert h.call("DELETE", f"/admin/sso/providers/{row.id}")[0] == 409
+    said = {tuple(names): text for names, _title, text in h.accounts_told}
+    assert set(said) == {("alice",), ("carol",)}
+    assert said[("alice",)].endswith("stay paused until an administrator lifts that. Your password signs you in as before.")
+    assert said[("carol",)].endswith("stay paused until an administrator lifts that.")
+    assert "password" not in said[("carol",)]

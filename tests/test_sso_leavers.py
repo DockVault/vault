@@ -1085,3 +1085,27 @@ def test_a_refusal_names_what_would_let_this_account_hold_a_password(monkeypatch
     db_less.tables[SsoProvider].append(other)
     db_less.tables[ExternalIdentity].extend([_identity(less, other, subject="s-2"), _identity(less, p_less, subject="s-3")])
     assert sso_only.password_remedy(db_less, less) == "allow password sign-in on Contoso and Fabrikam"
+
+
+def test_a_held_account_with_no_password_to_type_is_not_told_it_can_link_under_your_account(monkeypatch):
+    """A sign-in through another provider carried the address of an account that is held to its own provider.
+    Its owner is told what works. "You can link it under Your account" is true for an account with a password it
+    can type: a link is started with that password. An account that signs in only through its provider was told
+    the same, and never could."""
+    from app.services import sign_in
+    for types_one in (True, False):
+        bob, root = _user("bob"), _user("root", role="admin")
+        holding = _provider(name="contoso")
+        other = _provider(name="fabrikam", label="Sign in with Fabrikam",
+                          policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+        held_by = _identity(bob, holding, subject="bob-at-contoso", last_sign_in_at=datetime.utcnow() - LONG_AGO)
+        h = Resolving(monkeypatch, [bob, root], [holding, other], identities=[held_by])
+        monkeypatch.setattr(sign_in, "has_a_password_it_can_type", lambda user, _answer=types_one: _answer)
+        location, _ = _sign_in(h, other, sub="bob-at-fabrikam", email="bob@example.test")
+        assert location == "/#sso-error=held_to_a_provider", location
+        (ids, title, body), = [n for n in h.notice_bodies if n[1].endswith("with your address was kept out")]
+        said = "Once your account has signed in there, you can link Sign in with Fabrikam under Your account."
+        assert (said in body) is types_one, body
+        assert body.endswith("If it was not you, your address at Sign in with Fabrikam may be in someone else's "
+                             "hands: tell an administrator.")
+        assert "  " not in body

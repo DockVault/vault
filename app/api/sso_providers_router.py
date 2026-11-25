@@ -657,9 +657,15 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
                          "reason": "held_before_removal"})
         # The hold is written for every one of them. Told are the accounts that can sign in: one that is turned
         # off signs in nowhere, and its stored address is often a former employee's own.
-        people = [(u.id, u.username, u.email) for u in db.query(User).filter(User.id.in_(held_ids)).all()
-                  if u.is_active]
-        turned_off = held - len(people)
+        from app.services import sign_in as _sign_in
+        told_of_it = [u for u in db.query(User).filter(User.id.in_(held_ids)).all() if u.is_active]
+        # "Your password signs you in as before" is said to the accounts that have one they can type. An account
+        # that signs in only through another provider, or was made at a first sign-in with a password nobody
+        # knows, was told of a password it does not have.
+        people = [(u.id, u.username, u.email) for u in told_of_it if _sign_in.has_a_password_it_can_type(u)]
+        with_no_password = [(u.id, u.username, u.email) for u in told_of_it
+                            if not _sign_in.has_a_password_it_can_type(u)]
+        turned_off = held - len(told_of_it)
         name, shown = row.name, row.label or row.name
         db.commit()
         _tell_administrators(current_user.username, "Accounts were held before a provider's removal", (
@@ -668,10 +674,11 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
             "SSH keys, temporary credentials and devices back unseen. Lift each under Identities when it should "
             "have them back; the provider can be removed then."
             + (f" {turned_off} of them are turned off: held as the others are, and not told." if turned_off else "")))
-        _tell_accounts(people, "Your keys stay paused on this vault", (
-            f"You have not signed in through {shown} within the time your organisation allows, and {shown} is being "
-            "removed from this vault. Your SSH keys, temporary credentials and devices stay paused until an "
-            "administrator lifts that. Your password signs you in as before."))
+        paused = (f"You have not signed in through {shown} within the time your organisation allows, and {shown} is "
+                  "being removed from this vault. Your SSH keys, temporary credentials and devices stay paused until "
+                  "an administrator lifts that.")
+        _tell_accounts(people, "Your keys stay paused on this vault", paused + " Your password signs you in as before.")
+        _tell_accounts(with_no_password, "Your keys stay paused on this vault", paused)
         raise _refused(providers.held_by_the_removal(held))
     gone = {"provider_id": str(row.id), "name": row.name, "identities": providers.public(db, row)["identities"]}
     label = row.label or row.name
