@@ -255,8 +255,10 @@ def test_no_console_errors_on_email_tab(admin_page: Page):
     page = admin_page
     errors = []
     # The browser logs the step-up's refusal (403) as a resource that failed to load: that is the prompt's cue.
+    # Only that refusal is let through; any other resource that fails to load (a 404, a 500) still counts.
+    step_up_refusal = "the server responded with a status of 403"
     page.on("console", lambda m: errors.append(m.text) if m.type == "error"
-            and "Failed to load resource" not in m.text else None)
+            and step_up_refusal not in m.text else None)
     page.on("pageerror", lambda e: errors.append(str(e)))
     _open_email_tab(page)
     page.click("#email-profile-add")

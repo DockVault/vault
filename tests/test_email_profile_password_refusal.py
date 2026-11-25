@@ -3,8 +3,8 @@
 A save or a test send that would send the stored SMTP password to another server, port or username, or with the
 certificate check turned off, is refused unless it carries the password (400, reason smtp_password_required,
 app/core/mail_relay.py). The form shows that sentence beside the password field, marks the field and puts the
-cursor in it; any other failure stays on the form's result line. Typing a password, or opening the form again,
-takes the sentence away. The test send tests the form as it shows it, the certificate check's box included.
+cursor in it; any other failure stays on the form's result line. Typing a password, opening the form again, a
+later failure of another kind or a test send that goes through takes the sentence away. The test send tests the form as it shows it, the certificate check's box included.
 
 Driven in Node against the shipped functions from static/js/app.js, with stand-ins for the page's elements and
 for apiRequest. The step-up the save and the test send also ask for is answered inside apiRequest, as every
@@ -145,6 +145,41 @@ out.wired = field('ep-password').handlers.input.length;
     for when in ("typed", "reopened"):
         assert out[when]["said"] == "" and out[when]["hidden"] is True and out[when]["invalid"] is None, out[when]
     assert out["wired"] == 1, "the form's password field is listened to once, however often it opens"
+
+
+@pytest.mark.parametrize("action", ["saveEmailProfile", "sendEmailProfileTest"])
+def test_a_later_failure_takes_the_sentence_away(action):
+    out = _run(f"""
+openEmailProfileModal(PROFILE);
+field('ep-server').value = 'elsewhere.example';
+ANSWER = refusal({json.dumps(SENTENCE)}, 400, 'smtp_password_required');
+await {action}();
+out.refused = state();
+ANSWER = refusal('The mail server could not be reached.', 502, undefined);
+await {action}();
+out.failed = state();
+""")
+    assert out["refused"]["said"] == SENTENCE and out["refused"]["hidden"] is False
+    assert out["failed"]["said"] == "" and out["failed"]["hidden"] is True and out["failed"]["invalid"] is None
+    assert out["failed"]["result"] == "✗ The mail server could not be reached."
+
+
+def test_a_test_send_that_goes_through_takes_the_sentence_away():
+    # The administrator puts the server back instead of typing a password, and the test send goes through.
+    out = _run(f"""
+openEmailProfileModal(PROFILE);
+field('ep-server').value = 'elsewhere.example';
+ANSWER = refusal({json.dumps(SENTENCE)}, 400, 'smtp_password_required');
+await sendEmailProfileTest();
+out.refused = state();
+field('ep-server').value = 'mail.example.test';
+ANSWER = {{ message: 'Test email sent to ada@example.test' }};
+await sendEmailProfileTest();
+out.sent = state();
+""")
+    assert out["refused"]["said"] == SENTENCE and out["refused"]["hidden"] is False
+    assert out["sent"]["said"] == "" and out["sent"]["hidden"] is True and out["sent"]["invalid"] is None
+    assert out["sent"]["result"] == "✓ Test email sent to ada@example.test"
 
 
 def test_the_test_send_tests_the_form_as_it_shows_it():
