@@ -65,6 +65,7 @@ class Element extends Node {
     getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
     hasAttribute(k) { return k in this.attrs; }
     removeAttribute(k) { delete this.attrs[k]; }
+    toggleAttribute(k, force) { const on = force === undefined ? !(k in this.attrs) : !!force; if (on) this.attrs[k] = ''; else delete this.attrs[k]; return on; }
     appendChild(c) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.childNodes.push(c); return c; }
     insertBefore(c, ref) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; const i = ref ? this.childNodes.indexOf(ref) : -1; if (i < 0) this.childNodes.push(c); else this.childNodes.splice(i, 0, c); return c; }
     removeChild(c) { const i = this.childNodes.indexOf(c); if (i >= 0) this.childNodes.splice(i, 1); c.parentNode = null; return c; }

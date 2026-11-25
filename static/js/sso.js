@@ -202,14 +202,25 @@
     const startTest = (providerId) => startAuthed(`/admin/sso/providers/${encodeURIComponent(providerId)}/test/start`,
         'test', { provider: providerId });
     // A fresh sign-in at the provider that confirms the person for `action`; `then` names what the page does once
-    // it is back ('add-passkey').
-    const startConfirm = (providerId, action, then) => startAuthed(
+    // it is back ('add-passkey', 'step-up'), and `label` is the provider's name for the page to say on its return.
+    const startConfirm = (providerId, action, then, label) => startAuthed(
         `/users/me/identities/${encodeURIComponent(providerId)}/reauth`, 'step_up',
-        { provider: providerId, action, then: then || '' }, { action });
+        { provider: providerId, action, then: then || '', label: typeof label === 'string' ? label : '' }, { action });
+
+    // The providers that can confirm the signed-in person afresh, from their own identities: [{id, label}], in the
+    // sign-in page's order; empty when none can, or when the list cannot be read.
+    async function confirmers() {
+        let data = null;
+        try { data = await apiRequest('/users/me/identities', { silent: true }); } catch (_) { return []; }
+        const providers = (data && Array.isArray(data.providers)) ? data.providers : [];
+        return providers.filter((p) => p && p.reauth === true && typeof p.id === 'string' && p.id)
+            .map((p) => ({ id: p.id, label: typeof p.label === 'string' ? p.label : '' }));
+    }
 
     // What a signed-in page does with what came back, once the app is shown. Returns what happened, for the caller
-    // to act on: {kind: 'linked', passwordStopped} | {kind: 'tested', provider, summary} | {kind: 'confirmed', action, then} |
-    // {kind: 'error', message} | null.
+    // to act on: {kind: 'linked', passwordStopped} | {kind: 'tested', provider, summary} |
+    // {kind: 'confirmed', action, then, label, expiresIn} | {kind: 'error', message} | null. A confirmation lasts
+    // `expiresIn` seconds at the server, for this session and this action only.
     async function resume(back) {
         if (!back) return null;
         if (back.kind === 'sso-error') return { kind: 'error', message: await reasonText(back.value) };
@@ -230,7 +241,9 @@
                 return { kind: 'tested', provider: flow.provider, summary: (out && out.summary) || {} };
             }
             const out = await apiRequest('/users/me/identities/reauth/finish', claim);
-            return { kind: 'confirmed', action: (out && out.action) || flow.action || '', then: flow.then || '' };
+            const lasts = out && Number.isFinite(out.expires_in) && out.expires_in > 0 ? out.expires_in : 120;
+            return { kind: 'confirmed', action: (out && out.action) || flow.action || '', then: flow.then || '',
+                     label: typeof flow.label === 'string' ? flow.label : '', expiresIn: lasts };
         } catch (e) {
             return { kind: 'error', message: (e && e.message) || GENERIC };
         }
@@ -420,7 +433,7 @@
     }
 
     window.Sso = {
-        available, takeReturn, reasonText, renderButtons, startSignIn, startLink, startTest, startConfirm, resume, unlinkConfirmed,
-        renderAccount, reset, leaveToSignOut,
+        available, takeReturn, reasonText, renderButtons, startSignIn, startLink, startTest, startConfirm, confirmers, resume,
+        unlinkConfirmed, renderAccount, reset, leaveToSignOut,
     };
 })();

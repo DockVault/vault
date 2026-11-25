@@ -224,10 +224,55 @@ out(results);
     assert link["started"]["path"] == "/users/me/identities/p-1/start" and link["started"]["method"] == "POST"
     assert test["result"] == {"kind": "tested", "provider": "p-1", "summary": {"outcome": "ok"}}
     assert test["claimPath"] == "/admin/sso/providers/p-1/test/finish"
-    assert confirm["result"] == {"kind": "confirmed", "action": "account.second_factor", "then": "add-passkey"}
+    assert confirm["result"] == {"kind": "confirmed", "action": "account.second_factor", "then": "add-passkey",
+                                 "label": "", "expiresIn": 120}
     assert confirm["started"]["body"]["action"] == "account.second_factor"
     for one, code in ((link, "c-link"), (test, "c-test"), (confirm, "c-up")):
         assert one["code"] == code and one["withProof"] is True and one["hashSent"] is True
+
+
+def test_a_confirmation_for_a_step_up_comes_back_with_the_providers_name_and_how_long_it_lasts():
+    """The step-up dialog starts a fresh sign-in for one action and names the provider; the page that comes back says
+    that name, and keeps the confirmation for as long as the server said it lasts."""
+    got = _node(r"""
+answers['/users/me/identities/p-1/reauth'] = { authorization_url: 'https://idp.example.org/a' };
+await window.Sso.startConfirm('p-1', 'vault.delete', 'step-up', 'Contoso');
+const kept = flow();
+const started = asked[0];
+answers['/users/me/identities/reauth/finish'] = { staged: true, action: 'vault.delete', expires_in: 90 };
+const back = await window.Sso.resume(arrive('#sso-stepup=c-up'));
+// An answer that names no time is taken for the server's two minutes.
+await window.Sso.startConfirm('p-1', 'vault.delete', 'step-up', 'Contoso');
+answers['/users/me/identities/reauth/finish'] = { staged: true, action: 'vault.delete' };
+const plain = await window.Sso.resume(arrive('#sso-stepup=c-up2'));
+out({ kept: { provider: kept.provider, action: kept.action, then: kept.then, label: kept.label },
+      started: { path: started.path, body: Object.keys(started.body).sort() }, back, plain });
+""")
+    assert got["kept"] == {"provider": "p-1", "action": "vault.delete", "then": "step-up", "label": "Contoso"}
+    # The start sends the hash of the tab's proof and the action, nothing of the page's own.
+    assert got["started"] == {"path": "/users/me/identities/p-1/reauth", "body": ["action", "verifier_hash"]}
+    assert got["back"] == {"kind": "confirmed", "action": "vault.delete", "then": "step-up", "label": "Contoso",
+                           "expiresIn": 90}
+    assert got["plain"]["expiresIn"] == 120
+
+
+def test_the_providers_that_can_confirm_the_person_come_from_their_own_identities():
+    got = _node(r"""
+answers['/users/me/identities'] = { identities: [], providers: [
+    { id: 'p-1', label: 'Contoso', linked: true, reauth: true },
+    { id: 'p-2', label: 'Fabrikam', linked: true, reauth: false },
+    { id: 'p-3', label: 'Other', linked: false, reauth: false },
+    { id: '', label: 'No id', reauth: true }, null, { id: 'p-4', reauth: 'yes' }, { id: 'p-5', reauth: true }] };
+const found = await window.Sso.confirmers();
+answers['/users/me/identities'] = new Error('Temporary credentials cannot manage sign-in methods.');
+const refused = await window.Sso.confirmers();
+answers['/users/me/identities'] = {};
+const empty = await window.Sso.confirmers();
+out({ found, refused, empty, paths: asked.map((a) => a.path) });
+""")
+    assert got["found"] == [{"id": "p-1", "label": "Contoso"}, {"id": "p-5", "label": ""}]
+    assert got["refused"] == [] and got["empty"] == []
+    assert got["paths"] == ["/users/me/identities"] * 3
 
 
 def test_what_came_back_to_another_tab_or_for_another_purpose_is_not_claimed():

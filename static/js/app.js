@@ -2034,7 +2034,14 @@ async function _ssoResume(back) {
         await Sso.unlinkConfirmed(out.then.slice('unlink:'.length));
         return;
     }
-    if (out.kind === 'confirmed') showSuccess('Confirmed with your organisation\'s sign-in. Continue within two minutes.');
+    if (out.kind === 'confirmed') {
+        // A step-up the person met at the provider (the step-up dialog started it): the page is back on the view it
+        // left, and the action is done again from there. Its step-up then takes this confirmation in place of the
+        // password, once, while the server keeps it.
+        _noteProviderConfirmation(out.action, out.expiresIn, out.label);
+        showToast('You confirmed it is you with ' + (out.label || 'your organisation\'s sign-in') + '. Now do what '
+            + 'you were doing again, within two minutes: it goes through without a password.', 'success', 20000);
+    }
 }
 
 async function _initPasskeySignIn(policy) {
@@ -2766,6 +2773,7 @@ function renderEnrollmentWizard(box, opts) {
 // then retries the call once with the X-Second-Factor receipt. The receipt is single-use + session-bound.
 
 let _stepUpResolve = null;
+let _stepUpDrawn = 0;      // which drawing of the dialog is on screen: an answer that comes later draws nothing
 
 function _stepUpSettle(receipt) {
     const r = _stepUpResolve;
@@ -2773,14 +2781,66 @@ function _stepUpSettle(receipt) {
     if (r) r(receipt);
 }
 
+// A fresh sign-in at the organisation's provider that confirmed this person for one action, started from the
+// step-up dialog and staged at the server when the page came back (POST /users/me/identities/reauth/finish):
+// {action, label, until}, or null. The server keeps it for this session and this action, once, for the seconds it
+// said; the step-up for that action then names `password_method: 'idp_reauth'` in place of the password.
+let _providerConfirmation = null;
+
+function _noteProviderConfirmation(action, expiresIn, label) {
+    const seconds = Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 120;
+    _providerConfirmation = { action: String(action || ''), label: typeof label === 'string' ? label : '',
+                              until: Date.now() + seconds * 1000 };
+}
+
+// The confirmation staged for `action` while it lasts, else null (one that ran out is forgotten).
+function _providerConfirmationFor(action) {
+    const staged = _providerConfirmation;
+    if (!staged || !action || staged.action !== action) return null;
+    if (Date.now() >= staged.until) { _providerConfirmation = null; return null; }
+    return staged;
+}
+
+// Whether `method` meets the factor part of a step-up (app/core/step_up_methods.py): something the dialog asks for
+// here whichever way the password part is met.
+function _stepUpMeetsFactor(method) {
+    return method === 'totp' || method === 'email' || method === 'recovery' || method === 'passkey';
+}
+
+// Ask for the receipt with the staged confirmation as the password part: {receipt} or {message}.
+async function _stepUpByProvider(payload) {
+    try {
+        const resp = await fetch(`${API_BASE}/auth/second-factor/step-up`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authToken}` },
+            body: JSON.stringify(Object.assign({}, payload, { password_method: 'idp_reauth' }))
+        });
+        const d = await resp.json().catch(() => ({}));
+        if (!resp.ok) return { message: (d && typeof d.detail === 'string') ? d.detail : 'That was not accepted. Try again.' };
+        return d && d.receipt ? { receipt: d.receipt } : { message: 'That was not accepted. Try again.' };
+    } catch (_) {
+        return { message: 'Could not reach the server. Please try again.' };
+    }
+}
+
 // Resolve with an X-Second-Factor receipt for `action`, or null if the user cancels. `methods` comes
-// from the gated 403 (e.g. ['totp','recovery'] and/or ['password']).
-function requestStepUpReceipt(action, methods) {
+// from the gated 403 (e.g. ['totp','recovery'] and/or ['password'], or ['idp_reauth', 'password']).
+async function requestStepUpReceipt(action, methods) {
     _stepUpSettle(null);   // abandon any prior pending step-up
     const list = (Array.isArray(methods) && methods.length) ? methods : ['totp', 'recovery'];
+    let said = '';
+    // Back from the organisation's sign-in for this very action, with nothing to type here: the confirmation is
+    // spent at once and the action goes through without the dialog. One the server no longer holds opens the
+    // dialog with its sentence, and the person confirms again there.
+    if (list.includes('idp_reauth') && _providerConfirmationFor(action) && !list.some(_stepUpMeetsFactor)) {
+        const tried = await _stepUpByProvider({ action });
+        _providerConfirmation = null;
+        if (tried.receipt) return tried.receipt;
+        said = tried.message;
+    }
     return new Promise((resolve) => {
         _stepUpResolve = resolve;
-        _buildStepUpBody(action, list);
+        _buildStepUpBody(action, list, said);
         // The step-up can be summoned from within another open modal (e.g. Your Account), so lift it
         // above the default modal layer (z-index 1000) — otherwise it renders behind and is unusable.
         const m = document.getElementById('stepup-modal');
@@ -2789,14 +2849,80 @@ function requestStepUpReceipt(action, methods) {
     });
 }
 
-function _buildStepUpBody(action, methods) {
+// The step-up asks for the password part, and a fresh sign-in at the organisation's provider may meet it: the
+// server lists 'idp_reauth' only for an account with no password anybody can type, and never for a compliance
+// step. The dialog offers the provider (by name, from the account's own identities) and says what follows: this
+// page goes there, comes back, and the person does the same again within the time the server keeps the
+// confirmation. A factor the step-up also asks for is given after that, here.
+function _buildProviderStepUp(body, action, methods, said) {
+    const drawn = _stepUpDrawn;
+    // The first button leaves the page: the dialogs' controller focuses the dialog itself, so a stray Enter
+    // chooses nothing.
+    const stepUpModal = document.getElementById('stepup-modal');
+    if (stepUpModal) stepUpModal.toggleAttribute('data-no-autofocus', true);
+    const factorToo = methods.some(_stepUpMeetsFactor);
+    body.appendChild(_el('p', 'text-secondary text-sm mb-md', 'This action needs an extra confirmation.'));
+    const how = _el('p', 'text-sm', 'Confirm it is you with a fresh sign-in at your organisation. This page goes '
+        + 'there and you come back here afterwards. Then do the same again within two minutes: it goes through '
+        + 'without a password' + (factorToo ? ', once you have given your second factor here.' : '.'));
+    how.id = 'stepup-provider-how';
+    body.appendChild(how);
+    const box = _el('div', 'stepup-providers mt-sm');
+    box.id = 'stepup-providers';
+    box.appendChild(_el('p', 'text-secondary text-sm', 'Looking up your organisation\'s sign-in…'));
+    body.appendChild(box);
+    const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert');
+    body.appendChild(err);
+    if (said) _sfError(err, said);
+    const footer = _el('div', 'modal-footer mt-md');
+    const cancel = _el('button', 'btn btn-secondary', 'Cancel');
+    cancel.type = 'button';
+    cancel.addEventListener('click', () => { closeModal(); });   // closeModal settles the promise null
+    footer.appendChild(cancel);
+    body.appendChild(footer);
+    Sso.confirmers().then((providers) => {
+        if (drawn !== _stepUpDrawn) return;                     // the dialog was drawn again, or closed, meanwhile
+        box.replaceChildren();
+        if (!providers.length) {
+            box.appendChild(_el('p', 'text-secondary text-sm', 'Your organisation\'s sign-in cannot confirm you right '
+                + 'now. Try again later, or ask an administrator.'));
+            return;
+        }
+        providers.forEach((provider) => {
+            const go = _el('button', 'btn btn-primary btn-sm mt-sm mr-sm stepup-provider-btn',
+                provider.label ? 'Confirm with ' + provider.label : 'Confirm with your organisation\'s sign-in');
+            go.type = 'button';
+            go.dataset.provider = provider.id;
+            go.addEventListener('click', async () => {
+                box.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+                err.style.display = 'none';
+                try { await Sso.startConfirm(provider.id, action, 'step-up', provider.label || ''); }    // leaves the page
+                catch (e) {
+                    box.querySelectorAll('button').forEach((b) => { b.disabled = false; });
+                    _sfError(err, (e && e.message) || 'The confirmation could not be started.');
+                }
+            });
+            box.appendChild(go);
+        });
+    });
+}
+
+function _buildStepUpBody(action, methods, said) {
     const body = document.getElementById('stepup-modal-body');
     if (!body) { _stepUpSettle(null); return; }
     body.replaceChildren();
+    _stepUpDrawn += 1;
+
+    // The password part met by a fresh sign-in at the organisation's provider: until this tab holds a confirmation
+    // for this action, the dialog offers the provider; once it does, the password field is not shown (the account
+    // has none anybody can type) and the confirmation is named in its place.
+    const byProvider = methods.includes('idp_reauth') && !!window.Sso;
+    const confirmed = byProvider ? _providerConfirmationFor(action) : null;
+    if (byProvider && !confirmed) { _buildProviderStepUp(body, action, methods, said); return; }
 
     const otpMethod = methods.find(m => m === 'totp' || m === 'email') || null;
     const hasRecovery = methods.includes('recovery');
-    const hasPassword = methods.includes('password');
+    const hasPassword = methods.includes('password') && !confirmed;
     const hasPasskey = methods.includes('passkey') && !!window.Passkeys && Passkeys.supported();
     let otpMode = otpMethod ? 'otp' : (hasRecovery ? 'recovery' : null);   // 'otp' | 'recovery'
     // With nothing to type, the dialog's first button would start a passkey ceremony: the dialogs' controller then
@@ -2805,6 +2931,13 @@ function _buildStepUpBody(action, methods) {
     if (stepUpModal) stepUpModal.toggleAttribute('data-no-autofocus', hasPasskey && !otpMethod && !hasRecovery && !hasPassword);
 
     body.appendChild(_el('p', 'text-secondary text-sm mb-md', 'This action needs an extra confirmation.'));
+    if (confirmed) {
+        const note = _el('p', 'text-sm mb-sm', 'You confirmed it is you with '
+            + (confirmed.label || 'your organisation\'s sign-in') + '. Now give your second factor.');
+        note.id = 'stepup-provider-confirmed';
+        note.setAttribute('role', 'status');
+        body.appendChild(note);
+    }
 
     let codeInput = null, codeLabel = null, recoveryToggle = null;
     if (otpMethod || hasRecovery) {
@@ -2854,16 +2987,18 @@ function _buildStepUpBody(action, methods) {
                 const credential = await Passkeys.get(options);
                 const payload = { action, method: 'passkey', challenge_id, credential };
                 if (pwInput) payload.password = password;
+                if (confirmed) payload.password_method = 'idp_reauth';
                 const resp = await fetch(`${API_BASE}/auth/second-factor/step-up`, {
                     method: 'POST', headers: auth, body: JSON.stringify(payload)
                 });
                 if (!resp.ok) {
                     const e = await resp.json().catch(() => ({}));
-                    _sfError(err, (e && typeof e.detail === 'string') ? e.detail : 'That was not accepted. Try again.');
+                    refused((e && typeof e.detail === 'string') ? e.detail : 'That was not accepted. Try again.');
                     return;
                 }
                 const d = await resp.json();
                 _markPasskeyUsedHere();
+                if (confirmed) _providerConfirmation = null;       // spent by the server
                 _stepUpSettle(d.receipt || null);   // settle BEFORE closing so closeModal's settle(null) is a no-op
                 closeModal();
             } catch (e) {
@@ -2875,6 +3010,25 @@ function _buildStepUpBody(action, methods) {
     }
 
     const err = _el('div', 'alert alert-error mt-sm'); err.style.display = 'none'; err.setAttribute('role', 'alert'); body.appendChild(err);
+    if (said) _sfError(err, said);
+
+    // With a confirmation from the provider, a refusal may be of the code (it stays) or of the confirmation (it ran
+    // out, or the server no longer holds it): the person may confirm again from here.
+    let again = null;
+    if (confirmed) {
+        again = _el('button', 'btn btn-secondary btn-sm mt-sm', 'Confirm with '
+            + (confirmed.label || 'your organisation\'s sign-in') + ' again');
+        again.type = 'button';
+        again.id = 'stepup-provider-again';
+        again.style.display = 'none';
+        again.addEventListener('click', () => { _providerConfirmation = null; _buildStepUpBody(action, methods, ''); });
+        body.appendChild(again);
+    }
+    function refused(message) {
+        if (confirmed && !_providerConfirmationFor(action)) { _buildStepUpBody(action, methods, message); return; }
+        _sfError(err, message);
+        if (again) again.style.display = '';
+    }
 
     function applyCodeMode() {
         if (!codeInput) return;
@@ -2913,6 +3067,8 @@ function _buildStepUpBody(action, methods) {
             payload.password = pw;
             if (!payload.method) payload.method = 'password';
         }
+        // The password part is the confirmation from the provider this tab holds for this action.
+        if (confirmed) payload.password_method = 'idp_reauth';
         confirm.disabled = true;
         try {
             const resp = await fetch(`${API_BASE}/auth/second-factor/step-up`, {
@@ -2922,10 +3078,12 @@ function _buildStepUpBody(action, methods) {
             });
             if (!resp.ok) {
                 const e = await resp.json().catch(() => ({}));
-                _sfError(err, (e && typeof e.detail === 'string') ? e.detail : 'That was not accepted. Try again.');
-                confirm.disabled = false; return;
+                confirm.disabled = false;
+                refused((e && typeof e.detail === 'string') ? e.detail : 'That was not accepted. Try again.');
+                return;
             }
             const d = await resp.json();
+            if (confirmed) _providerConfirmation = null;       // spent by the server
             _stepUpSettle(d.receipt || null);   // settle BEFORE closing so closeModal's settle(null) is a no-op
             closeModal();
         } catch (_) {
@@ -3435,7 +3593,9 @@ function logout(how, reason) {
     if (window.EraseSettings && typeof window.EraseSettings.reset === 'function') {
         try { window.EraseSettings.reset(); } catch (_) {}
     }
-    // Single sign-on: the tab's proof for a flow under way, and the linked providers shown in Your account.
+    // Single sign-on: the tab's proof for a flow under way, and the linked providers shown in Your account; and a
+    // confirmation at the provider this tab holds for a step-up.
+    _providerConfirmation = null;
     if (window.Sso && typeof window.Sso.reset === 'function') {
         try { window.Sso.reset(); } catch (_) {}
     }

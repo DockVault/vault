@@ -333,6 +333,56 @@ def test_a_provider_only_account_is_told_what_a_passkey_is_for_and_confirms_at_i
     assert stand.finishes[-1][1]["code"] == "confirm-code" and stand.proof_matches()
 
 
+def test_a_step_up_met_at_the_provider_lets_the_action_done_again_pass_without_a_password(page: Page, base_url,
+                                                                                        fresh_user):
+    """The step-up dialog offers the provider the server lists ('idp_reauth') by its name and asks for no password;
+    the page leaves for the provider, comes back with the confirmation staged, says what to do, and the action done
+    again gets its receipt with the confirmation in place of the password, without the dialog."""
+    stand = Stand(page, base_url, providers=[])
+    stand.finish_answer = (200, {"staged": True, "action": "vault.delete", "expires_in": 120})
+    page.route("**/users/me/identities", lambda route: route.fulfill(status=200, json={
+        "identities": [], "email": None,
+        "providers": [{"id": PROVIDER, "label": "Company sign-in", "icon": "generic", "linked": True,
+                       "ends_password": False, "reauth": True}]}))
+    gated, stepped = [], []
+
+    def gate(route):
+        receipt = route.request.headers.get("x-second-factor")
+        gated.append(receipt)
+        if receipt:
+            route.fulfill(status=200, json={"done": True})
+        else:
+            route.fulfill(status=403, json={"detail": {"second_factor_required": True, "action": "vault.delete",
+                                                       "reason": "step_up_required",
+                                                       "methods": ["idp_reauth", "password"]}})
+    page.route("**/__gated-by-a-step-up", gate)
+
+    def step_up(route):
+        stepped.append(route.request.post_data_json or {})
+        route.fulfill(status=200, json={"receipt": "the-receipt"})
+    page.route("**/auth/second-factor/step-up", step_up)
+    _login(page, fresh_user["_username"], fresh_user["_password"])
+    stand.returns = "sso-stepup=confirm-code"
+    page.evaluate("() => { apiRequest('/__gated-by-a-step-up', { method: 'POST' }).catch(() => {}); }")
+    expect(page.locator("#stepup-modal .stepup-provider-btn")).to_have_text(["Confirm with Company sign-in"],
+                                                                           timeout=10000)
+    expect(page.locator("#stepup-password-input")).to_have_count(0)
+    expect(page.locator("#stepup-provider-how")).to_contain_text("you come back here afterwards")
+    page.click("#stepup-modal .stepup-provider-btn")
+    # Back from the provider: the confirmation is staged with this tab's proof, and the page says what to do.
+    expect(page.locator("#toast-container")).to_contain_text(
+        "You confirmed it is you with Company sign-in. Now do what you were doing again", timeout=20000)
+    start_url, start_body = stand.starts[-1]
+    assert start_url.endswith(f"/users/me/identities/{PROVIDER}/reauth") and start_body["action"] == "vault.delete"
+    assert stand.finishes[-1][1]["code"] == "confirm-code" and stand.proof_matches()
+    assert stepped == []
+    # The action done again passes: the receipt is asked for with the confirmation, and no dialog opens.
+    assert page.evaluate("() => apiRequest('/__gated-by-a-step-up', { method: 'POST' })") == {"done": True}
+    assert stepped == [{"action": "vault.delete", "password_method": "idp_reauth"}]
+    assert gated[-2:] == [None, "the-receipt"]
+    expect(page.locator("#stepup-modal")).not_to_have_class(re.compile(r"\bactive\b"))
+
+
 # --------------------------------------------------------------------------- signing out at the provider too
 
 def _sign_out_naming(page: Page, address):
