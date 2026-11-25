@@ -2,12 +2,16 @@
 carry only the advisory id.
 
 Every deployed host tool and running app reads main's docs/upgrade-matrix.json, so the short form is
-safe only if none of them tells an operator something different, apart from the two costs stated
-below for the host tools of 0.30.0 to 0.32.x: a release below the boundary asked for by name, and a
-container running one. The in-app check is not affected: up to 0.26.0 it reads no findings, and
-from 0.27.0 on it reads only those of the release it runs. The readers are taken from the
-release tags themselves (`git show vX.Y.Z:...`), not copied, so the check is against the code that
-is actually installed. The two forms compared are the committed matrix with every reference written
+safe only if none of them tells an operator something different, apart from the costs stated below.
+The readers of 0.30.0 to 0.32.x read a reference by its own title and fixed_in, so for a release
+below the boundary they collapse the short references into one entry with neither. Their host tool
+then misreads a release below the boundary asked for by name, and a container running one; their
+in-app check, which reads only the release it runs, misreads its own release, since every release
+of that code is below the boundary (0.32.6 has been since the boundary moved above it). Each still
+reports such a release as not secure. Up to 0.29.x the in-app check reads no findings, and from
+0.33.0 every reader takes a short reference's title and fix from its advisory. The readers are
+taken from the release tags themselves (`git show vX.Y.Z:...`), not copied, so the check is against
+the code that is actually installed. The two forms compared are the committed matrix with every reference written
 out in full and the same matrix shortened by `matrix_sync.py compact`; whichever form is committed,
 the comparison stays meaningful.
 
@@ -38,6 +42,9 @@ _HOST_TOOLS = ("v0.30.0", "v0.32.6")
 #: The host tools that end the description of a move with what it fixes and what it brings back,
 #: comparing the running version's list with the target's: the first and the last release of that code.
 _MOVE_SUMMARY_TOOLS = ("v0.31.0", "v0.32.6")
+#: The running apps whose update check reads the findings of the release it runs by each reference's own
+#: title and fixed_in: the first and the last release of that code.
+_IN_APP_TITLE_READERS = ("v0.30.0", "v0.32.6")
 #: The first release whose readers take a short reference's title and fix from its advisory.
 _FIRST_ID_READER = "v0.33.0"
 #: How many releases the host tools of 0.30.0 to 0.32.x list (`offered[:15]`).
@@ -194,7 +201,8 @@ def _move(tool, matrix: dict, current: str, target: str) -> tuple[int, set]:
 def test_an_older_host_tool_on_an_older_running_release_misreads_only_its_own_findings(
         tool_tag, forms, shipped):
     """`dockvault.py update` of 0.31.0 to 0.32.x on a host whose container runs a release below
-    the boundary (a checkout newer than the running release).
+    the boundary: a checkout newer than the running release, or one on the release it runs, which
+    for this code is always below the boundary.
 
     The second accepted cost of the short form. After the target's own warnings the tool says what
     the move fixes and what it brings back, comparing the running version's findings with the
@@ -236,6 +244,34 @@ def test_an_older_host_tool_on_an_older_running_release_misreads_only_its_own_fi
             said_brought_back += len(short_back - full_back)
 
     assert said_brought_back, "no move below the boundary misreads anything; restate this cost"
+
+
+@pytest.mark.parametrize("app_tag", _IN_APP_TITLE_READERS)
+def test_an_older_in_app_check_still_reports_its_own_release_not_secure(app_tag, forms, shipped):
+    """The in-app check of 0.30.0 to 0.32.x, on the release it runs.
+
+    The third accepted cost of the short form. The check reads only the running release's references,
+    merging main's into those of the matrix the image carries by (title, fixed_in). Every release of
+    that code is below the boundary, so the references main has for it collapse into one entry without
+    a title or a fix: the banner counts one known vulnerability where there are more, and names no
+    release that fixes it. The release is still reported as not secure, and nothing it names is
+    missing from the full form.
+    """
+    check = shipped(app_tag, "app/services/update_check.py")
+    bundled = json.loads(_at(app_tag, "docs/upgrade-matrix.json"))
+    running = app_tag.lstrip("v")
+    newest = _released_tags()[0].lstrip("v")
+    assert _vkey(running) < _vkey(_UM.ID_ONLY_REFERENCES_BELOW), "this release is no longer below the boundary"
+    said = {name: check.merged_security(running, newest, local_matrix=bundled, main_matrix=main)
+            for name, main in forms.items()}
+
+    named = {name: {(v["title"], v["fixed_in"]) for v in verdict["vulnerabilities"]}
+             for name, verdict in said.items()}
+    assert said["full"]["secure"] is False and said["short"]["secure"] is False
+    assert said["short"]["vulnerabilities"], "the short form hides every finding"
+    assert named["short"] - named["full"] <= {(None, None)}
+    assert len(said["short"]["vulnerabilities"]) < len(said["full"]["vulnerabilities"]), (
+        "the in-app check reads its own release in full; restate this cost")
 
 
 @pytest.mark.parametrize("reader", [

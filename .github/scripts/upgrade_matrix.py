@@ -105,8 +105,11 @@ _VULN_KEYS = {"advisory", "title", "fixed_in"}
 # `fixed_in` say: an id-only reference in that window would read as "no fix released yet". That
 # window reaches 0.33.5 today, and 0.33.6 once 0.36.0 is tagged; it only moves up as releases are
 # added, so references on 0.33.5 and later keep both fields. Below it that tool still reads a short
-# reference for a release asked for by name, or for the release a container runs;
-# tests/test_upgrade_matrix_older_readers.py states what it then shows.
+# reference for a release asked for by name, or for the release a container runs, and the in-app
+# check of 0.30.0 to 0.32.x reads the short references of the release it runs, every one of which is
+# below it: each counts the advisories main added there as one finding with no title and no fix, and
+# still reports the release not secure. tests/test_upgrade_matrix_older_readers.py states what each
+# shows.
 ID_ONLY_REFERENCES_BELOW = "0.33.5"
 # One record per vulnerability. title, description, impact and remediation carry the meaning and are
 # always stated. The ratings are required keys that may be null, so an unrated finding says so rather

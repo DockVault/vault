@@ -635,7 +635,10 @@ advisory's title and `fixed_in`, which is all that `dockvault.py` and the in-app
 0.33.0; from 0.33.0 they also accept an entry that carries only the advisory's id and take the rest
 from `advisories`. Below 0.33.5 an entry may carry only the id, which keeps the file small. From
 0.33.5 on the validator requires the repeated fields, because the `dockvault.py` of 0.30.0 to 0.32.x
-lists the newest releases from them; that boundary moves up as releases are added.
+lists the newest releases from them; that boundary moves up as releases are added. An install still
+running 0.30.0 to 0.32.x, which are end-of-life, is told by its update check and its `dockvault.py`
+that its release is not secure, but counts the advisories published after that release as one
+finding without a title or a fix.
 
 The validator recomputes every vector's score and refuses a severity that does not match it, requires
 an advisory to be listed on every release from the first it affects up to its fix, and refuses a
