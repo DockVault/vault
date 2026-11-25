@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
+from _settings_ui import settings_item
 from conftest import ApiClient, unique
 from test_ui_widths import ADMIN_SECTIONS, SETTINGS_PAGES, _go, _login
 
@@ -111,11 +112,13 @@ def test_every_settings_page_has_no_serious_finding(page: Page, an_admin, skin):
     assert _go(page, "settings")
     expect(page.locator("#save-all-settings-btn")).to_have_attribute("data-settings-ready", "true", timeout=15000)
     problems, visited = [], []
+    # The settings menu in the rail: its head (Back, the Advanced switch) and its pages.
+    problems += _findings(page, "settings:menu", "#sidebar")
     for tab in SETTINGS_PAGES:
-        btn = page.locator(f'#settings-section .tab-btn[data-tab="{tab}"]')
-        if not btn.is_visible():
+        item = settings_item(page, tab)
+        if not item.is_visible():
             continue
-        btn.click()
+        item.click()
         expect(page.locator(f"#settings-tab-{tab}")).to_be_visible(timeout=10000)
         page.wait_for_timeout(400)
         visited.append(tab)

@@ -18,7 +18,7 @@ import re
 import pytest
 from playwright.sync_api import Page, expect
 from _chain_read import wait_for_chain_read
-from _settings_ui import show_advanced
+from _settings_ui import open_settings_page, show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -43,7 +43,7 @@ def _login(page: Page, username: str, password: str, width=1440):
 def _open(page: Page):
     page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-    page.locator('#settings-section .tab-btn[data-tab="records"]').click()
+    open_settings_page(page, "records")   # from the settings menu, in the drawer on a phone
     show_advanced(page, "records")
     expect(page.locator("#retention-groups .retention-row").first).to_be_visible(timeout=10000)
 
@@ -423,7 +423,7 @@ def test_an_install_from_before_this_release_is_told_once(page: Page, admin_cred
     expect(banner).to_contain_text("keeps the audit log for good unless you choose otherwise")
     page.click("#retention-banner-dismiss")
     expect(banner).to_be_hidden()
-    page.locator('#settings-section .tab-btn[data-tab="records"]').click()
+    page.locator('#sidebar .sidebar-settings-item[data-tab="records"]').click()
     show_advanced(page, "records")
     page.wait_for_timeout(800)
     expect(banner).to_be_hidden()

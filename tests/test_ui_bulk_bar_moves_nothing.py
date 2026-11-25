@@ -11,6 +11,7 @@ capability sees no Download or Delete) is unchanged and pinned elsewhere.
 import pytest
 from playwright.sync_api import Page, expect
 
+from _settings_ui import is_phone, open_drawer
 from conftest import ApiClient, BASE_URL, unique
 
 pytestmark = pytest.mark.ui
@@ -84,9 +85,8 @@ def test_selecting_and_clearing_moves_no_row(page: Page, vault_with_files, skin,
     page.goto("/")
     page.evaluate("ui => localStorage.setItem('ui', ui)", skin)
     _login(page, user)
-    drawer = page.locator("#mobile-nav-toggle")
-    if drawer.is_visible():  # the phone's sidebar is a drawer
-        drawer.click()
+    if is_phone(page):  # the phone's sidebar is a drawer
+        open_drawer(page)
         expect(page.locator('.sidebar-item[data-section="vaults"]')).to_be_visible()
     page.click('.sidebar-item[data-section="vaults"]')
     page.click(f'.vault-card[data-vault-id="{vault["id"]}"] .vault-open')

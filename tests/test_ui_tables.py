@@ -198,7 +198,7 @@ def test_link_tables_have_created_and_last_used_and_sort(page: Page, admin, admi
         _login(page, admin_creds["username"], admin_creds["password"])
         page.click('.sidebar-item[data-section="settings"]')
         expect(page.locator("#save-all-settings-btn")).to_have_attribute("data-settings-ready", "true", timeout=15000)
-        page.click('#settings-section .tab-btn[data-tab="notelinks"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="notelinks"]')
         table = page.locator("#settings-tab-notelinks table.data-table").first
         expect(table).to_be_visible(timeout=15000)
         headers = [h.strip() for h in table.locator("thead th").all_text_contents()]

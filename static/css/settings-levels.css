@@ -30,7 +30,8 @@
     clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; border: 0;
 }
 
-/* "Show advanced settings (N)" at the top of a page. */
+/* At the top of a page whose every setting is advanced, while the Advanced switch is off: a short line saying
+   so. The switch itself is in the settings menu's head (components.css). */
 .settings-level-bar {
     display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 12px;
     margin-bottom: var(--space-md);
@@ -52,7 +53,7 @@
 .settings-provider-value { color: var(--text-secondary); overflow-wrap: anywhere; }
 .settings-provider-item p { margin: .25rem 0 0; max-width: none; overflow-wrap: anywhere; }
 
-/* The search above the tabs. */
+/* The search above the pages. */
 .settings-search { position: relative; margin-bottom: var(--space-md); max-width: 32rem; }
 .settings-search-input { width: 100%; }
 .settings-search-results {
@@ -80,6 +81,4 @@
 
 @media (max-width: 640px) {
     .settings-search { max-width: none; }
-    .settings-level-bar { justify-content: stretch; }
-    .settings-level-bar .settings-advanced-toggle { flex: 1 1 auto; }
 }

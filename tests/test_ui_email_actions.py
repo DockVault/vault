@@ -22,7 +22,7 @@ def _login(page: Page, username: str, password: str):
 
 def _open_email_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
-    page.click('.tab-btn[data-tab="email"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="email"]')
     show_advanced(page, "email")
     expect(page.locator("#email-actions-list")).to_be_visible(timeout=10000)
 

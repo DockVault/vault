@@ -47,7 +47,7 @@ def _logout(page: Page):
 def _open_accounts_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-    page.click('#settings-section .tab-btn[data-tab="accounts"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="accounts"]')
     show_advanced(page, "accounts")
     expect(page.locator(TAB)).to_be_visible()
     # The settings load fills the form after the tab shows, and resets anything touched before it

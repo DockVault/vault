@@ -218,6 +218,8 @@ code { background: var(--surface-2); color: var(--text-primary); border-radius: 
     letter-spacing: -0.01em;
 }
 .navbar-brand img { height: 22px !important; }
+/* A logo shown alone (Branding: the name is not shown beside it) is the brand mark, so it stands a little taller. */
+.navbar-brand img.brand-logo-alone { height: 26px !important; max-width: 200px; object-fit: contain; }
 .navbar-brand span { color: var(--text-primary); }
 .navbar-menu { display: flex; align-items: center; gap: var(--space-sm); }
 
@@ -300,14 +302,6 @@ code { background: var(--surface-2); color: var(--text-primary); border-radius: 
     background: var(--brand-secondary);
 }
 .sidebar-icon { font-size: 1rem; width: 1.1rem; text-align: center; }
-.sidebar-toggle {
-    color: var(--text-tertiary);
-    background: transparent; border: none;
-    border-radius: var(--radius-md);
-    padding: .3rem .5rem; cursor: pointer;
-}
-.sidebar-toggle:hover { background: var(--hover-overlay); color: var(--text-primary); }
-.sidebar-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
 /* Collapsed rail: icons only, no group labels */
 .sidebar.collapsed .nav-group-label { display: none; }

@@ -6,7 +6,7 @@ only — no passcode is minted here.
 """
 import pytest
 from playwright.sync_api import Page, expect
-from _settings_ui import show_advanced
+from _settings_ui import leave_settings, show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -23,7 +23,7 @@ def _login(page: Page, username: str, password: str):
 def _open_sftp_settings(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible()
-    page.click('.tab-btn[data-tab="sftp"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="sftp"]')
     show_advanced(page, "sftp")
     expect(page.locator("#settings-tab-sftp")).to_be_visible()
 
@@ -80,6 +80,7 @@ def test_temp_passcode_card_renders_and_round_trips(page: Page, admin, fresh_adm
         assert saved["temp_cred_allow_zk_vaults"] is False
 
         # Reload -> the card reflects the saved state (load path re-reads the overlay).
+        leave_settings(page)   # so the reload does not reopen Settings itself
         page.reload()
         _open_sftp_settings(page)
         expect(page.locator("#setting-temp-passcodes-enabled")).to_be_checked()

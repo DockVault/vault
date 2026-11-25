@@ -61,7 +61,7 @@ def _open_settings(page: Page, expected_sentinel: str):
 
 
 def _tab(page: Page, tab: str):
-    page.click(f'.tab-btn[data-tab="{tab}"]')
+    page.click(f'#sidebar .sidebar-settings-item[data-tab="{tab}"]')
     show_advanced(page, tab)
     expect(page.locator(f"#settings-tab-{tab}")).to_be_visible()
 

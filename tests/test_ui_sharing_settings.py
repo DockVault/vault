@@ -8,7 +8,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import unique
-from _settings_ui import show_advanced
+from _settings_ui import leave_settings, show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -25,7 +25,7 @@ def _login(page: Page, username: str, password: str):
 def _open_sharing_settings(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible()
-    page.click('.tab-btn[data-tab="sharing"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="sharing"]')
     show_advanced(page, "sharing")
     expect(page.locator("#settings-tab-sharing")).to_be_visible()
     # initSettings deliberately keeps Save disabled while /settings, /groups, and the other
@@ -58,7 +58,9 @@ def test_sharing_tab_renders_and_switch_round_trips(page: Page, admin, fresh_adm
             page.click("#save-all-settings-btn")
         assert resp.value.ok, f"PUT /settings failed: {resp.value.status}"
         assert admin.get("/settings").json()["sharing_enabled"] is True
-        # reload reflects it (load path re-reads the effective overlay)
+        # reload reflects it (load path re-reads the effective overlay); Settings is left first, so the
+        # reload does not reopen it itself
+        leave_settings(page)
         page.reload()
         _open_sharing_settings(page)
         expect(page.locator("#setting-sharing-enabled")).to_be_checked()

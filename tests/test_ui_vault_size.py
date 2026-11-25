@@ -46,7 +46,7 @@ def test_settings_quota_display_is_honest(page: Page, admin, admin_creds):
     try:
         _login(page, admin_creds["username"], admin_creds["password"])
         page.click('.sidebar-item[data-section="settings"]')
-        page.click('.tab-btn[data-tab="storage"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="storage"]')
         show_advanced(page, "storage")
         expect(page.locator("#setting-default-quota")).to_have_value("")
         expect(page.locator("#setting-max-vault-size")).to_have_value("")

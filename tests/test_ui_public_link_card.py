@@ -106,7 +106,7 @@ def test_the_cards_word_each_link_by_what_it_delivered(page: Page, admin, admin_
         page.evaluate("closeModal()")
         # The administrators' oversight list (Settings, Public Links).
         page.click('.sidebar-item[data-section="settings"]')
-        page.click('#settings-section .tab-btn[data-tab="notelinks"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="notelinks"]')
         oversight_table = page.locator("#pfl-admin-links table")
         expect(oversight_table).to_be_visible(timeout=15000)
         oversight = _cells(oversight_table, tags.values())

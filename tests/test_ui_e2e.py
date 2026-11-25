@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 from playwright.sync_api import Page, expect
-from _settings_ui import show_advanced
+from _settings_ui import leave_settings, open_settings, show_advanced
 from _ui_hand_over import expect_reason, replaced
 
 pytestmark = pytest.mark.ui
@@ -103,7 +103,7 @@ def test_directory_search_scope_setting_persists_via_ui(logged_in: Page, admin):
     admin.put("/settings", json={"directory_search_scope": "deployment"})  # deterministic start
     try:
         page.click('.sidebar-item[data-section="settings"]')
-        page.click('.tab-btn[data-tab="sftp"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="sftp"]')
         show_advanced(page, "sftp")
         # Wait until loadSettings has populated the control (else its async fetch would reset our
         # selection after select_option and the save would send the stale value).
@@ -127,9 +127,10 @@ def test_directory_search_scope_setting_persists_via_ui(logged_in: Page, admin):
             == "same_department"
         )
         # And the value round-trips back into the control on reload.
+        leave_settings(page)   # so the reload does not reopen Settings itself
         page.reload()
-        page.click('.sidebar-item[data-section="settings"]')
-        page.click('.tab-btn[data-tab="sftp"]')
+        open_settings(page)
+        page.click('#sidebar .sidebar-settings-item[data-tab="sftp"]')
         show_advanced(page, "sftp")
         expect(page.locator("#setting-directory-search-scope")).to_have_value("same_department")
     finally:
@@ -530,7 +531,7 @@ def _gen_ssh_pubkey() -> str:
 def _open_sftp_settings_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-    page.click('.tab-btn[data-tab="sftp"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="sftp"]')
     show_advanced(page, "sftp")
     expect(page.locator("#settings-tab-sftp")).to_be_visible(timeout=5000)
     save = page.locator("#save-all-settings-btn")
@@ -656,7 +657,7 @@ def test_settings_sftp_policy_survives_groups_fetch_failure(logged_in: Page, adm
 
         page.click('.sidebar-item[data-section="settings"]')
         expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-        page.click('.tab-btn[data-tab="sftp"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="sftp"]')
         show_advanced(page, "sftp")
         # Degraded read-only state is shown, not a silently empty picker.
         expect(page.locator("#sftp-temp-cred-group-picker")).to_contain_text(

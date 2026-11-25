@@ -33,7 +33,7 @@ def _login(page: Page, username: str, password: str):
 
 def _open_email_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
-    page.click('.tab-btn[data-tab="email"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="email"]')
     show_advanced(page, "email")
     expect(page.locator("#email-templates-grid")).to_be_visible(timeout=SLOW_MS)
 
@@ -311,8 +311,8 @@ def test_toolbar_wired_once_after_renavigation(admin_page: Page):
     # Bold click must wrap ONCE (a stacked listener would double-wrap <strong><strong>…).
     page = admin_page
     _open_email_tab(page)
-    page.click('.sidebar-item[data-section="dashboard"]')
-    page.wait_for_timeout(150)
+    page.click("#sidebar-settings-back")              # the settings menu's Back: to the dashboard
+    expect(page.locator("#dashboard-section")).to_be_visible()
     _open_email_tab(page)                              # attachSettingsListeners runs a second time
     _new_template(page, name="Once", body="")
     page.click('.et-toolbar [data-fmt="bold"]')       # exactly one user click

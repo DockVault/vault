@@ -5,6 +5,7 @@ each with an owner's message."""
 import pytest
 from playwright.sync_api import Page, expect
 
+from _settings_ui import close_drawer, is_phone, leave_settings, open_drawer, open_settings_page, settings_item
 from conftest import ApiClient, unique
 
 pytestmark = pytest.mark.ui
@@ -53,20 +54,20 @@ def _login(page: Page, user, skin, size):
 
 
 def _go(page: Page, section):
-    """Opens a section; False when its item is not in the menu (a feature switched off here)."""
-    drawer = page.locator("#mobile-nav-toggle")
-    if drawer.is_visible():
-        drawer.click()
+    """Opens a section; False when its item is not in the menu (a feature switched off here). From Settings, the
+    settings menu's Back comes first: while Settings is open the rail shows the Settings pages."""
+    if section != "settings" and page.locator("#settings-section").is_visible():
+        leave_settings(page)
+    open_drawer(page)
+    if is_phone(page):
         page.wait_for_timeout(300)
     item = page.locator(f'.sidebar-item[data-section="{section}"]')
     if not item.is_visible():
-        if drawer.is_visible():
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(300)
+        close_drawer(page)
         return False
     item.click()
     expect(page.locator(f"#{section}-section")).to_be_visible(timeout=15000)
-    if drawer.is_visible():
+    if is_phone(page):
         page.wait_for_function("() => getComputedStyle(document.getElementById('sidebar')).visibility === 'hidden'", timeout=5000)
     page.wait_for_timeout(500)
     return True
@@ -189,10 +190,11 @@ def test_every_settings_page_fits_the_screen(page: Page, people, skin, width):
     problems = {}
     visited = []
     for tab in SETTINGS_PAGES:
-        btn = page.locator(f'#settings-section .tab-btn[data-tab="{tab}"]')
-        if not btn.is_visible():
+        # The page's own list is hidden; its pages are in the settings menu (the drawer on a phone).
+        item = settings_item(page, tab)
+        if item.count() == 0 or item.evaluate("n => !!n.closest('.sidebar-settings-group[hidden]')"):
             continue
-        btn.click()
+        open_settings_page(page, tab)
         expect(page.locator(f"#settings-tab-{tab}")).to_be_visible(timeout=10000)
         page.wait_for_timeout(400)          # the pages that load lists on opening draw them
         visited.append(tab)

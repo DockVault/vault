@@ -7,7 +7,7 @@ import time
 import pytest
 from playwright.sync_api import Page, expect
 
-from _settings_ui import show_advanced
+from _settings_ui import leave_settings, open_settings, show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -183,10 +183,12 @@ def _line_payload(**extra):
 
 
 def _reopen_general(page):
-    # After a reload the session is kept; the banners render when Settings loads the status.
+    # After a reload the session is kept; the banners render when Settings loads the status. Settings is left
+    # first, so the reload does not reopen it itself.
+    leave_settings(page)
     page.reload()
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
-    page.click('.sidebar-item[data-section="settings"]')
+    open_settings(page)
     expect(page.locator("#settings-tab-general")).to_be_visible(timeout=10000)
     # The update banner is drawn in the same pass as the line banner, so once it shows, the line
     # banner is as this status leaves it.

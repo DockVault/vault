@@ -289,9 +289,33 @@ def test_the_menu_button_opens_a_drawer_that_closes_on_every_exit(page: Page, ph
     expect(toggle).to_have_attribute("aria-expanded", "false")
     expect(toggle).to_be_focused()
 
-    page.set_viewport_size({"width": 1280, "height": 800})       # a wide screen has the rail, no button
-    expect(toggle).to_be_hidden()
+    expect(toggle).to_have_attribute("aria-label", "Open menu")
+
+    # A wide screen has the rail, and the same button collapses and expands it, kept in this browser.
+    page.set_viewport_size({"width": 1280, "height": 800})
+    expect(toggle).to_be_visible()
     expect(page.locator('.sidebar-item[data-section="vaults"]')).to_be_visible()
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    expect(toggle).to_have_attribute("aria-label", "Collapse menu")
+    toggle.click()
+    expect(page.locator("#sidebar")).to_have_class(re.compile(r"\bcollapsed\b"))
+    expect(toggle).to_have_attribute("aria-expanded", "false")
+    expect(toggle).to_have_attribute("aria-label", "Expand menu")
+    assert page.evaluate("() => localStorage.getItem('sidebarCollapsed')") == "true"
+    expect(page.locator("#sidebar-backdrop")).to_be_hidden()
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    expect(page.locator("#sidebar")).to_have_class(re.compile(r"\bcollapsed\b"))
+    expect(toggle).to_have_attribute("aria-label", "Expand menu")
+    toggle.click()
+    expect(page.locator("#sidebar")).not_to_have_class(re.compile(r"\bcollapsed\b"))
+    expect(toggle).to_have_attribute("aria-expanded", "true")
+    assert page.evaluate("() => localStorage.getItem('sidebarCollapsed')") == "false"
+    # The rail starts at the top: no room is kept above its first item for a button of its own.
+    assert page.locator("#sidebar-toggle").count() == 0
+    rail = page.locator("#sidebar").bounding_box()
+    first = page.locator("#sidebar .sidebar-nav .sidebar-item").first.bounding_box()
+    assert first["y"] - rail["y"] < 60, (rail, first)
 
 
 @pytest.mark.ui

@@ -6,18 +6,11 @@
    is active.
    ============================================================================ */
 
-/* The menu button that opens the sidebar drawer. Hidden wherever the sidebar is a rail. */
-.mobile-nav-toggle { display: none; }
-
+/* The menu button in the top bar shows at every width (components.css); here it opens the sidebar drawer,
+   and is sized for a finger. */
 @media (max-width: 860px) {
-    .mobile-nav-toggle {
-        display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
-        width: 40px; height: 40px; margin: 0 var(--space-xs) 0 calc(-1 * var(--space-xs));
-        padding: 0; border: 0; border-radius: var(--radius-md);
-        background: transparent; color: var(--text-primary); cursor: pointer;
-    }
+    .mobile-nav-toggle { width: 40px; height: 40px; color: var(--text-primary); }
     .mobile-nav-toggle .icon { width: 22px; height: 22px; }
-    .mobile-nav-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
     /* The sidebar is a drawer under the top bar. Closed, it is off-screen AND hidden, so it drops
        out of the tab order; the visibility change waits for the slide to finish. */
@@ -36,7 +29,6 @@
         z-index: 960;
     }
     .sidebar.mobile-open { transform: none; visibility: visible; transition: transform .2s ease; }
-    .sidebar-toggle { display: none; }
     .sidebar-nav { flex-direction: column; margin-top: 0; padding: 0; gap: 2px; }
     .sidebar-item, .sidebar.collapsed .sidebar-item {
         justify-content: flex-start; gap: var(--space-md); min-height: 44px; white-space: nowrap;
@@ -44,6 +36,15 @@
     /* The desktop rail may be saved collapsed; the drawer always shows labels. */
     .sidebar.collapsed .sidebar-text { opacity: 1; width: auto; overflow: visible; }
     .sidebar.collapsed .nav-group-label { display: block; }
+    /* The same for the Settings menu the drawer shows while Settings is open. */
+    .sidebar.collapsed .sidebar-settings-head { justify-content: flex-start; }
+    .sidebar.collapsed .sidebar-settings-title { display: inline; }
+    .sidebar.collapsed .sidebar-settings-head .settings-advanced { display: inline-flex; }
+    .sidebar.collapsed .sidebar-settings-list { display: block; }
+    .sidebar-back { width: 40px; height: 40px; }
+    .settings-advanced-switch { width: 40px; height: 24px; }
+    .settings-advanced-thumb { top: 4px; left: 4px; width: 14px; height: 14px; }
+    .settings-advanced-switch[aria-checked="true"] .settings-advanced-thumb { transform: translateX(16px); }
 
     /* The top bar is a stacking context of its own (sticky, z-index 50), so its notifications panel
        and profile menu would open under the drawer. Lift it above the drawer; dialogs (1000) stay on top. */

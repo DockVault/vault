@@ -199,7 +199,7 @@ def test_the_link_tables_name_owners_with_the_chip(page: Page, admin, admin_cred
         _login(page, admin_creds["username"], admin_creds["password"])
         page.click('.sidebar-item[data-section="settings"]')
         expect(page.locator("#save-all-settings-btn")).to_have_attribute("data-settings-ready", "true", timeout=15000)
-        page.click('#settings-section .tab-btn[data-tab="notelinks"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="notelinks"]')
         owner = page.locator(f"#settings-tab-notelinks table td {CHIP}", has_text=a["_username"])
         expect(owner.first).to_be_visible(timeout=15000)
     finally:

@@ -20,6 +20,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _account_change_helpers import psql
+from _settings_ui import open_drawer
 from _sf_helpers import enroll_totp, enrolled_admin, put_settings_allowing_longer_sessions, step_up_receipt, totp
 from conftest import ApiClient, BASE_URL, unique
 
@@ -622,9 +623,7 @@ def test_back_after_a_sign_out_shows_nothing_of_the_person(page: Page, admin, an
         page.set_viewport_size({"width": 390, "height": 844})
         page.goto("/")
         _sign_in(page, boss)
-        toggle = page.locator("#mobile-nav-toggle")
-        if toggle.is_visible():
-            toggle.click()
+        open_drawer(page)   # on a phone; the menu button collapses the rail on a wide screen
         page.click('.sidebar-item[data-section="activity"]')
         expect(page.locator("#act-pager")).to_be_visible(timeout=15000)
         page.click("#act-filter-btn")
@@ -942,9 +941,7 @@ def test_a_name_another_page_gave_the_tab_neither_shows_its_text_nor_drops_the_s
 
 
 def _activity_with_a_search(page: Page, term: str):
-    toggle = page.locator("#mobile-nav-toggle")
-    if toggle.is_visible():
-        toggle.click()
+    open_drawer(page)   # on a phone; the menu button collapses the rail on a wide screen
     page.click('.sidebar-item[data-section="activity"]')
     expect(page.locator("#act-pager")).to_be_visible(timeout=15000)
     page.click("#act-filter-btn")
@@ -1199,9 +1196,7 @@ def _where_the_search_is(page: Page, term: str) -> list:
 
 
 def _open_activity(page: Page):
-    toggle = page.locator("#mobile-nav-toggle")
-    if toggle.is_visible():
-        toggle.click()
+    open_drawer(page)   # on a phone; the menu button collapses the rail on a wide screen
     page.click('.sidebar-item[data-section="activity"]')
     expect(page.locator("#act-pager")).to_be_visible(timeout=15000)
     page.wait_for_timeout(1500)

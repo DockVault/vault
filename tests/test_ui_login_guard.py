@@ -32,8 +32,8 @@ def _login_admin(page: Page, admin_creds):
 
 def _open_accounts_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
-    expect(page.locator("#settings-tab-accounts, .tab-btn[data-tab='accounts']").first).to_be_visible(timeout=10000)
-    page.click('.tab-btn[data-tab="accounts"]')
+    expect(page.locator("#settings-tab-accounts, #sidebar .sidebar-settings-item[data-tab='accounts']").first).to_be_visible(timeout=10000)
+    page.click('#sidebar .sidebar-settings-item[data-tab="accounts"]')
     show_advanced(page, "accounts")
     expect(page.locator("#setting-login-identifier")).to_be_visible(timeout=10000)
     # Wait for the async settings load to populate the select — otherwise populateAccountsPolicy can

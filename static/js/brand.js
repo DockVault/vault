@@ -13,10 +13,18 @@
  *   [data-brand-name]     -> textContent := app_name
  *   [data-brand-tagline]  -> textContent := app_full_name
  *   [data-brand-template] -> textContent := attr value with {name} -> app_name
- *   [data-brand-logo]     -> src := logo_small (alt := app_name)
+ *   [data-brand-logo]     -> src := logo_small. If the image cannot be loaded it switches once
+ *                            to the built-in /static/assets/logo-small.png; if that fails too,
+ *                            the image is hidden, so its alt text never shows beside the name.
  *   #powered-by           -> persistent attribution: [data-powered-by-name] text + link;
  *                            hidden only when powered_by.show is false (a deploy-level flag,
  *                            NOT the tenant editor, so a customizing tenant can't remove it)
+ *
+ * The name beside the logo: a [data-brand-name] in the same parent as a [data-brand-logo] (the
+ * top bar, the sign-in card, the public pages' header). When show_name_beside_logo is false and
+ * that logo has loaded, the name is hidden and the image's alt is the name. While the name shows,
+ * the alt is "" so screen readers do not read the name twice. If the logo cannot be loaded, the
+ * name shows. A logo on its own (the boot screen) has the name as its alt.
  *
  * Security: branding values are admin-editable and could be hostile. Text is set
  * via textContent only (never innerHTML — also hook-enforced). Asset URLs are
@@ -27,6 +35,11 @@
     'use strict';
 
     var CACHE_KEY = 'dv_branding';
+    // The built-in logo every [data-brand-logo] falls back to, once, when its own image fails.
+    var FALLBACK_LOGO = '/static/assets/logo-small.png';
+    // The last applied branding's name and name switch (default: the name shows).
+    var brandName = '';
+    var showName = true;
 
     // Allow only a same-origin path ("/...") or an absolute http(s) URL; reject
     // javascript:, data:, vbscript:, protocol-relative ("//host"), etc.
@@ -78,10 +91,95 @@
         }
     }
 
+    // ---- Logos -------------------------------------------------------------------------
+    // The [data-brand-name] that stands beside a logo: in the same parent element.
+    function nameBeside(img) {
+        var parent = img.parentElement;
+        return parent ? parent.querySelector('[data-brand-name]') : null;
+    }
+
+    // The brand's own logo is on screen: its image loaded (an SVG may report no natural width, so the
+    // load event counts too), and it is neither the built-in fallback nor hidden after two failures.
+    function logoLoaded(img) {
+        if (img.hasAttribute('data-brand-fallback') || img.hasAttribute('data-brand-logo-hidden')) return false;
+        return img.hasAttribute('data-brand-logo-loaded') || (img.complete && img.naturalWidth > 0);
+    }
+
+    // The name and the alt text of one logo. The name hides only while its logo is on screen.
+    function syncLogo(img) {
+        var name = nameBeside(img);
+        var label = brandName || (name && name.textContent) || '';
+        if (!name) {
+            if (label) img.setAttribute('alt', label);
+            return;
+        }
+        var logoOnly = !showName && logoLoaded(img);
+        name.style.display = logoOnly ? 'none' : '';
+        img.setAttribute('alt', logoOnly ? label : '');
+        img.classList.toggle('brand-logo-alone', logoOnly);
+        // The space kept for the name goes with it, so the logo stays centred; it comes back with the name.
+        if (logoOnly && !img.hasAttribute('data-brand-margin')) {
+            img.setAttribute('data-brand-margin', img.style.marginRight || '');
+            img.style.marginRight = '0';
+        } else if (!logoOnly && img.hasAttribute('data-brand-margin')) {
+            img.style.marginRight = img.getAttribute('data-brand-margin');
+            img.removeAttribute('data-brand-margin');
+        }
+    }
+
+    function syncLogos() {
+        document.querySelectorAll('[data-brand-logo]').forEach(syncLogo);
+    }
+
+    // First failure: switch to the built-in logo. A second one (or the built-in logo failing):
+    // hide the image, so the name shows on its own and no alt text shows beside it.
+    function onLogoError(img) {
+        var src = img.getAttribute('src') || '';
+        img.removeAttribute('data-brand-logo-loaded');
+        if (!img.hasAttribute('data-brand-fallback') && src !== FALLBACK_LOGO) {
+            img.setAttribute('data-brand-fallback', '1');
+            img.setAttribute('data-brand-failed', src);
+            img.setAttribute('src', FALLBACK_LOGO);
+        } else {
+            img.setAttribute('data-brand-logo-hidden', '1');
+            img.style.display = 'none';
+        }
+        syncLogo(img);
+    }
+
+    // Point a logo at the brand's address. An address that already failed on this image is not
+    // tried again: the image keeps its fallback.
+    function setLogoSrc(img, url) {
+        if (img.getAttribute('data-brand-failed') === url) return;
+        if (img.getAttribute('src') === url) return;
+        img.removeAttribute('data-brand-fallback');
+        img.removeAttribute('data-brand-failed');
+        img.removeAttribute('data-brand-logo-hidden');
+        img.removeAttribute('data-brand-logo-loaded');
+        img.style.display = '';
+        img.setAttribute('src', url);
+    }
+
+    // Image load and error events do not bubble, but a capturing listener on the document sees
+    // them. Added here in <head>, before any logo is parsed, so no early failure is missed.
+    document.addEventListener('error', function (e) {
+        var t = e.target;
+        if (t && t.tagName === 'IMG' && t.hasAttribute('data-brand-logo')) onLogoError(t);
+    }, true);
+    document.addEventListener('load', function (e) {
+        var t = e.target;
+        if (t && t.tagName === 'IMG' && t.hasAttribute('data-brand-logo')) {
+            t.setAttribute('data-brand-logo-loaded', '1');
+            syncLogo(t);
+        }
+    }, true);
+
     // <body> pieces (header/sidebar name, tagline, templated copy, logos).
     function applyBody(b) {
         if (!b || typeof b !== 'object') return;
         var name = b.app_name;
+        if (typeof name === 'string' && name) brandName = name;
+        showName = b.show_name_beside_logo !== false;
         if (name) {
             document.querySelectorAll('[data-brand-name]').forEach(function (el) {
                 el.textContent = name;
@@ -97,12 +195,10 @@
             });
         }
         var logoUrl = b.assets && (safeUrl(b.assets.logo_small) || safeUrl(b.assets.logo));
-        if (logoUrl) {
-            document.querySelectorAll('[data-brand-logo]').forEach(function (img) {
-                img.setAttribute('src', logoUrl);
-                if (name) img.setAttribute('alt', name);
-            });
-        }
+        document.querySelectorAll('[data-brand-logo]').forEach(function (img) {
+            if (logoUrl) setLogoSrc(img, logoUrl);
+            syncLogo(img);
+        });
         applyPoweredBy(b);
     }
 
@@ -134,6 +230,13 @@
         } else {
             applyBody(b);
         }
+    }
+
+    // 0. the markup's logos get their alt text even when no branding arrives
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', syncLogos);
+    } else {
+        syncLogos();
     }
 
     // 1. paint from cache synchronously (flash-free on repeat visits)

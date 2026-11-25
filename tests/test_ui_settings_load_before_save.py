@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, expect
 
-from _settings_ui import show_advanced
+from _settings_ui import leave_settings, show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -89,14 +89,14 @@ def test_three_visits_then_one_click_send_one_request_each(page: Page, settings_
     for _ in range(3):
         _open_settings(page)
         _wait_ready(page)
-        page.click('.sidebar-item[data-section="dashboard"]')
+        page.click("#sidebar-settings-back")   # the settings menu's Back: to the dashboard it was opened from
         expect(page.locator("#dashboard-section")).to_be_visible()
     _open_settings(page)
     _wait_ready(page)
     page.wait_for_timeout(1000)  # the visit's own reads are done
 
     tab_reads = _requests(page, "GET", "/settings/logs")
-    page.click('#settings-section .tab-btn[data-tab="logs"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="logs"]')
     expect(page.locator("#settings-tab-logs")).to_be_visible()
     page.wait_for_timeout(1000)
     assert len(tab_reads) == 1, f"one tab click, {len(tab_reads)} reads"
@@ -119,6 +119,7 @@ def test_another_pages_tab_bar_leaves_the_settings_tab_open(page: Page, settings
     _open_settings(page)
     _wait_ready(page)
     expect(page.locator("#settings-tab-general")).to_have_class(re.compile(r"\bactive\b"))
+    leave_settings(page)   # the rail shows the sections again
     page.click('.sidebar-item[data-section="shared"]')
     expect(page.locator("#shared-section")).to_be_visible(timeout=10000)
     page.click('[data-shared-tab="by-me"]')

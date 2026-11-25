@@ -8,7 +8,7 @@ import time
 
 import pytest
 from playwright.sync_api import Page, expect
-from _settings_ui import show_advanced
+from _settings_ui import leave_settings, show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -42,7 +42,7 @@ def _open_sftp_settings(page: Page):
     ):
         page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible()
-    page.click('.tab-btn[data-tab="sftp"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="sftp"]')
     show_advanced(page, "sftp")
     expect(page.locator("#settings-tab-sftp")).to_be_visible()
 
@@ -77,6 +77,7 @@ def test_org_floor_card_round_trips(page: Page, admin, fresh_admin):
         _wait_until(lambda: admin.get("/settings").json().get("force_no_remember_vault_password") is True,
                     "force_no_remember_vault_password did not persist after Save")
 
+        leave_settings(page)   # so the reload does not reopen Settings itself
         page.reload()
         _open_sftp_settings(page)
         expect(page.locator("#setting-force-no-remember-vault-password")).to_be_checked()

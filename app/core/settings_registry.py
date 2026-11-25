@@ -54,7 +54,7 @@ SETTINGS_LOCKED_KEYS never names it. Every entry of every kind carries:
 
 - ``level``: ESSENTIAL or ADVANCED. One rule decides it: a setting is essential when most administrators
   change it in their first month with the vault; everything else is advanced. A page shows its essential
-  settings, and "Show advanced settings (N)" reveals the rest, each marked Advanced.
+  settings, and the Advanced switch in the settings menu reveals the rest on every page, each marked Advanced.
 - ``since``: the release (X.Y.Z) in which the setting first appeared on the Settings pages. A setting is
   new (is_new) when it arrived in the current release line or the one before it, or after the release at
   which this administrator last opened the Settings pages; the pages mark it "New".

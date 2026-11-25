@@ -31,7 +31,7 @@ def _login(page: Page, username: str, password: str):
 
 def _open_log_tab(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
-    page.click('.tab-btn[data-tab="logs"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="logs"]')
     show_advanced(page, "logs")
     expect(page.locator("#settings-tab-logs")).to_be_visible(timeout=10000)
 

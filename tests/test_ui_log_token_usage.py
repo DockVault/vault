@@ -30,7 +30,7 @@ def test_log_token_reveal_shows_usage_curl(page: Page, admin_creds, admin):
         pytest.skip("the mint UI is gated on the log ceiling; needs a ceiling-on instance")
     _login(page, admin_creds["username"], admin_creds["password"])
     page.click('[data-section="settings"]')
-    page.click('.tab-btn[data-tab="logs"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="logs"]')
     show_advanced(page, "logs")
     page.click("#log-token-generate-btn")
     page.fill("#log-token-name", "usage-doc-test")

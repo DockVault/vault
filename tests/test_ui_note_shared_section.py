@@ -72,7 +72,7 @@ def test_admin_all_links_table_revokes_any_users_link(page: Page, admin, admin_c
     try:
         _login(page, admin_creds["username"], admin_creds["password"])
         page.click('.sidebar-item[data-section="settings"]')
-        page.click('#settings-section .tab-btn[data-tab="notelinks"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="notelinks"]')
         expect(page.locator("#settings-tab-notelinks")).to_be_visible(timeout=10000)
         # The owner's link shows in the admin table, attributed to them.
         row = page.locator("#nl-admin-links tr", has_text=owner["_username"])

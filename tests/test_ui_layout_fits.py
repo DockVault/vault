@@ -12,6 +12,7 @@ import time
 import pytest
 from playwright.sync_api import Page, expect
 
+from _settings_ui import is_phone, open_drawer, open_settings_page
 from conftest import ApiClient, BASE_URL, unique
 from _ui_hand_over import replaced
 
@@ -37,13 +38,13 @@ def _login(page: Page, username: str, password: str, skin: str = None, size=None
 
 def _section(page: Page, name: str):
     """Opens a section from the menu; on a phone the menu is a drawer, opened first and closed after."""
-    drawer = page.locator("#mobile-nav-toggle")
-    if drawer.is_visible():
-        drawer.click()
+    phone = is_phone(page)
+    open_drawer(page)
+    if phone:
         page.wait_for_timeout(300)
     page.click(f'.sidebar-item[data-section="{name}"]')
     expect(page.locator(f"#{name}-section")).to_be_visible(timeout=15000)
-    if drawer.is_visible():
+    if phone:
         page.wait_for_function("() => getComputedStyle(document.getElementById('sidebar')).visibility === 'hidden'", timeout=5000)
     page.wait_for_timeout(300)
 
@@ -231,7 +232,7 @@ def test_each_admin_link_tables_revoke_is_inside_its_scroll_box(page: Page, admi
     expect(page.locator("#save-all-settings-btn")).to_have_attribute("data-settings-ready", "true", timeout=15000)
     problems = {}
     for tab, hosts in (("notelinks", ("#nl-admin-links", "#pfl-admin-links")), ("uploadlinks", ("#rc-admin-links",))):
-        page.click(f'#settings-section .tab-btn[data-tab="{tab}"]')
+        open_settings_page(page, tab)
         for host in hosts:
             expect(page.locator(f"{host} table.data-table tbody tr").first).to_be_visible(timeout=15000)
             page.locator(host).scroll_into_view_if_needed()

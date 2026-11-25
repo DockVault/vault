@@ -6,6 +6,7 @@ import csv
 import pytest
 from playwright.sync_api import Page, expect
 
+from _settings_ui import open_drawer
 from conftest import unique
 
 pytestmark = pytest.mark.ui
@@ -28,9 +29,7 @@ def _login(page: Page, user, width=1280, height=900):
 
 
 def _open_activity(page: Page):
-    toggle = page.locator("#mobile-nav-toggle")
-    if toggle.is_visible():
-        toggle.click()
+    open_drawer(page)   # on a phone; the menu button collapses the rail on a wide screen
     page.click('.sidebar-item[data-section="activity"]')
     expect(page.locator("#activity-section")).to_be_visible(timeout=10000)
 

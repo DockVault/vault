@@ -28,7 +28,8 @@ POLICY_KEYS = ("require_uppercase", "require_lowercase", "require_numbers", "req
 
 
 # The real selectors, taken from tests/test_ui_settings_auth_limits.py rather than guessed. The
-# button is #save-all-settings-btn, the tabs are .tab-btn[data-tab=...], and the form is populated
+# button is #save-all-settings-btn, the pages open from the settings menu's .sidebar-settings-item[data-tab=...]
+# in the side rail, and the form is populated
 # asynchronously -- so a click before it has loaded reads the empty page, not the settings.
 SAVE_BTN = "#save-all-settings-btn"
 
@@ -44,7 +45,7 @@ def _open_settings(page, admin):
 
 
 def _tab(page, tab):
-    page.click('.tab-btn[data-tab="%s"]' % tab)
+    page.click('#sidebar .sidebar-settings-item[data-tab="%s"]' % tab)
     expect(page.locator("#settings-tab-%s" % tab)).to_be_visible()
 
 

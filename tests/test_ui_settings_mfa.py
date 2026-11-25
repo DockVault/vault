@@ -44,7 +44,7 @@ def test_admin_mfa_policy_and_action_matrix(page: Page, admin):
         item = page.locator('[data-section="settings"]')
         expect(item).to_be_visible(timeout=10000)
         item.click()
-        page.click('.tab-btn[data-tab="security"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="security"]')
         show_advanced(page, "security")
         expect(page.locator("#setting-mfa-mode")).to_be_visible(timeout=10000)
         # loadSettings populates the policy select then fetches the matrix asynchronously; wait for the

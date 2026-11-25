@@ -1,18 +1,19 @@
 """UI — Settings levels (static/js/settings-levels.js), in both skins and at a phone's width.
 
-Each Settings page shows its essential settings; "Show advanced settings (N)" reveals the advanced ones, each
-marked Advanced, and a container left with no setting showing goes too (the rate limits, a whole card, the
-groups of how long records are kept). A page whose every setting is advanced says so. "New" follows the
-catalogue, and its mark leaves a field's label as it was for assistive technology. The settings the provider
-has locked leave their place for one collapsed, read-only list at the foot of their page, "Set by your
-provider (N)", with each one's value and reason, and the toggle's N leaves them out; the single sign-on card,
-which shows its own lock, keeps its place and is listed there too. What the marks say
+Each Settings page shows its essential settings; one Advanced switch, in the settings menu's head in the side rail
+(the drawer on a phone), shows the advanced ones on every page, each marked Advanced. It is off by default and
+kept in this browser. A container left with no setting showing goes too (the rate limits, a whole card, the
+groups of how long records are kept). A page whose every setting is advanced says so, and how to see them. "New"
+follows the catalogue, and its mark leaves a field's label as it was for assistive technology. The settings the
+provider has locked leave their place for one collapsed, read-only list at the foot of their page, "Set by your
+provider (N)", with each one's value and reason, and the switch never shows them in place; the single sign-on
+card, which shows its own lock, keeps its place and is listed there too. What the marks say
 reaches assistive technology as each field's description, never on screen: each field names the note once,
-beside a description of its own, which stays when the mark goes. Opening Settings again reads the catalogue again.
-A search box above the tabs finds a setting by its label or its help text on any page (label hits first, at
-most twelve listed) and goes to it, revealing it where it is advanced; it and N follow what the app shows or
-hides. Hiding a setting never changes what "Save All Changes" sends. Nothing is wider than a phone. No console
-error.
+beside a description of its own, which stays when the mark goes. Opening Settings again reads the catalogue
+again. A search box above the pages finds a setting by its label or its help text on any page (label hits
+first, at most twelve listed) and goes to it, turning the switch on where it is advanced; it follows what the
+app shows or hides. Hiding a setting never changes what "Save All Changes" sends. Nothing is wider than a
+phone. No console error.
 
 The catalogue is the server's (GET /settings/catalogue), or served with an edit (a lock, a "New") where a test
 needs one the stack does not have. The tests sign in as a throwaway administrator, so a skin stored on the
@@ -25,10 +26,13 @@ import uuid
 import pytest
 from playwright.sync_api import Page, expect
 
+from _settings_ui import SWITCH, close_drawer, is_phone, leave_settings, open_drawer, open_settings_page
+
 pytestmark = pytest.mark.ui
 
 WIDE = {"width": 1440, "height": 900}
 PHONE = {"width": 390, "height": 844}
+ALL_ADVANCED = "Every setting on this page is advanced. Turn on Advanced to see them."
 
 
 @pytest.fixture
@@ -53,21 +57,19 @@ def _login(page: Page, user, skin="v2", viewport=WIDE):
 
 
 def _open(page: Page):
-    """Settings, with the catalogue read and applied (the General page's toggle shows)."""
-    drawer = page.locator("#mobile-nav-toggle")
-    if drawer.is_visible():
-        drawer.click()
+    """Settings, with the catalogue read and applied (the General page's advanced settings are marked)."""
+    open_drawer(page)
+    if is_phone(page):
         expect(page.locator('.sidebar-item[data-section="settings"]')).to_be_visible()
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-    if drawer.is_visible():
-        # The drawer slides out over .2s; wait for it before measuring or clicking anything.
-        page.wait_for_function("() => getComputedStyle(document.getElementById('sidebar')).visibility === 'hidden'")
-    expect(page.locator("#settings-tab-general .settings-advanced-toggle")).to_be_visible(timeout=15000)
+    # The drawer slides out over .2s; wait for it before measuring or clicking anything.
+    close_drawer(page)
+    expect(page.locator("#settings-tab-general [data-setting].setting-advanced").first).to_be_attached(timeout=15000)
 
 
 def _tab(page: Page, name):
-    page.locator(f'#settings-section .tab-btn[data-tab="{name}"]').click()
+    open_settings_page(page, name)
     expect(page.locator(f"#settings-tab-{name}")).to_be_visible()
 
 
@@ -75,8 +77,23 @@ def _setting(page: Page, key):
     return page.locator(f'#settings-section [data-setting="{key}"]').first
 
 
-def _toggle(page: Page, name):
-    return page.locator(f"#settings-tab-{name} .settings-advanced-toggle")
+def _switch(page: Page):
+    return page.locator(SWITCH)
+
+
+def _flip(page: Page):
+    """Click the Advanced switch (in the drawer on a phone) and wait for the page to follow."""
+    open_drawer(page)
+    _switch(page).click()
+    close_drawer(page)
+    _settled(page)
+
+
+def _advanced(page: Page, on=True):
+    """The Advanced switch turned on (or off); left as it is when it already is."""
+    if (_switch(page).get_attribute("aria-checked") == "true") != on:
+        _flip(page)
+    expect(_switch(page)).to_have_attribute("aria-checked", "true" if on else "false")
 
 
 def _serve_catalogue(page: Page, edit):
@@ -100,56 +117,65 @@ def _errors(page: Page):
 _VISIBLE_ADVANCED = """name => new Set([...document.querySelectorAll(`#settings-tab-${name} [data-setting].setting-advanced`)]
     .filter(n => n.offsetParent !== null).map(n => n.dataset.setting)).size"""
 
+# The advanced settings of a page the switch can show: marked advanced, not folded into the provider's list, and
+# not hidden by the app itself (the update checks while they are off).
+_ADVANCED_PRESENT = """name => new Set([...document.querySelectorAll(`#settings-tab-${name} [data-setting].setting-advanced:not(.setting-folded)`)]
+    .filter(n => !n.hidden && n.style.display !== 'none').map(n => n.dataset.setting)).size"""
+
 
 def _settled(page: Page):
     """Two animation frames: a change to the page has been applied (each pass runs in the next frame)."""
     page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
 
 
-def _shown_count(page: Page, name):
-    """N of a page's "Show advanced settings (N)", once the page's last change has been applied."""
+def _present_count(page: Page, name):
+    """How many advanced settings the switch would show on a page, once the page's last change has been applied."""
     _settled(page)
-    text = _toggle(page, name).inner_text().strip()
-    found = re.fullmatch(r"Show advanced settings \((\d+)\)", text)
-    assert found, text
-    return int(found.group(1))
+    return page.evaluate(_ADVANCED_PRESENT, name)
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])
-def test_a_page_shows_its_essential_settings_and_reveals_the_advanced_ones(page: Page, levels_admin, skin):
+def test_one_switch_shows_the_advanced_settings_on_every_page(page: Page, levels_admin, skin):
     errors = _errors(page)
     _login(page, levels_admin, skin)
     _open(page)
-    toggle = _toggle(page, "general")
+    switch = _switch(page)
+    # One switch, in the settings menu's head; no button on the pages.
+    expect(switch).to_have_attribute("role", "switch")
+    expect(switch).to_have_attribute("aria-checked", "false")        # off by default
+    expect(switch).to_have_accessible_name("Show advanced settings on every page")
+    expect(page.locator("#sidebar .sidebar-settings-head .settings-advanced-label")).to_have_text("Advanced")
+    expect(page.locator("#settings-section .settings-advanced-toggle")).to_have_count(0)
     for key in ("app_name", "max_file_size"):
         expect(_setting(page, key)).to_be_visible()
         expect(_setting(page, key).locator(".setting-chip-advanced")).to_have_count(0)
     for key in ("app_description", "allowed_file_types"):
         expect(_setting(page, key)).to_be_hidden()
-    expect(toggle).to_have_attribute("aria-pressed", "false")
     expect(page.locator("#settings-tab-general .settings-level-note")).to_be_hidden()   # it has essential ones
-    count = re.fullmatch(r"Show advanced settings \((\d+)\)", toggle.inner_text().strip())
-    assert count, toggle.inner_text()
-    toggle.click()
-    expect(toggle).to_have_text("Hide advanced settings")
-    expect(toggle).to_have_attribute("aria-pressed", "true")
+    count = _present_count(page, "general")
+    assert count >= 2, count
+    switch.click()
+    expect(switch).to_have_attribute("aria-checked", "true")
     expect(_setting(page, "app_description")).to_be_visible()
     expect(_setting(page, "app_description").locator(".setting-chip-advanced")).to_have_text("Advanced")
-    assert page.evaluate(_VISIBLE_ADVANCED, "general") == int(count.group(1))
-    toggle.click()
-    expect(_setting(page, "app_description")).to_be_hidden()
-    expect(toggle).to_be_focused()
+    assert page.evaluate(_VISIBLE_ADVANCED, "general") == count
 
-    # A page whose every setting is advanced says so; a container holding only hidden settings goes too.
+    # On every page: another page shows its advanced settings without being asked again.
     _tab(page, "logs")
     logs = page.locator("#settings-tab-logs")
-    expect(logs.locator(".settings-level-note")).to_have_text("Every setting on this page is advanced.")
-    expect(logs.locator(".card", has=page.locator('[data-setting="log_components"]'))).to_be_hidden()
-    expect(_setting(page, "log_tokens")).to_be_hidden()
-    _toggle(page, "logs").click()
     expect(_setting(page, "log_components")).to_be_visible()
     expect(_setting(page, "log_tokens")).to_be_visible()
     expect(logs.locator(".settings-level-note")).to_be_hidden()
+    # Off: a page whose every setting is advanced says so, and how to see them; a container holding only hidden
+    # settings goes too.
+    switch.click()
+    expect(switch).to_have_attribute("aria-checked", "false")
+    expect(switch).to_be_focused()
+    expect(logs.locator(".settings-level-note")).to_have_text(ALL_ADVANCED)
+    expect(logs.locator(".card", has=page.locator('[data-setting="log_components"]'))).to_be_hidden()
+    expect(_setting(page, "log_tokens")).to_be_hidden()
+    _tab(page, "general")
+    expect(_setting(page, "app_description")).to_be_hidden()
 
     # Rows the page's scripts draw: the rate limits, and how long records are kept.
     _tab(page, "security")
@@ -157,10 +183,11 @@ def test_a_page_shows_its_essential_settings_and_reveals_the_advanced_ones(page:
     limits_card = page.locator("#settings-tab-security .card", has=page.locator("#rate-limit-settings"))
     expect(page.locator("#rate-limit-settings .rl-row").first).to_be_attached(timeout=10000)
     expect(limits_card).to_be_hidden()
-    _toggle(page, "security").click()
+    switch.click()
     expect(limits_card).to_be_visible()
     expect(_setting(page, "rate_limit_vault_attempts")).to_be_visible()
     expect(_setting(page, "rate_limit_vault_attempts").locator(".setting-chip-advanced")).to_have_text("Advanced")
+    switch.click()
 
     _tab(page, "records")
     records = page.locator("#settings-tab-records")
@@ -171,11 +198,29 @@ def test_a_page_shows_its_essential_settings_and_reveals_the_advanced_ones(page:
     expect(page.locator("#retention-storage-card")).to_be_visible()          # not a setting: always there
     expect(_setting(page, "audit_levels")).to_be_hidden()
     expect(records.locator(".settings-level-note")).to_be_visible()
-    _toggle(page, "records").click()
+    switch.click()
     expect(_setting(page, "audit_max_days")).to_be_visible()
     expect(_setting(page, "audit_max_days").locator(".setting-chip-advanced")).to_have_text("Advanced")
     expect(page.locator("#recording-levels-card")).to_be_visible()
     assert not errors, errors
+
+
+def test_the_switch_is_kept_in_this_browser(page: Page, levels_admin):
+    """The choice is the browser's: it outlives a reload and a new visit to Settings, and turning it off is kept too."""
+    _login(page, levels_admin)
+    _open(page)
+    assert page.evaluate("() => localStorage.getItem('settingsAdvanced')") in (None, "false")
+    _advanced(page, True)
+    assert page.evaluate("() => localStorage.getItem('settingsAdvanced')") == "true"
+    leave_settings(page)
+    page.reload()
+    expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    _open(page)
+    expect(_switch(page)).to_have_attribute("aria-checked", "true")
+    expect(_setting(page, "app_description")).to_be_visible()
+    _advanced(page, False)
+    assert page.evaluate("() => localStorage.getItem('settingsAdvanced')") == "false"
+    expect(_setting(page, "app_description")).to_be_hidden()
 
 
 def test_the_new_marks_follow_the_catalogue_and_leave_labels_as_they_were(page: Page, levels_admin):
@@ -197,7 +242,7 @@ def test_the_new_marks_follow_the_catalogue_and_leave_labels_as_they_were(page: 
     # The note is read right after the label, outside it.
     note = _setting(page, "app_name").locator(".setting-marks-note")
     assert note.evaluate("n => [n.previousElementSibling.tagName, n.closest('label')]") == ["LABEL", None]
-    _toggle(page, "general").click()
+    _advanced(page, True)
     chips = _setting(page, "app_description").locator(".setting-chip")
     expect(chips).to_have_text(["New", "Advanced"])
     expect(page.locator("#setting-app-description")).to_have_accessible_name("Application Description")
@@ -205,7 +250,6 @@ def test_the_new_marks_follow_the_catalogue_and_leave_labels_as_they_were(page: 
         re.compile(r"^New in \d+\.\d+\.\d+\. An advanced setting\.$"))
     # A field that had a description keeps it, and the mark's is added beside it.
     _tab(page, "accounts")
-    _toggle(page, "accounts").click()
     domains = page.locator("#setting-signup-domain-input")
     expect(domains).to_be_visible()
     assert "accounts-domain-help" in domains.get_attribute("aria-describedby").split()
@@ -228,10 +272,10 @@ def test_reopening_settings_reads_the_catalogue_again_and_says_seen_again(page: 
         _open(page)
     expect(_setting(page, "app_name").locator(".setting-chip-new")).to_have_text("New")
     expect(page.locator("#setting-app-name")).to_have_accessible_description(re.compile(r"^New in "))
-    _toggle(page, "general").click()
+    _advanced(page, True)
     expect(page.locator("#setting-app-description")).to_have_accessible_description(
         re.compile(r"^New in \S+ An advanced setting\.$"))
-    page.click('.sidebar-item[data-section="dashboard"]')
+    leave_settings(page)
     expect(page.locator("#settings-section")).to_be_hidden()
     with page.expect_request(lambda r: r.url.endswith("/settings/catalogue/seen") and r.method == "POST"):
         page.click('.sidebar-item[data-section="settings"]')
@@ -261,19 +305,18 @@ def test_the_note_is_never_seen_and_each_field_names_it_once_however_often_the_p
     _serve_catalogue(page, mark)
     _login(page, levels_admin, skin)
     _open(page)
-    _toggle(page, "general").click()
+    _advanced(page, True)
     for key in ("app_name", "app_description"):
         note = _setting(page, key).locator(".setting-marks-note")
         expect(note).to_have_count(1)
         assert note.evaluate(_NOTE_BOX) == [True, "absolute", "hidden"], key
     for _ in range(3):
-        _toggle(page, "general").click()
-        _settled(page)
+        _flip(page)
         page.evaluate("""() => { const s = document.getElementById('settings-section');
             const d = document.createElement('div'); s.append(d); d.remove(); }""")
         _settled(page)
+    _advanced(page, True)
     _tab(page, "accounts")
-    _toggle(page, "accounts").click()
     _settled(page)
     _tab(page, "general")
     _settled(page)
@@ -301,12 +344,12 @@ def test_a_fields_own_description_stays_when_its_mark_goes(page: Page, levels_ad
     _serve_catalogue(page, mark)
     _login(page, levels_admin)
     _open(page)
+    _advanced(page, True)
     _tab(page, "accounts")
-    _toggle(page, "accounts").click()
     domains = page.locator("#setting-signup-domain-input")
     expect(domains).to_be_visible()
     expect(domains).to_have_accessible_description(re.compile(r"^Type a domain .* New in \S+ An advanced setting\.$"))
-    page.click('.sidebar-item[data-section="dashboard"]')
+    leave_settings(page)
     expect(page.locator("#settings-section")).to_be_hidden()
     with page.expect_request(lambda r: r.url.endswith("/settings/catalogue/seen") and r.method == "POST"):
         page.click('.sidebar-item[data-section="settings"]')
@@ -323,7 +366,7 @@ def test_a_setting_drawn_inside_another_is_described_by_its_own_marks_only(page:
     holds it most closely, never by an outer one's."""
     _login(page, levels_admin)
     _open(page)
-    _toggle(page, "general").click()
+    _advanced(page, True)
     page.evaluate("""() => {
         const outer = document.querySelector('#settings-tab-general [data-setting="app_description"]');
         const inner = document.createElement('div');
@@ -346,7 +389,7 @@ def test_the_new_marks_on_a_page_are_the_servers(page: Page, levels_admin, admin
     _open(page)
     _tab(page, "records")
     expect(page.locator('#retention-groups .retention-row[data-key="audit_max_days"]')).to_be_attached(timeout=10000)
-    _toggle(page, "records").click()
+    _advanced(page, True)
     entries = page.evaluate("() => apiRequest('/settings/catalogue', {silent: true})")["entries"]
     on_page = [e for e in entries if e["page"] == "records" and not e["locked"]]
     assert on_page
@@ -407,9 +450,9 @@ def test_locked_settings_fold_into_the_providers_list_on_their_page(page: Page, 
     expect(item.locator(".settings-provider-reason")).to_contain_text("AUDIT_HOT_DAYS")
     expect(fold.locator('.settings-provider-item[data-fold-key="audit_levels"]')).to_contain_text("Recording levels")
     expect(fold.locator("input, select, textarea, button")).to_have_count(0)
-    # Revealing the advanced settings shows the others, never a locked one; the toggle counts only those.
-    count = _shown_count(page, "records")
-    _toggle(page, "records").click()
+    # The switch shows the other advanced settings, never a locked one.
+    count = _present_count(page, "records")
+    _advanced(page, True)
     expect(_setting(page, "audit_max_days")).to_be_visible()
     expect(_setting(page, "audit_hot_days")).to_be_hidden()
     expect(page.locator("#recording-levels-card")).to_be_hidden()
@@ -419,8 +462,7 @@ def test_locked_settings_fold_into_the_providers_list_on_their_page(page: Page, 
         "Set by your provider (1)")
     expect(page.locator('#rate-limit-settings .rl-row[data-key="rate_limit_vault_attempts"]')).to_be_attached(
         timeout=10000)
-    count = _shown_count(page, "security")
-    _toggle(page, "security").click()
+    count = _present_count(page, "security")
     expect(_setting(page, "rate_limit_api_default")).to_be_visible()
     expect(page.locator('#rate-limit-settings .rl-row[data-key="rate_limit_vault_attempts"]')).to_be_hidden()
     assert page.evaluate(_VISIBLE_ADVANCED, "security") == count
@@ -435,6 +477,7 @@ def test_the_fold_lists_what_the_deployment_locked(page: Page, levels_admin, adm
         pytest.skip("this stack locks no setting (SETTINGS_LOCKED_KEYS is empty)")
     _login(page, levels_admin)
     _open(page)
+    _advanced(page, True)
     for name in sorted({e["page"] for e in locked}):
         mine = [e for e in locked if e["page"] == name]
         _tab(page, name)
@@ -443,9 +486,6 @@ def test_the_fold_lists_what_the_deployment_locked(page: Page, levels_admin, adm
         fold = page.locator(f"#settings-tab-{name} > .settings-provider-fold")
         expect(fold.locator("summary")).to_have_text(f"Set by your provider ({len(mine)})")
         fold.locator("summary").click()
-        toggle = _toggle(page, name)
-        if toggle.is_visible() and toggle.inner_text().startswith("Show"):
-            toggle.click()
         for e in mine:
             expect(fold.locator(f'.settings-provider-item[data-fold-key="{e["key"]}"] .settings-provider-reason')
                    ).to_have_text(e["reason"])
@@ -495,6 +535,7 @@ def test_the_search_finds_a_setting_on_any_page_and_goes_to_it(page: Page, level
     box = page.locator("#settings-search")
     results = page.locator("#settings-search-results")
     expect(results).to_be_hidden()
+    expect(_switch(page)).to_have_attribute("aria-checked", "false")
 
     box.fill("tagline")
     hit = results.locator('.settings-search-hit[data-key="brand_tagline"]')
@@ -502,25 +543,32 @@ def test_the_search_finds_a_setting_on_any_page_and_goes_to_it(page: Page, level
     expect(hit).to_contain_text("Branding · Advanced")
     hit.click()
     expect(page.locator('#settings-section .tab-btn[data-tab="branding"]')).to_have_class(re.compile(r"\bactive\b"))
+    # The settings menu marks the page the search went to.
+    expect(page.locator('#sidebar .sidebar-settings-item[data-tab="branding"]')).to_have_attribute(
+        "aria-current", "page")
     expect(page.locator("#setting-brand-tagline")).to_be_visible()
     expect(page.locator("#setting-brand-tagline")).to_be_focused()
+    # An advanced setting found turns the Advanced switch on.
+    expect(_switch(page)).to_have_attribute("aria-checked", "true")
     expect(results).to_be_hidden()
     expect(box).to_have_value("")
+    _advanced(page, False)
 
     # A word of a help text on the page finds its setting; Enter goes to the first.
     box.fill("MAX_FILE_SIZE_MB")
     expect(results.locator('.settings-search-hit[data-key="max_file_size"]')).to_be_visible()
     box.press("Enter")
     expect(page.locator("#setting-max-file-size")).to_be_focused()
+    expect(_switch(page)).to_have_attribute("aria-checked", "false")   # an essential setting leaves it off
 
-    # A setting on a page not opened yet, drawn when it opens, advanced: its page, revealed.
+    # A setting on a page not opened yet, drawn when it opens, advanced: its page, shown.
     box.fill("keep audit rows for at most")
     expect(results.locator('.settings-search-hit[data-key="audit_max_days"]')).to_contain_text("Activity and records")
     box.press("Enter")
     row = _setting(page, "audit_max_days")
     expect(row).to_be_visible(timeout=10000)
     expect(row.locator("input")).to_be_focused()
-    expect(_toggle(page, "records")).to_have_text("Hide advanced settings")
+    expect(_switch(page)).to_have_attribute("aria-checked", "true")
 
     # The catalogue's help text counts too.
     box.fill("daily blocks")
@@ -551,16 +599,18 @@ def test_nothing_is_wider_than_a_phone(page: Page, levels_admin, skin):
     _serve_catalogue(page, _locked)
     _login(page, levels_admin, skin, PHONE)
     _open(page)
+    # The drawer's settings menu, its head with Back and the Advanced switch, fits the screen.
+    open_drawer(page)
+    for part in ("#sidebar-settings-back", SWITCH, '#sidebar .sidebar-settings-item[data-tab="general"]'):
+        box = page.locator(part).bounding_box()
+        assert box and box["x"] >= 0 and box["x"] + box["width"] <= PHONE["width"] + 1, (part, box)
+    close_drawer(page)
+    _advanced(page, True)
     wide = {}
     for name in ("general", "security", "records", "logs"):
         _tab(page, name)
         if name == "records":
             expect(page.locator("#retention-groups .retention-row").first).to_be_attached(timeout=10000)
-        toggle = _toggle(page, name)
-        expect(toggle).to_be_visible()
-        box = toggle.bounding_box()
-        assert box["x"] >= 0 and box["x"] + box["width"] <= PHONE["width"] + 1, (name, box)
-        toggle.click()
         fold = page.locator(f"#settings-tab-{name} > .settings-provider-fold")
         if fold.is_visible():
             fold.locator("summary").click()
@@ -569,6 +619,12 @@ def test_nothing_is_wider_than_a_phone(page: Page, levels_admin, skin):
         if width > PHONE["width"] + 1:
             wide[name] = width
     assert not wide, f"these pages scroll sideways at {PHONE['width']}px: {wide}"
+    # Off, a page whose every setting is advanced says so within the screen.
+    _advanced(page, False)
+    note = page.locator("#settings-tab-logs .settings-level-note")
+    expect(note).to_have_text(ALL_ADVANCED)
+    box = note.bounding_box()
+    assert box["x"] >= 0 and box["x"] + box["width"] <= PHONE["width"] + 1, box
     search = page.locator("#settings-search")
     search.scroll_into_view_if_needed()
     search.fill("limit")
@@ -599,7 +655,7 @@ def test_the_search_leaves_out_a_setting_the_app_hides(page: Page, levels_admin)
     box.press("Escape")
     # On: the Settings pages read the status again when they open, and the search offers the checks.
     status["enabled"] = True
-    page.click('.sidebar-item[data-section="dashboard"]')
+    leave_settings(page)
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#update-controls")).to_be_attached()
     page.wait_for_function("() => document.getElementById('update-controls').style.display !== 'none'",
@@ -615,17 +671,17 @@ def _update_status(enabled):
             "checked_at": 1700000000, "interval_minutes": 360}
 
 
-def test_the_count_and_the_search_follow_what_the_app_shows_or_hides_after_the_catalogue(page: Page, levels_admin):
+def test_the_search_follows_what_the_app_shows_or_hides_after_the_catalogue(page: Page, levels_admin):
     """The update checks' controls show while the checks are on. Once the catalogue has been applied, the app
-    hides them by their style (the checks turned off) and shows them again: the General page's count and the
-    search follow each time."""
+    hides them by their style (the checks turned off) and shows them again: what the switch would show on the
+    General page, and the search, follow each time."""
     page.route("**/api/update-status*", lambda route: route.fulfill(
         status=200, content_type="application/json", body=json.dumps(_update_status(True))))
     _login(page, levels_admin)
     _open(page)
     page.wait_for_function("() => document.getElementById('update-controls').style.display !== 'none'",
                            timeout=10000)
-    shown = _shown_count(page, "general")
+    shown = _present_count(page, "general")
     box = page.locator("#settings-search")
     results = page.locator("#settings-search-results")
     hit = results.locator('.settings-search-hit[data-key="update_check_interval"]')
@@ -634,13 +690,13 @@ def test_the_count_and_the_search_follow_what_the_app_shows_or_hides_after_the_c
     box.press("Escape")
     page.evaluate("us => renderUpdateStatus(us)", _update_status(False))
     expect(page.locator("#update-controls")).to_be_hidden()
-    expect(_toggle(page, "general")).to_have_text(f"Show advanced settings ({shown - 1})")
+    assert _present_count(page, "general") == shown - 1
     box.fill("update checks")
     expect(results).to_contain_text("No setting matches.")
     expect(hit).to_have_count(0)
     box.press("Escape")
     page.evaluate("us => renderUpdateStatus(us)", _update_status(True))
-    expect(_toggle(page, "general")).to_have_text(f"Show advanced settings ({shown})")
+    assert _present_count(page, "general") == shown
     box.fill("update checks")
     expect(hit).to_be_visible()
 

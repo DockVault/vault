@@ -17,6 +17,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from _account_change_helpers import psql
+from _settings_ui import open_settings_page
 from _ui_hand_over import SIGN_OUT_STANDS, sign_in_on_the_tab, sign_out_as, wait_replaced
 
 pytestmark = pytest.mark.ui
@@ -35,7 +36,7 @@ def _login(page: Page, username: str, password: str, width=1440):
 def _open(page: Page):
     page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-    page.locator('#settings-section .tab-btn[data-tab="records"]').click()
+    open_settings_page(page, "records")   # from the settings menu (the drawer on a phone)
     expect(page.locator("#erase-card")).to_be_visible(timeout=10000)
     expect(page.locator("#erase-list")).not_to_be_empty(timeout=10000)
 

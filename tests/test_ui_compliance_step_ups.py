@@ -7,7 +7,7 @@ it always asks for, and no switch to change it; the list fits a phone's width.
 import pytest
 from playwright.sync_api import Page, expect
 
-from _settings_ui import show_advanced
+from _settings_ui import open_settings_page, show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -34,7 +34,7 @@ def _open_security(page: Page, admin_creds, width=1440, height=900):
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
     page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-    page.locator('#settings-section .tab-btn[data-tab="security"]').click()
+    open_settings_page(page, "security")                  # from the settings menu (the drawer on a phone)
     show_advanced(page, "security")                       # the step-up matrix is an advanced setting
     expect(page.get_by_label("Require OTP for Delete a vault")).to_be_visible(timeout=10000)
 

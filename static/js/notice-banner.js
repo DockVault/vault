@@ -94,7 +94,7 @@
         try { status = await request('/privacy/recording/status'); } catch (_) { return; }
         if (!status || !status.show) { hide(RECORDING); return; }
         show({
-            id: RECORDING, text: status.text, linkText: 'What this vault records', href: '/recording',
+            id: RECORDING, text: status.text, linkText: 'Privacy', href: '/recording',
             onRead: () => request('/privacy/recording/seen', { method: 'POST', body: JSON.stringify({ version: status.version }) }),
         });
     }

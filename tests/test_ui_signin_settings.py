@@ -30,7 +30,7 @@ def _open(page: Page, admin_creds):
 def _open_page(page: Page):
     page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    page.locator('#sidebar .sidebar-settings-item[data-tab="signin"]').click()
     expect(page.locator("#settings-tab-signin")).to_be_visible()
     expect(page.locator('#signin-passkey-settings [data-setting="webauthn_mode"]')).to_be_visible(timeout=10000)
 
@@ -52,7 +52,7 @@ def test_the_page_says_where_passkeys_are_made_and_lists_the_settings(page: Page
     if "No passkey can be made" in (line.text_content() or ""):
         pytest.skip("this stack has no address a passkey can be made at (ALLOWED_HOSTS)")
     expect(line).to_contain_text("Passkeys can be made at " + page.evaluate("() => location.origin"))
-    # The essential settings show; the rest wait behind "Show advanced settings", like on every other page.
+    # The essential settings show; the rest wait for the Advanced switch, like on every other page.
     box = page.locator("#signin-passkey-settings")
     expect(box.locator('[data-setting="webauthn_mode"] select')).to_have_value("optional")
     expect(box.locator('[data-setting="webauthn_sign_in"]')).to_be_visible()
@@ -106,7 +106,7 @@ def test_a_change_the_server_refuses_is_said_in_its_words_and_asks_for_no_passwo
     expect(said).to_have_attribute("role", "alert")
     expect(page.locator("#stepup-modal.active")).to_have_count(0)
     # Nothing changed: the page read again shows the value in force.
-    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    page.locator('#sidebar .sidebar-settings-item[data-tab="signin"]').click()
     expect(page.locator(ATTESTATION + " select")).to_have_value("none", timeout=10000)
 
 

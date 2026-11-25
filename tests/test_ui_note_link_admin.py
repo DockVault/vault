@@ -19,7 +19,7 @@ def _login(page: Page, username: str, password: str):
 
 def _open_notelinks(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
-    page.click('#settings-section .tab-btn[data-tab="notelinks"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="notelinks"]')
     show_advanced(page, "notelinks")
     expect(page.locator("#settings-tab-notelinks")).to_be_visible(timeout=10000)
 

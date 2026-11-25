@@ -15,6 +15,7 @@ from playwright.sync_api import Browser, Page, expect
 from _account_change_helpers import psql
 from _auditor_helpers import forget_grants, grant_right, new_auditor_account, two_admins
 from _owner_notice_helpers import approved_case, forget_cases, owner_with_vault, wait_for
+from _settings_ui import open_drawer
 from conftest import BASE_URL, unique
 
 pytestmark = pytest.mark.ui
@@ -63,9 +64,7 @@ def _login(page: Page, account, codes):
 def _activity(page: Page, hash_: str):
     """The Activity page, entered from the sidebar (a drawer on a phone) with ``hash_`` as its link."""
     page.evaluate("(h) => history.replaceState(null, '', location.pathname + h)", hash_)
-    toggle = page.locator("#mobile-nav-toggle")
-    if toggle.is_visible():
-        toggle.click()
+    open_drawer(page)   # on a phone; the menu button collapses the rail on a wide screen
     nav = page.locator('.sidebar-item[data-section="activity"]')
     expect(nav).to_be_visible(timeout=15000)
     nav.click()

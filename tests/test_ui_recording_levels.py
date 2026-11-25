@@ -10,7 +10,7 @@ import json
 
 import pytest
 from playwright.sync_api import Page, expect
-from _settings_ui import show_advanced
+from _settings_ui import open_settings_page, show_advanced
 
 pytestmark = pytest.mark.ui
 
@@ -29,7 +29,7 @@ def _login(page: Page, username: str, password: str):
 def _open(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-    page.click('#settings-section .tab-btn[data-tab="records"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="records"]')
     show_advanced(page, "records")
     expect(page.locator(TAB)).to_be_visible()
     expect(page.locator("#recording-levels-table tbody tr")).to_have_count(5, timeout=10000)
@@ -117,7 +117,7 @@ def test_the_table_fits_a_phone(page: Page, admin_creds):
     _login(page, admin_creds["username"], admin_creds["password"])
     page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-    page.locator('#settings-section .tab-btn[data-tab="records"]').click()
+    open_settings_page(page, "records")   # from the settings menu, in the drawer on a phone
     show_advanced(page, "records")
     expect(page.locator("#recording-levels-table tbody tr")).to_have_count(5, timeout=10000)
     width = page.evaluate("() => document.getElementById('recording-levels-card').scrollWidth")

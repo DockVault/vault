@@ -85,7 +85,8 @@ def test_shell_reflects_brand_override(page: Page):
         # brand.js sets the login h1 text from /branding.app_name after the fetch resolves.
         expect(page.locator("#login-screen [data-brand-name]")).to_have_text("AcmeBrand", timeout=10000)
         expect(page).to_have_title("AcmeBrand - Acme Secure", timeout=10000)
-        expect(page.locator("#login-screen [data-brand-logo]")).to_have_attribute("alt", "AcmeBrand")
+        # The name shows beside the logo, so the image is not named again (alt="").
+        expect(page.locator("#login-screen [data-brand-logo]")).to_have_attribute("alt", "")
         # applyHead() runs before the name is set, so the :root colour is applied by now.
         color = page.evaluate(
             "() => getComputedStyle(document.documentElement).getPropertyValue('--primary-color').trim()"
@@ -94,6 +95,41 @@ def test_shell_reflects_brand_override(page: Page):
         # the header NAME reflects the override (the persistent 'powered by DockVault'
         # footer legitimately still carries DockVault, so we don't scan the whole body).
         expect(page.locator("#login-screen [data-brand-name]")).not_to_have_text("DockVault")
+
+
+def test_the_logo_shows_alone_when_the_name_switch_is_off(page: Page):
+    """show_name_beside_logo false: once the logo has loaded, the name beside it is hidden and the image
+    carries the name as its alt text."""
+    with brand_override({"app_name": "AcmeBrand", "show_name_beside_logo": False}):
+        page.goto("/")
+        logo = page.locator("#login-screen [data-brand-logo]")
+        expect(logo).to_have_attribute("alt", "AcmeBrand", timeout=10000)
+        expect(page.locator("#login-screen [data-brand-name]")).to_be_hidden()
+        expect(logo).to_be_visible()
+
+
+def test_a_logo_that_cannot_load_falls_back_and_the_name_shows(page: Page):
+    """A logo address that fails switches once to the built-in logo; the name then shows beside it even with
+    the switch off, and the image is not named twice."""
+    broken = "/static/assets/no-such-logo.png"
+    with brand_override({"app_name": "AcmeBrand", "show_name_beside_logo": False,
+                         "logo_url": broken, "logo_small_url": broken}):
+        page.goto("/")
+        logo = page.locator("#login-screen [data-brand-logo]")
+        expect(logo).to_have_attribute("src", "/static/assets/logo-small.png", timeout=10000)
+        expect(page.locator("#login-screen [data-brand-name]")).to_have_text("AcmeBrand")
+        expect(page.locator("#login-screen [data-brand-name]")).to_be_visible()
+        expect(logo).to_have_attribute("alt", "")
+
+
+def test_a_logo_whose_fallback_fails_too_is_hidden(page: Page):
+    """When the built-in logo cannot be loaded either, the image is hidden: no alt text beside the name."""
+    broken = "/static/assets/no-such-logo.png"
+    page.route("**/static/assets/logo-small.png*", lambda route: route.abort())
+    with brand_override({"app_name": "AcmeBrand", "logo_url": broken, "logo_small_url": broken}):
+        page.goto("/")
+        expect(page.locator("#login-screen [data-brand-logo]")).to_be_hidden(timeout=10000)
+        expect(page.locator("#login-screen [data-brand-name]")).to_be_visible()
 
 
 def test_shell_default_is_data_driven_from_branding(page: Page):
@@ -191,7 +227,7 @@ def test_admin_branding_editor_saves_live(page: Page, admin_creds, admin):
         admin.put("/settings", json={"app_tagline": "", "primary_color": ""})
         _login(page, admin_creds["username"], admin_creds["password"])
         page.click('.sidebar-item[data-section="settings"]')
-        page.click('.tab-btn[data-tab="branding"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="branding"]')
         show_advanced(page, "branding")
         tagline = page.locator("#setting-brand-tagline")
         expect(tagline).to_be_visible(timeout=10000)
@@ -224,7 +260,7 @@ def test_admin_uploads_logo_via_form(page: Page, admin_creds, admin, tmp_path):
     try:
         _login(page, admin_creds["username"], admin_creds["password"])
         page.click('.sidebar-item[data-section="settings"]')
-        page.click('.tab-btn[data-tab="branding"]')
+        page.click('#sidebar .sidebar-settings-item[data-tab="branding"]')
         show_advanced(page, "branding")
         expect(page.locator("#brand-logo-upload")).to_be_visible(timeout=10000)
         page.set_input_files("#brand-logo-file", str(png))

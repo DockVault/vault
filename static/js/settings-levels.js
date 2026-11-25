@@ -6,8 +6,10 @@
  * scripts draw: the rate limits in app.js, how long records are kept in settings-retention.js), and the
  * catalogue gives each key its page, its level, whether it is new to this administrator and whether the
  * deployment has locked it. On each page:
- *   - the essential settings show; "Show advanced settings (N)" reveals the advanced ones, each marked
- *     Advanced; a container marked data-setting-group hides when every setting in it is hidden;
+ *   - the essential settings show; the one Advanced switch in the settings menu (static/js/settings-menu.js
+ *     puts it in the rail's head) reveals the advanced ones on every page, each marked Advanced. It is off
+ *     until turned on, and kept in this browser; a page whose every setting is advanced says how to see
+ *     them; a container marked data-setting-group hides when every setting in it is hidden;
  *   - a setting that arrived recently, or after the release this administrator last opened Settings at, is
  *     marked New;
  *   - the marks are for the eye (aria-hidden, so a label's accessible name stays as it was); what they say
@@ -17,8 +19,8 @@
  *     "Set by your provider (N)", read-only, each with its value and the reason. A container marked
  *     data-setting-shows-lock (the single sign-on card) shows its own read-only state, so it stays where it is,
  *     listed there all the same and counted neither as essential nor as advanced.
- * A search box above the tabs finds a setting by its label and help text on every page, and goes to it (its
- * page, its advanced settings shown, or its line in the provider's list).
+ * A search box above the pages finds a setting by its label and help text on every page, and goes to it (its
+ * page, the Advanced switch turned on for an advanced one, or its line in the provider's list).
  *
  * Nothing here changes a value or what a save sends: a hidden setting is still on the page, filled and
  * saved as before. Without the catalogue (it could not be read) every setting shows, and the search still
@@ -30,8 +32,15 @@
 (function () {
     'use strict';
 
-    const S = { data: null, byKey: {}, show: {}, loaded: false, loading: null, frame: 0, query: '' };
+    const ADVANCED_KEY = 'settingsAdvanced';
+    const S = { data: null, byKey: {}, advanced: readAdvanced(), loaded: false, loading: null, frame: 0, query: '',
+        switch: null };
     const LIMIT = 12;
+
+    // The Advanced switch's choice, kept per browser. Off when nothing is kept or storage cannot be read.
+    function readAdvanced() {
+        try { return localStorage.getItem(ADVANCED_KEY) === 'true'; } catch (_) { return false; }
+    }
 
     function el(tag, cls, text) {
         const node = document.createElement(tag);
@@ -174,25 +183,68 @@
 
     // ------------------------------------------------------------------ one page
 
-    function bar(page, pageEl) {
+    // A page whose every setting is advanced, while the switch is off: one short line saying so.
+    function bar(pageEl) {
         let box = pageEl.querySelector(':scope > .settings-level-bar');
         if (!box) {
             box = el('div', 'settings-level-bar');
-            const note = el('p', 'text-secondary text-sm settings-level-note', 'Every setting on this page is advanced.');
-            note.hidden = true;
-            const button = el('button', 'btn btn-outline btn-sm settings-advanced-toggle');
-            button.type = 'button';
-            button.setAttribute('aria-pressed', 'false');
-            button.addEventListener('click', () => {
-                S.show[page] = !S.show[page];
-                applyNow();
-            });
-            box.append(note, button);
+            box.appendChild(el('p', 'text-secondary text-sm settings-level-note',
+                'Every setting on this page is advanced. Turn on Advanced to see them.'));
             box.hidden = true;
             pageEl.insertBefore(box, pageEl.firstChild);
         }
         return box;
     }
+
+    // ------------------------------------------------------------------ the Advanced switch
+
+    function syncSwitch() {
+        if (!S.switch) return;
+        const button = S.switch.querySelector('[role="switch"]');
+        if (button.getAttribute('aria-checked') !== String(S.advanced)) {
+            button.setAttribute('aria-checked', String(S.advanced));
+        }
+    }
+
+    function setAdvanced(on) {
+        const next = !!on;
+        if (next !== S.advanced) {
+            S.advanced = next;
+            try { localStorage.setItem(ADVANCED_KEY, String(next)); } catch (_) { /* kept for this page only */ }
+        }
+        syncSwitch();
+        applyNow();
+    }
+
+    // The switch, made once: its label "Advanced" and a role="switch" button. The settings menu puts it in
+    // the rail's head.
+    function switchControl() {
+        if (S.switch) return S.switch;
+        const box = el('div', 'settings-advanced');
+        const button = el('button', 'settings-advanced-switch');
+        button.type = 'button';
+        button.id = 'settings-advanced-switch';
+        button.setAttribute('role', 'switch');
+        button.setAttribute('aria-checked', 'false');
+        button.setAttribute('aria-label', 'Show advanced settings on every page');
+        button.title = 'Show advanced settings on every page';
+        button.appendChild(el('span', 'settings-advanced-thumb'));
+        button.addEventListener('click', () => setAdvanced(!S.advanced));
+        const label = el('label', 'settings-advanced-label', 'Advanced');
+        label.htmlFor = button.id;
+        box.append(label, button);
+        S.switch = box;
+        syncSwitch();
+        return box;
+    }
+
+    // Another tab of this browser turned the switch: follow it.
+    window.addEventListener('storage', (e) => {
+        if (e.key !== ADVANCED_KEY) return;
+        S.advanced = readAdvanced();
+        syncSwitch();
+        schedule();
+    });
 
     function setText(node, text) {
         if (node.textContent !== text) node.textContent = text;
@@ -240,8 +292,7 @@
     }
 
     function applyPage(pageEl) {
-        const page = pageEl.id.slice('settings-tab-'.length);
-        const show = !!S.show[page];
+        const show = S.advanced;
         const advanced = new Set();
         const essential = new Set();
         pageEl.querySelectorAll('[data-setting]').forEach((node) => {
@@ -263,13 +314,8 @@
                 node.classList.contains('setting-folded') || node.classList.contains('setting-level-hidden'));
             toggleClass(group, 'setting-group-hidden', empty);
         });
-        const box = bar(page, pageEl);
-        setHidden(box, advanced.size === 0);
-        const button = box.querySelector('.settings-advanced-toggle');
-        setText(button, show ? 'Hide advanced settings' : `Show advanced settings (${advanced.size})`);
-        if (button.getAttribute('aria-pressed') !== String(show)) button.setAttribute('aria-pressed', String(show));
-        setHidden(box.querySelector('.settings-level-note'), show || essential.size > 0 || advanced.size === 0);
-        renderFold(page, pageEl);
+        setHidden(bar(pageEl), show || essential.size > 0 || advanced.size === 0);
+        renderFold(pageEl.id.slice('settings-tab-'.length), pageEl);
     }
 
     function applyNow() {
@@ -430,8 +476,9 @@
             if (box) box.open = true;
             target = box && box.querySelector(`[data-fold-key="${q(key)}"]`);
         } else {
-            if (isAdvanced(entry)) S.show[page] = true;
-            applyNow();
+            // An advanced setting turns the Advanced switch on: it shows, and so do the others like it.
+            if (isAdvanced(entry)) setAdvanced(true);
+            else applyNow();
             target = await wait(() => firstPresent(page, key), 5000);
         }
         if (!target) return;
@@ -512,5 +559,7 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
     else start();
 
-    window.SettingsLevels = { load, apply: applyNow, search, go };
+    window.SettingsLevels = {
+        load, apply: applyNow, search, go, switchControl, setAdvanced, advanced: () => S.advanced,
+    };
 })();

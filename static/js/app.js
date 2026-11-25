@@ -10451,6 +10451,7 @@ const BRAND_SETTING_FIELDS = {
     'setting-brand-company-url': 'company_url',
     'setting-brand-website-url': 'website_url',
     'setting-brand-docs-url': 'docs_url',
+    'setting-brand-privacy-policy-url': 'privacy_policy_url',
     'setting-brand-primary-color': 'primary_color',
     'setting-brand-secondary-color': 'secondary_color',
     'setting-brand-accent-color': 'accent_color',
@@ -10507,6 +10508,12 @@ async function applyBrandFields(settings) {
         const el = document.getElementById(elId);
         if (el) el.value = settings[key] || '';
     }
+    // The name switch: on unless the settings say it is off (GET /settings reports it as in effect).
+    wireBrandShowName();
+    setBrandShowName(settings.show_name_beside_logo !== false);
+    // An uploaded logo or favicon whose file is gone from the server: say so beside it.
+    const missing = Array.isArray(settings.brand_assets_missing) ? settings.brand_assets_missing : [];
+    ['logo', 'favicon'].forEach(slot => _brandMissing(slot, missing.includes(slot)));
     let brand = null;
     try {
         brand = await apiRequest('/branding', { method: 'GET', silent: true });
@@ -10569,6 +10576,27 @@ function setBrandPreview(id, url, bust) {
     if (!safe) { img.removeAttribute('src'); return; }
     img.src = bust ? safe + (safe.includes('?') ? '&' : '?') + 't=' + Date.now() : safe;
 }
+// The Branding switch "Show the name beside the logo" (a role="switch" button; aria-checked holds the value).
+function setBrandShowName(on) {
+    const sw = document.getElementById('setting-brand-show-name');
+    if (sw) sw.setAttribute('aria-checked', on ? 'true' : 'false');
+}
+function brandShowNameValue() {
+    const sw = document.getElementById('setting-brand-show-name');
+    return sw ? sw.getAttribute('aria-checked') === 'true' : null;
+}
+function wireBrandShowName() {
+    // Wired once: initSettings() runs on every visit to Settings.
+    const sw = document.getElementById('setting-brand-show-name');
+    if (!sw || sw.dataset.wired) return;
+    sw.dataset.wired = '1';
+    sw.addEventListener('click', () => setBrandShowName(!brandShowNameValue()));
+}
+// The note beside a logo or favicon whose uploaded file is missing from the server.
+function _brandMissing(slot, isMissing) {
+    const el = document.getElementById(`brand-${slot}-missing`);
+    if (el) el.hidden = !isMissing;
+}
 function _brandStatus(slot, msg, isError) {
     const el = document.getElementById(`brand-${slot}-status`);
     if (!el) return;
@@ -10592,6 +10620,7 @@ async function uploadBrandAsset(slot) {
         if (!resp.ok) throw new Error(data.detail || `Upload failed (${resp.status})`);
         setBrandPreview(`brand-${slot}-preview`, data.url, true);
         if (input) input.value = '';
+        _brandMissing(slot, false);
         _brandStatus(slot, 'Uploaded. Reload to apply site-wide.', false);
     } catch (e) {
         _brandStatus(slot, e.message || 'Upload failed', true);
@@ -10607,6 +10636,7 @@ async function resetBrandAsset(slot) {
         setBrandPreview(`brand-${slot}-preview`, url, true);
         const input = document.getElementById(`brand-${slot}-file`);
         if (input) input.value = '';
+        _brandMissing(slot, false);
         _brandStatus(slot, 'Reset to default.', false);
     } catch (e) {
         _brandStatus(slot, e.message || 'Reset failed', true);
@@ -12038,6 +12068,9 @@ async function saveAllSettings() {
             const el = document.getElementById(elId);
             if (el) settings[key] = el.value;
         }
+        // The name switch. The deployment's own value keeps no override server-side.
+        const showName = brandShowNameValue();
+        if (showName !== null) settings.show_name_beside_logo = showName;
 
         // Persist the department-scoped policies ONLY when the department list
         // actually loaded. If GET /groups failed, the pickers are read-only and the
@@ -26270,28 +26303,28 @@ document.addEventListener('DOMContentLoaded', () => {
         settingsBtn.addEventListener('click', openUserSettingsModal);
     }
     
-    // Sidebar navigation
-    const sidebarToggle = document.getElementById('sidebar-toggle');
+    // Sidebar navigation. One menu button in the top bar, at every width: on a wide screen it collapses the
+    // rail to its icons or expands it again (kept in this browser as 'sidebarCollapsed'); on a phone the
+    // sidebar is a drawer (mobile.css), opened by the same button and closed by choosing a section, tapping
+    // outside it, Escape, or widening past the breakpoint.
     const sidebar = document.getElementById('sidebar');
-    if (sidebarToggle && sidebar) {
-        // Restore sidebar state from localStorage
-        const sidebarCollapsed = localStorage.getItem('sidebarCollapsed') === 'true';
-        if (sidebarCollapsed) {
-            sidebar.classList.add('collapsed');
-        }
-        
-        sidebarToggle.addEventListener('click', () => {
-            sidebar.classList.toggle('collapsed');
-            localStorage.setItem('sidebarCollapsed', sidebar.classList.contains('collapsed'));
-        });
-    }
-
-    // Phone width: the sidebar is a drawer (mobile.css), opened by the menu button in the top bar and
-    // closed by choosing a section, tapping outside it, Escape, or widening past the breakpoint.
     const mobileNavToggle = document.getElementById('mobile-nav-toggle');
     const sidebarBackdrop = document.getElementById('sidebar-backdrop');
     const mobileNavQuery = window.matchMedia('(max-width: 860px)');
     const mainContent = document.querySelector('.main-content');
+    let savedCollapsed = false;
+    try { savedCollapsed = localStorage.getItem('sidebarCollapsed') === 'true'; } catch (_) {}
+    if (sidebar && savedCollapsed) sidebar.classList.add('collapsed');
+    // What the button says follows what it does at this width: the drawer open or closed on a phone, the
+    // rail expanded or collapsed on a wide screen.
+    const syncNavToggle = () => {
+        if (!mobileNavToggle || !sidebar) return;
+        const phone = mobileNavQuery.matches;
+        const open = phone ? sidebar.classList.contains('mobile-open') : !sidebar.classList.contains('collapsed');
+        const label = phone ? (open ? 'Close menu' : 'Open menu') : (open ? 'Collapse menu' : 'Expand menu');
+        if (mobileNavToggle.getAttribute('aria-expanded') !== String(open)) mobileNavToggle.setAttribute('aria-expanded', String(open));
+        if (mobileNavToggle.getAttribute('aria-label') !== label) mobileNavToggle.setAttribute('aria-label', label);
+    };
     const setMobileNav = (open) => {
         if (!sidebar) return;
         const on = !!open && mobileNavQuery.matches;
@@ -26300,17 +26333,29 @@ document.addEventListener('DOMContentLoaded', () => {
         // The page under an open drawer is out of reach, so keyboard focus cannot land on a control
         // the drawer covers.
         if (mainContent) mainContent.inert = on;
-        if (mobileNavToggle) {
-            mobileNavToggle.setAttribute('aria-expanded', String(on));
-            mobileNavToggle.setAttribute('aria-label', on ? 'Close menu' : 'Open menu');
-        }
+        syncNavToggle();
         if (on) {
-            const current = sidebar.querySelector('.sidebar-item.active') || sidebar.querySelector('.sidebar-item');
+            // The menu the drawer shows: the sections, or the Settings pages while Settings is open.
+            const shown = (sel) => Array.from(sidebar.querySelectorAll(sel)).find(i => i.getClientRects().length > 0);
+            const current = shown('.sidebar-item.active') || shown('.sidebar-item');
             if (current) current.focus({ preventScroll: true });
         }
     };
+    // Choosing a Settings page in the drawer closes it, as choosing a section does.
+    window.closeNavDrawer = () => setMobileNav(false);
     if (mobileNavToggle && sidebar) {
-        mobileNavToggle.addEventListener('click', () => setMobileNav(!sidebar.classList.contains('mobile-open')));
+        mobileNavToggle.addEventListener('click', () => {
+            if (mobileNavQuery.matches) {
+                setMobileNav(!sidebar.classList.contains('mobile-open'));
+                return;
+            }
+            const collapsed = sidebar.classList.toggle('collapsed');
+            try { localStorage.setItem('sidebarCollapsed', String(collapsed)); } catch (_) {}
+            syncNavToggle();
+        });
+        // The rail is also expanded and collapsed by the Settings menu (entering and leaving Settings).
+        new MutationObserver(syncNavToggle).observe(sidebar, { attributes: true, attributeFilter: ['class'] });
+        syncNavToggle();
         if (sidebarBackdrop) sidebarBackdrop.addEventListener('click', () => setMobileNav(false));
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape' && sidebar.classList.contains('mobile-open')) {
@@ -26326,8 +26371,9 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Sidebar item navigation
-    document.querySelectorAll('.sidebar-item').forEach(item => {
+    // Sidebar item navigation (the sections; the Settings menu's pages, static/js/settings-menu.js, wire
+    // their own clicks)
+    document.querySelectorAll('.sidebar-item[data-section]').forEach(item => {
         item.addEventListener('click', (e) => {
             e.preventDefault();
             setMobileNav(false);

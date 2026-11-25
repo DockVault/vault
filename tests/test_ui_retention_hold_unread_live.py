@@ -171,7 +171,7 @@ def test_before_the_chain_is_read_through_the_hold_is_turned_on_in_the_server(th
             expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
             page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
             expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
-            page.locator('#settings-section .tab-btn[data-tab="records"]').click()
+            page.locator('#sidebar .sidebar-settings-item[data-tab="records"]').click()
             show_advanced(page, "records")
             hold = page.locator('#retention-groups .retention-row[data-key="logs_hold"]')
             expect(hold.locator(".retention-source")).to_have_text("Not read yet", timeout=10000)

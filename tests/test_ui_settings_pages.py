@@ -1,8 +1,14 @@
-"""Settings you can find: on a wide screen the pages are a list at the left under five headings (a sixth,
-Sign-in, hidden until it has a page), the open page beside it; on a phone the same buttons are the strip and the
-headings are not shown. A long help text says one sentence, with the rest under "More"."""
+"""Settings you can find: while Settings is open the side rail is the settings menu (static/js/settings-menu.js),
+the pages under six headings (a sixth, Sign-in, hidden until it has a page), with Back to the section open before
+and the Advanced switch in its head. The page's own list stays in the page, hidden at every width, and the open
+page takes the full width. On a phone the drawer shows the same menu. A long help text says one sentence, with
+the rest under "More"."""
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
+
+from _settings_ui import MENU, close_drawer, leave_settings, open_drawer, settings_item
 
 pytestmark = pytest.mark.ui
 
@@ -16,62 +22,120 @@ def _login(page: Page, admin_creds):
     page.fill("#password", admin_creds["password"])
     page.click("#login-form button[type=submit]")
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
+    open_drawer(page)
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#save-all-settings-btn")).to_have_attribute("data-settings-ready", "true", timeout=15000)
+    close_drawer(page)
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])
-def test_wide_screens_list_the_pages_at_the_left_under_six_headings(page: Page, admin_creds, skin):
+def test_the_rail_is_the_settings_menu_under_six_headings(page: Page, admin_creds, skin):
     page.set_viewport_size({"width": 1280, "height": 900})
     page.goto("/")
     page.evaluate("ui => localStorage.setItem('ui', ui)", skin)
     _login(page, admin_creds)
-    nav = page.locator("#settings-section .settings-nav")
-    titles = [t.strip() for t in nav.locator(".settings-nav-group:not([hidden]) .settings-nav-title").all_text_contents()]  # drawn in capitals
-    assert titles == GROUPS, titles
-    expect(nav.locator('.settings-nav-group[data-settings-group="signin"] .tab-btn')).to_have_text("Sign-in methods")
-    assert nav.locator(".tab-btn").count() == 13
-    # The list is at the left of the open page, both starting at the same height.
-    nav_box = nav.bounding_box()
-    page_box = page.locator("#settings-tab-general").bounding_box()
-    assert nav_box and page_box
-    assert nav_box["x"] + nav_box["width"] <= page_box["x"] + 1, (nav_box, page_box)
-    assert abs(nav_box["y"] - page_box["y"]) < 8, (nav_box, page_box)
-    # Every page still opens by its button, from any group, and the search still lands on it.
-    page.click('#settings-section .tab-btn[data-tab="email"]')
+    menu = page.locator(MENU)
+    expect(menu).to_be_visible()
+    expect(menu).to_have_attribute("aria-label", "Settings")
+    # The sections' menu is gone while Settings is open.
+    expect(page.locator('.sidebar-item[data-section="dashboard"]')).to_be_hidden()
+    expect(menu.locator(".sidebar-settings-title")).to_have_text("Settings")
+    expect(page.locator("#sidebar-settings-back")).to_have_accessible_name("Back")
+    titles = [t.strip() for t in menu.locator(".sidebar-settings-group:not([hidden]) .nav-group-label").all_text_contents()]
+    assert [t.lower() for t in titles] == [g.lower() for g in GROUPS], titles   # drawn in capitals
+    expect(settings_item(page, "signin")).to_have_text("Sign-in methods")
+    expect(menu.locator(".sidebar-settings-item")).to_have_count(13)
+    # The items have no icons, and the open page is marked.
+    expect(menu.locator(".sidebar-settings-item .sidebar-icon")).to_have_count(0)
+    expect(settings_item(page, "general")).to_have_class(re.compile(r"\bactive\b"))
+    expect(settings_item(page, "general")).to_have_attribute("aria-current", "page")
+    # The page's own list is hidden, and the open page takes the section's width.
+    expect(page.locator("#settings-section .settings-nav")).to_be_hidden()
+    section = page.locator("#settings-section").bounding_box()
+    general = page.locator("#settings-tab-general").bounding_box()
+    assert abs(general["x"] - section["x"]) < 2 and abs(general["width"] - section["width"]) < 2, (section, general)
+    # Every page still opens by its item, from any group; the menu follows.
+    settings_item(page, "email").click()
     expect(page.locator("#settings-tab-email")).to_be_visible()
     expect(page.locator("#settings-tab-general")).to_be_hidden()
-    email_box = page.locator("#settings-tab-email").bounding_box()
-    assert email_box["x"] >= nav_box["x"] + nav_box["width"] - 1
-    page.click('#settings-section .tab-btn[data-tab="logs"]')
+    expect(settings_item(page, "email")).to_have_attribute("aria-current", "page")
+    expect(settings_item(page, "general")).not_to_have_attribute("aria-current", "page")
+    assert menu.locator(".sidebar-settings-item[aria-current=page]").count() == 1
+    settings_item(page, "logs").click()
     expect(page.locator("#settings-tab-logs")).to_be_visible()
 
 
-def test_a_phone_keeps_the_strip_without_headings(page: Page, admin_creds):
-    page.set_viewport_size({"width": 390, "height": 844})
+def test_back_returns_to_the_section_open_before_settings(page: Page, admin_creds):
+    page.set_viewport_size({"width": 1280, "height": 900})
+    _login(page, admin_creds)
+    leave_settings(page)
+    expect(page.locator("#dashboard-section")).to_be_visible()
+    page.click('.sidebar-item[data-section="vaults"]')
+    expect(page.locator("#vaults-section")).to_be_visible(timeout=10000)
+    page.click('.sidebar-item[data-section="settings"]')
+    expect(page.locator(MENU)).to_be_visible()
+    # Focus moves into the menu, to the open page.
+    expect(settings_item(page, "general")).to_be_focused()
+    page.click("#sidebar-settings-back")
+    expect(page.locator("#vaults-section")).to_be_visible(timeout=10000)
+    expect(page.locator(MENU)).to_be_hidden()
+    expect(page.locator('.sidebar-item[data-section="vaults"]')).to_be_visible()
+    expect(page.locator('.sidebar-item[data-section="vaults"]')).to_be_focused()
+
+
+def test_a_hidden_group_stays_hidden_in_the_menu(page: Page, admin_creds):
+    page.set_viewport_size({"width": 1280, "height": 900})
+    _login(page, admin_creds)
+    group = page.locator(f'{MENU} .sidebar-settings-group[data-settings-group="email"]')
+    expect(group).to_be_visible()
+    page.evaluate("() => { document.querySelector('#settings-section [data-settings-group=\"email\"]').hidden = true; }")
+    expect(group).to_be_hidden()
+    page.evaluate("() => { document.querySelector('#settings-section [data-settings-group=\"email\"]').hidden = false; }")
+    expect(group).to_be_visible()
+
+
+def test_a_rail_saved_collapsed_opens_in_full_in_settings(page: Page, admin_creds):
+    page.set_viewport_size({"width": 1280, "height": 900})
     page.goto("/")
-    page.evaluate("() => localStorage.setItem('ui', 'v2')")
+    page.evaluate("() => localStorage.setItem('sidebarCollapsed', 'true')")
     page.goto("/")
     expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
     page.fill("#username", admin_creds["username"])
     page.fill("#password", admin_creds["password"])
     page.click("#login-form button[type=submit]")
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
-    drawer = page.locator("#mobile-nav-toggle")
-    if drawer.is_visible():
-        drawer.click()
+    sidebar = page.locator("#sidebar")
+    expect(sidebar).to_have_class(re.compile(r"\bcollapsed\b"))
     page.click('.sidebar-item[data-section="settings"]')
-    expect(page.locator("#save-all-settings-btn")).to_have_attribute("data-settings-ready", "true", timeout=15000)
+    expect(page.locator(MENU)).to_be_visible()
+    expect(sidebar).not_to_have_class(re.compile(r"\bcollapsed\b"))
+    expect(settings_item(page, "general")).to_be_visible()
+    page.click("#sidebar-settings-back")
+    expect(page.locator("#dashboard-section")).to_be_visible()
+    expect(sidebar).to_have_class(re.compile(r"\bcollapsed\b"))   # as saved
+    page.evaluate("() => localStorage.removeItem('sidebarCollapsed')")
+
+
+def test_a_phone_shows_the_same_menu_in_the_drawer(page: Page, admin_creds):
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto("/")
+    page.evaluate("() => localStorage.setItem('ui', 'v2')")
+    _login(page, admin_creds)
     nav = page.locator("#settings-section .settings-nav")
-    for title in nav.locator(".settings-nav-title").all():
-        expect(title).to_be_hidden()
-    first = nav.locator(".tab-btn").nth(0).bounding_box()
-    second = nav.locator(".tab-btn").nth(1).bounding_box()
-    assert first and second and abs(first["y"] - second["y"]) < 2 and second["x"] > first["x"], (first, second)
-    # The page sits under the strip, not beside it.
-    strip = nav.bounding_box()
-    body = page.locator("#settings-tab-general").bounding_box()
-    assert body["y"] >= strip["y"] + strip["height"] - 1
+    expect(nav).to_be_hidden()
+    open_drawer(page)
+    menu = page.locator(MENU)
+    expect(menu).to_be_visible()
+    expect(page.locator('.sidebar-item[data-section="dashboard"]')).to_be_hidden()
+    expect(menu.locator(".sidebar-settings-item")).to_have_count(13)
+    for part in ("#sidebar-settings-back", "#settings-advanced-switch"):
+        expect(page.locator(part)).to_be_visible()
+    # Choosing a page opens it and closes the drawer.
+    settings_item(page, "email").click()
+    page.wait_for_function("() => getComputedStyle(document.getElementById('sidebar')).visibility === 'hidden'")
+    expect(page.locator("#settings-tab-email")).to_be_visible()
+    expect(page.locator("#mobile-nav-toggle")).to_have_attribute("aria-expanded", "false")
+    assert page.evaluate("() => document.documentElement.scrollWidth") <= 391
 
 
 def test_long_help_texts_say_one_sentence_with_the_rest_under_more(page: Page, admin_creds):
@@ -114,18 +178,20 @@ def test_long_help_texts_say_one_sentence_with_the_rest_under_more(page: Page, a
     assert page.evaluate("() => SettingsHelp.shorten()") == 0
 
 
-def test_the_page_strip_is_a_group_of_buttons_and_marks_the_open_page(page: Page, admin_creds):
-    """Not a tab list: a labelled group of plain buttons; the open page's button says so with aria-current."""
+def test_the_page_list_is_a_group_of_buttons_and_marks_the_open_page(page: Page, admin_creds):
+    """Not a tab list: a labelled group of plain buttons; the open page's button says so with aria-current. The
+    menu's items click these buttons, so they still mark the open page."""
     page.set_viewport_size({"width": 1280, "height": 900})
     _login(page, admin_creds)
     nav = page.locator("#settings-section .settings-nav")
     expect(nav).to_have_attribute("role", "group")
     expect(nav).to_have_attribute("aria-label", "Settings pages")
     assert page.locator("#settings-section [role=tablist], #settings-section [role=tab]").count() == 0
+    assert page.locator(f"{MENU} [role=tablist], {MENU} [role=tab]").count() == 0
     general = nav.locator('.tab-btn[data-tab="general"]')
     email = nav.locator('.tab-btn[data-tab="email"]')
     expect(general).to_have_attribute("aria-current", "page")
-    email.click()
+    settings_item(page, "email").click()
     expect(email).to_have_attribute("aria-current", "page")
     expect(general).not_to_have_attribute("aria-current", "page")
     assert nav.locator(".tab-btn[aria-current=page]").count() == 1
@@ -143,6 +209,7 @@ def test_the_page_strip_is_a_group_of_buttons_and_marks_the_open_page(page: Page
 def test_the_other_page_strips_mark_the_open_page_too(page: Page, admin_creds, section, attr, second):
     page.set_viewport_size({"width": 1280, "height": 900})
     _login(page, admin_creds)
+    leave_settings(page)   # the rail shows the sections again
     item = page.locator(f'.sidebar-item[data-section="{section}"]')
     if not item.is_visible():
         pytest.skip(f"the {section} page is not offered on this install")

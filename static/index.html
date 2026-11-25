@@ -10,7 +10,7 @@
     <link rel="icon" type="image/png" href="/static/assets/logo-small.png?v=1">
     <link rel="apple-touch-icon" href="/static/assets/logo.png?v=1">
     <link rel="stylesheet" href="/static/css/theme.css?v=20260822a">
-    <link rel="stylesheet" href="/static/css/components.css?v=20261117a">
+    <link rel="stylesheet" href="/static/css/components.css?v=20261125a">
     <link rel="stylesheet" href="/static/css/utilities.css?v=20261117a">
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-sans-500.woff2" crossorigin>
     <link rel="preload" as="font" type="font/woff2" href="/static/assets/fonts/plex-mono-500.woff2" crossorigin>
@@ -22,15 +22,15 @@
          still blocks render, so there is no unstyled flash either way).
          To adopt v2 permanently: keep only ui-v2.css, delete redesign.css +
          ui-boot.js + the Interface switcher in the profile dropdown. -->
-    <link rel="stylesheet" href="/static/css/redesign.css?v=20261117a" id="skin-v1" disabled>
-    <link rel="stylesheet" href="/static/css/ui-v2.css?v=20261117a" id="skin-v2">
+    <link rel="stylesheet" href="/static/css/redesign.css?v=20261125a" id="skin-v1" disabled>
+    <link rel="stylesheet" href="/static/css/ui-v2.css?v=20261125a" id="skin-v2">
     <link rel="stylesheet" href="/static/css/activity.css?v=20261108a">
     <link rel="stylesheet" href="/static/css/compliance.css?v=20261108a">
-    <link rel="stylesheet" href="/static/css/settings-levels.css?v=20261108a">
+    <link rel="stylesheet" href="/static/css/settings-levels.css?v=20261125a">
     <link rel="stylesheet" href="/static/css/people.css?v=20261117a">
     <link rel="stylesheet" href="/static/css/tables.css?v=20261117a">
     <!-- Phone-width layout shared by both skins; after them so it wins at the same specificity. -->
-    <link rel="stylesheet" href="/static/css/mobile.css?v=20260929a">
+    <link rel="stylesheet" href="/static/css/mobile.css?v=20261125a">
     <script src="/static/js/ui-boot.js?v=20260703a"></script>
     <!-- Auth boot: picks the first-paint screen from whether a session token is
          cached, so an expired/logged-out load never flashes the app shell, and stops
@@ -39,7 +39,7 @@
     <script src="/static/js/auth-boot.js?v=20261108a"></script>
     <!-- Branding boot: applies effective /branding (name, logo, favicon, theme colours)
          to the shell, pre-paint after the skin boot. See static/js/brand.js. -->
-    <script src="/static/js/brand.js?v=20260703a"></script>
+    <script src="/static/js/brand.js?v=20261125a"></script>
     <meta name="theme-color" content="#0a0f18">
 </head>
 <body>
@@ -110,7 +110,7 @@
             <div class="card" style="max-width: 420px; width: 100%; margin: var(--space-lg);">
                 <div class="card-body text-center">
                     <div class="flex items-center justify-center mb-md">
-                        <img src="/static/assets/logo-small.png" data-brand-logo alt="Logo" style="height: 48px; margin-right: var(--space-sm);">
+                        <img src="/static/assets/logo-small.png" data-brand-logo alt="" style="height: 48px; margin-right: var(--space-sm);">
                         <h1 class="text-3xl font-bold" data-brand-name style="line-height:48px; margin:0;">DockVault</h1>
                     </div>
                     <p class="text-secondary mb-lg" data-brand-tagline>Secure File Transfer Platform</p>
@@ -189,9 +189,10 @@
                         </div>
                     </form>
 
-                    <!-- Sign-in and sign-up record the address and the name typed: say what the vault records. -->
+                    <!-- Sign-in and sign-up record the address and the name typed: the Privacy page says what the
+                         vault records, and links the organisation's own policy when one is set. -->
                     <p class="text-secondary recording-link" style="margin-top: var(--space-md); font-size: 0.85em;">
-                        <a href="/recording" target="_blank" rel="noopener">What this vault records</a>
+                        <a href="/recording" target="_blank" rel="noopener">Privacy</a>
                     </p>
 
                     <!-- Persistent product attribution. Visible by default so it survives even
@@ -226,7 +227,7 @@
                     <div class="loading-spinner" style="margin: var(--space-lg) auto;" aria-hidden="true"></div>
                 </div>
                 <p class="text-secondary text-center recording-link" style="margin: 0 0 var(--space-md); font-size: 0.85em;">
-                    <a href="/recording" target="_blank" rel="noopener">What this vault records</a>
+                    <a href="/recording" target="_blank" rel="noopener">Privacy</a>
                 </p>
             </div>
         </div>
@@ -250,7 +251,7 @@
                 <button type="button" class="mobile-nav-toggle" id="mobile-nav-toggle" aria-label="Open menu" aria-controls="sidebar" aria-expanded="false">
                     <svg class="icon" aria-hidden="true"><use href="#i-menu"/></svg>
                 </button>
-                <img src="/static/assets/logo-small.png" data-brand-logo alt="Logo" style="height: 32px; margin-right: var(--space-xs);">
+                <img src="/static/assets/logo-small.png" data-brand-logo alt="" style="height: 32px; margin-right: var(--space-xs);">
                 <span data-brand-name>DockVault</span>
             </div>
             <div class="navbar-menu">
@@ -341,7 +342,7 @@
                         </button>
                         <a class="profile-dropdown-item" id="recording-notice-link" href="/recording" target="_blank" rel="noopener">
                             <svg class="icon"><use href="#i-info"/></svg>
-                            <span>What this vault records</span>
+                            <span>Privacy</span>
                         </a>
                         <button class="profile-dropdown-item" id="dropdown-logout-btn">
                             <svg class="icon"><use href="#i-logout"/></svg>
@@ -355,11 +356,8 @@
         <!-- Main Layout with Sidebar -->
         <div class="app-layout">
             <!-- Sidebar -->
+            <!-- While Settings is open the rail shows the Settings pages instead (static/js/settings-menu.js). -->
             <aside class="sidebar" id="sidebar">
-                <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle sidebar">
-                    <span class="sidebar-toggle-icon">☰</span>
-                </button>
-                
                 <nav class="sidebar-nav">
                     <a href="#" class="sidebar-item active" data-section="dashboard">
                         <span class="sidebar-icon"><svg class="icon"><use href="#i-dashboard"/></svg></span>
@@ -1763,9 +1761,9 @@
                         <button type="button" id="settings-load-retry" class="btn btn-secondary btn-sm">Retry</button>
                     </div>
 
-                    <!-- The Settings pages: on a wide screen a list at the left, grouped under six headings; on a
-                         phone the same buttons as a strip, the headings hidden. The groups are CSS only, so every
-                         page keeps its data-tab. -->
+                    <!-- The Settings pages, grouped under six headings. The settings menu in the side rail is
+                         drawn from this list and clicks its buttons (static/js/settings-menu.js), so every page
+                         keeps its data-tab; the list itself is then hidden. -->
                     <div class="tabs mb-lg settings-nav" role="group" aria-label="Settings pages">
                         <div class="settings-nav-group" data-settings-group="organisation">
                             <span class="settings-nav-title">Organisation</span>
@@ -1948,6 +1946,11 @@
                                     <label for="setting-brand-docs-url">Documentation URL</label>
                                     <input type="url" id="setting-brand-docs-url" class="form-control" maxlength="500" placeholder="https://example.com/docs">
                                 </div>
+                                <div data-setting="brand_privacy_policy_url" class="form-group">
+                                    <label for="setting-brand-privacy-policy-url">Privacy policy URL</label>
+                                    <input type="url" id="setting-brand-privacy-policy-url" class="form-control" maxlength="500" placeholder="https://example.com/privacy" aria-describedby="setting-brand-privacy-policy-url-help">
+                                    <small class="text-secondary" id="setting-brand-privacy-policy-url-help">Your organisation's privacy policy. The Privacy page links to it. Leave it blank if you have none.</small>
+                                </div>
                                 <small class="text-secondary">Only <code>https://</code>, <code>http://</code>, or a site-relative <code>/path</code> is accepted.</small>
                             </div>
                         </div>
@@ -2032,8 +2035,17 @@
                                         <input type="file" id="brand-logo-file" aria-label="Logo file" accept="image/png,image/jpeg,image/gif,image/webp,image/x-icon,image/svg+xml">
                                         <button type="button" id="brand-logo-upload" class="btn btn-secondary">Upload</button>
                                         <button type="button" id="brand-logo-reset" class="btn btn-secondary">Reset</button>
+                                        <!-- Shown when GET /settings reports the uploaded file gone (brand_assets_missing). -->
+                                        <span class="brand-asset-missing text-error text-sm" id="brand-logo-missing" role="status" hidden>The uploaded logo is missing from the server. Upload it again.</span>
                                     </div>
                                     <small class="text-secondary" id="brand-logo-status"></small>
+                                </div>
+                                <div data-setting="brand_show_name" class="form-group flex items-start gap-md">
+                                    <button type="button" id="setting-brand-show-name" class="settings-advanced-switch brand-switch mt-xs" role="switch" aria-checked="true" aria-describedby="setting-brand-show-name-help"><span class="settings-advanced-thumb" aria-hidden="true"></span></button>
+                                    <div class="flex-1">
+                                        <label for="setting-brand-show-name">Show the name beside the logo</label>
+                                        <small class="text-secondary block" id="setting-brand-show-name-help">Turn this off when your logo already shows the name. The name is still used for the browser tab, emails and screen readers, and shows on its own if the logo cannot be loaded.</small>
+                                    </div>
                                 </div>
                                 <div data-setting="brand_favicon" class="form-group">
                                     <label>Favicon</label>
@@ -2042,6 +2054,7 @@
                                         <input type="file" id="brand-favicon-file" accept="image/png,image/x-icon,image/svg+xml,image/gif,image/webp">
                                         <button type="button" id="brand-favicon-upload" class="btn btn-secondary">Upload</button>
                                         <button type="button" id="brand-favicon-reset" class="btn btn-secondary">Reset</button>
+                                        <span class="brand-asset-missing text-error text-sm" id="brand-favicon-missing" role="status" hidden>The uploaded favicon is missing from the server. Upload it again.</span>
                                     </div>
                                     <small class="text-secondary" id="brand-favicon-status"></small>
                                 </div>
@@ -4465,7 +4478,7 @@
     <script src="/static/js/tables.js?v=20261117a"></script>
     <script src="/static/js/passkeys.js?v=20261117a"></script>
     <script src="/static/js/sso.js?v=20261125a"></script>
-    <script src="/static/js/app.js?v=20261118a"></script>
+    <script src="/static/js/app.js?v=20261125a"></script>
     <script src="/static/js/dashboard-actions.js?v=20261117a"></script>
     <script src="/static/js/session-watch.js?v=20261117a"></script>
     <script src="/static/js/settings-help.js?v=20261117a"></script>
@@ -4479,8 +4492,9 @@
     <script src="/static/js/settings-erase.js?v=20261108a"></script>
     <script src="/static/js/settings-removal.js?v=20261108a"></script>
     <script src="/static/js/settings-integrity.js?v=20261108a"></script>
-    <script src="/static/js/settings-levels.js?v=20261113a"></script>
-    <script src="/static/js/notice-banner.js?v=20261108a"></script>
+    <script src="/static/js/settings-levels.js?v=20261125a"></script>
+    <script src="/static/js/settings-menu.js?v=20261125a"></script>
+    <script src="/static/js/notice-banner.js?v=20261125a"></script>
     <script src="/static/js/compliance.js?v=20261113a"></script>
 </body>
 </html>

@@ -28,7 +28,7 @@ def test_only_served_components_are_listed(page: Page, admin, admin_creds):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible(timeout=10000)
     expect(page.locator("#save-all-settings-btn")).to_have_attribute("data-settings-ready", "true", timeout=15000)
-    page.click('#settings-section .tab-btn[data-tab="logs"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="logs"]')
     expect(page.locator("#settings-tab-logs")).to_be_visible()
     show_advanced(page, "logs")
     rows = page.locator("#log-flags input[type=checkbox]")

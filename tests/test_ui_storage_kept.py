@@ -53,7 +53,7 @@ def test_the_storage_panel_says_what_is_kept_for_cases(page: Page, admin_creds, 
     assert files >= 1
     _login(page, admin_creds["username"], admin_creds["password"])
     page.click('.sidebar-item[data-section="settings"]')
-    page.click('.tab-btn[data-tab="storage"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="storage"]')
     line = page.locator("#storage-stat-kept")
     expect(line).to_be_visible(timeout=10000)
     expect(line).to_contain_text(f"Kept for cases: {files} file" + ("" if files == 1 else "s"))

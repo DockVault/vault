@@ -275,9 +275,12 @@ def test_get_started_opens_the_settings_page_of_its_item(page: Page, admin, admi
     email.get_by_role("button", name="Open settings").click()
     expect(page.locator("#settings-tab-email")).to_be_visible(timeout=15000)
     expect(page.locator('#settings-section .tab-btn[data-tab="email"]')).to_have_attribute("aria-current", "page")
+    # The settings menu in the rail marks the same page.
+    expect(page.locator('#sidebar .sidebar-settings-item[data-tab="email"]')).to_have_attribute("aria-current", "page")
     expect(page.locator("#settings-tab-general")).to_be_hidden()
-    page.click('.sidebar-item[data-section="dashboard"]')
+    page.click("#sidebar-settings-back")   # Back: to the dashboard Settings was opened from
     expect(card).to_be_visible(timeout=15000)
     card.locator('.get-started-item[data-check="second_factor"]').get_by_role("button", name="Open settings").click()
     expect(page.locator("#settings-tab-security")).to_be_visible(timeout=15000)
     expect(page.locator('#settings-section .tab-btn[data-tab="security"]')).to_have_attribute("aria-current", "page")
+    expect(page.locator('#sidebar .sidebar-settings-item[data-tab="security"]')).to_have_attribute("aria-current", "page")

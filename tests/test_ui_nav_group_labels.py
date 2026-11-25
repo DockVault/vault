@@ -20,7 +20,8 @@ def _login(page: Page, username: str, password: str):
 
 
 def _label(page: Page, text: str):
-    return page.locator(".sidebar-nav .nav-group-label", has_text=text)
+    # The sections' menu, not the Settings menu the rail also holds (its "Security and access" says Access).
+    return page.locator(".sidebar-nav:not(.sidebar-settings-nav) .nav-group-label", has_text=text)
 
 
 def test_admin_keeps_all_nav_group_labels(page: Page, admin_creds):

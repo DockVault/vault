@@ -892,29 +892,72 @@ button.vault-sort-dir {
 }
 
 /* Dashboard personal lanes (What's waiting / Favourites / Most recent). Shared by both skins. */
-/* Settings pages (static/index.html, the .settings-nav strip). On a narrow screen the groups are not drawn
-   (display: contents) and the buttons stay the one-row strip; from 1024px the section is a grid: the list of
-   pages at the left under its headings, the open page beside it. Every page is a .tab-btn with its data-tab,
-   so the switching code and the search are the same on both. */
+/* Settings pages (static/index.html, the .settings-nav list). The settings menu in the side rail
+   (static/js/settings-menu.js) is drawn from this list and clicks its buttons, so every page keeps its
+   data-tab and the switching code and the search are unchanged. Once that menu exists the list is hidden at
+   every width and the open page takes the section's full width. Without it the list is a one-row strip. */
 .settings-nav .settings-nav-group { display: contents; }
 .settings-nav .settings-nav-title { display: none; }
 .settings-nav .settings-nav-group[hidden] { display: none; }
-@media (min-width: 1024px) {
-    #settings-section.active { display: grid; grid-template-columns: 220px minmax(0, 1fr); column-gap: var(--space-xl); align-items: start; }
-    #settings-section > :not(.settings-nav):not(.settings-tab-content) { grid-column: 1 / -1; }
-    #settings-section > .settings-nav { grid-column: 1; grid-row: 3; position: sticky; top: var(--space-md); display: block;
-        border-bottom: 0; overflow: visible; margin-bottom: 0; padding-right: var(--space-sm); }
-    #settings-section > .settings-tab-content { grid-column: 2; grid-row: 3; min-width: 0; }
-    .settings-nav .settings-nav-group { display: block; margin-bottom: var(--space-md); }
-    .settings-nav .settings-nav-group[hidden] { display: none; }
-    .settings-nav .settings-nav-title { display: block; font-size: .72rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
-        color: var(--text-tertiary); padding: 0 var(--space-sm); margin: 0 0 .3rem; }
-    #settings-section .settings-nav .tab-btn { display: block; width: 100%; text-align: left; border-bottom: 0; bottom: 0; white-space: normal;
-        border-left: 3px solid transparent; border-radius: var(--radius-sm); padding: .45rem .6rem; font-size: var(--text-sm, .88rem); }
-    #settings-section .settings-nav .tab-btn:hover { background: var(--surface-1); }
-    #settings-section .settings-nav .tab-btn.active { border-left-color: var(--primary, var(--brand-secondary)); background: var(--surface-1);
-        border-bottom-color: transparent; }
+body.has-settings-menu #settings-section > .settings-nav { display: none; }
+
+/* The settings menu in the rail, shown in place of the sections while Settings is open (both skins; the
+   phone's drawer shows the same menu). The pages have no icons. */
+.sidebar-settings-nav[hidden] { display: none; }
+body.settings-mode .sidebar > .sidebar-nav:not(.sidebar-settings-nav) { display: none; }
+.sidebar-settings-head {
+    display: flex; align-items: center; gap: var(--space-sm);
+    padding: .25rem .25rem .6rem; margin-bottom: .25rem;
+    border-bottom: 1px solid var(--line, var(--border-color));
 }
+.sidebar-back {
+    display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+    width: 28px; height: 28px; padding: 0; cursor: pointer;
+    border: 1px solid var(--line, var(--border-color)); border-radius: var(--radius-md);
+    background: transparent; color: var(--text-secondary);
+}
+.sidebar-back:hover { background: var(--hover-overlay, var(--surface-2)); color: var(--text-primary); }
+.sidebar-back:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.sidebar-back .icon { width: 16px; height: 16px; }
+.sidebar-settings-title { font-weight: 650; font-size: var(--text-sm); color: var(--text-primary); white-space: nowrap; }
+.sidebar-settings-nav .nav-group-label {
+    font-size: .625rem; font-weight: 600; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--text-tertiary); padding: 0 .625rem; margin: var(--space-md) 0 .35rem; user-select: none;
+}
+/* Each heading leads its own group, so a skin's "first label in the menu" rule must not close the gaps. */
+.sidebar-settings-nav .sidebar-settings-group > .nav-group-label:first-child { margin-top: var(--space-md); }
+.sidebar-settings-nav .sidebar-settings-list > .sidebar-settings-group:first-child > .nav-group-label:first-child { margin-top: .5rem; }
+.sidebar-settings-group[hidden] { display: none; }
+.sidebar-settings-group { display: flex; flex-direction: column; gap: 1px; }
+/* The pages are buttons: drop the browser's button look, keep the rail item's. */
+.sidebar-settings-item {
+    width: 100%; border: 0; background: transparent; font: inherit; text-align: left; white-space: normal;
+}
+.sidebar-settings-item:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.sidebar.collapsed .sidebar-settings-title,
+.sidebar.collapsed .sidebar-settings-head .settings-advanced,
+.sidebar.collapsed .sidebar-settings-list { display: none; }
+.sidebar.collapsed .sidebar-settings-head { justify-content: center; }
+
+/* The Advanced switch in the menu's head (static/js/settings-levels.js). */
+.settings-advanced { margin-left: auto; display: inline-flex; align-items: center; gap: .45rem; }
+.settings-advanced-label {
+    font-size: .75rem; font-weight: 600; color: var(--text-secondary); cursor: pointer; user-select: none; margin: 0;
+}
+.settings-advanced-switch {
+    position: relative; flex: 0 0 auto; width: 32px; height: 18px; padding: 0; cursor: pointer;
+    border: 1px solid var(--line, var(--border-color)); border-radius: 999px; background: var(--surface-2);
+    transition: background var(--transition-fast, .15s), border-color var(--transition-fast, .15s);
+}
+.settings-advanced-thumb {
+    position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%;
+    background: var(--text-tertiary); transition: transform var(--transition-fast, .15s), background var(--transition-fast, .15s);
+}
+.settings-advanced-switch[aria-checked="true"] {
+    background: color-mix(in srgb, var(--brand-secondary) 35%, transparent); border-color: var(--brand-secondary);
+}
+.settings-advanced-switch[aria-checked="true"] .settings-advanced-thumb { transform: translateX(14px); background: var(--brand-secondary); }
+.settings-advanced-switch:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 /* A long help text: one sentence, the rest under "More" (static/js/settings-help.js). */
 .form-help .help-more, p.text-secondary .help-more, small .help-more, .email-hint .help-more { display: inline; }
 .help-more > summary { display: inline; cursor: pointer; color: var(--brand-on-tint, var(--brand-strong, var(--primary))); list-style: none; font-weight: 600; }
@@ -1147,43 +1190,23 @@ button.vault-sort-dir {
     width: 64px;
 }
 
-.sidebar-toggle {
-    position: absolute;
-    top: var(--space-md);
-    right: var(--space-md);
-    background: var(--surface-2);
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-md);
-    width: 32px;
-    height: 32px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    transition: all var(--transition-base);
-    z-index: 101;
+/* The menu button in the top bar, at every width (app.js): on a wide screen it collapses or expands the
+   rail, on a phone it opens the drawer (mobile.css sizes it for a finger there). */
+.mobile-nav-toggle {
+    display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto;
+    width: 32px; height: 32px; margin: 0 var(--space-xs) 0 calc(-1 * var(--space-xs));
+    padding: 0; border: 0; border-radius: var(--radius-md);
+    background: transparent; color: var(--text-secondary); cursor: pointer;
 }
-
-.sidebar-toggle:hover {
-    background: var(--surface-3);
-    transform: scale(1.05);
-}
-
-.sidebar-toggle-icon {
-    font-size: 18px;
-    transition: transform var(--transition-base);
-}
-
-.sidebar.collapsed .sidebar-toggle-icon {
-    transform: rotate(180deg);
-}
+.mobile-nav-toggle:hover { background: var(--hover-overlay, var(--surface-2)); color: var(--text-primary); }
+.mobile-nav-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.mobile-nav-toggle .icon { width: 18px; height: 18px; }
 
 .sidebar-nav {
-    padding: var(--space-lg) var(--space-sm);
+    padding: var(--space-xs) var(--space-sm) var(--space-lg);
     display: flex;
     flex-direction: column;
     gap: var(--space-xs);
-    margin-top: calc(var(--space-lg) + 32px); /* Space for toggle button */
 }
 
 .sidebar-item {

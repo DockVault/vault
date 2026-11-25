@@ -45,7 +45,7 @@ def _stub_zk_enabled(page: Page, plan_forced: bool):
 def _open_sftp_settings(page: Page):
     page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible()
-    page.click('.tab-btn[data-tab="sftp"]')
+    page.click('#sidebar .sidebar-settings-item[data-tab="sftp"]')
     show_advanced(page, "sftp")
     expect(page.locator("#settings-tab-sftp")).to_be_visible()
 
