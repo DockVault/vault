@@ -1640,6 +1640,9 @@ async def unlink_my_identity(
     # Kept for the record and the notice, before the identity goes: how it was linked, and what its provider
     # still asked of the account (a deadline that was running).
     linked_by = getattr(identity, "linked_by", None)
+    # Whether this provider could hold the account to its own sign-in: where it could, the unlink takes the
+    # account out of that for good, and the administrators are told by email too (below).
+    could_hold = sso.provider_can_hold(db, account, row)
     told = owners_unlink_text(current_user.username, (row.label or row.name) if row is not None else
                               "an organisation provider", asked=bool(asked), linked_by=linked_by,
                               standing=standing, policy=sso.policy_of(row) if row is not None else None,
@@ -1664,16 +1667,21 @@ async def unlink_my_identity(
                     "restored": settled == sso_only.RESTORED})
     label = (row.label or row.name) if row is not None else "an organisation provider"
     may_set_password = settled == sso_only.RESTORED
-    # Every unlink by its owner is told to the administrators, in the app and by email as an administrator's own
-    # unlink is: from now on the provider says nothing about the account. The owner who is an administrator
-    # reads their own notice as the owner, and not a second one that says somebody unlinked.
+    # Every unlink by its owner is told to the administrators in the app: from now on the provider says nothing
+    # about the account. By email as well only where the provider could hold the account to its own sign-in:
+    # there the unlink is what a person does whom the provider is about to stop signing in, and an identity
+    # linked by an address is unlinked there with no confirmation at all. Everywhere else an email for every
+    # unlink would be noise in a large organisation. The owner who is an administrator reads their own notice
+    # as the owner, and not a second one that says somebody unlinked.
     try:
         admins = [a for a in api._active_admins(db) if str(a.id) != str(current_user.id)]
         api._notify_users([str(a.id) for a in admins], "account_changed",
                           title=f"{current_user.username} unlinked {label}", body=told, target="#users")
-        from app.core import setting_changes
-        api._fire_action_email_bulk(db, setting_changes.EMAIL_ACTION, [(a.email, a.username) for a in admins],
-                                    {"change": told, "by": current_user.username, "when": api._change_time_text()})
+        if could_hold:
+            from app.core import setting_changes
+            api._fire_action_email_bulk(db, setting_changes.EMAIL_ACTION, [(a.email, a.username) for a in admins],
+                                        {"change": told, "by": current_user.username,
+                                         "when": api._change_time_text()})
     except Exception as exc:  # noqa: BLE001 -- the unlink stands without its notice
         log.info("sso unlink notice to administrators skipped: %s", type(exc).__name__)
     _tell_owner(db, current_user, row, "A sign-in method was removed from your account",

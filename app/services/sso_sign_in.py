@@ -1386,20 +1386,12 @@ def reauth_providers(db, user) -> list:
 UNLINK_CONFIRMATION = "sso.identity.unlink"
 
 
-def unlink_asks_the_provider(db, user, identity, row) -> bool:
-    """Whether the owner's unlink of ``identity`` asks for a fresh sign-in through its provider ``row`` first.
-
-    Where the provider closes the account's other ways in once the person has stopped signing in there
-    (``sso_lapse_ends_sign_in``), unlinking it would end that for good: an account with no identity has no days
-    to run out. A person the provider no longer signs in could unlink it on the day before, and keep the password.
-    So the unlink is confirmed by what such a person cannot give: a sign-in through the provider, made now.
-
-    Asked exactly where the provider can hold the account. Not where it has nothing to hold it by: its days are
-    0 and a refusal of the person ends nothing (no deadline ever stands then, and a provider that cannot confirm
-    would leave every owner to an administrator for a hold that cannot exist). Not for an identity the provider
-    itself put on the account by a verified address (the owner's answer to a link they did not make stays one
-    click). And not for an account the hold never reaches (app/services/sso_freshness.may_be_held: the same rule
-    as the hold's own, so an account that is held cannot unlink in one step)."""
+def provider_can_hold(db, user, row) -> bool:
+    """Whether ``row`` can hold ``user``'s account to its own sign-in at all: it closes the account's other ways in
+    once the person has stopped signing in there, it has something to hold the account by (days that run out, or
+    a refusal that ends access), and the account is one a hold reaches (app/services/sso_freshness.may_be_held).
+    Where it can, an unlink of it takes the account out of that hold for good: that is where the owner's unlink
+    asks the provider first, and where the administrators are told of an owner's unlink by email as well."""
     from app.services import sso_freshness
     if row is None:
         return False
@@ -1408,9 +1400,26 @@ def unlink_asks_the_provider(db, user, identity, row) -> bool:
         return False
     if policy["sso_freshness_days"] <= 0 and not policy["sso_refusal_ends_access"]:
         return False
+    return sso_freshness.may_be_held(db, user)
+
+
+def unlink_asks_the_provider(db, user, identity, row) -> bool:
+    """Whether the owner's unlink of ``identity`` asks for a fresh sign-in through its provider ``row`` first.
+
+    Where the provider closes the account's other ways in once the person has stopped signing in there
+    (``sso_lapse_ends_sign_in``), unlinking it would end that for good: an account with no identity has no days
+    to run out. A person the provider no longer signs in could unlink it on the day before, and keep the password.
+    So the unlink is confirmed by what such a person cannot give: a sign-in through the provider, made now.
+
+    Asked exactly where the provider can hold the account (:func:`provider_can_hold`). Not where it has nothing
+    to hold it by: its days are 0 and a refusal of the person ends nothing (no deadline ever stands then, and a
+    provider that cannot confirm would leave every owner to an administrator for a hold that cannot exist). Not
+    for an account the hold never reaches (the same rule as the hold's own, so an account that is held cannot
+    unlink in one step). And not for an identity the provider itself put on the account by a verified address:
+    the owner's answer to a link they did not make stays one click, and the administrators are told of it."""
     if getattr(identity, "linked_by", None) == LINKED_BY_EMAIL:
         return False
-    return sso_freshness.may_be_held(db, user)
+    return provider_can_hold(db, user, row)
 
 
 def reauth_offered(row) -> bool:

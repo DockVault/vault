@@ -513,8 +513,8 @@ def test_what_the_administrators_are_told_of_an_owners_unlink():
 
 def test_the_owners_unlink_records_how_the_identity_was_linked_and_tells_the_administrators_by_email_too(monkeypatch):
     """The record says how the identity was linked as it was (not 'self' for every one), that its owner unlinked
-    it, and the day a sign-in there was due. The administrators are told in the app and by email, as they are of
-    an administrator's own unlink; the owner who is an administrator gets neither."""
+    it, and the day a sign-in there was due. The provider could hold the account, and the identity was unlinked
+    with no confirmation (it was linked by an address): the administrators are told in the app and by email."""
     ada, root, alice, p = _user("ada", role="admin"), _user("root", role="admin"), _user(), _provider()
     identity = _identity(alice, p, linked_by="email", last_sign_in_at=datetime.utcnow() - timedelta(days=27))
     h = Harness(monkeypatch, [alice, ada, root], [p], identities=[identity])
@@ -594,3 +594,52 @@ def test_the_owners_unlink_waits_a_short_time_for_the_accounts_turn_and_is_answe
     # Let go, the same request unlinks.
     monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: None)
     assert _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")[0] == 200 and identity not in h.identities()
+
+
+@pytest.mark.parametrize("policy, mailed", [
+    (None, True),                                                              # it closes the other ways in
+    ({"sso_lapse_ends_sign_in": False}, False),                                # it only pauses keys
+    ({"sso_freshness_days": 0, "sso_refusal_ends_access": False}, False),      # it has nothing to hold by
+    ({"sso_freshness_days": 0, "sso_refusal_ends_access": True}, True),        # a refusal there ends access
+])
+@pytest.mark.parametrize("linked_by", ["self", "email"])
+def test_the_administrators_are_emailed_of_an_owners_unlink_only_where_the_provider_could_hold(monkeypatch, policy,
+                                                                                               mailed, linked_by):
+    """Every owner's unlink is told to the administrators in the app. The email goes only where the unlinked
+    provider could hold the account to its own sign-in: the unlink a leaver makes. However the identity was
+    linked: one linked by an address is unlinked there with no confirmation, which is the case the email is for."""
+    from app.core import setting_changes
+    from app.services import sso_sign_in as sso
+    root, alice, p = _user("root", role="admin"), _user(), _provider(policy=policy)
+    identity = _identity(alice, p, linked_by=linked_by, last_sign_in_at=datetime.utcnow())
+    h = Harness(monkeypatch, [alice, root], [p], identities=[identity])
+    h.current_user = alice
+    monkeypatch.setattr(h.S, "_active_admins", lambda db: [root])
+    monkeypatch.setattr(sso, "unlink_asks_the_provider", lambda db, user, identity, row: False)   # not what is asked here
+    sent = []
+    monkeypatch.setattr(h.S, "_fire_action_email_bulk",
+                        lambda db, key, recipients, context=None: sent.append((key, [r[1] for r in recipients])))
+    assert sso.provider_can_hold(h.db, alice, p) is mailed
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
+    assert status == 200 and out["removed"] is True, out
+    assert [ids for ids, title in h.notices if title == "alice unlinked " + (p.label or p.name)] == [[str(root.id)]]
+    assert [s for s in sent if s[0] == setting_changes.EMAIL_ACTION] == ([(setting_changes.EMAIL_ACTION, ["root"])]
+                                                                          if mailed else [])
+
+
+def test_no_email_goes_out_for_the_unlink_of_an_account_no_hold_reaches(monkeypatch):
+    from app.core import setting_changes
+    from app.services import sso_freshness
+    from app.services import sso_sign_in as sso
+    root, alice, p = _user("root", role="admin"), _user(), _provider()
+    identity = _identity(alice, p, last_sign_in_at=datetime.utcnow())
+    h = Harness(monkeypatch, [alice, root], [p], identities=[identity])
+    h.current_user = alice
+    monkeypatch.setattr(h.S, "_active_admins", lambda db: [root])
+    monkeypatch.setattr(sso_freshness, "may_be_held", lambda db, user: False)
+    sent = []
+    monkeypatch.setattr(h.S, "_fire_action_email_bulk", lambda db, key, recipients, context=None: sent.append(key))
+    assert sso.provider_can_hold(h.db, alice, p) is False and sso.provider_can_hold(h.db, alice, None) is False
+    assert _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")[0] == 200
+    assert setting_changes.EMAIL_ACTION not in sent
+    assert [ids for ids, title in h.notices if title == "alice unlinked " + (p.label or p.name)] == [[str(root.id)]]
