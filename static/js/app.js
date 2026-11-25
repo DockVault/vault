@@ -10088,11 +10088,16 @@ let notifUnread = 0;
 
 // Map a server-supplied notification target to an in-app section. Targets are short server-controlled
 // tokens, and we only ever navigate to a KNOWN sidebar section — never inject an arbitrary href.
-const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes', '#users': 'users', '#uploadlinks': 'uploadlinks' };
-// (the expiry reminders use these targets too: #shared, #vaults, #notes, #uploadlinks)
+const _NOTIF_TARGET_SECTION = { '#shared': 'shared', '#temp-creds': 'temp-creds', '#vaults': 'vaults', '#notes': 'notes', '#users': 'users', '#uploadlinks': 'uploadlinks', '#settings': 'settings' };
+// (the expiry reminders use these targets too: #shared, #vaults, #notes, #uploadlinks; the administrators'
+// notices about settings and single sign-on providers use #settings)
 // Targets that open a dialog rather than a page: a notice about the reader's own account (a password,
-// an email address or a second factor an administrator changed) opens "Your account".
-const _NOTIF_TARGET_OPEN = { '#profile': () => openUserSettingsModal() };
+// an email address or a second factor an administrator changed) opens "Your account". A notice about
+// sign-in opens the Settings page on its Sign-in methods tab.
+const _NOTIF_TARGET_OPEN = {
+    '#profile': () => openUserSettingsModal(),
+    '#settings/signin': () => _openSettingsTab('signin'),
+};
 // A notice about one vault opens it: "#vault/" and its id, nothing else (a zero-knowledge vault's name is
 // sealed, so a notice can only name it by id). The id is matched in full before it is used.
 const _NOTIF_VAULT_TARGET = /^#vault\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
@@ -10120,6 +10125,24 @@ function _flashWhenDrawn(selector, tries) {
         if (--left > 0) setTimeout(tick, 100);
     };
     setTimeout(tick, 50);
+}
+
+// Opens the Settings page on one of its tabs. The page is asked for first; the tab is chosen once the page shows
+// with its tab bar wired (opening Settings wires it, at once or after its sidebar item was decided). A page that
+// does not open, as for anyone but an administrator, is waited for briefly and then left alone.
+function _openSettingsTab(tab, tries) {
+    navigateToSection('settings');
+    let left = tries || 30;
+    const tick = () => {
+        const page = document.getElementById('settings-section');
+        const button = document.querySelector('#settings-section .tab-btn[data-tab="' + tab + '"]');
+        if (page && page.classList.contains('active') && button && button.dataset.wired) {
+            button.click();
+            return;
+        }
+        if (--left > 0) setTimeout(tick, 100);
+    };
+    tick();
 }
 
 // Opens what a target names: a page, a tab of a page (and the item on it), a vault, or a vault's "My public
