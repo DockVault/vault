@@ -1390,16 +1390,25 @@ def unlink_asks_the_provider(db, user, identity, row) -> bool:
     Where the provider closes the account's other ways in once the person has stopped signing in there
     (``sso_lapse_ends_sign_in``), unlinking it would end that for good: an account with no identity has no days
     to run out. A person the provider no longer signs in could unlink it on the day before, and keep the password.
-    So the unlink is confirmed by what such a person cannot give: a sign-in through the provider, made now. Not
-    for an identity the provider itself put on the account by a verified address (the owner's answer to a link
-    they did not make stays one click), and not for an account the rule never holds (an administrator, a holder
-    of the auditor right)."""
-    from app.core import privileged_accounts
-    if row is None or not policy_of(row)["sso_lapse_ends_sign_in"]:
+    So the unlink is confirmed by what such a person cannot give: a sign-in through the provider, made now.
+
+    Asked exactly where the provider can hold the account. Not where it has nothing to hold it by: its days are
+    0 and a refusal of the person ends nothing (no deadline ever stands then, and a provider that cannot confirm
+    would leave every owner to an administrator for a hold that cannot exist). Not for an identity the provider
+    itself put on the account by a verified address (the owner's answer to a link they did not make stays one
+    click). And not for an account the hold never reaches (app/services/sso_freshness.may_be_held: the same rule
+    as the hold's own, so an account that is held cannot unlink in one step)."""
+    from app.services import sso_freshness
+    if row is None:
+        return False
+    policy = policy_of(row)
+    if not policy["sso_lapse_ends_sign_in"]:
+        return False
+    if policy["sso_freshness_days"] <= 0 and not policy["sso_refusal_ends_access"]:
         return False
     if getattr(identity, "linked_by", None) == LINKED_BY_EMAIL:
         return False
-    return privileged_accounts.kind(db, user) is None
+    return sso_freshness.may_be_held(db, user)
 
 
 def reauth_offered(row) -> bool:

@@ -129,6 +129,33 @@ def lapsed(db, user_id, *, now: Optional[datetime] = None) -> Optional[Deadline]
     return None
 
 
+def may_be_held(db, user) -> bool:
+    """Whether a provider's hold can reach ``user`` at all: every account but one that keeps a password of its own
+    in use now, which is an administrator, or the holder of an auditor right that is in force (an active grant).
+
+    A proposal for the right exempts nobody, and neither does a right that is suspended: neither lets the account
+    do anything yet that needs its password. Counted as exempt, an account with a proposal waiting could unlink
+    its provider in one step, and after the proposal lapsed it was an ordinary account with no identity, which
+    nothing holds.
+
+    One rule for the hold itself (:func:`held_to_a_provider`), for what a person and the administrators are told
+    of it (:func:`closes_the_other_ways_in`, :func:`password_after_a_refusal`) and for whether the owner's unlink
+    asks the provider first (app/services/sso_sign_in.unlink_asks_the_provider): an account the hold reaches
+    cannot step out of it by unlinking. Who may be linked by a verified address, or made to sign in only through
+    a provider, is another question and keeps its own rule (app/core/privileged_accounts.py: a proposal counts
+    there, since the account will need its password once the proposal is approved)."""
+    from app.core import auditor_rights
+    from app.core.models import RoleEnum
+    if user is None:
+        return False
+    if getattr(user, "role", None) == RoleEnum.ADMIN:
+        return False
+    if getattr(db, "get_bind", None) is not None and not auditor_rights._has_grants(db):
+        return True            # a database without the grants table holds no grant
+    grant = auditor_rights.open_grant(db, getattr(user, "id", None))
+    return grant is None or getattr(grant, "status", None) != "active"
+
+
 def held_to_a_provider(db, user, *, now: Optional[datetime] = None) -> Optional[Deadline]:
     """The missed deadline that leaves ``user`` no way in but a provider's sign-in, or None.
 
@@ -136,16 +163,15 @@ def held_to_a_provider(db, user, *, now: Optional[datetime] = None) -> Optional[
     then. The days count for this only while the provider is turned on; a refusal holds whatever the provider's
     state, and so do days that had run out before it was turned off (recorded as a refusal then). A sign-in
     through any provider the account is linked to is still let in, and one through the provider that asks
-    restores everything; what is refused is what goes through none. Never an account that must keep a password
-    of its own (an administrator, a holder of the auditor right)."""
+    restores everything; what is refused is what goes through none. Never an account that keeps a password of
+    its own in use (:func:`may_be_held`: an administrator, a holder of an auditor right in force)."""
     if user is None or getattr(user, "id", None) is None:
         return None
     now = now or datetime.utcnow()
     missed = [found for found in deadlines(db, user.id) if closes_now(found, now)]
     if not missed:
         return None
-    from app.core import privileged_accounts
-    if privileged_accounts.kind(db, user) is not None:
+    if not may_be_held(db, user):
         return None
     return missed[0]
 
@@ -161,9 +187,7 @@ def closes_the_other_ways_in(db, user, found: Deadline) -> bool:
     """Whether ``found``, once missed, also closes ``user``'s ways in that go through no provider: what the
     warning and the notices say to that person. Not while the provider is turned off: its days close nothing
     then, and the person is told of their keys alone."""
-    from app.core import privileged_accounts
-    return (bool(found.ends_sign_in) and (found.refused or found.provider_on)
-            and privileged_accounts.kind(db, user) is None)
+    return bool(found.ends_sign_in) and (found.refused or found.provider_on) and may_be_held(db, user)
 
 
 def closes_a_connection(db, user, *, by_password: bool) -> bool:
@@ -353,8 +377,7 @@ def password_after_a_refusal(db, user) -> str:
     if held_to_a_provider(db, user) is not None:
         return (" Their password and passkeys no longer sign them in either, until the provider admits them again "
                 "or the refusal is cleared.")
-    from app.core import privileged_accounts
-    if privileged_accounts.kind(db, user) is not None:
+    if not may_be_held(db, user):
         return (" Their password still signs them in: an administrator or an auditor keeps a password of their own. "
                 "Lock or deactivate the account if it should not.")
     return (" Their password still signs them in to the web app: this provider does not close the other ways in "

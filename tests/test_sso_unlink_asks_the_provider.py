@@ -117,12 +117,15 @@ def test_a_provider_that_cannot_confirm_leaves_the_unlink_to_an_administrator(mo
 
 
 def test_which_unlinks_ask_the_provider(monkeypatch):
-    """Where the provider closes the other ways in: every identity but one the provider itself put on the account
-    by a verified address, and every account the rule can hold."""
+    """Exactly where the provider can hold the account: it closes the other ways in, it has something to hold
+    the account by (days that run out, or a refusal that ends access), the identity is not one the provider
+    itself put on the account by a verified address, and the account is one the hold reaches."""
     sso = _sso()
     from app.core import privileged_accounts
-    kind = [None]
-    monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: kind[0])
+    from app.services import sso_freshness
+    reached = [True]
+    monkeypatch.setattr(sso_freshness, "may_be_held", lambda db, user: reached[0])
+    monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: "auditor_right")   # not what is asked here
     alice, p = _user(), _provider()
     for by in ("self", "jit", "invitation", "admin"):
         assert sso.unlink_asks_the_provider(None, alice, _identity(alice, p, linked_by=by), p) is True, by
@@ -130,9 +133,20 @@ def test_which_unlinks_ask_the_provider(monkeypatch):
     assert sso.unlink_asks_the_provider(None, alice, _identity(alice, p), None) is False
     only_pauses_keys = _provider(policy={"sso_lapse_ends_sign_in": False})
     assert sso.unlink_asks_the_provider(None, alice, _identity(alice, only_pauses_keys), only_pauses_keys) is False
-    for standing in ("administrator", "auditor_right"):
-        kind[0] = standing
-        assert sso.unlink_asks_the_provider(None, alice, _identity(alice, p), p) is False, standing
+    # Nothing to hold the account by: no days and no refusal that ends access. No deadline ever stands on such a
+    # provider, so nothing is asked (and a provider that cannot confirm leaves nobody to an administrator for it).
+    for policy, asks in (({"sso_freshness_days": 0, "sso_refusal_ends_access": False}, False),
+                         ({"sso_freshness_days": 0, "sso_refusal_ends_access": True}, True),
+                         ({"sso_freshness_days": 30, "sso_refusal_ends_access": False}, True),
+                         ({"sso_freshness_days": 1, "sso_refusal_ends_access": False}, True)):
+        row = _provider(policy=policy)
+        identity = _identity(alice, row)
+        assert sso.unlink_asks_the_provider(None, alice, identity, row) is asks, policy
+        if not asks:
+            assert sso_freshness.deadline_of(identity, row) is None
+    # An account the hold does not reach is asked nothing.
+    reached[0] = False
+    assert sso.unlink_asks_the_provider(None, alice, _identity(alice, p), p) is False
 
 
 def test_an_identity_linked_by_email_and_one_on_a_provider_that_only_pauses_keys_are_unlinked_in_one_step(monkeypatch):

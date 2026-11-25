@@ -114,13 +114,52 @@ def test_an_account_that_keeps_a_password_of_its_own_is_never_held(monkeypatch, 
     from app.core import auditor_rights
     alice, p, i, db = _world(role="admin" if who == "an administrator" else "user")
     monkeypatch.setattr(auditor_rights, "_has_grants", lambda db: True)
-    monkeypatch.setattr(auditor_rights, "open_grant",
-                        lambda db, user_id, **kw: object() if who == "a holder of the auditor right" else None)
+    grant = types.SimpleNamespace(status="active") if who == "a holder of the auditor right" else None
+    monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: grant)
     found = F.lapsed(db, alice.id)
     assert found is not None and found.ends_sign_in is True
+    assert F.may_be_held(db, alice) is False
     assert F.held_to_a_provider(db, alice) is None and F.closes_the_other_ways_in(db, alice, found) is False
     assert F.closes_a_connection(db, alice, by_password=True) is False
     assert F.closes_a_connection(db, alice, by_password=False) is True
+    assert "keeps a password of their own" in F.password_after_a_refusal(db, alice)
+
+
+@pytest.mark.parametrize("status", ["proposed", "suspended"])
+def test_a_proposal_for_the_auditor_right_or_a_right_that_is_suspended_exempts_nobody(monkeypatch, status):
+    """Neither lets the account do anything yet that needs its password. Counted as exempt, an account with a
+    proposal waiting unlinked its provider in one step, and after the proposal lapsed it was an ordinary account
+    with no identity, which nothing holds. Held, told so, and asked for the provider's confirmation at an unlink:
+    one rule for the three."""
+    from app.core import auditor_rights, privileged_accounts
+    from app.services import sso_sign_in as sso
+    erin, p, i, db = _world()
+    monkeypatch.setattr(auditor_rights, "_has_grants", lambda db: True)
+    monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: types.SimpleNamespace(status=status))
+    assert privileged_accounts.kind(db, erin) == privileged_accounts.AUDITOR_RIGHT       # still that, for a link
+    found = F.lapsed(db, erin.id)
+    assert F.may_be_held(db, erin) is True
+    assert F.held_to_a_provider(db, erin) is not None and F.closes_the_other_ways_in(db, erin, found) is True
+    assert F.closes_a_connection(db, erin, by_password=True) is True
+    assert "no longer sign them in either" in F.password_after_a_refusal(db, erin)
+    assert sso.unlink_asks_the_provider(db, erin, i, p) is True
+    # With no grant at all, the same; with the right in force, none of it.
+    monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: None)
+    assert F.may_be_held(db, erin) is True and sso.unlink_asks_the_provider(db, erin, i, p) is True
+    monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: types.SimpleNamespace(status="active"))
+    assert F.may_be_held(db, erin) is False and F.held_to_a_provider(db, erin) is None
+    assert sso.unlink_asks_the_provider(db, erin, i, p) is False
+    assert F.may_be_held(db, None) is False                                   # nobody is nobody to hold
+    # What the administrators are told of the password follows the same rule: an account with a proposal, on a
+    # provider that only pauses keys, is told of as any ordinary account, not as one that keeps a password.
+    monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: types.SimpleNamespace(status=status))
+    frank, _p, _i, pauses = _world(policy={"sso_lapse_ends_sign_in": False})
+    assert "does not close the other ways in" in F.password_after_a_refusal(pauses, frank)
+    # Where the grants are not kept (a database from before them), nobody holds one: asked of a real session.
+    session = types.SimpleNamespace(get_bind=lambda: None)
+    monkeypatch.setattr(auditor_rights, "_has_grants", lambda db: False)
+    monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id, **kw: pytest.fail("no grants are kept"))
+    assert F.may_be_held(session, erin) is True
 
 
 def test_turning_a_provider_off_hands_nobody_a_password_back():
