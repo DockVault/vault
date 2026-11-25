@@ -1506,10 +1506,10 @@ def test_a_persons_refusal_still_comes_back_as_its_reason_and_a_tests_sentences_
     assert sso.reason_text(oc.SIGNING_KEY_TOO_SHORT) == (
         "Your organisation's sign-in signs its answers with a key this vault does not accept. Tell your "
         "administrator.")
-    # At the provider's logout it is a failure of the provider's keys, not a token the provider sent wrongly.
+    # At the provider's logout it is a token that fails validation, as one with a wrong signature is: sent again,
+    # it is refused again.
     from app.api import sso_router as _router
-    assert oc.SIGNING_KEY_TOO_SHORT not in _router.TOKEN_REFUSALS
-    assert _router.TOKEN_REFUSALS == frozenset({oc.TOKEN_INVALID, oc.ISSUER_MISMATCH})
+    assert _router.TOKEN_REFUSALS == frozenset({oc.TOKEN_INVALID, oc.ISSUER_MISMATCH, oc.SIGNING_KEY_TOO_SHORT})
     # A reason with no sentence of its own is still said as a failed test.
     assert sso.test_failure_text(sso.PROVIDER_DISABLED) == "The test sign-in did not pass: " + sso.reason_text(sso.PROVIDER_DISABLED)
     # A state with nobody to hand the answer to (no account named) goes back as a reason.

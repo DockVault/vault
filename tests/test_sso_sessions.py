@@ -327,8 +327,8 @@ def test_the_back_channel_limiter_keeps_a_bucket_per_provider_and_source_and_a_t
             return (len(noted) == 1, 0, 10)
         return real(*a, **kw)
     monkeypatch.setattr(RL, "check_rate_limit", refusing)
-    assert h.logout(p, token) == (501, {"error": "logout_failed"})
-    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    assert h.logout(p, token) == (400, {"error": "logout_failed"})
+    assert h.logout(p, token) == (400, {"error": "logout_failed"})
     window = sso_router.START_WINDOW
     assert asked == [(f"{source}:{p.id}", sso_router.LOGOUT_LIMIT, window, False)] * 2 and sso_router.LOGOUT_LIMIT >= 600
     assert noted == [(f"{p.id}:{source}", 1, window, False)] * 2
@@ -340,16 +340,17 @@ def test_the_back_channel_limiter_keeps_a_bucket_per_provider_and_source_and_a_t
     # The counter of traces down: nothing is written (a flood during an outage writes no row per request).
     note_down.append(True)
     before = len(h.audits)
-    assert h.logout(p, token) == (501, {"error": "logout_failed"})
+    assert h.logout(p, token) == (400, {"error": "logout_failed"})
     assert len(h.audits) == before
 
 
 def test_a_logout_the_vault_cannot_act_on_is_a_failed_logout_not_an_invalid_token(monkeypatch):
-    """The specification's 400 says the token is not valid and the provider does not retry; everything the vault
-    could not act on is 501, the logout failed, so it may: the state store down, the provider unreachable (and not
+    """Every refused logout is 400: the specification gives that status for a token that fails validation and for
+    a logout that failed, and names no other. The body tells them apart. Everything the vault could not act on
+    is ``logout_failed``, and its token is not spent: the state store down, the provider unreachable (and not
     asked again for a while), its address refused, its discovery no longer fitting, its keys not fetched, a
     configuration the vault cannot read, anything unexpected while verifying, every slot busy past a short wait. A
-    token whose own issuer is wrong is the token's fault: 400."""
+    token whose own issuer is wrong is the token's fault: ``invalid_request``. Why is in the record, each time."""
     import asyncio
     alice, p = _user(), _provider()
     h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
@@ -362,7 +363,8 @@ def test_a_logout_the_vault_cannot_act_on_is_a_failed_logout_not_an_invalid_toke
 
     def reasons():
         return [a[2].get("reason") for a in h.audits if a[0] == "sso_backchannel_logout" and a[1] == "failure"]
-    failed = (501, {"error": "logout_failed"})
+    failed = (400, {"error": "logout_failed"})
+    assert sso_router.LOGOUT_REFUSED == 400
     # The state store down.
     real_seen = sso_state.seen_logout_jti
     monkeypatch.setattr(sso_state, "seen_logout_jti", lambda *a, **k: (_ for _ in ()).throw(sso_state.Unavailable("down")))
@@ -410,8 +412,9 @@ def test_a_logout_the_vault_cannot_act_on_is_a_failed_logout_not_an_invalid_toke
     assert h.logout(p, token) == failed and reasons()[-1] == "busy"
     monkeypatch.setattr(sso_router, "_BACKCHANNEL_SLOTS", asyncio.Semaphore(sso_router.BACKCHANNEL_CONCURRENCY))
     assert 1 <= sso_router.BACKCHANNEL_CONCURRENCY <= 8 and sso_router.BACKCHANNEL_WAIT_SECONDS <= 10
-    # A key the vault does not hold after a fresh fetch: the token's fault (400). Another unknown key within the
-    # minute after that fetch may be newer than it: not the token's fault (501, the provider retries).
+    # A key the vault does not hold after a fresh fetch: the token's fault (invalid_request). Another unknown key
+    # within the minute after that fetch may be newer than it: not the token's fault (logout_failed, and the token
+    # is not spent).
     import time as _time
     def keyed(kid):
         now = int(_time.time())
@@ -715,9 +718,28 @@ def test_a_second_step_after_the_provider_records_the_providers_session_whatever
     assert result.provider_sid == "route-sid" and result.provider_sub == "subject-1"
 
 
+def test_a_logout_signed_with_a_key_too_short_to_trust_is_a_token_that_is_not_valid(monkeypatch):
+    """The provider signs its logout tokens with an RSA key of 1024 bits. The key verifies nothing, so the token
+    fails validation: 400 ``invalid_request``, however often it is sent. No session is ended on its word, and the
+    record says it was the key, for the administrator who reads why the provider's logouts do nothing."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from app.services import oidc_client as oc
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    _signed_in(h, p, sid="s-1")
+    monkeypatch.setattr(oc, "_DEFAULT_CACHE", oc.Cache())
+    h.signer.rsa = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+    token = h.logout_token(sid="s-1", sub="subject-1")
+    for _ in range(2):
+        assert h.logout(p, token) == (400, {"error": "invalid_request"})
+    refused = [a for a in h.audits if a[0] == "sso_backchannel_logout"]
+    assert [(a[1], a[2].get("reason")) for a in refused] == [("failure", "signing_key_too_short")] * 2
+    assert all(s.is_active for s in h.active_sessions()) and h.revoked == []
+
+
 def test_a_logout_that_could_not_be_applied_does_not_spend_the_token(monkeypatch):
     """The token's id is recorded when it is verified; if the sessions could not be ended, the id is forgotten and
-    the answer is 501, so the provider's retry of the same token ends them."""
+    the answer is the failed logout, so the same token sent again ends them."""
     alice, p = _user(), _provider()
     h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
     _signed_in(h, p, sid="s-1")
@@ -732,7 +754,7 @@ def test_a_logout_that_could_not_be_applied_does_not_spend_the_token(monkeypatch
         return through(db, **kw)
     monkeypatch.setattr(h.S, "_revoke_sessions", failing_once)
     status, body = h.logout(p, token)
-    assert (status, body) == (501, {"error": "logout_failed"})
+    assert (status, body) == (400, {"error": "logout_failed"})
     assert all(s.is_active for s in h.active_sessions())
     assert any(a[0] == "sso_backchannel_logout" and a[1] == "failure" and a[2].get("reason") == "revocation_failed"
                for a in h.audits), h.audits
@@ -1099,8 +1121,8 @@ def test_a_logged_out_session_is_asked_about_only_where_the_providers_logouts_ar
 
 
 def test_a_logout_that_cannot_note_what_it_names_fails_and_ends_nothing(monkeypatch):
-    """The store down where the logout is noted: the logout failed (501), nothing is ended, and the token is not
-    spent, so the provider's retry is honoured."""
+    """The store down where the logout is noted: the logout failed, nothing is ended, and the token is not
+    spent, so the same token sent again is honoured."""
     from app.core import sso_state
     alice, p = _user(), _provider()
     h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
@@ -1112,7 +1134,7 @@ def test_a_logout_that_cannot_note_what_it_names_fails_and_ends_nothing(monkeypa
         raise sso_state.Unavailable("down")
     monkeypatch.setattr(sso_state, "note_logged_out", down)
     status, body = h.logout(p, token)
-    assert status == 501 and body == {"error": "logout_failed"}, body
+    assert status == 400 and body == {"error": "logout_failed"}, body
     assert all(s.is_active for s in h.active_sessions()) and h.revoked == []
     monkeypatch.setattr(sso_state, "note_logged_out", real)
     assert h.logout(p, token)[0] == 200 and not [s for s in h.active_sessions() if s.is_active]

@@ -49,13 +49,17 @@ START_WINDOW = 300
 LOGOUT_LIMIT = 600                 # back-channel logouts per source address and window, for each provider (and one
                                    # bucket for every id with no provider): signing many people out is not a person
 BACKCHANNEL_CONCURRENCY = 4         # back-channel verifications in flight at once, per process
-BACKCHANNEL_WAIT_SECONDS = 5.0      # how long a logout waits for one of them before it is answered 501 (the provider
-                                    # may retry; the refusal is recorded)
+BACKCHANNEL_WAIT_SECONDS = 5.0      # how long a logout waits for one of them before it is answered as failed (the
+                                    # provider may send it again; the refusal is recorded)
 _BACKCHANNEL_SLOTS = asyncio.Semaphore(BACKCHANNEL_CONCURRENCY)
-# The refusals that say the token itself is not valid (400, the provider does not retry): its signature, claims or
-# issuer. A failure of the provider's discovery or keys (a signing key too short to trust among them), of the state
-# store or of the vault is a failed logout (501).
-TOKEN_REFUSALS = frozenset({oc.TOKEN_INVALID, oc.ISSUER_MISMATCH})
+# Every refused logout is answered 400, as the specification gives it (Back-Channel Logout 1.0: 2.6 for a token that
+# fails validation, 2.8 for a logout that failed). The body tells the two apart, and never says why.
+# These are the refusals that say the token itself is not valid (``invalid_request``): its signature, claims or
+# issuer, or a signing key too short to trust, which verifies nothing however often the token is sent. A failure
+# to reach the provider's discovery or keys, of the state store or of the vault is a failed logout
+# (``logout_failed``): the token is not spent, and sent again it may end the sessions then.
+LOGOUT_REFUSED = 400
+TOKEN_REFUSALS = frozenset({oc.TOKEN_INVALID, oc.ISSUER_MISMATCH, oc.SIGNING_KEY_TOO_SHORT})
 
 
 class _ProviderUnusable(Exception):
@@ -744,8 +748,8 @@ def _end_what_a_logout_names(db, row_id, scope, claims, client_ip):
     the route's answer. A function of its own, called in the thread pool (it waits for locks)."""
     api = _api()
     from app.core.models import SsoSession
-    invalid = JSONResponse(status_code=400, content={"error": "invalid_request"})
-    failed = JSONResponse(status_code=501, content={"error": "logout_failed"})
+    invalid = JSONResponse(status_code=LOGOUT_REFUSED, content={"error": "invalid_request"})
+    failed = JSONResponse(status_code=LOGOUT_REFUSED, content={"error": "logout_failed"})
     # The session id in the form the sign-in kept it in (a long one as its hash), so the two meet.
     sid, sub = sso.kept_sid(claims.get("sid")), claims.get("sub")
     query = db.query(SsoSession).filter(SsoSession.provider_id == row_id)
@@ -834,20 +838,21 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
     """Where the provider says a person signed out of it (OpenID Connect back-channel logout, a form with
     ``logout_token``): the token is verified as an ID token with the logout event, honoured once by its id, and the
     vault sessions it names (by the provider's session id, else by the subject) are ended, those and no others.
-    200 on success; 400 with ``{"error": "invalid_request"}`` for a token that is not valid, never a body that says
-    why; 501 with ``{"error": "logout_failed"}`` when the vault could not act on a token (the limiter, the store, the
-    provider's keys unreachable). The specification (Back-Channel Logout 1.0, 2.8) gives 400 for a failed logout as
-    well; the vault answers a server error on purpose, so that a provider which sends again after one does, and the
-    token, which was not spent, ends the sessions then. A provider that follows the text to the letter reads either
-    as a logout that failed. Every answer carries ``Cache-Control: no-store``, as the specification asks: the server
-    sets it on every answer of the API, and the route's tests hold each of its answers to it."""
+    200 on success. Every refusal is 400, as the specification gives it (Back-Channel Logout 1.0: 2.6 for a token
+    that fails validation, 2.8 for a logout that failed; it names no other status for either), with a body that
+    tells the two apart and never says why: ``{"error": "invalid_request"}`` for a token that is not valid, and
+    ``{"error": "logout_failed"}`` when the vault could not act on a token (the limiter, the store, the provider's
+    discovery or keys out of reach, the sessions not ended). A token the vault could not act on is not spent: sent
+    again, it ends the sessions then. Why a logout was refused is in its record (the reason), for an
+    administrator. Every answer carries ``Cache-Control: no-store``, as the specification asks: the server sets it
+    on every answer of the API, and the route's tests hold each of its answers to it."""
     api = _api()
     client_ip = api.get_client_ip(request)
     from app.core import sign_in_lockout
     from app.core.models import SsoSession
     from app.core.rate_limiter import rate_limiter as _rl, RateLimiterUnavailable
-    invalid = JSONResponse(status_code=400, content={"error": "invalid_request"})
-    failed = JSONResponse(status_code=501, content={"error": "logout_failed"})
+    invalid = JSONResponse(status_code=LOGOUT_REFUSED, content={"error": "invalid_request"})
+    failed = JSONResponse(status_code=LOGOUT_REFUSED, content={"error": "logout_failed"})
     source = sign_in_lockout.source_of(client_ip)
     # Everything this route needs from the provider's row, read at once; the connection then goes back to the pool,
     # before the body is read or anything waits, and the rest of the request takes another.
