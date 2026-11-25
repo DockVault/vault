@@ -374,8 +374,10 @@
         const discovery = input('sso-discovery', provider.discovery_url);
         const inside = tick('sso-private', 'The provider is inside the network', provider.private_network,
             'Lets the vault call a provider on a private address or name. Leave it off for a provider on the internet.');
-        box.appendChild(field('Name', name, 'For administrators: in this list, in notices and in the records.'));
-        box.appendChild(field('Button text', label, 'What the sign-in page\'s button says. Empty: the name.'));
+        box.appendChild(field('Name', name, 'For administrators: in this list, in their notices and in the records.'));
+        box.appendChild(field('Button text', label, 'What people see: the sign-in page\'s button, under “Sign in with '
+            + 'your organisation”, and the name in their notices and emails. Write the name people know, such as '
+            + 'Contoso. Empty: the name.'));
         box.appendChild(field('Provider type', icon, 'Which provider this is: it chooses the instructions shown above for its console.'));
         box.appendChild(field('Order', order, 'Lower comes first on the sign-in page.'));
         box.appendChild(shown.group);
@@ -1102,7 +1104,8 @@
         tell();
         body.appendChild(field('Provider', kind));
         body.appendChild(hint);
-        body.appendChild(field('Name', name, 'For administrators; the sign-in page\'s button can say something else.'));
+        body.appendChild(field('Name', name, 'For administrators. People see the button text, which you can set after '
+            + 'adding.'));
         const said = _el('span', 'text-sm ml-sm sso-said');
         const make = _el('button', 'btn btn-primary btn-sm mt-md', 'Add');
         make.type = 'button';

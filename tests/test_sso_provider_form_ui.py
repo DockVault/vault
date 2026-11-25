@@ -180,3 +180,21 @@ await openPage('connection');
 out(helpOf('sso-show'));
 """)
     assert got == "Without the button, people use the sign-in link above, or link it under Your account."
+
+
+def test_the_name_is_for_administrators_and_the_button_text_is_what_people_see():
+    """People see the button text: on the sign-in page's button, and as the provider's name in their notices and
+    emails. The name is the administrators': this list, their notices, the records."""
+    got = _node(r"""
+await openPage('connection');
+const form = { name: helpOf('sso-name'), label: helpOf('sso-label') };
+document.listeners.click.forEach((f) => f({ target: byId('signin-sso-add') }));
+await tick();
+out(Object.assign(form, { adding: helpOf('sso-new-name') }));
+""")
+    assert got["name"] == "For administrators: in this list, in their notices and in the records."
+    assert got["label"] == ("What people see: the sign-in page's button, under “Sign in with your organisation”, and "
+                            "the name in their notices and emails. Write the name people know, such as Contoso. "
+                            "Empty: the name.")
+    assert "notices and emails" in got["label"]
+    assert got["adding"] == "For administrators. People see the button text, which you can set after adding."
