@@ -968,6 +968,7 @@ async function _apiRequestNow(endpoint, options = {}) {
                 }
                 const err = new Error(errorDetail || 'Permission denied');
                 err.status = 403;  // a refusal, which callers may tell apart from a failure
+                err.shown = !silent;   // said above: serverSaid leaves the caller's own words after it
                 err.reason = (data && typeof data.reason === 'string') ? data.reason : undefined;
                 // A structured refusal carries its reason inside the detail.
                 if (err.reason === undefined && refusalReason !== undefined) err.reason = refusalReason;
@@ -1025,6 +1026,7 @@ async function _apiRequestNow(endpoint, options = {}) {
             // A caller may wait and try again (pasteMoveCopy does): the status, and the wait the server asks for.
             const limited = new Error(errorDetail);
             limited.status = 429;
+            limited.shown = !silent;   // said above: serverSaid leaves the caller's own words after it
             limited.retryAfterMs = _retryAfterMs(response.headers.get('Retry-After'));
             throw limited;
         }
@@ -1060,6 +1062,16 @@ async function _apiRequestNow(endpoint, options = {}) {
         }
         throw error;
     }
+}
+
+// The sentence to show for a request that failed: the server's own when it answered (apiRequest gives the error the
+// answer's status), else the caller's `fallback`: no answer at all (offline), or a failure of the page's own. A
+// sentence apiRequest has shown already (a refusal of permission or a rate limit, for a caller that is not silent) is
+// not said twice: the caller's own words follow it. A busy answer (503, "Try again in a moment") is said and never
+// sent again by the page: its wait is for the person.
+function serverSaid(e, fallback) {
+    return (e && !e.shown && typeof e.status === 'number' && e.status >= 400 && typeof e.message === 'string'
+        && e.message) ? e.message : fallback;
 }
 
 // Show permission denied message with special styling
@@ -4174,7 +4186,7 @@ async function loadRecentEvents() {
             box.className = 'empty-state text-center p-lg';
             const p = document.createElement('p');
             p.className = 'text-secondary';
-            p.textContent = "Couldn't load recent events.";
+            p.textContent = serverSaid(error, "Couldn't load recent events.");
             box.appendChild(p);
             eventsFeed.replaceChildren(box);
         }
@@ -7856,7 +7868,7 @@ async function loadUserSshKeys(userId, root = document) {
         host.replaceChildren();
         const msg = document.createElement('span');
         msg.className = 'text-tertiary text-sm';
-        msg.textContent = 'Could not load SSH keys.';
+        msg.textContent = serverSaid(e, 'Could not load SSH keys.');
         host.appendChild(msg);
     }
 }
@@ -10227,7 +10239,7 @@ async function saveLogFlag(component, enabled) {
         if (res && res.flags && window._logSettings) { window._logSettings.flags = res.flags; }
         showSuccess('Log access updated');
     } catch (e) {
-        showError('Could not update log access');
+        showError(serverSaid(e, 'Could not update log access'));
         loadLogSettings();  // resync the checkbox to the server truth
     }
 }
@@ -10238,7 +10250,7 @@ async function saveLogStealth(enabled) {
         if (res && window._logSettings) { window._logSettings.stealth_404 = !!res.stealth_404; }
         showSuccess(enabled ? 'Endpoint hidden from unauthenticated callers' : 'Endpoint returns the standard 401');
     } catch (e) {
-        showError('Could not update log visibility');
+        showError(serverSaid(e, 'Could not update log visibility'));
         loadLogSettings();  // resync the toggle to the server truth
     }
 }
@@ -10293,7 +10305,7 @@ async function disableLogToken(id) {
         showSuccess('Token disabled');
         loadLogSettings();
     } catch (e) {
-        showError('Could not disable token');
+        showError(serverSaid(e, 'Could not disable token'));
     }
 }
 
@@ -10341,7 +10353,7 @@ async function generateLogToken() {
     let res;
     try {
         res = await apiRequest('/settings/logs', { method: 'POST', body: JSON.stringify({ name, scope }) });
-    } catch (e) { showError('Could not create token'); return; }
+    } catch (e) { showError(serverSaid(e, 'Could not create token')); return; }
     if (!res || !res.token) { showError('Could not create token'); return; }
     toggleLogTokenGenerate(false);
     revealLogToken(res);
@@ -10616,7 +10628,7 @@ async function checkForUpdatesNow() {
         renderUpdateStatus(us);
         showSuccess(us && us.update_available ? 'A newer version is available' : 'Checked — you’re up to date');
     } catch (e) {
-        showError('Could not check for updates');
+        showError(serverSaid(e, 'Could not check for updates'));
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = 'Check for updates'; }
     }
@@ -10634,7 +10646,7 @@ async function saveUpdateInterval() {
         showSuccess('Update interval saved');
         scheduleUpdatePoll(res && res.interval_minutes);
     } catch (e) {
-        showError('Could not save the update interval');
+        showError(serverSaid(e, 'Could not save the update interval'));
     }
 }
 
@@ -11998,8 +12010,11 @@ async function loadSftpPolicyGroups() {
         settingsAllGroups = [];
         settingsGroupsLoaded = false;
         // Surface it: a silent failure here would otherwise let a later Save wipe
-        // the policy (now guarded in saveAllSettings + the read-only render below).
-        showWarning('Could not load departments — the confidentiality policies are read-only and will not be changed on save.');
+        // the policy (now guarded in saveAllSettings + the read-only render below). The server's sentence, when it
+        // answered (busy, say), comes first.
+        const said = serverSaid(error, '');
+        showWarning((said ? said + ' ' : '')
+            + 'Could not load departments — the confidentiality policies are read-only and will not be changed on save.');
     }
     renderSftpGroupPicker();
     renderStandardWhitelistPicker();
@@ -12229,7 +12244,7 @@ async function loadEmailProfiles() {
         grid.replaceChildren();
         const err = document.createElement('div');
         err.className = 'text-sm text-secondary';
-        err.textContent = 'Could not load sending profiles.';
+        err.textContent = serverSaid(e, 'Could not load sending profiles.');
         grid.appendChild(err);
     }
 }
@@ -18797,7 +18812,7 @@ async function renameVaultItem(itemId, currentName, type) {
         // Operation and code only: this catch is downstream of crypto calls, and a coded
         // failure retains the platform exception as its cause.
         console.error('rename failed', (error && error.code) || 'UNCODED');
-        showError('Failed to rename item');
+        showError(serverSaid(error, 'Failed to rename item'));
     }
 }
 
@@ -22011,7 +22026,7 @@ async function openGroupMembersModal(groupId, groupName) {
     try {
         const g = await apiRequest('/groups/' + encodeURIComponent(groupId), { silent: true });
         members = (g && g.members) || [];
-    } catch (e) { showError('Could not load department members.'); return; }
+    } catch (e) { showError(serverSaid(e, 'Could not load department members.')); return; }
     document.querySelectorAll('.vga-members-modal').forEach(m => m.remove());
     const modal = document.createElement('div');
     modal.className = 'modal active vga-members-modal';
@@ -22200,8 +22215,8 @@ async function showGrantRecipientKey(userId, box) {
     let pk = null;
     try {
         pk = await apiRequest(`/ecc/users/${encodeURIComponent(userId)}/public-key`, { silent: true });
-    } catch (_) {
-        if (box.dataset.seq === seq) shown.textContent = "Their encryption key could not be looked up.";
+    } catch (e) {
+        if (box.dataset.seq === seq) shown.textContent = serverSaid(e, "Their encryption key could not be looked up.");
         return;
     }
     if (box.dataset.seq !== seq) return;   // unticked (or ticked again) while this was on its way
@@ -22850,7 +22865,7 @@ async function loadUsersForPermission() {
         });
     } catch (error) {
         console.error('Failed to load users:', error);
-        showError('Failed to load users for permissions');
+        showError(serverSaid(error, 'Failed to load users for permissions'));
     }
 }
 
@@ -25293,7 +25308,18 @@ async function enterAuthedSession() {
         if (!resp.ok) {
             // -> login, no dashboard flash. Only a refusal of the session ends it on the server and signs out the
             // other tabs; a check that could not be answered signs out this tab alone, as it always did, and leaves
-            // the session to the tabs still using it.
+            // the session to the tabs still using it. A busy vault says so in a sentence (a proxy's page while the
+            // vault restarts says nothing): the sign-in screen shows it, and nothing is sent again by itself.
+            if (resp.status === 503) {
+                let said;
+                try {
+                    const body = await resp.json();
+                    if (body && typeof body.detail === 'string' && body.detail) said = body.detail;
+                } catch (_) { said = undefined; }
+                if (asked !== _sessionsEnded) return;
+                logout(SIGN_OUT_THIS_TAB, said);
+                return;
+            }
             logout(await _refusesTheSession(resp) ? undefined : SIGN_OUT_THIS_TAB);
             return;
         }

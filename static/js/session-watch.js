@@ -400,7 +400,18 @@
                     : ENDED, sent);
                 return;
             }
-            if (!res.ok || !body || !body.access_token) throw new Error('no token');
+            if (!res.ok) {
+                // Any other refusal (the vault busy with this account, a limit) is said in the server's words, and
+                // the warning stays for the person to try again: a renewal mints a new token, so it is never sent
+                // again behind their back.
+                const said = body && typeof body.detail === 'string' ? body.detail : '';
+                if (typeof showError === 'function') {
+                    showError(said || 'Could not extend the session right now. Try again, or sign in again when it ends.');
+                }
+                show();
+                return;
+            }
+            if (!body || !body.access_token) throw new Error('no token');
             if (authToken !== sent) { endUnwantedSession(body.access_token); return; }
             authToken = body.access_token;
             if (renewing) renewing.renewed = authToken;
