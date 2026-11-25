@@ -213,24 +213,28 @@ def _said_of_sessions_standing(standing: Optional[int]) -> str:
             "to end them, or sign those accounts out.")
 
 
-def _held_by_its_days_after(db, row, *, by, ip, held_before) -> list:
-    """The accounts ``row``'s days hold after a change of them was committed, and the record of it, in a
-    transaction of its own (the change's own record was written with the change, before this could be counted):
-    how many are held, and how many of them since this change. A count that cannot be made holds up nothing: the
-    change stands, nobody is said to be held, and the failure is logged."""
+def _held_after(db, row, *, by, ip, held_before) -> tuple:
+    """The accounts ``row`` holds to a provider's sign-in after a change of what its days hold was committed, and
+    the record of it, in a transaction of its own (the change's own record was written with the change, before
+    this could be counted). Returns (every account held, the ids of those held by its days): the rest are held by
+    a refusal or hold on record. The record says how many of each, and how many are held since this change. A
+    count that cannot be made holds up nothing: the change stands, nobody is said to be held, and the failure is
+    logged."""
     try:
-        held = providers.held_by_its_days(db, row)
+        held = providers.held_through(db, row)
+        by_days = {user.id for user in providers.held_by_its_days(db, row)}
         newly = sum(1 for user in held if user.id not in held_before)
         if newly:
             _record(db, "sso_provider_updated", user=by, ip=ip, row_id=row.id,
                     details={"provider_id": str(row.id), "name": row.name, "changed": [],
-                             "reason": "held_by_its_days", "held_by_its_days": len(held), "newly_held": newly})
+                             "reason": "held_by_its_days", "held_by_its_days": len(by_days),
+                             "held_by_a_refusal": len(held) - len(by_days), "newly_held": newly})
             db.commit()
-        return held
+        return held, by_days
     except Exception as exc:  # noqa: BLE001
         db.rollback()
-        log.warning("the accounts a provider's days hold were not counted: %s", type(exc).__name__)
-        return []
+        log.warning("the accounts a provider holds were not counted: %s", type(exc).__name__)
+        return [], set()
 
 
 def _accounts_named(db, usernames) -> list:
@@ -347,7 +351,7 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     # Whom the provider's days hold to a sign-in through it, before the change: a save that shortens the days, or
     # turns on that they end sign-in, holds more accounts from the moment it is committed. Counted here and
     # after the commit, never while the provider's row is held: it reads every linked account.
-    held_before = {u.id for u in providers.held_by_its_days(db, row)} if "policy" in changes else set()
+    held_before = {u.id for u in providers.held_through(db, row)} if "policy" in changes else set()
     row = _row_or_404(db, provider_id, lock=True)
     try:
         changes = providers.clean(body, row=row)
@@ -387,19 +391,25 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     # is off holds nobody by its days (one this change turned off among them): the count is given when it is
     # turned on again.
     days_changed = any(field in outcome["changed"] for field in providers.WHAT_ITS_DAYS_HOLD)
-    held_now = _held_by_its_days_after(db, row, by=current_user, ip=api.get_client_ip(request),
-                                       held_before=held_before) if days_changed else []
+    held_now, by_days = (_held_after(db, row, by=current_user, ip=api.get_client_ip(request), held_before=held_before)
+                         if days_changed else ([], set()))
     newly_held = [(u.id, u.username, u.email) for u in held_now if u.id not in held_before]
+    newly_by_days = [one for one in newly_held if one[0] in by_days]
+    newly_by_a_refusal = [one for one in newly_held if one[0] not in by_days]
     outcome = {**outcome, "turned_off": bool(turned_off), "sessions_ended": ended, "sessions_not_ended": standing,
-               "held": held, "owners_told": len(owners), "held_by_its_days": len(held_now),
-               "newly_held": len(newly_held)}
+               "held": held, "owners_told": len(owners), "held_by_its_days": len(by_days),
+               "held_by_a_refusal": len(held_now) - len(by_days), "newly_held": len(newly_held)}
     label = row.label or row.name
     # The people the change holds from this moment had no warning of it (the warning counts five days down to the
     # days as they were): each is told now, in the app and by email, what stopped and what brings it back.
-    _tell_accounts(newly_held, f"Sign in through {label} to keep signing in here", (
+    _tell_accounts(newly_by_days, f"Sign in through {label} to keep signing in here", (
         f"An administrator changed how often {label} must have seen you. Your last sign-in through {label} is older "
         f"than that: your password and passkeys do not sign you in to this vault until you have signed in through "
         f"{label} again."))
+    _tell_accounts(newly_by_a_refusal, f"Sign in through {label} to keep signing in here", (
+        f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
+        f"sign-in through {label}: its password and passkeys do not sign it in to this vault until {label} has "
+        "admitted it again. If it does not, ask your administrator."))
     _tell_accounts(owners, f"{label} was pointed somewhere else", (
         f"An administrator changed where this vault finds {label}, a sign-in your account is linked to. Nobody signs "
         f"in through {label} until an administrator has tested it again and turned it on. If the sign-in you meet "
@@ -435,10 +445,16 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
                 else ".")
             if owners:
                 said += f" The {len(owners)} account(s) linked to it were told."
-        if newly_held:
-            said += (f" {len(newly_held)} more linked account(s) have not signed in through it within its days as "
+        if newly_by_days:
+            said += (f" {len(newly_by_days)} more linked account(s) have not signed in through it within its days as "
                      "they are now: their password and passkeys do not sign them in until they have. They were "
-                     f"told. {len(held_now)} account(s) are held so in all.")
+                     "told.")
+        if newly_by_a_refusal:
+            said += (f" {len(newly_by_a_refusal)} more linked account(s) that it had not admitted are held to a "
+                     "sign-in through it now: their password and passkeys do not sign them in until it admits them. "
+                     "They were told.")
+        if newly_held:
+            said += f" {len(held_now)} account(s) are held so in all."
         if turned_off:
             said += (" Its connection changed, so it was turned off until a test sign-in passes again"
                      + (f", and {ended} session(s) that came through it were ended." if ended else "."))

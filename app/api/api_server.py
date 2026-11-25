@@ -29240,6 +29240,8 @@ def _run_lightweight_migrations():
             # The deadline an administrator's lift of a hold answered (see ExternalIdentity in models.py). For a
             # database whose table an earlier build of this release made.
             "ALTER TABLE external_identities ADD COLUMN IF NOT EXISTS hold_lifted_for TIMESTAMP",
+            # Whether the hold on record was written for keys only (see ExternalIdentity in models.py).
+            "ALTER TABLE external_identities ADD COLUMN IF NOT EXISTS keys_only_hold_at TIMESTAMP",
             # When a role's passkey requirement first applied to the account, and the host operator's clearance.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_required_since TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_requirement_cleared_at TIMESTAMP",

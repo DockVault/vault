@@ -3928,6 +3928,12 @@ class ExternalIdentity(Base):
     # does not hold again one whose lift answered the deadline it still has. NULL: no lift, or none that a
     # deadline stood behind.
     hold_lifted_for = Column(DateTime, nullable=True)
+    # Set, to the hold's own moment, when the hold on record (``refused_at``) is one the vault wrote while the
+    # provider's days only paused keys: at a turn-off or before a removal, for days that had run out. The person
+    # was told then that their password signs them in as before. While the provider is off such a hold closes
+    # no password, whatever the provider's settings become. NULL, or another moment than ``refused_at``: the
+    # hold on record is the provider's own refusal, or one written while its days ended sign-in.
+    keys_only_hold_at = Column(DateTime, nullable=True)
 
     user = relationship('User', backref=backref('external_identities', cascade='all, delete-orphan',
                                                 passive_deletes=True))

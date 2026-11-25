@@ -58,6 +58,7 @@ class Deadline:
     window_days: int = 0        # the provider's freshness window (0: off, a refusal alone)
     ends_sign_in: bool = False  # missed, it also closes the account's ways in that go through no provider
     provider_on: bool = True    # the provider is turned on here (its days close the other ways in only then)
+    keys_only_hold: bool = False  # the hold on record is the vault's own, written while the days only paused keys
 
 
 def warning_lead(window_days: int) -> timedelta:
@@ -99,10 +100,12 @@ def deadline_of(identity, provider) -> Optional[Deadline]:
     since = last or getattr(identity, "linked_at", None) or datetime.utcnow()
     due = since + timedelta(days=days) if days > 0 else refused_at
     name = (getattr(provider, "name", None) or "").strip() or (getattr(provider, "label", None) or "").strip()
+    keys_only = getattr(identity, "keys_only_hold_at", None)
     return Deadline(identity_id=str(identity.id), user_id=str(identity.user_id), provider_id=str(identity.provider_id),
                     provider_name=name or "your identity provider", due=due, refused=refused, window_days=days,
                     ends_sign_in=bool(policy["sso_lapse_ends_sign_in"]),
-                    provider_on=getattr(provider, "state", None) == "enabled")
+                    provider_on=getattr(provider, "state", None) == "enabled",
+                    keys_only_hold=bool(refused and keys_only is not None and keys_only == refused_at))
 
 
 def deadlines(db, user_id) -> List[Deadline]:
@@ -181,18 +184,28 @@ def held_to_a_provider(db, user, *, now: Optional[datetime] = None) -> Optional[
     return missed[0]
 
 
+def a_hold_closes(found: Deadline) -> bool:
+    """Whether the hold on record for ``found`` is one that closes the other ways in where the provider says a
+    missed sign-in does: the provider's own refusal always, whatever the provider's state. Not, while the
+    provider is off, a hold the vault wrote itself for days that had run out while those days only paused keys
+    (at a turn-off, or before a removal). That person was told "your password signs you in as before", and
+    nobody can sign in through a provider that is off: a later save that makes the days end sign-in closed
+    their password, passkeys and SFTP password at once, with no way back in and nobody told."""
+    return found.refused and (found.provider_on or not found.keys_only_hold)
+
+
 def closes_now(found: Deadline, now: datetime) -> bool:
     """Whether ``found`` closes the ways in that go through no provider at ``now``, for an account that can be
-    held at all: the provider says so, and either it refused the person, or its days have run out while it is
-    turned on."""
-    return bool(found.ends_sign_in) and (found.refused or (found.provider_on and found.due <= now))
+    held at all: the provider says so, and either a hold on record closes them (:func:`a_hold_closes`), or its
+    days have run out while it is turned on."""
+    return bool(found.ends_sign_in) and (a_hold_closes(found) or (found.provider_on and found.due <= now))
 
 
 def closes_the_other_ways_in(db, user, found: Deadline) -> bool:
     """Whether ``found``, once missed, also closes ``user``'s ways in that go through no provider: what the
     warning and the notices say to that person. Not while the provider is turned off: its days close nothing
     then, and the person is told of their keys alone."""
-    return bool(found.ends_sign_in) and (found.refused or found.provider_on) and may_be_held(db, user)
+    return bool(found.ends_sign_in) and (a_hold_closes(found) or found.provider_on) and may_be_held(db, user)
 
 
 def closes_a_connection(db, user, *, by_password: bool) -> bool:

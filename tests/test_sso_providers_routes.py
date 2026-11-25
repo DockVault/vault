@@ -1474,17 +1474,18 @@ def test_a_save_that_shortens_a_providers_days_says_whom_it_holds_and_tells_them
     status, out = h.call("PATCH", path, {"policy": {"sso_freshness_days": 7}})
     assert status == 200 and out["changed"] == ["policy.sso_freshness_days"], out
     assert out["held_by_its_days"] == 2 and out["newly_held"] == 1                      # ben, since this save
+    assert out["held_by_a_refusal"] == 1                                                # dee, before and after
     (told,) = h.accounts_told
     assert told[0] == ["ben"] and told[1].startswith("Sign in through ")
     assert "your password and passkeys do not sign you in to this vault until you have signed in through" in told[2]
     said = h.told[-1][2]
     assert ("1 more linked account(s) have not signed in through it within its days as they are now: their password "
-            "and passkeys do not sign them in until they have. They were told. 2 account(s) are held so in all.") in said
+            "and passkeys do not sign them in until they have. They were told. 3 account(s) are held so in all.") in said
     # Recorded after the change's own record, which was written with the change before this could be counted.
     change, count = h.audit("sso_provider_updated")
     assert change[2]["changed"] == ["policy.sso_freshness_days"] and "newly_held" not in change[2]
     assert count[2] == {"provider_id": str(row.id), "name": row.name, "changed": [], "reason": "held_by_its_days",
-                        "held_by_its_days": 2, "newly_held": 1}
+                        "held_by_its_days": 2, "held_by_a_refusal": 1, "newly_held": 1}
     # A change of something else, while two accounts are held: nobody is counted, nobody told again.
     del h.accounts_told[:], h.audits[:]
     status, out = h.call("PATCH", path, {"label": "Staff sign-in"})
@@ -1539,10 +1540,124 @@ def test_the_accounts_a_providers_days_hold_are_never_counted_while_its_row_is_h
     import inspect
     from app.api import sso_providers_router as R
     source = inspect.getsource(R.update_provider)
-    steps = ('held_before = {u.id for u in providers.held_by_its_days(db, row)} if "policy" in changes else set()',
+    steps = ('held_before = {u.id for u in providers.held_through(db, row)} if "policy" in changes else set()',
              "row = _row_or_404(db, provider_id, lock=True)",
              "        db.commit()",
-             "held_now = _held_by_its_days_after(db, row, by=current_user, ip=api.get_client_ip(request),")
+             "held_now, by_days = (_held_after(db, row, by=current_user, ip=api.get_client_ip(request), held_before=held_before)")
     order = [source.index(step) for step in steps]
     assert order == sorted(order), order
-    assert source.count("held_by_its_days(db, row)") == 1 and source.count("_held_by_its_days_after(") == 1
+    assert source.count("held_through(db, row)") == 1 and source.count("_held_after(") == 1
+    assert "held_by_its_days(db, row)" not in source
+
+
+def _held_for_keys_only_by_a_removal(monkeypatch):
+    """Contoso is off, asks 7 days and only pauses keys. Alice last signed in 30 days ago. A removal is tried:
+    she is held, and told that her password signs her in as before."""
+    from datetime import datetime, timedelta
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
+    alice = _user("alice")
+    now = datetime.utcnow()
+    link = _identity(alice, row, last_sign_in_at=now - timedelta(days=30), linked_at=now - timedelta(days=60),
+                     refused_at=None, hold_lifted_for=None, keys_only_hold_at=None)
+    h = Admin(monkeypatch, [row], users=[alice], identities=[link])
+    assert h.call("DELETE", f"/admin/sso/providers/{row.id}")[0] == 409
+    assert link.refused_at is not None and link.keys_only_hold_at == link.refused_at
+    assert h.accounts_told[-1][2].endswith("Your password signs you in as before.")
+    return h, row, alice, link
+
+
+def test_a_hold_written_for_keys_only_closes_no_password_while_its_provider_is_off(monkeypatch):
+    """Later an administrator turns on "after those days, or a refusal, the account signs in only through a
+    provider" for Contoso, still off (the removal's own advice leads there). A hold on record closes the password
+    wherever a provider says so, whatever the provider's state: Alice's password, passkeys and SFTP password were
+    refused from that save on, with nobody able to sign in through Contoso, the save answering that it held
+    nobody, and nobody told. The hold was written for her keys and closes no more than that while Contoso is off."""
+    from app.services import sso_freshness as F
+    h, row, alice, link = _held_for_keys_only_by_a_removal(monkeypatch)
+    del h.accounts_told[:]
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": True}})
+    assert status == 200 and out["newly_held"] == 0 and out["held_by_a_refusal"] == 0 and out["held_by_its_days"] == 0, out
+    assert F.held_to_a_provider(h.db, alice) is None                    # her password signs her in as she was told
+    assert F.lapsed(h.db, alice.id) is not None                         # her keys stay paused, as she was told
+    assert h.accounts_told == []
+    standing = F.deadline_of(link, row)
+    assert standing.refused and standing.keys_only_hold and not F.a_hold_closes(standing)
+    assert F.closes_the_other_ways_in(h.db, alice, standing) is False
+    # Turned on again: people can sign in through it, its days have run out, and the hold closes as any does.
+    row.state = "enabled"
+    standing = F.deadline_of(link, row)
+    assert F.a_hold_closes(standing) and F.held_to_a_provider(h.db, alice) is not None
+
+
+def test_a_providers_own_refusal_and_a_hold_from_days_that_ended_sign_in_close_whatever_its_state(monkeypatch):
+    """What stays as it was: a refusal the provider made holds the account while the provider is off (turning a
+    provider off in an incident hands nothing back), and so does a hold written at a turn-off for days that
+    already ended sign-in (those people's passwords were closed before the turn-off)."""
+    from datetime import datetime, timedelta
+    from app.services import sso_freshness as F
+    from app.services import sso_providers
+    now = datetime.utcnow()
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": True}
+    alice = _user("alice")
+    refused = _identity(alice, row, last_sign_in_at=now - timedelta(days=30), refused_at=now - timedelta(days=1),
+                        keys_only_hold_at=None)
+    assert F.a_hold_closes(F.deadline_of(refused, row)) is True
+    # A mark from an earlier hold says nothing of a refusal made since: the refusal is the provider's own.
+    refused.keys_only_hold_at = now - timedelta(days=9)
+    assert F.deadline_of(refused, row).keys_only_hold is False and F.a_hold_closes(F.deadline_of(refused, row)) is True
+    # Written by a turn-off while the days ended sign-in: no mark, and it closes while the provider is off.
+    row.state = "enabled"
+    lapsed = _identity(alice, row, last_sign_in_at=now - timedelta(days=30), refused_at=None, hold_lifted_for=None,
+                       keys_only_hold_at=now - timedelta(days=90))
+
+    class DB:
+        def query(self, model):
+            return self
+
+        def filter(self, *a):
+            return self
+
+        def all(self):
+            return [lapsed]
+    assert sso_providers.hold_lapsed(DB(), row) == 1 and lapsed.refused_at is not None and lapsed.keys_only_hold_at is None
+    row.state = "disabled"
+    assert F.a_hold_closes(F.deadline_of(lapsed, row)) is True
+    # No hold in force: nothing to close, marked or not.
+    plain = _identity(alice, row, last_sign_in_at=now, refused_at=None, keys_only_hold_at=now)
+    assert F.deadline_of(plain, row).keys_only_hold is False and F.a_hold_closes(F.deadline_of(plain, row)) is False
+
+
+def test_a_save_that_makes_a_missed_sign_in_end_the_password_counts_whom_a_refusal_holds(monkeypatch):
+    """Contoso is on and only pauses keys. It refused Cy at his last sign-in. An administrator makes a missed
+    sign-in end the password too: Cy's password stops at that save. The count read only the accounts the days
+    hold, so the save answered that nobody was newly held, and Cy was told nothing."""
+    from datetime import datetime, timedelta
+    h, row, (ann, ben, cy) = _linked_since(monkeypatch, [1, 2, 3], policy={"sso_freshness_days": 30,
+                                                                         "sso_lapse_ends_sign_in": False})
+    from app.core.models import ExternalIdentity
+    link = next(i for i in h.db.rows_of(ExternalIdentity) if i.user_id == cy.id)
+    link.refused_at = datetime.utcnow() - timedelta(hours=1)             # refused since his last sign-in
+    link.last_sign_in_at = datetime.utcnow() - timedelta(days=3)
+    from app.services import sso_providers as providers
+    assert providers.held_through(h.db, row) == [] and providers.held_by_its_days(h.db, row) == []
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": True}})
+    assert status == 200, out
+    assert (out["newly_held"], out["held_by_a_refusal"], out["held_by_its_days"]) == (1, 1, 0), out
+    assert [u.username for u in providers.held_through(h.db, row)] == ["cy"] and providers.held_by_its_days(h.db, row) == []
+    label = row.label or row.name
+    assert h.accounts_told == [(["cy"], f"Sign in through {label} to keep signing in here", (
+        f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
+        f"sign-in through {label}: its password and passkeys do not sign it in to this vault until {label} has "
+        "admitted it again. If it does not, ask your administrator."))]
+    count = [a for a in h.audit("sso_provider_updated") if a[2].get("reason") == "held_by_its_days"]
+    assert count[0][2] == {"provider_id": str(row.id), "name": row.name, "changed": [], "reason": "held_by_its_days",
+                           "held_by_its_days": 0, "held_by_a_refusal": 1, "newly_held": 1}
+    assert ("1 more linked account(s) that it had not admitted are held to a sign-in through it now: their password "
+            "and passkeys do not sign them in until it admits them. They were told. 1 account(s) are held so in "
+            "all.") in h.told[-1][2]
+    # Saved again with nothing changed in what the days hold: nobody is held anew.
+    del h.accounts_told[:]
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 31}})
+    assert status == 200 and out["newly_held"] == 0 and out["held_by_a_refusal"] == 1 and h.accounts_told == []

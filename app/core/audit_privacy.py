@@ -283,7 +283,7 @@ DETAIL_KEYS.update({
     "sessions": COUNT,
     # how many linked accounts a provider's days hold to a sign-in through it after a change of them, and how
     # many of those since that change
-    "held_by_its_days": COUNT, "newly_held": COUNT,
+    "held_by_its_days": COUNT, "held_by_a_refusal": COUNT, "newly_held": COUNT,
     # what changed on a settings save or an account: the setting's or field's name, then its old and new
     # value; an account's email address is an email address
     "changes": NESTED,

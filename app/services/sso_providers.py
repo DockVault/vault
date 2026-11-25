@@ -286,6 +286,9 @@ def hold_lapsed(db, row, *, now=None, into=None) -> int:
             continue
         if standing is not None and not standing.refused and standing.due <= now:
             identity.refused_at = now
+            # Written while the days only pause keys: marked so, with the hold's own moment. It closes no
+            # password while the provider is off, whatever its settings become (sso_freshness.a_hold_closes).
+            identity.keys_only_hold_at = None if standing.ends_sign_in else now
             held += 1
             if into is not None:
                 into.append(identity.user_id)
@@ -321,13 +324,9 @@ def days_ran_out(db, row, *, now=None) -> int:
 WHAT_ITS_DAYS_HOLD = ("policy.sso_freshness_days", "policy.sso_lapse_ends_sign_in")
 
 
-def held_by_its_days(db, row, *, now=None) -> list:
-    """The accounts linked to ``row`` (which is on) that its days hold to a provider's sign-in right now: their
-    last sign-in through it is older than its days, and their password and passkeys sign them in to nothing until
-    they have signed in through it again. Not the ones it refused: those are held by the refusal, whatever the
-    days are. And not an account that is turned off: it signs in nowhere whatever the days are, so it is neither
-    counted among the accounts a save holds nor told that its password stopped (the address on such an account
-    is often a former employee's own)."""
+def _held(db, row, now=None) -> list:
+    """(account, its deadline) for each account that can sign in and that ``row`` holds to a provider's sign-in
+    right now: its password and passkeys sign it in to nothing until the provider admits it again."""
     from datetime import datetime
     from app.core.models import ExternalIdentity, User
     from app.services import sso_freshness
@@ -335,12 +334,30 @@ def held_by_its_days(db, row, *, now=None) -> list:
     held = []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
         standing = sso_freshness.deadline_of(identity, row)
-        if standing is None or standing.refused or not sso_freshness.closes_now(standing, now):
+        if standing is None or not sso_freshness.closes_now(standing, now):
             continue
         user = db.query(User).filter(User.id == identity.user_id).first()
         if user is not None and user.is_active and sso_freshness.closes_the_other_ways_in(db, user, standing):
-            held.append(user)
+            held.append((user, standing))
     return held
+
+
+def held_by_its_days(db, row, *, now=None) -> list:
+    """The accounts linked to ``row`` (which is on) that its days hold to a provider's sign-in right now: their
+    last sign-in through it is older than its days, and their password and passkeys sign them in to nothing until
+    they have signed in through it again. Not the ones it refused: those are held by the refusal, whatever the
+    days are. And not an account that is turned off: it signs in nowhere whatever the days are, so it is neither
+    counted among the accounts a save holds nor told that its password stopped (the address on such an account
+    is often a former employee's own)."""
+    return [user for user, standing in _held(db, row, now) if not standing.refused]
+
+
+def held_through(db, row, *, now=None) -> list:
+    """Every account that can sign in and that ``row`` holds to a provider's sign-in right now, whatever holds
+    it: its days (:func:`held_by_its_days`), or a refusal or hold on record. What a save that changes what the
+    days hold is measured by: counted by the days alone, a save that makes a missed sign-in end the password
+    closed it for everybody a refusal held, and said that it held nobody."""
+    return [user for user, _standing in _held(db, row, now)]
 
 
 def due_at_turn_on(db, row, *, now=None) -> int:
