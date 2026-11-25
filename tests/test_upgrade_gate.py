@@ -1432,7 +1432,7 @@ def test_the_install_is_shown_its_lines_newest_release_and_support_period(tmp_pa
     tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.1")
     _list_only(tool)
     out = capsys.readouterr().out
-    assert "release line    : 0.33 -- security fixes until 2027-06-10" in out
+    assert "release line    : 0.33 -- supported until 2027-06-10" in out
     assert "newest on line  : v0.33.2 (fixes 1 known vulnerability in 0.33.1)" in out
     assert "    v0.33.2   <- newest of your line" in out
     listed = [line.split()[0] for line in out.splitlines() if line.startswith("    v0.")]
@@ -1442,12 +1442,12 @@ def test_the_install_is_shown_its_lines_newest_release_and_support_period(tmp_pa
 def test_a_line_past_its_support_date_says_so(tmp_path, monkeypatch, capsys):
     tool = _lines_deployment(tmp_path, monkeypatch, running="0.33.2", today="2027-06-11")
     _list_only(tool)
-    assert "release line    : 0.33 -- security fixes ended on 2027-06-10" in capsys.readouterr().out
+    assert "release line    : 0.33 -- support ended on 2027-06-10" in capsys.readouterr().out
 
     tool = _lines_deployment(tmp_path, monkeypatch, running="0.34.1", today="2027-06-11")
     with pytest.raises(SystemExit):                     # the way back is irreversible, and refused
         _update(tool, tag="v0.33.2", dry_run=True)
-    assert ("Note: v0.33.2 is on the 0.33 line, which stopped receiving security fixes on "
+    assert ("Note: v0.33.2 is on the 0.33 line, which reached the end of its support on "
             "2027-06-10.") in capsys.readouterr().out
 
 
@@ -1455,7 +1455,8 @@ def test_the_newest_line_has_no_end_yet(tmp_path, monkeypatch, capsys):
     tool = _lines_deployment(tmp_path, monkeypatch, running="0.34.1")
     _list_only(tool)
     out = capsys.readouterr().out
-    assert "release line    : 0.34 -- the newest line: security fixes continue until six months" in out
+    assert ("release line    : 0.34 -- the newest line: security fixes continue, and once the next minor "
+            "release ships it has 30 more days to upgrade") in out
     assert "newest on line" not in out, "it is the newest release of its line"
 
 
@@ -1517,8 +1518,8 @@ def _row(out, tag):
 
 def test_the_list_names_support_as_the_security_policy_defines_it(tmp_path, monkeypatch, capsys):
     """End-of-life is the upgrade floor, not the end of support: a release that is not end-of-life is listed as
-    supported only while its line gets security fixes. A line older than every line the matrix lists gets none,
-    and a line past its day has ended; the newest line and a line inside its period are supported."""
+    supported only while its line is supported. A line older than every line the matrix lists gets no security
+    fixes, and a line past its day has ended; the newest line and a line inside its period are supported."""
     tool = _lines_deployment(tmp_path, monkeypatch, running="0.34.1", today="2027-02-01")
     _list_only(tool)
     out = capsys.readouterr().out
@@ -1529,8 +1530,8 @@ def test_the_list_names_support_as_the_security_policy_defines_it(tmp_path, monk
     tool = _lines_deployment(tmp_path, monkeypatch, running="0.34.1", today="2027-06-11")
     _list_only(tool)
     out = capsys.readouterr().out
-    assert "(security fixes ended on 2027-06-10)" in _row(out, "v0.33.2"), out
-    assert "(security fixes ended on 2027-06-10 -- " in _row(out, "v0.33.1"), out
+    assert "(support ended on 2027-06-10)" in _row(out, "v0.33.2"), out
+    assert "(support ended on 2027-06-10 -- " in _row(out, "v0.33.1"), out
     assert "ended" not in _row(out, "v0.34.1") and "no security fixes" not in _row(out, "v0.34.1"), out
 
 
@@ -1539,7 +1540,7 @@ def test_support_line_reads_the_release_lines():
     assert dv.support_line(m, "0.32.6", today="2027-02-01").startswith("no security fixes -- ")
     assert dv.support_line(m, "0.33.2", today="2027-02-01") == "supported"
     assert dv.support_line(m, "0.33.2", today="2027-06-10") == "supported"          # its last day is inside
-    assert dv.support_line(m, "0.33.2", today="2027-06-11") == "security fixes ended on 2027-06-10"
+    assert dv.support_line(m, "0.33.2", today="2027-06-11") == "support ended on 2027-06-10"
     assert dv.support_line(m, "0.34.1", today="2099-01-01") == "supported"          # the newest line
     m.pop("lines")
     assert dv.support_line(m, "0.32.6", today="2027-02-01").startswith("supported -- ")  # the matrix does not say

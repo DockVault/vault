@@ -4227,10 +4227,10 @@ def support_line(matrix, version, today=None):
     one line per release has no room for them. Every matrix-sourced fragment is escape-stripped
     before it reaches a terminal.
 
-    A version that is not end-of-life is "supported" only while its release line receives security
-    fixes, as .github/SECURITY.md defines support and the matrix's `lines` map states it: end-of-life
-    is the upgrade floor, not the end of support. A line whose fixes have ended, or one older than every
-    line the map lists, reads "no security fixes" (or the day they ended)."""
+    A version that is not end-of-life is "supported" only while its release line is supported, as
+    .github/SECURITY.md defines support and the matrix's `lines` map states it: end-of-life is the
+    upgrade floor, not the end of support. A line whose support has ended reads the day it ended, and
+    one older than every line the map lists reads "no security fixes"."""
     s = version_support(matrix, version)
     if not s:
         return ""
@@ -4243,7 +4243,7 @@ def support_line(matrix, version, today=None):
         head = "; ".join(parts)
     else:
         line = line_support_note(matrix, version, today=today)
-        if line.startswith("security fixes ended"):
+        if line.startswith("support ended"):
             head = clean_matrix_text(line)
         elif line.startswith("no longer"):
             head = "no security fixes"
@@ -4360,7 +4360,7 @@ def line_support_until(matrix, line):
     """What a matrix's `lines` map says about a release line, as (stated, until).
 
     stated is False when the map is missing or malformed, or does not list the line. When stated,
-    until is the day the line's security fixes end (YYYY-MM-DD), or None for the newest line, whose
+    until is the last day the line is supported (YYYY-MM-DD), or None for the newest line, whose
     end is set when the next minor release ships. A value of any other shape reads as not stated: a
     fetched matrix is untrusted, and only a plain date is ever printed."""
     lines = matrix.get("lines") if isinstance(matrix, dict) else None
@@ -4418,11 +4418,12 @@ def line_support_note(matrix, version, today=None):
             return "no longer receives security fixes (lines before %s are not supported)" % first
         return ""
     if until is None:
-        return ("the newest line: security fixes continue until six months after the next minor "
-                "release")
+        # The rule of .github/SECURITY.md, in the one sentence this tool prints of it.
+        return ("the newest line: security fixes continue, and once the next minor release ships it "
+                "has 30 more days to upgrade")
     if until < (today or _today()):
-        return "security fixes ended on %s" % until
-    return "security fixes until %s" % until
+        return "support ended on %s" % until
+    return "supported until %s" % until
 
 
 def merge_lifecycle_matrix(local_matrix, main_matrix, released_ceiling):
@@ -8895,14 +8896,14 @@ class DockVault:
         _lifecycle_ceiling = _release_tags[0] if _release_tags else None
         merged_lifecycle, lifecycle_source = merge_lifecycle_matrix(
             local_matrix, fetch_main_lifecycle_matrix(), _lifecycle_ceiling)
-        # The install's release line: how long it gets security fixes, and its newest release, taken
+        # The install's release line: how long it is supported, and its newest release, taken
         # from the releases list so only a release that exists is named, and never one this checkout
         # marks end-of-life: such a release is neither listed nor a place to move to (see below).
         _line_note = line_support_note(merged_lifecycle, current)
         _line_newest = newest_on_line([t for t in _release_tags if not is_eol(local_matrix, t)], current)
         if release_line(current) and _line_note:
             text = "  release line    : %s -- %s" % (release_line(current), _line_note)
-            ended = _line_note.startswith(("security fixes ended", "no longer"))
+            ended = _line_note.startswith(("support ended", "no longer"))
             print(pal.paint(text, "yellow") if ended else text)
         if _line_newest and parse_semver(_line_newest) > parse_semver(current):
             _gone = len(_finding_keys(merged_lifecycle, current)
@@ -9007,11 +9008,11 @@ class DockVault:
                 print(pal.paint(
                     "  WARNING: %s has known unpatched vulnerabilities. (%s)" % (tag, _src_phrase), "red"))
         _target_line = line_support_note(merged_lifecycle, tag)
-        if _target_line.startswith(("security fixes ended", "no longer")) \
+        if _target_line.startswith(("support ended", "no longer")) \
                 and release_line(tag) != release_line(current):
             print(pal.paint("  Note: %s is on the %s line, which %s." % (
-                tag, release_line(tag), _target_line.replace("security fixes ended",
-                                                             "stopped receiving security fixes")),
+                tag, release_line(tag), _target_line.replace("support ended",
+                                                             "reached the end of its support")),
                 "yellow"))
 
         # What this change does to the deployment's known vulnerabilities -- only when where it starts

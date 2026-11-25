@@ -225,9 +225,9 @@ def test_line_support_periods_merge_add_only_and_the_earlier_end_wins():
 def test_a_line_note_reads_the_merged_period():
     merged, _ = _merged(_lines(**{"0_33": None}), _lines(**{"0_33": "2027-06-10", "0_34": None}))
     assert dv.line_support_note(merged, "0.33.1", today="2027-06-10") == \
-        "security fixes until 2027-06-10"
+        "supported until 2027-06-10"
     assert dv.line_support_note(merged, "0.33.1", today="2027-06-11") == \
-        "security fixes ended on 2027-06-10"
+        "support ended on 2027-06-10"
     assert dv.line_support_note(merged, "v0.34.0", today="2027-06-11").startswith("the newest line")
     assert dv.line_support_note({"versions": {}}, "0.33.1") == ""
 
@@ -240,7 +240,7 @@ def test_the_tool_and_the_app_count_a_support_period_by_the_same_day_in_utc(monk
     monkeypatch.setattr(time, "gmtime", lambda *a: late)
     merged = {"versions": {}, "lines": {"0.33": {"security_fixes_until": "2027-05-09"}}}
     assert dv._today() == "2027-05-09"
-    assert dv.line_support_note(merged, "0.33.1") == "security fixes until 2027-05-09"
+    assert dv.line_support_note(merged, "0.33.1") == "supported until 2027-05-09"
     assert U.line_status("0.33.1", merged, None)["ended"] is False
 
 
@@ -274,7 +274,7 @@ def test_the_tool_and_the_app_read_release_lines_the_same_way():
     assert {line: entry["security_fixes_until"] for line, entry in merged["lines"].items()} == \
         U._merge_lines(bundled["lines"], main["lines"])
     for today in ("2027-05-01", "2027-05-02"):
-        ended = dv.line_support_note(merged, "0.33.1", today=today).startswith("security fixes ended")
+        ended = dv.line_support_note(merged, "0.33.1", today=today).startswith("support ended")
         assert ended is U.line_status("0.33.1", bundled, main, today=today)["ended"], today
 
     # The newest release of the install's line: the tool takes it from the releases list, the app
