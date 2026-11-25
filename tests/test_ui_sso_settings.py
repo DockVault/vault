@@ -261,6 +261,13 @@ def test_who_may_sign_in_is_set_on_its_own_page_and_a_rule_the_server_holds_is_s
     page.wait_for_load_state("networkidle", timeout=10000)
     saved = next(p for p in admin.get("/admin/sso/providers").json()["providers"] if p["name"] == provider_name)
     assert saved["policy"]["sso_freshness_days"] == 7 and saved["policy"]["sso_required_groups"] == ["Vault Users", "staff"]
+    # The box cleared and saved: refused in words, and the days stay what they were (never 0, which is no limit).
+    page.fill("#sso-freshness", "")
+    page.click("#sso-save")
+    expect(page.locator("#sso-page-sessions .sso-said")).to_have_text(
+        "Days without signing in: Type a whole number from 0 to 365: an empty box is not 0.", timeout=10000)
+    saved = next(p for p in admin.get("/admin/sso/providers").json()["providers"] if p["name"] == provider_name)
+    assert saved["policy"]["sso_freshness_days"] == 7
 
 
 def _beside_the_dialog(page: Page):

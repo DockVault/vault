@@ -309,6 +309,10 @@ def validate(changes) -> dict:
             out[key] = value
         elif key in _INTS:
             low, high = _INTS[key]
+            if value is None or value == "":
+                # A box left empty is no number, and never the lowest one: 0 days turns the rule off, and is
+                # only ever what somebody typed.
+                raise PolicyInvalid(key, f"Type a whole number from {low} to {high}: an empty box is not 0.")
             if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
                 raise PolicyInvalid(key, f"A whole number from {low} to {high}.")
             out[key] = value

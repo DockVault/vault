@@ -259,3 +259,23 @@ def test_a_tenant_the_issuer_already_names_restricts_nobody():
     assert P.is_restricted(policy()) is True                       # asked without an issuer: as the list says
     # The check of the person is unchanged: the tenant claim is still compared.
     assert _judge({"sso_allowed_tenants": [T]}, tenant_id="someone-else") == P.RESTRICTED
+
+
+def test_days_left_empty_are_refused_and_only_a_typed_zero_turns_the_rule_off():
+    """The page's box cleared and saved: as a number an empty box is 0, and 0 days means no limit. An empty value
+    is refused in words that say so; 0 is saved only as what was typed."""
+    for empty in (None, ""):
+        with pytest.raises(P.PolicyInvalid) as refused:
+            P.validate({"sso_freshness_days": empty})
+        assert refused.value.key == "sso_freshness_days"
+        assert str(refused.value) == "Type a whole number from 0 to 365: an empty box is not 0."
+    assert P.validate({"sso_freshness_days": 0}) == {"sso_freshness_days": 0}
+    for wrong in ("7", 7.5, True, -1, 366, [], " "):
+        with pytest.raises(P.PolicyInvalid) as refused:
+            P.validate({"sso_freshness_days": wrong})
+        assert str(refused.value) == "A whole number from 0 to 365.", wrong
+    # The page sends an empty box as empty, never as the number it would convert to.
+    from pathlib import Path
+    page = (Path(__file__).resolve().parents[1] / "static" / "js" / "settings-sso.js").read_text(encoding="utf-8")
+    assert "const days = fresh.value.trim() === '' ? null : Number(fresh.value);" in page
+    assert "sso_freshness_days: days," in page and "sso_freshness_days: Number(" not in page

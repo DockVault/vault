@@ -454,8 +454,11 @@
         box.appendChild(lapse.group);
         const said = _el('span', 'text-sm ml-sm sso-said');
         box.appendChild(saveBar(() => {
+            // An empty box is sent as empty, for the server to refuse: as a number it would be 0, and 0 days
+            // turns the rule off.
+            const days = fresh.value.trim() === '' ? null : Number(fresh.value);
             const part = changed({ sso_backchannel_logout: back.box.checked, sso_idp_logout: out.box.checked,
-                sso_freshness_days: Number(fresh.value), sso_refusal_ends_access: ends.box.checked,
+                sso_freshness_days: days, sso_refusal_ends_access: ends.box.checked,
                 sso_lapse_ends_sign_in: lapse.box.checked }, policy);
             return Object.keys(part).length ? { policy: part } : {};
         }, said));

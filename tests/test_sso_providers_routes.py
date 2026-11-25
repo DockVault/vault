@@ -128,7 +128,12 @@ def test_a_change_is_judged_then_stepped_up_then_written_and_recorded_by_field_n
             ({"issuer": "http://plain.example.org"}, "issuer", "Issuer: The endpoint must use https."),
             ({"made_up": 1}, "made_up", "Unknown field."),
             ({"policy": {"sso_freshness_days": 999}}, "policy.sso_freshness_days",
-             "Days without signing in: A whole number from 0 to 365.")):
+             "Days without signing in: A whole number from 0 to 365."),
+            # A box left empty: refused, and never taken for 0 (which turns the rule off).
+            ({"policy": {"sso_freshness_days": None}}, "policy.sso_freshness_days",
+             "Days without signing in: Type a whole number from 0 to 365: an empty box is not 0."),
+            ({"policy": {"sso_freshness_days": ""}}, "policy.sso_freshness_days",
+             "Days without signing in: Type a whole number from 0 to 365: an empty box is not 0.")):
         status, out = h.call("PATCH", path, body)
         assert status == 400 and out["detail"] == {"reason": "invalid", "field": field, "message": said}, out
     status, out = h.call("PATCH", path, {"policy": {"sso_account_creation": "jit"}})
