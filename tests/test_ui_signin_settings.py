@@ -3,6 +3,8 @@ made at the vault's address, changes a passkey setting with their password, find
 reload, and reads the server's own sentence when a change is refused.
 
 Needs a stack with an address passkeys can be made at (ALLOWED_HOSTS naming the address the test opens)."""
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
 
@@ -129,9 +131,14 @@ def test_the_page_says_when_it_was_opened_at_another_address_than_passkeys_are_m
     _open(page, admin_creds)
     line = page.locator("#signin-passkey-readiness")
     here = page.evaluate("() => location.origin")
+    host = page.evaluate("() => location.hostname")
+    # Where this address could carry passkeys, the line also says how to make it the vault's.
+    could = not re.fullmatch(r"\d+(\.\d+){3}|\[.*\]", host) and (here.startswith("https://") or host == "localhost")
+    fix = (f" If people open the vault at {here}, put that address first in ALLOWED_HOSTS in .env and run python "
+           "dockvault.py restart.") if could else ""
     expect(line).to_have_text(f"Passkeys can be made at https://vault.example.test, which is not the address this "
                               f"page was opened at ({here}). Open the vault there to add or use one: here the "
-                              "browser refuses.")
+                              "browser refuses." + fix)
     assert "alert-warning" in (line.get_attribute("class") or "")
     page.unroute_all(behavior="ignoreErrors")
 

@@ -395,3 +395,40 @@ def test_a_providers_identities_page_lists_the_accounts_linked_to_it_and_lifts_a
     page.click("#confirm-modal-confirm-btn")
     expect(page.locator("#toast-container")).to_contain_text("No such identity.", timeout=10000)
     expect(page.locator("#stepup-modal.active")).to_have_count(0)
+
+
+def _answer_changed(change):
+    """A route handler that applies ``change`` to the server's own answer of a GET."""
+    def answer(route):
+        if route.request.method != "GET":
+            return route.fallback()
+        response = route.fetch()
+        body = response.json()
+        change(body)
+        route.fulfill(response=response, json=body)
+    return answer
+
+
+def test_a_page_opened_at_another_address_than_the_vaults_says_how_to_make_it_the_vaults(page: Page, boss):
+    """The vault's address is the first ALLOWED_HOSTS entry. When it is not the address the page was opened at, the
+    passkey line and the single sign-on line both say how to make this address the vault's, where this address could
+    carry passkeys and single sign-on (a host name over https, or this computer by name)."""
+    elsewhere = "https://vault.example.test"
+
+    def readiness(body):
+        body["readiness"] = {"usable": True, "rp_id": "vault.example.test", "origin": elsewhere, "reason": "ok"}
+        body["why_not"] = ""
+
+    def address(body):
+        body["address"] = dict(body.get("address") or {}, usable=True, base=elsewhere)
+    page.route("**/settings/sign-in", _answer_changed(readiness))
+    page.route("**/admin/sso/providers", _answer_changed(address))
+    _open(page, boss)
+    here = page.evaluate("() => location.origin")
+    host = page.evaluate("() => location.hostname")
+    if re.fullmatch(r"\d+(\.\d+){3}|\[.*\]", host) or not (here.startswith("https://") or host == "localhost"):
+        pytest.skip("this stack is opened at an address that could not carry passkeys or single sign-on")
+    for line in (page.locator("#signin-passkey-readiness"), page.locator("#signin-sso-address")):
+        expect(line).to_contain_text(elsewhere + ", which is not the address this page was opened at")
+        expect(line).to_contain_text(f"If people open the vault at {here}, put that address first in ALLOWED_HOSTS "
+                                     "in .env and run python dockvault.py restart.")

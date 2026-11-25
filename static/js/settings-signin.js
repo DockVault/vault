@@ -178,6 +178,17 @@
     const noAnchors = (data) => valueOf(data, 'webauthn_attestation') === 'direct' && Number(data.trust_anchors) === 0
         && valueOf(data, 'webauthn_mode') !== 'off';
 
+    // Opened at another address than the vault's: the vault's may be the wrong one. Where this page's own address
+    // could carry passkeys (a host name, not an IP address, over https or on this computer by name), the line says
+    // how to make it the vault's: the first ALLOWED_HOSTS entry is the vault's address.
+    function orFixTheAddress() {
+        const host = String(location.hostname || '');
+        const couldServe = host !== '' && !/^\d+(\.\d+){3}$/.test(host) && !host.startsWith('[')
+            && (location.protocol === 'https:' || host === 'localhost');
+        return couldServe ? ` If people open the vault at ${location.origin}, put that address first in ALLOWED_HOSTS `
+            + 'in .env and run python dockvault.py restart.' : '';
+    }
+
     function drawReadiness(data) {
         const line = byId('signin-passkey-readiness');
         if (!line) return;
@@ -186,12 +197,13 @@
         line.hidden = false;
         if (ready.usable && ready.origin && ready.origin !== location.origin) {
             line.className = 'alert alert-warning mb-md';
-            line.textContent = blocked
+            line.textContent = (blocked
                 ? `Passkeys work at ${ready.origin}, which is not the address this page was opened at `
                     + `(${location.origin}). Open the vault there to use one: here the browser refuses. None can be `
                     + 'added now (see below).'
                 : `Passkeys can be made at ${ready.origin}, which is not the address this page was opened at `
-                    + `(${location.origin}). Open the vault there to add or use one: here the browser refuses.`;
+                    + `(${location.origin}). Open the vault there to add or use one: here the browser refuses.`)
+                + orFixTheAddress();
         } else if (ready.usable && blocked) {
             line.className = 'alert alert-warning mb-md';
             line.textContent = `Passkeys work at ${ready.origin}: those already added sign in there. None can be added `

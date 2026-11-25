@@ -1,7 +1,8 @@
 """Settings -> Sign-in as an administrator reads it (static/js/settings-signin.js): what the counts the server reads
 mean under the rows they concern, and that a save which applies reads the page again for them; the alert while
 direct attestation has no trust anchors; the note while 'Required for roles' names no role; and the accounts the
-server's operator lifted the requirement for, listed as text.
+server's operator lifted the requirement for, listed as text. With the single sign-on card's address line
+(static/js/settings-sso.js): what to change when the page was opened at another address than the vault's.
 
 Driven in Node against the shipped script, on the small document of tests/js/mini_dom.js, with the server's answer
 built from the passkey settings as they are registered (app/core/webauthn_settings.py).
@@ -273,3 +274,78 @@ def test_the_list_of_lifted_accounts_says_when_it_shows_only_the_first_500_and_h
                                   "asked for the passkey a role requires.")
     assert got["items"][0].startswith("ann (External people), since ")
     assert not _loaded(_answer(), LIFTED)["shown"]
+
+
+# --------------------------------------------------------------------------- opened at another address
+
+SSO = ROOT / "static" / "js" / "settings-sso.js"
+SSO_PRELUDE = r"""
+const dom = require('./tests/js/mini_dom.js');
+const { document } = dom.install();
+for (const id of ['signin-sso-address', 'signin-sso-providers']) {
+    const node = document.createElement('div'); node.id = id; document.body.appendChild(node);
+}
+const add = document.createElement('button'); add.id = 'signin-sso-add'; document.body.appendChild(add);
+global.location = %(location)s;
+var currentUser = { id: 'root-id', username: 'root', role: 'admin' };
+global.apiRequest = async (path) => {
+    if (path !== '/admin/sso/providers') throw new Error('Not arranged: ' + path);
+    return { providers: [], presets: [], icons: ['generic'], limit: 20,
+             address: { usable: true, base: 'https://vault.example.test' } };
+};
+global.showToast = () => {};
+global._el = (tag, cls, text) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+};
+"""
+
+ELSEWHERE = {"usable": True, "rp_id": "vault.example.test", "origin": "https://vault.example.test", "reason": "ok"}
+OPENED_AT = [
+    ({"origin": "http://localhost:8200", "hostname": "localhost", "protocol": "http:"}, True),
+    ({"origin": "https://vault.example.com:8443", "hostname": "vault.example.com", "protocol": "https:"}, True),
+    ({"origin": "https://10.0.0.5:8443", "hostname": "10.0.0.5", "protocol": "https:"}, False),
+    ({"origin": "https://[::1]:8443", "hostname": "[::1]", "protocol": "https:"}, False),
+    ({"origin": "http://vault.lan:8200", "hostname": "vault.lan", "protocol": "http:"}, False),
+]
+
+
+def _fix(origin):
+    return (f" If people open the vault at {origin}, put that address first in ALLOWED_HOSTS in .env and run python "
+            "dockvault.py restart.")
+
+
+@pytest.mark.parametrize("location, can_serve", OPENED_AT)
+def test_the_passkey_line_opened_at_another_address_says_that_allowed_hosts_may_be_what_is_wrong(location, can_serve):
+    """Passkeys are made at the first ALLOWED_HOSTS entry. Where the page's own address could carry them (a host
+    name over https, or this computer by name), the vault may simply have the wrong address first: the line says how
+    to put this one there. An address reached by IP, or plain http on another name, could not carry them."""
+    got = _loaded(_answer(readiness=ELSEWHERE), "out(textOf(byId('signin-passkey-readiness')));", location)
+    said = ("Passkeys can be made at https://vault.example.test, which is not the address this page was opened at "
+            f"({location['origin']}). Open the vault there to add or use one: here the browser refuses.")
+    assert got == said + (_fix(location["origin"]) if can_serve else "")
+    # Also while no passkey can be added there.
+    got = _loaded(_answer({"webauthn_attestation": "direct"}, readiness=ELSEWHERE, trust_anchors=0),
+                  "out(textOf(byId('signin-passkey-readiness')));", location)
+    assert got.endswith("None can be added now (see below)." + (_fix(location["origin"]) if can_serve else ""))
+
+
+@pytest.mark.parametrize("location, can_serve", OPENED_AT)
+def test_the_single_sign_on_line_opened_at_another_address_says_that_allowed_hosts_may_be_what_is_wrong(location,
+                                                                                                      can_serve):
+    node = shutil.which("node")
+    assert node, "Node is required: the page's own code must not be skipped"
+    script = (SSO_PRELUDE % {"location": json.dumps(location)} + SSO.read_text(encoding="utf-8")
+              + "\n(async () => {\nawait window.SsoSettings.load();\n"
+              + "console.log(JSON.stringify(document.getElementById('signin-sso-address').textContent));\n"
+              + "})().catch((e) => { console.error(e); process.exit(1); });\n")
+    done = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=60,
+                          cwd=str(ROOT), env=dict(os.environ, TZ="UTC"))
+    assert done.returncode == 0, done.stdout + done.stderr
+    got = json.loads(done.stdout.strip().splitlines()[-1])
+    said = ("Providers send people back to https://vault.example.test, which is not the address this page was opened "
+            f"at ({location['origin']}). A sign-in, a link or a test started here does not come back here: open the "
+            "vault there.")
+    assert got == said + (_fix(location["origin"]) if can_serve else "")

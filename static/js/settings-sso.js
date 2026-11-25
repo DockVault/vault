@@ -64,6 +64,17 @@
 
     // ---------------------------------------------------------------- the card
 
+    // Opened at another address than the vault's: the vault's may be the wrong one. Where this page's own address
+    // could serve single sign-on and passkeys (a host name, not an IP address, over https or on this computer by
+    // name), the line says how to make it the vault's: the first ALLOWED_HOSTS entry is the vault's address.
+    function orFixTheAddress() {
+        const host = String(location.hostname || '');
+        const couldServe = host !== '' && !/^\d+(\.\d+){3}$/.test(host) && !host.startsWith('[')
+            && (location.protocol === 'https:' || host === 'localhost');
+        return couldServe ? ` If people open the vault at ${location.origin}, put that address first in ALLOWED_HOSTS `
+            + 'in .env and run python dockvault.py restart.' : '';
+    }
+
     function drawAddress() {
         const line = byId('signin-sso-address');
         if (!line) return;
@@ -73,7 +84,7 @@
             line.className = 'alert alert-warning mb-md';
             line.textContent = `Providers send people back to ${address.base}, which is not the address this page was `
                 + `opened at (${location.origin}). A sign-in, a link or a test started here does not come back here: `
-                + 'open the vault there.';
+                + 'open the vault there.' + orFixTheAddress();
         } else if (address.usable) {
             line.className = 'alert alert-info mb-md';
             line.textContent = `Providers send people back to ${address.base}. Changing the vault's address later means `
