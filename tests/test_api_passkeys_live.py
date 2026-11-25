@@ -314,3 +314,29 @@ def test_the_user_list_counts_the_passkeys_each_account_holds(person, admin):
     assert counted() == 1
     assert admin.delete(f"/users/{uid}/passkeys/{r.json()['id']}").status_code == 200
     assert counted() == 0
+
+
+def test_the_user_list_counts_a_passkey_made_at_another_address_apart(person, admin):
+    """The Users page writes how many passkeys an account can sign in with, and beside it how many it holds in
+    name only. A key made here counts as the first; the same key with another address on record as the second:
+    read from the route itself."""
+    from _account_change_helpers import psql
+    client, uid = person
+
+    def numbers():
+        row = next(row for row in admin.get("/users").json() if row["id"] == uid)
+        return row["passkey_count"], row["passkey_unusable_count"]
+
+    assert numbers() == (0, 0)
+    first, _ = _register(client, "Laptop")
+    assert first.status_code == 201, first.text
+    assert numbers() == (1, 0)
+    # The vault moves to another host name: the key's address on record is no longer the vault's. (Set on the row,
+    # as a vault that moved finds it; the routes that write it are held by their own tests.)
+    key_id = first.json()["id"]
+    try:
+        psql(f"UPDATE webauthn_credentials SET rp_id = 'elsewhere.example.test' WHERE id = '{key_id}'")
+        assert numbers() == (0, 1)
+    finally:
+        psql(f"UPDATE webauthn_credentials SET rp_id = NULL WHERE id = '{key_id}'")
+    assert numbers() == (1, 0)                         # no address on record: taken as made here

@@ -281,6 +281,9 @@ def test_the_user_list_gives_each_account_its_count():
     listing = listing[:listing.index("\n@app.")]
     assert listing.count("_passkey_tally(db, [u.id for u in users])") == 1
     assert "item.passkey_count, item.passkey_unusable_count = passkey_tally.get(user.id, (0, 0))" in listing
+    # Given once, and not written again further down the row (test_api_passkeys_live.py reads both numbers from
+    # the running route).
+    assert listing.count("passkey_unusable_count") == 1 and listing.count("item.passkey_count") == 1
     answer = source[source.index("class UserResponse("):source.index("class UserResponse(") + 4500]
     assert "passkey_count: int = 0" in answer and "passkey_unusable_count: int = 0" in answer
 
