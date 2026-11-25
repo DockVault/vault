@@ -29,8 +29,8 @@ pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parent.parent
 APP_JS = ROOT / "static" / "js" / "app.js"
 _SHIPPED = ("_el", "parseServerTime", "formatDayMonth", "_changedBy", "pendingApproval", "confirmCredentialChange",
-            "_passkeysShownFor", "loadUserPasskeys", "renderUserPasskeys", "removeUserPasskey", "_passkeysHeld",
-            "renderUserDetail")
+            "_passkeysShownFor", "loadUserPasskeys", "renderUserPasskeys", "_passkeyWhen", "_passkeyStateText",
+            "removeUserPasskey", "_passkeysHeld", "renderUserDetail")
 
 
 def _function(js, name):
@@ -200,6 +200,49 @@ out({ toasts, reloads: reloads.length, disabled: host.querySelector('.user-passk
 """)
     assert got == {"toasts": [["error", "Could not remove the passkey: That passkey was not found."]], "reloads": 1,
                    "disabled": False}
+
+
+def test_a_key_that_signs_nobody_in_says_why_and_one_whose_algorithm_runs_out_says_until_when():
+    """An administrator asked why someone cannot sign in with a passkey sees it on the key: each reason a key is no
+    factor now, and the day a removed algorithm stops being accepted, under the key's dates. A usable key says
+    nothing more, and every key keeps its Remove button."""
+    got = _node(r"""
+const key = (id, more) => Object.assign({ id, label: id, created_at: '2026-03-02T10:00:00Z', last_used_at: null,
+    synced: false, provisional: false, provisional_until: null, usable: true, not_usable_because: null,
+    accepted_until: null, algorithm: 'ES256', user_verified: true }, more);
+renderUserPasskeys('u-carol', [
+    key('works', {}),
+    key('off', { usable: false, not_usable_because: 'passkeys_turned_off' }),
+    key('moved', { usable: false, not_usable_because: 'passkeys_at_another_address' }),
+    key('old-alg', { usable: false, not_usable_because: 'passkeys_no_longer_accepted', algorithm: 'RS256' }),
+    key('no-pin', { usable: false, not_usable_because: 'passkeys_without_verification', user_verified: false }),
+    key('ending', { accepted_until: '2026-07-01T09:00:00Z', algorithm: 'RS256' })]);
+const lines = {};
+host.querySelectorAll('.user-passkey-item').forEach((item) => {
+    lines[item.dataset.passkeyId] = {
+        said: item.querySelectorAll('.passkey-not-usable, .passkey-accepted-until').map((l) => [l.className, l.textContent]),
+        remove: item.querySelectorAll('.user-passkey-remove-btn').length };
+});
+// The date as the rest of the row writes it, in the viewer's own locale.
+out({ lines, ending: new Date('2026-07-01T09:00:00Z').toLocaleDateString(undefined,
+                                                                         { year: 'numeric', month: 'short', day: 'numeric' }) });
+""")
+    lines = got["lines"]
+    warn = "text-warning text-xs "
+    assert lines["works"] == {"said": [], "remove": 1}
+    assert lines["off"] == {"said": [[warn + "passkey-not-usable", "Not usable: passkeys are turned off on this vault."]],
+                            "remove": 1}
+    assert lines["moved"]["said"] == [[warn + "passkey-not-usable",
+                                       "Not usable: it was made at another address than this vault has now."]]
+    assert lines["old-alg"]["said"] == [[warn + "passkey-not-usable",
+                                         "Not usable: its signature algorithm (RS256) is no longer accepted here."]]
+    assert lines["no-pin"]["said"] == [[warn + "passkey-not-usable",
+                                        "Not usable: it has never checked the person with a PIN, fingerprint or face, "
+                                        "and this vault asks for that."]]
+    assert lines["ending"]["said"] == [[warn + "passkey-accepted-until",
+                                        f"Its signature algorithm (RS256) is accepted until {got['ending']}; then it "
+                                        "stops signing in."]]
+    assert all(line["remove"] == 1 for line in lines.values()), lines
 
 
 

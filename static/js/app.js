@@ -8230,7 +8230,12 @@ function renderUserPasskeys(userId, keys, root = document) {
         bits.push(key.synced ? 'synced between devices' : 'bound to one device');
         if (key.provisional && day(key.provisional_until)) bits.push('provisional until ' + day(key.provisional_until));
         meta.appendChild(_el('span', 'ssh-key-by text-tertiary text-xs', bits.join(' · ')));
-        item.appendChild(meta);
+        // The key's name and dates, and under them why it signs nobody in now, or until when its algorithm counts.
+        const text = _el('div', 'flex-1 min-w-0');
+        text.appendChild(meta);
+        const state = _passkeyStateText(key, false, day);
+        if (state) text.appendChild(_el('div', state.cls, state.text));
+        item.appendChild(text);
         const remove = _el('button', 'btn btn-sm btn-danger user-passkey-remove-btn', 'Remove');
         remove.type = 'button';
         remove.setAttribute('aria-label', 'Remove the passkey ' + (key.label || 'with no name'));
@@ -8313,6 +8318,57 @@ function _passkeyWhen(iso) {
     } catch (_) { return null; }
 }
 
+// What a passkey's row says of the key beyond its name and dates, as {text, cls}, or null when there is nothing to
+// say. The server says of every key it lists whether it is a factor now (usable), why not (not_usable_because, the
+// reasons of webauthn_settings.why_a_key_is_no_factor, or passkeys turned off) and, while a removed signature
+// algorithm runs out its days, the day it stops being accepted (accepted_until). ``owner``: the words for the key's
+// owner (Your account), else for an administrator (the Users page). ``when`` writes a date; Your account's way by
+// default. A key that never checked the person counts again once it does at a use, and a switch turned back on
+// makes every key count again: the sentences say so where the owner can act on it.
+function _passkeyStateText(key, owner, when) {
+    if (!key) return null;
+    const alg = key.algorithm || 'a signature algorithm';
+    if (key.usable === false) {
+        let text = null;
+        switch (key.not_usable_because) {
+        case 'passkeys_turned_off':
+            text = owner ? 'Passkeys are turned off on this vault: it counts again if they are turned back on.'
+                : 'Not usable: passkeys are turned off on this vault.';
+            break;
+        case 'passkeys_at_another_address':
+            text = owner ? 'Made at another address than this vault has now: it no longer signs you in or confirms it '
+                + 'is you here. Remove it and add a new one.'
+                : 'Not usable: it was made at another address than this vault has now.';
+            break;
+        case 'passkeys_no_longer_accepted':
+            text = owner ? 'Uses ' + alg + ', which this vault no longer accepts: it no longer signs you in or '
+                + 'confirms it is you. Remove it and add a new one.'
+                : 'Not usable: its signature algorithm (' + alg + ') is no longer accepted here.';
+            break;
+        case 'passkeys_without_verification':
+            text = owner ? 'This vault now asks a passkey to check your PIN, fingerprint or face, and this one has '
+                + 'not: it does not sign you in or confirm it is you until it does. Set that up on it and use it once, '
+                + 'or remove it and add another.'
+                : 'Not usable: it has never checked the person with a PIN, fingerprint or face, and this vault asks '
+                + 'for that.';
+            break;
+        default:
+            return null;
+        }
+        return { text, cls: 'text-warning text-xs passkey-not-usable' };
+    }
+    if (key.accepted_until) {
+        const day = (when || _passkeyWhen)(key.accepted_until) || key.accepted_until;
+        return {
+            text: owner ? 'Uses ' + alg + ', which this vault stops accepting on ' + day + ': add a new passkey '
+                + 'before then, then remove this one.'
+                : 'Its signature algorithm (' + alg + ') is accepted until ' + day + '; then it stops signing in.',
+            cls: 'text-warning text-xs passkey-accepted-until',
+        };
+    }
+    return null;
+}
+
 async function renderAccountPasskeys() {
     const section = document.getElementById('us-passkeys-section');
     const body = document.getElementById('us-passkeys-body');
@@ -8351,6 +8407,9 @@ async function renderAccountPasskeys() {
             key.last_used_at ? 'last used ' + _passkeyWhen(key.last_used_at) : 'never used',
             key.synced ? 'synced across devices' : 'on one device'];
         text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
+        // A key that no longer signs its owner in says so, and what to do; one whose algorithm runs out, until when.
+        const state = _passkeyStateText(key, true);
+        if (state) text.appendChild(_el('div', state.cls, state.text));
         if (data.attestation === 'direct' && key.attested === false) {
             text.appendChild(_el('div', 'text-secondary text-xs', 'Added before this vault checked authenticator makes: '
                 + 'it signs you in, and does not prove a compliance action. Add it again to change that.'));
