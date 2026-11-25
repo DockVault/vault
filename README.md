@@ -31,6 +31,9 @@ Licensed under **AGPL-3.0** — self-host it freely.
   (`MIN_FREE_SPACE_GB`, by default the larger of 2 GB and 5% of the disk, never more than half of it nor more than
   20 GB): an upload that would leave less is refused rather than fill the disk the database shares.
 - **Login rate-limiting** and durable session revocation.
+- **Passkeys and single sign-on** — people can add passkeys, and administrators can connect OpenID Connect
+  identity providers (Microsoft Entra ID, Google Workspace, Okta, Keycloak, Authentik or another); see
+  [Passkeys and single sign-on](#passkeys-and-single-sign-on).
 - **Single standalone image** — needs only its bundled PostgreSQL + Redis; no external
   services required.
 
@@ -824,6 +827,48 @@ repository root and auto-loads the root `.env` (existing deployments keep their 
 names). The files a self-hoster touches — `dockvault.py` and `.env.example` —
 all live at the root.
 
+## Passkeys and single sign-on
+
+From 0.36.0 people can add passkeys: a phone, computer, security key or password manager keeps the key and unlocks
+it with a fingerprint, a face or a PIN. Each person adds their own under **Your account**. Administrators can
+connect identity providers that speak OpenID Connect. Both are set under **Settings → Sign-in methods**. Each
+change there is saved on its own and asks for the administrator's password, and the second factor when they have
+one.
+
+- **The address.** Both are built on the first `ALLOWED_HOSTS` entry, never on the address a request came to.
+  Passkeys need an `https` host name, not an address reached by IP (plain `http` only on localhost), and a
+  certificate the browser trusts: Chrome and Edge refuse passkeys on a self-signed certificate the device does not
+  trust, so use Let's Encrypt or your own certificate. Single sign-on needs an `https` address there too, and an
+  IP address serves it where the provider accepts one as a redirect address (Google does not). A passkey works only
+  at the host name it was made at. `python dockvault.py status` says whether passkeys can be made at the address,
+  and why not.
+- **Adding a provider.** **Add a provider** offers presets for Microsoft Entra ID, Google Workspace, Okta,
+  Keycloak and Authentik, and takes any other OpenID Connect provider. Each provider's **Connection** page shows
+  the addresses to give the provider's console: the redirect address
+  `https://<address>/auth/sso/<provider id>/callback`, the back-channel logout address and the sign-out return
+  address. A provider is turned on only after a **Test sign-in** passed with its settings as they are now.
+- **Who gets in.** By default only people who were invited or are already linked sign in through a provider.
+  Making accounts at a first sign-in, or linking an existing account by its verified email, needs the provider to
+  say who may sign in: a tenant, a domain, required groups, or the sign-up domain list when it is an allow-list.
+- **People who leave** (all on by default). A provider's back-channel logout ends the sessions it names. When the
+  provider refuses a person it knows, their access here ends. After 30 days without a sign-in through the
+  provider, the person's SSH keys, temporary credentials and devices pause, and their password, a passkey by itself
+  and Stay signed in are refused until they sign in through the provider again.
+- **Administrators always keep a password.** An administrator types the password after a passkey. Neither an
+  administrator nor a holder of the auditor right is ever held to a provider, so when a provider cannot be reached
+  an administrator signs in with the password and can turn the provider off. From the host,
+  `python dockvault.py accounts` resets an administrator's password or second factor, and
+  `--action clear-passkey-requirement` lets one account whose browser cannot make the passkey its role requires
+  sign in without it (see [Account changes from the host](#account-changes-from-the-host)).
+- **Zero-knowledge vaults** still open with their passphrase only: neither a passkey nor a provider opens one.
+- **Locking.** `SETTINGS_LOCKED_KEYS` with the group `sso` freezes the providers as they are. The passkey settings
+  take their `WEBAUTHN_*` values in `.env`, the defaults where none is set, and locking them (the group
+  `webauthn`) holds those values.
+- **The desktop app.** DockVault Desktop 0.2.0-preview.4 carries the web app of 0.33.2, which knows neither
+  passkeys nor single sign-on; the 0.36.0 release notes list the accounts it cannot sign in.
+
+The [hardening guide](docs/guides/hardening.md#sign-in-passkeys-and-single-sign-on) says which settings to choose.
+
 ## Security model
 
 - **Encryption at rest:** a standard vault's file contents are sealed with AES-256-GCM under a key per file,
@@ -858,6 +903,8 @@ them, but a README-only reader can miss them (the off-host key backup is always 
 - **Set `ALLOWED_HOSTS`** to the name people reach the vault by. It rejects a forged `Host` header, and every
   emailed link (a password reset, an invitation, the links in notices) is built on it: without it, self-service
   password reset sends nothing and invitations are not emailed. The first entry that is not a wildcard is the base of every emailed link, so make it the address people open in their browser: a bare name means `https://name`; when people use another port, or plain http, write that entry as the full origin (`https://name:8443`). Behind a reverse proxy or port forwarding, that is the proxy's or the forwarded address (usually the bare name), not the port the vault publishes. The Host check reads each entry's host name without its scheme or port; a wildcard is never the link base; an entry with no host name stops the vault at start, naming it; IPv6 literals and `0.0.0.0` match no request.
+  Passkeys and single sign-on are built on the same first entry: see
+  [Passkeys and single sign-on](#passkeys-and-single-sign-on).
 - **Behind a reverse proxy, name it in `TRUSTED_PROXIES`** so the audit log and the sign-in limits see real
   client addresses: a proxy container's address, or `gateway` for a proxy on the same host together with
   `WEB_BIND=127.0.0.1` (the port published on loopback only). A range never trusts the Docker gateway, which
