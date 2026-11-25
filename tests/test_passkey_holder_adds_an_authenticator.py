@@ -66,10 +66,18 @@ def test_an_account_with_no_factor_enrolls_with_its_password_as_before(world, mo
 
 def test_at_a_held_sign_in_the_factor_is_asked_where_it_is_stored_and_not_here(world, monkeypatch):
     from app.core import security
+    from app.services import sign_in
     monkeypatch.setattr(security, "verify_password", lambda given, stored: False)
+    held = types.SimpleNamespace(id=uuid.uuid4())
+    # The hold's own check asks (an account that holds a factor gives it first; stood in for here)...
+    seen = []
+    monkeypatch.setattr(sign_in, "refuse_enrollment_before_the_accounts_factor",
+                        lambda db, user, pending: seen.append(pending))
+    monkeypatch.setattr(sign_in, "provider_proves_an_enrollment", lambda user, pending: False)
     with pytest.raises(HTTPException) as refused:
-        _enroll(world, pending=types.SimpleNamespace(id=uuid.uuid4()))
-    assert refused.value.status_code == 400 and world.asked == []
+        _enroll(world, pending=held)
+    # ...and the session's question is not put to it: the password's turn follows.
+    assert refused.value.status_code == 400 and world.asked == [] and seen == [held]
     # The helper by itself: a session asks, a held sign-in does not, an account without a factor does not.
     ask = world.api._factor_before_another_from_a_session
     request = types.SimpleNamespace(headers={})
@@ -80,3 +88,19 @@ def test_at_a_held_sign_in_the_factor_is_asked_where_it_is_stored_and_not_here(w
     world.holds = False
     ask(world.db, world.alice, request, None)
     assert world.asked == [("alice", "account.second_factor")]
+
+
+def test_an_account_with_no_password_of_its_own_is_told_so_before_its_factor_is_asked_for(world, monkeypatch):
+    """Under Your account, an account whose password nobody can type sets no authenticator up: it is told where
+    one is set up. Its passkey is not asked for first, to be given for an answer that writes nothing."""
+    from app.services import sign_in
+    monkeypatch.setattr(sign_in, "has_a_password_it_can_type", lambda user: False)
+    with pytest.raises(HTTPException) as refused:
+        _enroll(world)
+    assert refused.value.status_code == 409 and "no password of its own" in refused.value.detail
+    assert world.asked == []
+    # With a password it can type, the same account gives its factor first.
+    monkeypatch.setattr(sign_in, "has_a_password_it_can_type", lambda user: True)
+    with pytest.raises(HTTPException) as refused:
+        _enroll(world)
+    assert refused.value.status_code == 403 and world.asked == [("alice", "account.second_factor")]

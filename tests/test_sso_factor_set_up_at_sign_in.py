@@ -323,7 +323,7 @@ def test_an_identity_linked_by_email_loses_the_providers_mfa_while_the_account_h
     carol = _without_a_password("signs in only through its provider", name="carol")
     w = World(monkeypatch, [carol], mfa_mode="optional", trust=True, linked_by="email",
               passkeys="off" if state == "passkeys kept while they are switched off" else "optional")
-    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=carol.id, retired_at=None, cose_alg=-7)
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=carol.id, uv_initialized=True, retired_at=None, cose_alg=-7)
     if state == "an authenticator":
         w.db.rows_of(SecondFactorEnrollment).append(
             types.SimpleNamespace(id=uuid.uuid4(), user_id=carol.id, method="totp", status="active"))
@@ -376,7 +376,8 @@ def test_an_account_with_a_password_linked_by_email_answers_what_it_owes_behind_
         alice.second_factor_reset_at = datetime.utcnow()
     else:
         w.db.rows_of(WebAuthnCredential).append(
-            types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, retired_at=None, cose_alg=-257))
+            types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, uv_initialized=True, retired_at=None,
+                                  cose_alg=-257))
         monkeypatch.setattr(w.wss, "algorithm_usable", lambda db, cose_alg, now=None: (False, False))
     body, _headers = w.held(alice, with_its_mfa=True)
     assert body["stage"] == "password" and body["enrollment_required"] is False and body["access_token"] is None, body
@@ -494,7 +495,7 @@ def test_passkeys_made_at_another_address_are_set_up_again_at_the_providers_sign
     w = World(monkeypatch, [dana], mfa_mode="optional")
     here = w.wss.address_now()
     assert here
-    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=dana.id, retired_at=None, cose_alg=-7,
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=dana.id, uv_initialized=True, retired_at=None, cose_alg=-7,
                                 rp_id="old.example.test")
     w.db.rows_of(WebAuthnCredential).append(key)
     monkeypatch.setattr(w.wss, "algorithm_usable", lambda db, cose_alg, now=None: (True, False))

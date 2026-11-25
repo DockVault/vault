@@ -11764,7 +11764,6 @@ async def enroll_totp(
         raise HTTPException(status_code=404, detail="User not found")
     if _sf_enrollment(db, user.id, status="active"):
         raise HTTPException(status_code=409, detail="A second factor is already active; disable it before enrolling a new one.")
-    _factor_before_another_from_a_session(db, user, request, pending)
     # A held sign-in, whatever proved it: an account that came to hold a factor since gives that factor first,
     # as at the passkey's enrollment on the same hold.
     sign_in.refuse_enrollment_before_the_accounts_factor(db, user, pending)
@@ -11773,11 +11772,15 @@ async def enroll_totp(
     elif pending is None and not sign_in.has_a_password_it_can_type(user):
         # Under Your account such an account is asked for nothing it cannot give: it is told where its
         # authenticator is set up (a sign-in that asks for a second factor), and that a passkey can be added here.
+        # Said before its factor is asked for: the answer writes nothing, and the factor would be given for it.
         raise HTTPException(status_code=409, detail=(
             "Your account has no password of its own, so an authenticator app is set up at a sign-in that asks "
             "for a second factor. A passkey can be added here."))
-    elif not user.password_hash or not verify_password(body.current_password, user.password_hash):
-        raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
+    else:
+        # From a session, an account that holds a factor gives it before the password is looked at.
+        _factor_before_another_from_a_session(db, user, request, pending)
+        if not user.password_hash or not verify_password(body.current_password, user.password_hash):
+            raise HTTPException(status_code=400, detail="Your current password is required and must be correct.")
 
     seed = sf.generate_totp_secret()
     # Replace any prior UNCONFIRMED row (a restarted enrollment); never an active one (guarded above).
