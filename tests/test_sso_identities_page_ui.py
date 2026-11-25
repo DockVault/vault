@@ -178,11 +178,13 @@ def test_a_hold_whose_days_ran_out_says_so_in_the_past_and_its_lift_says_the_key
     """A hold the vault wrote when the provider was turned off, after the person's days there had run out: the row
     says the days ran out (in the past, whatever the state), and the confirmation says what the lift gives as the
     server says it: the keys stay paused until the person signs in through the provider; their password back while
-    the provider is off, and nothing they can do while it is on. Where the provider's days pause the keys only, the
-    password signed the person in all along, and the confirmation does not say it comes back."""
+    the provider is off, and nothing they can do while it is on. Nobody can sign in through a provider that is off:
+    there the confirmation says so, and what ends the pause instead. Where the provider's days pause the keys only,
+    the password signed the person in all along, and the confirmation does not say it comes back."""
     holds_now, holds_after = {"provider on": (True, True), "provider off": (True, False),
                               "keys only": (False, False)}[case]
     got = _node(r"""
+PROVIDER.state = %s;
 const held = { id: 'i-bob', user_id: 'u-bob', username: 'bob', linked_by: 'email', linked_at: '2026-08-01T10:00:00Z',
     last_sign_in_at: '2026-08-02T10:00:00Z', state: 'refused', refused_at: '2026-10-20T10:00:00Z',
     due_at: '2026-09-01T10:00:00Z', holds_sign_in: %s, own: false,
@@ -194,7 +196,7 @@ confirmAnswer = false;
 document.querySelector('.sso-identity-row button').click();
 await tick(); await tick();
 out({ row: rows()[0], confirm: confirms[0][0] });
-""" % (json.dumps(holds_now), json.dumps(holds_after)))
+""" % (json.dumps("disabled" if case == "provider off" else "enabled"), json.dumps(holds_now), json.dumps(holds_after)))
     row = got["row"]
     assert row["state"] == "Refused or held" and row["actions"] == ["Lift refusal", "Unlink"]
     assert "refused or held since " in row["bits"] and "its days ran out on " in row["bits"]
@@ -206,8 +208,9 @@ out({ row: rows()[0], confirm: confirms[0][0] });
                                           "lifting it changes nothing they can do. They and the other administrators "
                                           "are told.")
     elif case == "provider off":
-        assert got["confirm"] == start + (". Their password and passkeys sign them in again. They and the other "
-                                          "administrators are told.")
+        assert got["confirm"] == start + (", which nobody can while this provider is turned off: turn it on so they "
+                                          "can, or unlink the account here, which ends the pause. Their password and "
+                                          "passkeys sign them in again. They and the other administrators are told.")
     else:
         assert got["confirm"] == start + ". They and the other administrators are told."
     assert "work again" not in got["confirm"]

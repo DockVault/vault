@@ -135,6 +135,40 @@ out({ placed, badges, notes, days: { ben: day('2026-06-05T00:00:00Z'), eve: day(
     assert got["notes"]["dan"] is None
 
 
+def test_an_account_on_a_provider_that_is_turned_off_is_not_told_that_a_sign_in_there_restores_its_keys():
+    """The days go on counting while a provider is off (GET /users gives provider_on: false), and nobody can sign in
+    through it then: the details say so, and what ends the pause instead (turning it on, or the Unlink of the
+    provider's Identities page, which another administrator does for the viewer's own account)."""
+    got = _node(r"""
+const off = (extra) => okta(Object.assign({ provider_on: false }, extra));
+const day = (v) => new Date(v).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+out({ hal: _ssoStandingNote(row('hal', off({ due: '2026-06-05T00:00:00Z', lapsed: true, refused: false, held: false }))),
+      me: _ssoStandingNote(Object.assign(row('me', off({ due: '2026-06-05T00:00:00Z', lapsed: true, refused: false,
+                                                         held: false })), { role: 'admin' })),
+      ivy: _ssoStandingNote(row('ivy', off({ due: '2026-06-01T00:00:00Z', lapsed: true, refused: true, held: true }))),
+      cat: _ssoStandingNote(row('cat', off({ due: '2026-06-30T00:00:00Z', lapsed: false, refused: false, held: false }))),
+      on: _ssoStandingNote(row('ben', okta({ due: '2026-06-05T00:00:00Z', lapsed: true, refused: false, held: false,
+                                             provider_on: true }))),
+      days: { hal: day('2026-06-05T00:00:00Z'), cat: day('2026-06-30T00:00:00Z') } });
+""")
+    days = got["days"]
+    paused = (f"Their SSH keys, temporary credentials and devices paused on {days['hal']}: they have not signed in "
+              "through Okta within its days. A sign-in through Okta restores them, and Okta is turned off, so nobody "
+              "can sign in through it: turn it on so they can, or {who} the account on Okta’s Identities page "
+              "(Settings, Sign-in methods), which ends the pause.")
+    assert got["hal"] == paused.format(who="unlink")
+    assert got["me"] == paused.format(who="have another administrator unlink")
+    assert got["ivy"] == ("Okta refused this person at a sign-in, or the vault held them after their days without a "
+                          "sign-in there had run out. Their SSH keys, temporary credentials and devices are paused, and "
+                          "their password and passkeys do not sign them in, until they sign in through Okta again, "
+                          "which nobody can while Okta is turned off. You can also lift it with Lift refusal on Okta’s "
+                          "Identities page (Settings, Sign-in methods), which says what lifting it gives.")
+    assert got["cat"] == (f"Their SSH keys, temporary credentials and devices pause on {days['cat']} unless they sign "
+                          "in through Okta before then, which nobody can while Okta is turned off.")
+    # A provider that is on: the sign-in through it is what restores them.
+    assert got["on"].endswith(" A sign-in through Okta restores them.")
+
+
 def test_the_users_list_asks_whether_an_account_is_held_only_for_a_lapsed_one(monkeypatch):
     from app.services import sso_freshness
     root, ann, ben, cat, dan = (_user(n, **({"role": "admin"} if n == "root" else {}), password_set_by=None,

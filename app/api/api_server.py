@@ -1171,7 +1171,8 @@ class UserResponse(BaseModel):
     credential_change: Optional[Dict[str, Any]] = None
     # Single sign-on freshness, for an account a provider asks to sign in again: when its SSH keys, temporary
     # credentials and devices pause (or paused), through which provider, and whether the provider refused it
-    # ({due, provider, lapsed, refused, held}; held: its password and passkeys are held to that provider too).
+    # ({due, provider, lapsed, refused, provider_on, held}; provider_on: that provider is turned on; held: its
+    # password and passkeys are held to that provider too).
     sso_freshness: Optional[Dict[str, Any]] = None
     # The account's current password was set by someone else ({by: their username or None, at}), or None
     # (app/core/password_origin.py). Filled in by the admin users list, for the promote dialog's warning.

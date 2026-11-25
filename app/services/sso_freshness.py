@@ -503,8 +503,10 @@ def _all_deadlines(db) -> List[Deadline]:
 
 
 def standing_of(db, now: Optional[datetime] = None) -> dict:
-    """For each account a provider asks of: ``{"due", "provider", "lapsed", "refused"}`` for the deadline that
-    matters most (a refusal, else a lapse, else the earliest), what the administrators' user list shows."""
+    """For each account a provider asks of: ``{"due", "provider", "lapsed", "refused", "provider_on"}`` for the
+    deadline that matters most (a refusal, else a lapse, else the earliest), what the administrators' user list
+    shows. ``provider_on`` is false while that provider is turned off: its days go on counting (:func:`deadline_of`)
+    and nobody can sign in through it, so the list does not offer that sign-in as what restores the keys."""
     now = now or datetime.utcnow()
     best: dict = {}
     for found in _all_deadlines(db):
@@ -513,7 +515,8 @@ def standing_of(db, now: Optional[datetime] = None) -> dict:
         if held is None or rank < held[0]:
             best[found.user_id] = (rank, found)
     return {uid: {"due": found.due.isoformat() + "Z", "provider": found.provider_name,
-                  "lapsed": found.refused or found.due <= now, "refused": found.refused}
+                  "lapsed": found.refused or found.due <= now, "refused": found.refused,
+                  "provider_on": found.provider_on}
             for uid, (_, found) in best.items()}
 
 

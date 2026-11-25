@@ -673,7 +673,9 @@
     // What lifting the refusal or hold on an account gives, from where the server says the lift leaves it
     // (`after_lift`). A hold the vault wrote after the person's days had run out leaves them run out: the keys stay
     // paused until the person signs in through the provider, and while the provider is on they sign in only there.
-    function liftSays(name, identity) {
+    // While the provider is turned off (`off`) nobody can sign in through it: what ends the pause then is turning it
+    // on, or the Unlink beside the account.
+    function liftSays(name, identity, off) {
         const after = identity.after_lift || { state: 'linked', holds_sign_in: false };
         const signInBack = identity.holds_sign_in && !after.holds_sign_in
             ? ' Their password and passkeys sign them in again.' : '';
@@ -684,7 +686,9 @@
                 + 'in through it' + (after.holds_sign_in
                     ? ', and their password and passkeys still do not sign them in: until then, lifting it changes '
                       + 'nothing they can do.'
-                    : '.') + signInBack + told;
+                    : off ? ', which nobody can while this provider is turned off: turn it on so they can, or unlink '
+                        + 'the account here, which ends the pause.'
+                        : '.') + signInBack + told;
         }
         return `Lift the refusal or hold on ${name}? Their SSH keys, temporary credentials and devices work again, `
             + 'unless another rule pauses them.' + signInBack + told
@@ -775,7 +779,8 @@
             lift.type = 'button';
             lift.setAttribute('aria-label', 'Lift the refusal of ' + name);
             lift.addEventListener('click', async () => {
-                const ok = await showConfirm(liftSays(name, identity), 'Lift refusal', null, 'Lift refusal');
+                const off = !!(open && open.id === providerId && open.state !== 'enabled');
+                const ok = await showConfirm(liftSays(name, identity, off), 'Lift refusal', null, 'Lift refusal');
                 if (!ok) return;
                 lift.disabled = true;
                 try {

@@ -7793,34 +7793,43 @@ function fillCredentialChangeNotes() {
 }
 
 // Where the account stands with a provider that asks it to sign in again (GET /users sso_freshness: {due, provider,
-// lapsed, refused, held}), or null.
+// lapsed, refused, provider_on, held}), or null.
 function _ssoStanding(u) {
     return (u && u.sso_freshness) || null;
 }
 
 // The line in the account's details about that standing: what paused its keys, since or until when, and what
 // restores them. A refusal on record is the provider's, or a hold the vault wrote after the days had run out
-// (when the provider was turned off or was to be removed); the line is true of both.
+// (when the provider was turned off or was to be removed); the line is true of both. The days go on counting while
+// the provider is turned off (provider_on false), and nobody can sign in through it then: the line says so, and,
+// for days run out, what ends the pause instead (the Unlink of the provider's Identities page, which the server
+// refuses an administrator for their own account).
 function _ssoStandingNote(u) {
     const f = _ssoStanding(u);
     if (!f) return '';
     const p = f.provider;
+    const own = !!(currentUser && u.id === currentUser.id);
+    const off = f.provider_on === false;
+    const nobody = off ? ', which nobody can while ' + p + ' is turned off.' : '.';
     if (f.refused) {
-        const who = (currentUser && u.id === currentUser.id) ? 'Another administrator can also' : 'You can also';
+        const who = own ? 'Another administrator can also' : 'You can also';
         return p + ' refused this person at a sign-in, or the vault held them after their days without a sign-in '
             + 'there had run out. Their SSH keys, temporary credentials and devices are paused'
             + (f.held ? ', and their password and passkeys do not sign them in,' : '')
-            + ' until they sign in through ' + p + ' again. ' + who + ' lift it with Lift refusal on ' + p
+            + ' until they sign in through ' + p + ' again' + nobody + ' ' + who + ' lift it with Lift refusal on ' + p
             + '’s Identities page (Settings, Sign-in methods), which says what lifting it gives.';
     }
     if (f.lapsed) {
+        const restores = ' A sign-in through ' + p + (f.held ? ' restores all of it' : ' restores them');
         return 'Their SSH keys, temporary credentials and devices paused on ' + formatDayMonth(f.due)
             + ': they have not signed in through ' + p + ' within its days.'
-            + (f.held ? ' Their password and passkeys do not sign them in either. A sign-in through ' + p
-                + ' restores all of it.' : ' A sign-in through ' + p + ' restores them.');
+            + (f.held ? ' Their password and passkeys do not sign them in either.' : '')
+            + (off ? restores + ', and ' + p + ' is turned off, so nobody can sign in through it: turn it on so they '
+                + 'can, or ' + (own ? 'have another administrator unlink' : 'unlink') + ' the account on ' + p
+                + '’s Identities page (Settings, Sign-in methods), which ends the pause.' : restores + '.');
     }
     return 'Their SSH keys, temporary credentials and devices pause on ' + formatDayMonth(f.due)
-        + ' unless they sign in through ' + p + ' before then.';
+        + ' unless they sign in through ' + p + ' before then' + nobody;
 }
 
 // The badge in the status of an account whose keys a provider paused: put in the row with no text, and named here.

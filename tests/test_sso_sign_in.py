@@ -1221,7 +1221,7 @@ def test_the_administrators_user_list_shows_when_keys_pause(monkeypatch):
     by_name = {r["username"]: r for r in rows}
     assert by_name["alice"]["sso_freshness"] == {"due": (signed_in + timedelta(days=30)).isoformat() + "Z",
                                                  "provider": "contoso", "lapsed": False, "refused": False,
-                                                 "held": False}
+                                                 "provider_on": True, "held": False}
     assert by_name["bob"]["sso_freshness"] is None and by_name["root"]["sso_freshness"] is None
 
 

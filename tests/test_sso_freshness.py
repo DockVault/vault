@@ -145,10 +145,23 @@ def test_the_user_list_shows_the_deadline_that_matters_most():
         _identity(carol, a, signed_in=NOW - 40 * DAY), _identity(carol, b, signed_in=NOW, refused=NOW + DAY)])
     standing = F.standing_of(db, now=NOW)
     assert standing[str(alice.id)] == {"due": (NOW + 8 * DAY).isoformat() + "Z", "provider": "fabrikam",
-                                       "lapsed": False, "refused": False}
+                                       "lapsed": False, "refused": False, "provider_on": True}
     assert standing[str(bob.id)]["provider"] == "contoso" and standing[str(bob.id)]["lapsed"] is True
     assert standing[str(carol.id)]["provider"] == "fabrikam" and standing[str(carol.id)]["refused"] is True
     assert str(dave.id) not in standing
+
+
+def test_the_user_list_says_when_the_provider_shown_is_turned_off():
+    """The days go on counting while a provider is off, and nobody can sign in through it then: the list says the
+    provider is off, so the Users page does not offer that sign-in as what restores the keys."""
+    alice, bob = _user(), _user("bob")
+    off = _provider(30, name="contoso", state="disabled")
+    db = _db([alice, bob], [off], [_identity(alice, off, signed_in=NOW - 40 * DAY),
+                                    _identity(bob, off, signed_in=NOW - DAY, refused=NOW)])
+    standing = F.standing_of(db, now=NOW)
+    assert standing[str(alice.id)] == {"due": (NOW - 10 * DAY).isoformat() + "Z", "provider": "contoso",
+                                       "lapsed": True, "refused": False, "provider_on": False}
+    assert standing[str(bob.id)]["refused"] is True and standing[str(bob.id)]["provider_on"] is False
 
 
 # --------------------------------------------------------------------------- the sweep
