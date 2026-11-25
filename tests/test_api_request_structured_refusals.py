@@ -131,3 +131,18 @@ def test_a_refused_code_claim_is_its_sentence_and_the_person_stays_signed_in():
     # What the server answered before: the same refusal as a 401 signed the person out.
     before = _refused(401, {"detail": "This code is not valid for this tab; start again."}, silent=True)
     assert before["signed_out"] == 1 and before["held"] is False
+
+
+def test_a_busy_answer_is_its_sentence_with_its_reason_and_never_signs_out():
+    """A route that finds the account being changed answers 503 with the reason busy; any route whose wait for the
+    database ran out answers a plain 503. Either is the sentence, with the status (and the reason where there is
+    one) for a caller that offers to try again, and the person stays signed in."""
+    message = "Your account is being changed right now. Try again in a moment."
+    out = _refused(503, {"detail": {"reason": "busy", "message": message}})
+    assert out["settled"] == "rejected" and out["kind"] == "Error", out
+    assert out["status"] == 503 and out["reason"] == "busy" and out["message"] == message
+    assert out["signed_out"] == 0 and out["held"] is True
+    plain = "The vault is busy with this right now. Try again in a moment."
+    out = _refused(503, {"detail": plain})
+    assert out["status"] == 503 and out["reason"] is None and out["message"] == plain
+    assert out["signed_out"] == 0 and out["held"] is True

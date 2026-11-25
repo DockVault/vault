@@ -317,3 +317,50 @@ out(page());
     assert "its time ran out on Nov 1, 2026: sign out and sign in through it" in passed["text"]
     assert "sign in through it by" not in passed["text"]
     assert "sign in through it by" not in none["text"] and "ran out" not in none["text"]
+
+
+BUSY = "Your account is being changed right now. Try again in a moment."
+
+
+def test_an_unlink_after_the_providers_confirmation_that_finds_the_account_busy_offers_to_try_again_here():
+    """The provider's confirmation is staged for this session for two minutes and is spent only by an unlink that goes
+    through; the busy answer comes before it is taken. So trying again sends the unlink again from here, and does not
+    send the person to the provider once more."""
+    got = _node(r"""
+let tries = 0;
+answers['DELETE /users/me/identities/i-1'] = () => {
+    tries += 1;
+    return tries === 1 ? refused(503, 'busy', 'BUSY') : { removed: true, sessions_ended: 0, ended_this_session: false };
+};
+answers['GET ' + LIST] = { identities: [], providers: [], email: null };
+await window.Sso.unlinkConfirmed('i-1', 'Contoso');
+await settle();
+out({ confirms, successes, errors, asked, left });
+""".replace("'BUSY'", json.dumps(BUSY)))
+    assert got["confirms"] == [{"message": BUSY, "title": "Unlink single sign-on", "label": "Try again"}]
+    assert got["asked"] == ["DELETE /users/me/identities/i-1", "DELETE /users/me/identities/i-1",
+                            "GET /users/me/identities"]
+    assert got["successes"] == ["Unlinked."] and got["errors"] == [] and got["left"] == []
+
+
+def test_a_busy_unlink_the_person_does_not_try_again_reads_the_list_again_and_any_other_failure_is_shown():
+    got = _node(r"""
+answers['DELETE /users/me/identities/i-1'] = refused(503, 'busy', 'BUSY');
+answers['GET ' + LIST] = { identities: [], providers: [], email: null };
+confirmAnswers = [false];
+await window.Sso.unlinkConfirmed('i-1', 'Contoso');
+await settle();
+const declined = { confirms: confirms.slice(), errors: errors.slice(), asked: asked.slice() };
+confirms.length = 0; asked.length = 0;
+answers['DELETE /users/me/identities/i-1'] = refused(503, undefined, 'The vault is busy with this right now. Try again in a moment.');
+await window.Sso.unlinkConfirmed('i-1', 'Contoso');
+await settle();
+out({ declined, other: { confirms, errors, asked } });
+""".replace("'BUSY'", json.dumps(BUSY)))
+    declined, other = got["declined"], got["other"]
+    assert len(declined["confirms"]) == 1 and declined["errors"] == []
+    assert declined["asked"] == ["DELETE /users/me/identities/i-1", "GET /users/me/identities"]
+    # A busy answer of another kind may come after the confirmation was taken: shown, not tried again from here.
+    assert other["confirms"] == []
+    assert other["errors"] == ["The vault is busy with this right now. Try again in a moment."]
+    assert other["asked"] == ["DELETE /users/me/identities/i-1", "GET /users/me/identities"]

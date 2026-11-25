@@ -277,6 +277,15 @@
         try {
             answer = await apiRequest('/users/me/identities/' + encodeURIComponent(identityId), { method: 'DELETE' });
         } catch (e) {
+            if (e && e.status === 503 && e.reason === 'busy') {
+                // The account was being changed: nothing was done, and the answer came before the provider's
+                // confirmation was taken, so it stays staged for this session for its two minutes. Trying again
+                // sends the unlink again from here, not the person to the provider once more.
+                const again = await showConfirm(e.message, 'Unlink single sign-on', null, 'Try again');
+                if (again) return unlinkConfirmed(identityId, label);
+                renderAccount();
+                return;
+            }
             showError((e && e.message) || 'It was not unlinked.');
             renderAccount();
             return;
