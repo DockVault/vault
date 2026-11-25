@@ -7592,6 +7592,13 @@ function fillCredentialChangeNotes() {
         }
         const standing = _ssoStandingNote(u);
         if (standing) lines.push(standing);
+        if (u && u.passkey_requirement_cleared_at) {
+            // Lifted on the host (dockvault.py accounts); it ends by itself with a passkey or a new role.
+            lines.push('The server’s operator lifted the passkey requirement for this account on '
+                + formatDayMonth(u.passkey_requirement_cleared_at) + ': it signs in without a passkey although its '
+                + 'role must hold one. That ends when the account adds a passkey, when its role changes, or when the '
+                + 'server’s operator puts it back.');
+        }
         note.replaceChildren(...lines.map(t => _el('div', null, t)));
         note.hidden = lines.length === 0;
     });
@@ -7815,6 +7822,7 @@ function renderUserRow(u) {
                 ${u.is_locked ? `<span class="badge badge-warning">${iconSvg('lock', 'icon-sm')} Locked</span>` : ''}
                 ${!u.is_locked && u.sign_in_block ? `<span class="badge badge-warning sign-in-block-badge" data-user-id="${u.id}">${iconSvg('clock', 'icon-sm')} Sign-ins paused</span>` : ''}
                 ${_ssoStanding(u) && (_ssoStanding(u).lapsed || _ssoStanding(u).refused) ? `<span class="badge badge-warning sso-standing-badge" data-user-id="${u.id}"></span>` : ''}
+                ${u.passkey_requirement_cleared_at ? '<span class="badge badge-secondary">Passkey requirement lifted</span>' : ''}
             </div></td>
             <td>${_holdsAFactor(u)
                     ? `<span class="badge badge-success">${iconSvg('shield', 'icon-sm')} On</span>`

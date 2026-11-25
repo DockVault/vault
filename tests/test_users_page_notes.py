@@ -129,3 +129,23 @@ out({ lines: lines(), asked: asked.map((a) => a.path) });
     assert got["lines"] == [UNCONFIRMED + " They can confirm it under Your account with a code sent to it, or you "
                                           "can, with Confirm address."]
     assert got["asked"][-1] == "/settings"
+
+
+# --------------------------------------------------------------------------- the passkey requirement lifted
+
+def test_an_account_the_passkey_requirement_was_lifted_for_says_so_and_when_it_ends():
+    got = _node(r"""
+globalThis.iconSvg = () => ''; globalThis.escapeHtml = (s) => String(s); globalThis.groupChip = () => '';
+globalThis.People = { placeholder: () => '', whenPlaceholder: () => '' };
+const day = new Date('2026-05-02T09:00:00Z').toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+const before = { lines: (fillCredentialChangeNotes(), lines()), badge: renderUserRow(carol).includes('Passkey requirement lifted') };
+carol.passkey_requirement_cleared_at = '2026-05-02T09:00:00Z';
+fillCredentialChangeNotes();
+out({ before, lines: lines(), badge: renderUserRow(carol).includes('Passkey requirement lifted'), day });
+""", ("signInMethods", "signInMethodBadges", "_holdsAFactor", "_passkeysHeld", "_passkeysShownFor", "renderUserDetail",
+      "renderUserRow"))
+    assert got["before"] == {"lines": None, "badge": False}
+    assert got["lines"] == [f"The server’s operator lifted the passkey requirement for this account on {got['day']}: it "
+                            "signs in without a passkey although its role must hold one. That ends when the account "
+                            "adds a passkey, when its role changes, or when the server’s operator puts it back."]
+    assert got["badge"] is True
