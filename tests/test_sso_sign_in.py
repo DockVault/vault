@@ -714,7 +714,8 @@ def test_an_unlink_is_the_owners_and_keeps_the_last_way_in_of_an_sso_only_accoun
     monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: revoked.append(kw) or len(kw["session_ids"]))
     monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: turns.append(owner))
     status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{identity.id}")
-    assert status == 200 and out == {"removed": True, "sessions_ended": 1} and h.identities() == [bobs], out
+    assert status == 200 and out == {"removed": True, "sessions_ended": 1, "ended_this_session": False}, out
+    assert h.identities() == [bobs]
     assert revoked == [{"session_ids": [through], "actor_username": "alice", "durable": True}]
     # The account's turn: before its identities are read, where its flag is settled, and where what came through
     # this identity ends. Taken again, a turn the transaction holds waits for nothing.

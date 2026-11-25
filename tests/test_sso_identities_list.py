@@ -123,3 +123,46 @@ def test_an_account_with_a_password_is_told_to_sign_in_with_it_before_a_link_and
     # A token from before tokens named their proofs began with the password.
     h.session_claims = {"sub": str(alice.id)}
     assert _offered(_listed(h))[str(p.id)]["link_refusal"] is None
+
+
+ONE_STEP = {"sso_lapse_ends_sign_in": False}       # an unlink asks nothing of the provider (tests/test_sso_sign_in.py)
+
+
+def _signed_in_through(h, user, provider, subject, token="this-tab-token"):
+    """The request's session: one a sign-in through ``provider`` as ``subject`` made, as its sso_sessions row says."""
+    import types
+    from app.core.models import ActiveSession, SsoSession
+    from app.core.session_hash_utils import hash_session_token
+    session_id = uuid.uuid4()
+    h.db.rows_of(ActiveSession).append(types.SimpleNamespace(id=session_id, user_id=user.id,
+                                                             session_token=hash_session_token(token)))
+    h.db.rows_of(SsoSession).append(types.SimpleNamespace(session_id=session_id, provider_id=provider.id,
+                                                          idp_sub=subject))
+    h.session_claims = {"amr": [], "session_token": token}
+    return session_id
+
+
+def test_the_identity_this_session_came_through_is_marked_and_its_unlink_says_it_ended_this_session(monkeypatch):
+    """A person who signed in through a provider and unlinks it is signed out here too: every session made through
+    the identity ends with it. The list marks that identity, so the page can say so first, and the unlink's answer
+    says the caller's own session ended, so the page signs out with a sentence instead of reading the list again."""
+    alice = _user()
+    p = _provider(name="contoso", label="Contoso", policy=ONE_STEP)
+    q = _provider(name="fabrikam", label="Fabrikam", policy=ONE_STEP)
+    through, other = _identity(alice, p, subject="subject-1"), _identity(alice, q, subject="subject-1")
+    h = Harness(monkeypatch, [alice], [p, q], identities=[through, other])
+    session_id = _signed_in_through(h, alice, p, "subject-1")
+    marked = {i["provider_id"]: i["this_session"] for i in _listed(h)["identities"]}
+    # The same subject at another provider is another identity.
+    assert marked == {str(p.id): True, str(q.id): False}
+    # A session no provider's sign-in made marks none.
+    h.session_claims = {"amr": ["pwd"]}
+    assert {i["this_session"] for i in _listed(h)["identities"]} == {False}
+    h.session_claims = {"amr": [], "session_token": "this-tab-token"}
+    revoked = []
+    monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: revoked.append(kw["session_ids"]) or len(kw["session_ids"]))
+    monkeypatch.setattr(h.S, "_sessions_turn", lambda db, owner: None)
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{other.id}")
+    assert status == 200 and out["ended_this_session"] is False and revoked == [], out
+    status, out, _ = _call(h.S, "DELETE", f"/users/me/identities/{through.id}")
+    assert status == 200 and out["ended_this_session"] is True and revoked == [[session_id]], out

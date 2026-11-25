@@ -2084,7 +2084,7 @@ async function _ssoResume(back) {
     if (out.kind === 'confirmed' && typeof out.then === 'string' && out.then.indexOf('unlink:') === 0) {
         // The provider confirmed the person for the unlink they asked for: it is done now, in Your account.
         openUserSettingsModal();
-        await Sso.unlinkConfirmed(out.then.slice('unlink:'.length));
+        await Sso.unlinkConfirmed(out.then.slice('unlink:'.length), out.label);
         return;
     }
     if (out.kind === 'confirmed') {

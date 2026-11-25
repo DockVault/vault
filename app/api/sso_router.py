@@ -714,6 +714,25 @@ def _a_session_is_live(db, session_ids) -> bool:
         return True
 
 
+def _came_through(db, request):
+    """The identity the current session came through at its provider, as ``(provider id, subject)`` from the
+    session's sso_sessions row, or None: a session no provider's sign-in made, or no token read. An unlink of that
+    identity ends this session too (:func:`_end_what_came_through` ends every session made through it)."""
+    from app.core.models import ActiveSession, SsoSession
+    from app.core.session_hash_utils import hash_session_token
+    from app.services import sign_in
+    token = (_session_claims(request) or {}).get("session_token")
+    if not token or not sign_in.table_present(db, "sso_sessions"):
+        return None
+    row = db.query(ActiveSession).filter(ActiveSession.session_token == hash_session_token(token)).first()
+    if row is None:
+        return None
+    kept = db.query(SsoSession).filter(SsoSession.session_id == row.id).first()
+    if kept is None or not getattr(kept, "idp_sub", None):
+        return None
+    return (str(kept.provider_id), kept.idp_sub)
+
+
 def _end_what_came_through(db, account, identity) -> int:
     """End the sessions that came through ``identity`` (its provider and its subject) and spend the sign-ins of
     ``account`` under way, in the caller's transaction. Returns how many sessions ended. Raises when it cannot:
@@ -1547,6 +1566,7 @@ async def list_my_identities(
     offered = [p for p in providers.values() if sso.usable_for(p, sso_state.LINK) is None]
     offered.sort(key=lambda p: (p.sort_order or 0, (p.label or p.name or "").lower(), str(p.id)))
     may_confirm = sso.reauth_allowed(db, current_user)        # a provider confirms only an account with no password
+    came = _came_through(db, request)
 
     def shown(identity):
         row = providers.get(str(identity.provider_id))
@@ -1558,6 +1578,8 @@ async def list_my_identities(
         # that nobody is sent to the provider for nothing.
         refusal = owners_unlink_refusal(db, current_user, identity, row)
         out["unlink_refusal"] = {"reason": refusal[0], "message": refusal[1]} if refusal is not None else None
+        # Whether this session came through it: its unlink signs the person out here too, which the page says first.
+        out["this_session"] = came is not None and came == (str(identity.provider_id), identity.subject)
         return out
     from app.core import privileged_accounts
     # An administrator's or auditor's account keeps a password of its own: a provider whose people hold none never
@@ -1810,7 +1832,8 @@ async def unlink_my_identity(
     # What came through the identity ends with it, in the same transaction: the sessions made by a sign-in through
     # it, and the sign-ins of the account under way. An unlink is the owner's answer to a link they did not make;
     # whoever was signed in through it must not stay signed in, least of all once the owner links their own
-    # identity on the same provider.
+    # identity on the same provider. This session among them, when it came through the identity: the answer says so.
+    this_session = _came_through(db, request) == (str(identity.provider_id), identity.subject)
     ended = _end_what_came_through(db, account, identity)
     db.delete(identity)
     db.commit()
@@ -1848,4 +1871,5 @@ async def unlink_my_identity(
     answer = {"removed": True, "sessions_ended": ended}
     if may_set_password:
         answer["may_set_password"] = True
+    answer["ended_this_session"] = bool(this_session)
     return answer

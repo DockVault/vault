@@ -150,3 +150,80 @@ out({ refusedOnly, oneLinkable: page() });
     assert "Link your organisation's sign-in above instead" not in refused_only["text"]
     assert one["links"] == ["Link Fabrikam"] and one["linkRefused"] == ["Contoso: " + NO_PASSWORD]
     assert "Link your organisation's sign-in above instead" in one["text"]
+
+
+def _identity(**extra):
+    fields = {"id": "i-1", "provider_id": "p-1", "provider": "Contoso", "email": None, "display_name": None,
+              "linked_at": "2026-10-01T10:00:00Z", "linked_by": "self", "last_sign_in_at": "2026-11-19T10:00:00Z",
+              "unlink_asks_provider": False, "provider_can_confirm": True, "unlink_refusal": None,
+              "this_session": False, "restores_password": False, "due_at": None}
+    fields.update(extra)
+    return fields
+
+
+def _list(*identities):
+    return json.dumps({"identities": list(identities), "providers": [], "email": None})
+
+
+SIGNED_OUT_HERE = ("You signed in this time through Contoso, so unlinking it also signs you out here and wherever you "
+                   "signed in through it.")
+SIGNED_OUT = ("You unlinked Contoso, which this session came through, so you were signed out. Sign in again another "
+              "way.")
+
+
+def test_unlinking_the_provider_this_session_came_through_says_so_first_and_signs_out_with_a_sentence():
+    got = _node(r"""
+answers['GET ' + LIST] = LISTED;
+answers['DELETE /users/me/identities/i-1'] = { removed: true, sessions_ended: 1, ended_this_session: true };
+await window.Sso.renderAccount();
+button('Unlink').click();
+await settle();
+out({ confirms, logouts, successes, asked });
+""".replace("LISTED", _list(_identity(this_session=True))))
+    assert len(got["confirms"]) == 1 and got["confirms"][0]["message"].endswith(SIGNED_OUT_HERE), got["confirms"]
+    assert got["logouts"] == [{"how": None, "reason": SIGNED_OUT}]
+    assert got["successes"] == []
+    # The list is not read again: its answer would be the 401 of a session that has ended.
+    assert got["asked"] == ["GET /users/me/identities", "DELETE /users/me/identities/i-1"]
+
+
+def test_an_identity_this_session_did_not_come_through_is_unlinked_as_before():
+    got = _node(r"""
+answers['GET ' + LIST] = LISTED;
+answers['DELETE /users/me/identities/i-1'] = { removed: true, sessions_ended: 0, ended_this_session: false };
+await window.Sso.renderAccount();
+button('Unlink').click();
+await settle();
+out({ confirms, logouts, successes, asked });
+""".replace("LISTED", _list(_identity())))
+    assert got["confirms"][0]["message"] == "Unlink Contoso? You will no longer sign in through it."
+    assert got["logouts"] == [] and got["successes"] == ["Unlinked."]
+    assert got["asked"] == ["GET /users/me/identities", "DELETE /users/me/identities/i-1", "GET /users/me/identities"]
+
+
+def test_an_unlink_confirmed_at_the_provider_names_it_and_signs_out_when_it_ended_this_session():
+    """The provider confirms the unlink with a fresh sign-in there: the page leaves for it with the provider's name
+    kept for its return, and the unlink done on the return signs out with the same sentence."""
+    got = _node(r"""
+answers['GET ' + LIST] = LISTED;
+answers['POST /users/me/identities/p-1/reauth'] = { authorization_url: 'https://idp.example.test/authorize' };
+await window.Sso.renderAccount();
+button('Unlink').click();
+await settle();
+const flow = JSON.parse(store.dv_sso_flow);
+answers['DELETE /users/me/identities/i-1'] = { removed: true, sessions_ended: 2, ended_this_session: true };
+asked.length = 0;
+await window.Sso.unlinkConfirmed('i-1', flow.label);
+await settle();
+out({ confirms, logouts, asked, flow: { label: flow.label, then: flow.then }, left });
+""".replace("LISTED", _list(_identity(this_session=True, unlink_asks_provider=True))))
+    assert got["confirms"][0]["message"].endswith(SIGNED_OUT_HERE), got["confirms"]
+    assert got["flow"] == {"label": "Contoso", "then": "unlink:i-1"}
+    assert got["left"] == ["https://idp.example.test/authorize"]
+    assert got["logouts"] == [{"how": None, "reason": SIGNED_OUT}]
+    assert got["asked"] == ["DELETE /users/me/identities/i-1"]
+
+
+def test_the_page_back_from_the_provider_hands_the_providers_name_to_the_unlink():
+    source = (ROOT / "static" / "js" / "app.js").read_text(encoding="utf-8")
+    assert "await Sso.unlinkConfirmed(out.then.slice('unlink:'.length), out.label);" in source

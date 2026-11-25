@@ -16,7 +16,7 @@
  * The fragment is taken out of the address before anything else reads it (takeReturn, called by app.js as the page
  * loads). An address the server answers is followed only when it is https (or http on this computer).
  *
- * Uses app.js's API_BASE, apiRequest, showConfirm, showError, showSuccess and _el. Builds everything with
+ * Uses app.js's API_BASE, apiRequest, logout, showConfirm, showError, showSuccess and _el. Builds everything with
  * createElement and textContent.
  */
 (function () {
@@ -252,13 +252,32 @@
     // The name a fresh sign-in is staged under to confirm an unlink (app/services/sso_sign_in.py).
     const UNLINK_CONFIRMATION = 'sso.identity.unlink';
 
-    // The unlink of an identity, once the person is back from confirming it at the provider.
-    async function unlinkConfirmed(identityId) {
-        try {
-            await apiRequest('/users/me/identities/' + encodeURIComponent(identityId), { method: 'DELETE' });
-            showSuccess('Unlinked.');
-        } catch (e) { showError((e && e.message) || 'It was not unlinked.'); }
+    // What the page does once an unlink went through. An unlink ends every session made through the identity, so
+    // when this session came through it (the answer's ended_this_session) the page signs out with a sentence: the
+    // list read again would meet a session that has ended. Another way in is left, or the unlink was refused.
+    function afterUnlink(answer, name) {
+        if (answer && answer.ended_this_session === true) {
+            logout(undefined, 'You unlinked ' + name + ', which this session came through, so you were signed out. '
+                + 'Sign in again another way.');
+            return;
+        }
+        showSuccess('Unlinked.');
         renderAccount();
+    }
+
+    // The unlink of an identity, once the person is back from confirming it at the provider. `label` is the
+    // provider's name, kept with the confirmation's flow.
+    async function unlinkConfirmed(identityId, label) {
+        const name = typeof label === 'string' && label ? label : 'the provider';
+        let answer;
+        try {
+            answer = await apiRequest('/users/me/identities/' + encodeURIComponent(identityId), { method: 'DELETE' });
+        } catch (e) {
+            showError((e && e.message) || 'It was not unlinked.');
+            renderAccount();
+            return;
+        }
+        afterUnlink(answer, name);
     }
 
     // ---------------------------------------------------------------- Your account
@@ -304,6 +323,9 @@
             unlink.setAttribute('aria-label', 'Unlink ' + (identity.provider || 'this provider'));
             unlink.addEventListener('click', async () => {
                 const name = identity.provider || 'this provider';
+                // The unlink ends every session made through the identity, this one too when it came through it.
+                const signsOut = identity.this_session === true ? ' You signed in this time through ' + name
+                    + ', so unlinking it also signs you out here and wherever you signed in through it.' : '';
                 if (identity.unlink_asks_provider) {
                     // The provider confirms the unlink with a fresh sign-in there: the page goes to the provider
                     // and unlinks once it is back (app.js, resume).
@@ -312,22 +334,26 @@
                         return;
                     }
                     const go = await showConfirm('Unlink ' + name + '? You will no longer sign in through it. To '
-                        + 'confirm it is you, ' + name + ' asks you to sign in there once more first.',
+                        + 'confirm it is you, ' + name + ' asks you to sign in there once more first.' + signsOut,
                         'Unlink single sign-on', null, 'Continue');
                     if (!go) return;
                     unlink.disabled = true;
-                    try { await startConfirm(identity.provider_id, UNLINK_CONFIRMATION, 'unlink:' + identity.id); }
+                    try { await startConfirm(identity.provider_id, UNLINK_CONFIRMATION, 'unlink:' + identity.id, name); }
                     catch (e) { unlink.disabled = false; showError((e && e.message) || 'It could not be started.'); }
                     return;
                 }
                 const ok = await showConfirm('Unlink ' + name + '? You will no longer '
-                    + 'sign in through it.', 'Unlink single sign-on', null, 'Unlink');
+                    + 'sign in through it.' + signsOut, 'Unlink single sign-on', null, 'Unlink');
                 if (!ok) return;
+                let answer;
                 try {
-                    await apiRequest('/users/me/identities/' + encodeURIComponent(identity.id), { method: 'DELETE' });
-                    showSuccess('Unlinked.');
-                } catch (e) { showError((e && e.message) || 'It was not unlinked.'); }
-                renderAccount();
+                    answer = await apiRequest('/users/me/identities/' + encodeURIComponent(identity.id), { method: 'DELETE' });
+                } catch (e) {
+                    showError((e && e.message) || 'It was not unlinked.');
+                    renderAccount();
+                    return;
+                }
+                afterUnlink(answer, name);
             });
             row.appendChild(unlink);
             body.appendChild(row);
