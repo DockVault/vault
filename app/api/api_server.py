@@ -12265,11 +12265,21 @@ def _passkey_algorithm_check(db, user, row) -> None:
     if not usable:
         raise ws.Refused("algorithm_not_allowed", "the key's algorithm is no longer accepted")
     if in_grace:
+        # Named, with its algorithm and the day it stops: someone with several keys of the algorithm was told the
+        # same sentence for each, and could not tell which key to replace, or by when. Told once for each removal
+        # of the algorithm (the day is in the key of the notice), however often the key is used.
+        label = row.label or "Passkey"
+        alg = _PASSKEY_ALG_NAMES.get(row.cose_alg)
+        uses = f"uses {alg}, a signature algorithm" if alg else "uses a signature algorithm"
         try:
-            _notify_users([str(user.id)], "security", title="One of your passkeys needs replacing",
-                          body=("The signature algorithm one of your passkeys uses is no longer accepted by this vault. "
-                                "It still signs you in for 30 days from the change; register a new passkey before then."),
-                          target="#profile", dedup_prefix=f"passkey_alg_grace:{row.id}")
+            until = webauthn_settings.algorithm_accepted_until(db, row.cose_alg)
+            ends = (f"It still signs you in until {_cc_date(until)}" if until else
+                    f"It stops signing you in {webauthn_settings.ALG_GRACE_DAYS} days after the change")
+            _notify_users([str(user.id)], "security", title=f"Your passkey \"{label}\" needs replacing",
+                          body=(f"Your passkey \"{label}\" {uses} this vault no longer accepts. {ends}; add a new "
+                                "passkey before then, then remove this one."),
+                          target="#profile",
+                          dedup_prefix=f"passkey_alg_grace:{row.id}" + (f":{until.date().isoformat()}" if until else ""))
         except Exception as e:      # noqa: BLE001
             print(f"⚠ passkey notice skipped: {type(e).__name__}")
 
