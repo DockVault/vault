@@ -1514,8 +1514,14 @@ def test_the_requested_acr_rides_in_the_authorization_request_and_the_test_repor
 def test_a_privileged_account_never_links_itself_to_a_password_less_provider(monkeypatch):
     root, p = _user("root", role="admin"), _provider(policy={"sso_password_login": "disabled"})
     h = Resolving(monkeypatch, [root], [p])
+    # Refused at the start, before anybody is sent to the provider (tests/test_sso_identities_list.py).
+    status, out = h.start_link(p)
+    assert status == 409 and out["detail"]["reason"] == "privileged_on_password_less", out
+    # And on the return, where the provider came to hold its people to no password while the person was there.
+    p.policy = {"sso_password_login": "allowed"}
     status, out = h.start_link(p)
     assert status == 200, out
+    p.policy = {"sso_password_login": "disabled"}
     state, _ = h.state_of(out["authorization_url"])
     status, location, _ = h.callback(p, state)
     assert location == "/#sso-error=privileged_on_password_less", location

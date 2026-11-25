@@ -1558,13 +1558,31 @@ async def list_my_identities(
         refusal = owners_unlink_refusal(db, current_user, identity, row)
         out["unlink_refusal"] = {"reason": refusal[0], "message": refusal[1]} if refusal is not None else None
         return out
+    from app.core import privileged_accounts
+    # An administrator's or auditor's account keeps a password of its own: a provider whose people hold none never
+    # takes it (sso._password_less_refusal), and its start refuses it at once (start_link).
+    privileged = privileged_accounts.kind(db, current_user) is not None
+
+    def link_refusal(p):
+        """Why the start of a link to ``p`` would be refused whatever the provider says, or None: shown in place of
+        the Link button, so that nobody is sent through a step-up and to the provider for nothing."""
+        if str(p.id) in linked:
+            return None
+        if privileged and sso_only.password_less(p):
+            return {"reason": sso.PRIVILEGED_ON_PASSWORD_LESS, "message": sso.reason_text(sso.PRIVILEGED_ON_PASSWORD_LESS)}
+        return None
+
+    def offered_one(p):
+        return {"id": str(p.id), "label": p.label or p.name, "icon": p.icon or "generic",
+                "linked": str(p.id) in linked,
+                # Linking it ends the account's password: the page says so before it starts the link. Never true of
+                # a privileged account, which such a provider never takes.
+                "ends_password": (str(p.id) not in linked and sso_only.password_less(p) and not privileged
+                                  and not getattr(current_user, "sso_only", False)),
+                "link_refusal": link_refusal(p),
+                "reauth": may_confirm and str(p.id) in linked and sso.reauth_offered(p)}
     return {"identities": [shown(i) for i in rows],
-            "providers": [{"id": str(p.id), "label": p.label or p.name, "icon": p.icon or "generic",
-                           "linked": str(p.id) in linked,
-                           # Linking it ends the account's password: the page says so before it starts the link.
-                           "ends_password": (str(p.id) not in linked and sso_only.password_less(p)
-                                             and not getattr(current_user, "sso_only", False)),
-                           "reauth": may_confirm and str(p.id) in linked and sso.reauth_offered(p)} for p in offered],
+            "providers": [offered_one(p) for p in offered],
             # The account's address, when confirming it would let a provider's sign-in find the account: the
             # page then offers the code (or says who can confirm it, where the vault sends no email).
             "email": ({"address": current_user.email, "can_send_code": bool(_api()._smtp_configured(db)),
@@ -1606,6 +1624,14 @@ async def start_link(
     if due is not None:
         raise HTTPException(status_code=409, detail={"reason": "sso_sign_in_due",
                                                      "message": sso_freshness.way_in_text(db, due)})
+    # A provider whose people hold no password never takes an administrator's or auditor's account: refused here,
+    # before the step-up is spent and the person is sent to the provider, and not only on their return.
+    from app.core import privileged_accounts
+    wanted = _provider(db, provider_id)
+    if (wanted is not None and sso_only.password_less(wanted)
+            and privileged_accounts.kind(db, current_user) is not None):
+        raise HTTPException(status_code=409, detail={"reason": sso.PRIVILEGED_ON_PASSWORD_LESS,
+                                                     "message": sso.reason_text(sso.PRIVILEGED_ON_PASSWORD_LESS)})
     client_ip = api.get_client_ip(request)
     _limit_start(client_ip)
     claims = _session_claims(request)

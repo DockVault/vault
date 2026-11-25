@@ -123,8 +123,9 @@ REASON_TEXTS = {
                          "confirm as yours. Open the invitation again and choose a password there; you can link "
                          "your organisation's sign-in from Your account afterwards."),
     ADMINISTRATOR_INVITATION: ("An administrator's invitation is accepted with a password: an administrator types it at "
-                               "every sign-in. Open the invitation again and choose a password there; you can link "
-                               "your organisation's sign-in from Your account afterwards."),
+                               "every sign-in. Open the invitation again and choose a password there. Where your "
+                               "organisation's sign-in lets accounts keep a password, you can link it from Your "
+                               "account afterwards."),
     EMAIL_REQUIRED: ("Your organisation's sign-in did not provide a verified email address, and this vault requires "
                      "one for a new account. Ask your administrator."),
     ACCOUNT_LIMIT: "This vault cannot take another account right now. Ask your administrator.",

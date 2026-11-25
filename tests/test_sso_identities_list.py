@@ -36,3 +36,44 @@ def test_a_provider_without_a_sign_in_button_is_offered_for_a_link_and_one_that_
     # And the link of the button-less provider starts.
     status, out = h.start_link(hidden)
     assert status == 200 and out["authorization_url"], out
+
+
+def test_an_administrator_is_told_why_a_password_less_provider_cannot_be_linked_and_its_start_is_refused_at_once(
+        monkeypatch):
+    """An administrator's or auditor's account keeps a password of its own, so a provider whose people hold none never
+    takes it. The list says so in place of the link, and says nothing of a password that would stop; the start
+    refuses at once, before the step-up is spent and before anybody is sent to the provider."""
+    from app.services import sso_sign_in as sso
+    root = _user("root", role="admin")
+    password_less = _provider(name="no-password", label="No password", policy={"sso_password_login": "disabled"})
+    keeps = _provider(name="keeps", label="Keeps")
+    h = Harness(monkeypatch, [root], [password_less, keeps])
+    offered = _offered(_listed(h))
+    refused = offered[str(password_less.id)]
+    assert refused["linked"] is False and refused["ends_password"] is False
+    assert refused["link_refusal"] == {"reason": "privileged_on_password_less",
+                                       "message": sso.reason_text(sso.PRIVILEGED_ON_PASSWORD_LESS)}
+    assert offered[str(keeps.id)]["link_refusal"] is None
+    status, out = h.start_link(password_less)
+    assert status == 409 and out["detail"] == refused["link_refusal"], out
+    assert "authorization_url" not in out and h.step_ups == []
+    assert not [key for key in h.redis.rows if key.startswith("sso:state:")]       # nobody is sent to the provider
+    # A provider that lets its people keep a password is linked as before.
+    status, out = h.start_link(keeps)
+    assert status == 200 and out["authorization_url"] and h.step_ups == ["account.second_factor"], out
+
+
+def test_an_account_that_is_not_privileged_is_still_told_that_a_password_less_provider_ends_its_password(monkeypatch):
+    alice = _user()
+    password_less = _provider(name="no-password", label="No password", policy={"sso_password_login": "disabled"})
+    h = Harness(monkeypatch, [alice], [password_less])
+    offered = _offered(_listed(h))[str(password_less.id)]
+    assert offered["ends_password"] is True and offered["link_refusal"] is None
+
+
+def test_an_administrators_invitation_says_a_provider_is_linked_afterwards_only_where_it_lets_accounts_keep_a_password():
+    from app.services import sso_sign_in as sso
+    said = sso.reason_text(sso.ADMINISTRATOR_INVITATION)
+    assert said.endswith("Where your organisation's sign-in lets accounts keep a password, you can link it from Your "
+                         "account afterwards."), said
+    assert "you can link your organisation's sign-in from Your account afterwards" not in said

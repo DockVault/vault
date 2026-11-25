@@ -333,6 +333,17 @@
             body.appendChild(row);
         });
         linkable.forEach((provider) => {
+            const refusal = provider.link_refusal;
+            if (refusal && typeof refusal.message === 'string' && refusal.message) {
+                // The server would refuse the start whatever the provider says: its reason is said in place of the
+                // button, so nobody is sent through a step-up and to the provider for nothing.
+                const said = _el('p', 'text-secondary text-sm identity-link-refused',
+                    (provider.label || 'A provider') + ': ' + refusal.message);
+                said.dataset.provider = provider.id;
+                if (typeof refusal.reason === 'string') said.dataset.reason = refusal.reason;
+                body.appendChild(said);
+                return;
+            }
             const link = _el('button', 'btn btn-secondary btn-sm mr-sm mb-sm identity-link', 'Link ' + (provider.label || 'a provider'));
             link.type = 'button';
             link.dataset.provider = provider.id;
