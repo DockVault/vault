@@ -745,7 +745,8 @@ def _end_what_a_logout_names(db, row_id, scope, claims, client_ip):
     from app.core.models import SsoSession
     invalid = JSONResponse(status_code=400, content={"error": "invalid_request"})
     failed = JSONResponse(status_code=501, content={"error": "logout_failed"})
-    sid, sub = claims.get("sid"), claims.get("sub")
+    # The session id in the form the sign-in kept it in (a long one as its hash), so the two meet.
+    sid, sub = sso.kept_sid(claims.get("sid")), claims.get("sub")
     query = db.query(SsoSession).filter(SsoSession.provider_id == row_id)
     if isinstance(sid, str) and sid:
         query, by = query.filter(SsoSession.idp_sid == sid), "sid"

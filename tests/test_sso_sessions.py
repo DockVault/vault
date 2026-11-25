@@ -1375,3 +1375,55 @@ def test_every_busy_refusal_of_a_provider_sign_in_is_the_one_answer_with_the_wai
     import re
     for raised in re.finditer(r"raise HTTPException\(status_code=503.*?\) from None", source, re.S):
         assert "Retry-After" in raised.group(0), raised.group(0)
+
+
+@pytest.mark.parametrize("length", [1, 255, 256, 300, 4000])
+def test_a_providers_session_id_of_any_length_is_kept_and_its_logout_finds_the_session(monkeypatch, length):
+    """OpenID Connect sets no limit on a session id, and the column it is kept in has one. Kept whole, an id
+    longer than the column failed the commit of every sign-in through that provider. A long id is kept as its
+    hash, at the sign-in and at the logout alike: the session is recorded, the logout that names it ends it and
+    no other, and a sign-in held while the logout came in is refused."""
+    import hashlib
+    from app.core import sso_state
+    from app.core.models import SsoSession
+    from app.services import sso_sign_in
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    sid = ("s" * length)[:-1] + "x" if length > 1 else "x"
+    other = sid[:-1] + "y"                              # differs in its last character only
+    kept = sso_sign_in.kept_sid(sid)
+    assert len(kept) <= SsoSession.__table__.c.idp_sid.type.length == sso_sign_in.SID_WIDTH == 255
+    if length <= 255:
+        assert kept == sid
+    else:
+        assert kept == "sha256:" + hashlib.sha256(sid.encode()).hexdigest() and len(kept) == 71
+    _signed_in(h, p, sid=sid)
+    _signed_in(h, p, sid=other)
+    waiting, _ = _sign_in(h, p, sid=sid)
+    assert sorted(r.idp_sid for r in h.sso_sessions()) == sorted([kept, sso_sign_in.kept_sid(other)])
+    assert kept != sso_sign_in.kept_sid(other)
+    status, body = h.logout(p, h.logout_token(sid=sid, sub="subject-1"))
+    assert status == 200 and body == {}, body
+    ended = [s for s in h.active_sessions() if not s.is_active]
+    assert len(ended) == 1 and [r for r in h.sso_sessions() if r.session_id == ended[0].id][0].idp_sid == kept
+    assert sso_state.logged_out_since(scope=str(p.id), sid=kept) is not None
+    assert h.finish(waiting)[0] == 401                  # the sign-in held meanwhile came through that session
+
+
+def test_what_is_no_session_id_is_kept_as_none():
+    from app.services import sso_sign_in
+    for nothing in (None, "", 7, True, ["s"], {"sid": "s"}, b"s"):
+        assert sso_sign_in.kept_sid(nothing) is None, nothing
+    # Another script: counted in characters, as the column counts them, and hashed over its UTF-8.
+    import hashlib
+    wide = "\u00fc" * 255
+    assert sso_sign_in.kept_sid(wide) == wide
+    longer = "\u00fc" * 256
+    assert sso_sign_in.kept_sid(longer) == "sha256:" + hashlib.sha256(longer.encode("utf-8")).hexdigest()
+    # Both places an id comes in at make the one form.
+    import inspect
+    from app.api import sso_router
+    assert 'sid = kept_sid(claims.get("sid"))' in inspect.getsource(sso_sign_in)
+    assert 'sso.kept_sid(claims.get("sid"))' in inspect.getsource(sso_router._end_what_a_logout_names)
+    for module in (sso_sign_in, sso_router):
+        assert inspect.getsource(module).count('claims.get("sid")') == 1, module

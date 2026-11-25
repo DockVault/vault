@@ -303,7 +303,7 @@ def verified_answer(row, state: sso_state.LoginState, *, code: str, fetch=None, 
     amr = claims.get("amr")
     amr = [a for a in amr if isinstance(a, str)] if isinstance(amr, list) else []
     acr = claims.get("acr")
-    sid = claims.get("sid")
+    sid = kept_sid(claims.get("sid"))
     hosted = claims.get(claim_name(row, "domain", "hd"))
     groups_name = claim_name(row, "groups", "groups")
     raw_groups = claims.get(groups_name)
@@ -314,9 +314,27 @@ def verified_answer(row, state: sso_state.LoginState, *, code: str, fetch=None, 
     return ProviderAnswer(claims=claims, subject=str(claims["sub"]), issuer=str(claims["iss"]), tenant_id=tenant,
                           email=email, email_verified=claims.get(verified_name) is True, display_name=display,
                           auth_time=auth_time, amr=amr, acr=acr if isinstance(acr, str) else None,
-                          sid=sid if isinstance(sid, str) else None, id_token=tokens.id_token,
+                          sid=sid, id_token=tokens.id_token,
                           hosted_domain=hosted.strip()[:255] if isinstance(hosted, str) and hosted.strip() else None,
                           groups=groups, groups_overage=overage)
+
+
+# The width of the column a provider's session id is kept in (sso_sessions.idp_sid).
+SID_WIDTH = 255
+
+
+def kept_sid(sid) -> Optional[str]:
+    """A provider's session id as the vault keeps it, or None for what is no session id. OpenID Connect sets no
+    limit on its length and the column has one: an id that fits is kept as it is, a longer one as its SHA-256 in
+    a marked form. Kept whole, a long id failed the commit of every sign-in through that provider, and an account
+    with no password it can type had no other way in. The same form is made wherever an id comes in (a sign-in's
+    ID token, a logout token), so a provider's logout still finds the session it names."""
+    if not isinstance(sid, str) or not sid:
+        return None
+    if len(sid) <= SID_WIDTH:
+        return sid
+    import hashlib
+    return "sha256:" + hashlib.sha256(sid.encode("utf-8")).hexdigest()
 
 
 def _as_time(value) -> Optional[datetime]:
