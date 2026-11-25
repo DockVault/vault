@@ -8228,6 +8228,11 @@ function renderUserPasskeys(userId, keys, root = document) {
         if (day(key.created_at)) bits.push('added ' + day(key.created_at));
         bits.push(key.last_used_at ? 'last used ' + day(key.last_used_at) : 'never used');
         bits.push(key.synced ? 'synced between devices' : 'bound to one device');
+        // A key counts as one that checks the person from its first use that does: until then, said here. One that is
+        // no factor for that reason says so on its own line.
+        if (key.usable !== false && key.user_verified === false) {
+            bits.push('has not checked the person with a PIN, fingerprint or face yet');
+        }
         if (key.provisional && day(key.provisional_until)) bits.push('provisional until ' + day(key.provisional_until));
         meta.appendChild(_el('span', 'ssh-key-by text-tertiary text-xs', bits.join(' · ')));
         // The key's name and dates, and under them why it signs nobody in now, or until when its algorithm counts.
@@ -8406,6 +8411,7 @@ async function renderAccountPasskeys() {
         const bits = ['Added ' + (_passkeyWhen(key.created_at) || 'earlier'),
             key.last_used_at ? 'last used ' + _passkeyWhen(key.last_used_at) : 'never used',
             key.synced ? 'synced across devices' : 'on one device'];
+        if (key.usable !== false && key.user_verified === false) bits.push('has not asked for your PIN, fingerprint or face yet');
         text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
         // A key that no longer signs its owner in says so, and what to do; one whose algorithm runs out, until when.
         const state = _passkeyStateText(key, true);

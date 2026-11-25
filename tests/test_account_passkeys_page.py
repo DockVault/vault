@@ -157,3 +157,23 @@ out(said);
         "Not usable: it has never checked the person with a PIN, fingerprint or face, and this vault asks for that."]
     assert owner[4] is None and admin[4] is None
     assert got["usable"] == [None, None]
+
+
+def test_a_usable_key_that_never_checked_the_person_says_so_with_its_dates():
+    """A key that has not asked for its owner's PIN, fingerprint or face yet is usable while the vault does not ask
+    for that, and counts as one that does from its first use that does. Its dates say so. A key that is no factor for
+    that very reason says it in its own line, not twice; a key the server says nothing of is shown as before."""
+    got = account_node(r"""
+answers['GET /users/me/passkeys'] = LIST([
+    KEY('tablet', { user_verified: false }),
+    KEY('old', { usable: false, not_usable_because: 'passkeys_without_verification', user_verified: false }),
+    { id: 'plain', label: 'plain', created_at: '2026-03-02T10:00:00Z', last_used_at: null, synced: true }]);
+await renderAccountPasskeys();
+out({ rows: rows(), added: day('2026-03-02T10:00:00Z') });
+""")
+    dates = {row["id"]: row["lines"][1] for row in got["rows"]}
+    added = got["added"]
+    assert dates == {
+        "tablet": f"Added {added} · never used · on one device · has not asked for your PIN, fingerprint or face yet",
+        "old": f"Added {added} · never used · on one device",
+        "plain": f"Added {added} · never used · synced across devices"}

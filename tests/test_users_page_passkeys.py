@@ -129,7 +129,17 @@ await loadUserPasskeys('u-carol');
 // The dates as the viewer's own locale writes them, for the expected lines.
 const day = (v) => new Date(v).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 const days = ['2026-03-02T10:00:00Z', '2026-06-01T10:00:00Z', '2026-06-10T10:00:00Z', '2026-06-24T10:00:00Z'].map(day);
-out({ listed, none, failed: host.textContent, asked: asked.map((a) => a.path), days });
+const failed = host.textContent;
+// A usable key that has never checked the person with a PIN, fingerprint or face (it counts as one that did from its
+// first use that does), and a key that is no factor for that reason (its own line says so, not the dates).
+renderUserPasskeys('u-carol', [
+    { id: 'k-3', label: 'tablet', created_at: '2026-03-02T10:00:00Z', last_used_at: null, synced: false,
+      provisional: false, provisional_until: null, usable: true, user_verified: false },
+    { id: 'k-4', label: 'old', created_at: '2026-03-02T10:00:00Z', last_used_at: null, synced: false,
+      provisional: false, provisional_until: null, usable: false, not_usable_because: 'passkeys_without_verification',
+      user_verified: false }]);
+const meta = host.querySelectorAll('.user-passkey-item').map((item) => item.querySelector('.ssh-key-meta').textContent);
+out({ listed, none, failed, asked: asked.map((a) => a.path), days, meta });
 """)
     first, second = got["listed"]
     added, used, added2, until = got["days"]
@@ -140,6 +150,9 @@ out({ listed, none, failed: host.textContent, asked: asked.map((a) => a.path), d
                       "remove": ["Remove", "Remove the passkey with no name"]}
     assert got["none"] == "No passkeys." and got["failed"] == "Could not load the passkeys."
     assert got["asked"] == ["/users/u-carol/passkeys"] * 3
+    assert got["meta"] == [f"tabletadded {added} · never used · bound to one device · has not checked the person with "
+                           "a PIN, fingerprint or face yet",
+                           f"oldadded {added} · never used · bound to one device"]
 
 
 def test_a_removal_says_what_it_does_before_it_is_sent_and_the_list_is_read_again():
