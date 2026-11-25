@@ -656,7 +656,14 @@ def test_a_page_opened_at_another_address_says_where_passkeys_work_and_offers_no
     page.goto("/")
     note = page.locator("#login-origin-note")
     expect(note).to_be_visible(timeout=8000)
-    expect(note).to_have_text(f"Signing in with a passkey works at {ELSEWHERE}. Open the vault there to use it.")
+    # The vault's address may be the wrong one: where this page's address could serve passkeys in its place (a host
+    # name over https, or localhost), the note says what to tell the administrator.
+    here, host = page.evaluate("location.origin"), page.evaluate("location.hostname")
+    told = ((here.startswith("https://") or host == "localhost")
+            and not (host.startswith("[") or host.replace(".", "").isdigit()))
+    tell = (f" If nothing answers there, tell your administrator: the vault's address is set to {ELSEWHERE}, and you "
+            f"opened it at {here}.") if told else ""
+    expect(note).to_have_text(f"Signing in with a passkey works at {ELSEWHERE}. Open the vault there to use it." + tell)
     assert note.locator("a").get_attribute("href") == ELSEWHERE + "/"
     expect(page.locator("#passkey-sign-in-btn")).to_be_hidden()
     expect(page.locator("#login-form")).to_be_visible()
@@ -666,7 +673,7 @@ def test_a_page_opened_at_another_address_says_where_passkeys_work_and_offers_no
     expect(page.locator("#dashboard-screen")).to_be_visible(timeout=15000)
     _open_account(page)
     expect(page.locator("#us-passkeys-body")).to_contain_text(
-        f"Passkeys are added and used at {ELSEWHERE}. Open the vault there to add one.", timeout=8000)
+        f"Passkeys are added and used at {ELSEWHERE}. Open the vault there to add one." + tell, timeout=8000)
     expect(page.locator("#us-passkey-add")).to_have_count(0)
 
 

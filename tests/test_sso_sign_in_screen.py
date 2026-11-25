@@ -67,8 +67,8 @@ APP_JS = ROOT / "static" / "js" / "app.js"
 SSO_JS = ROOT / "static" / "js" / "sso.js"
 # The sign-in screen's single sign-on, as shipped; a name that is not in app.js is left out (and its test fails on
 # what the page does, not on a missing name).
-_SHIPPED = ("_el", "_showReasonNote", "_showLoginError", "_signInOriginElsewhere", "_noteSignInOrigin", "_ssoReturnTo",
-            "_initSsoSignIn", "_ssoStartHandOut", "_ssoOnSignInScreen", "_ssoResume")
+_SHIPPED = ("_el", "_showReasonNote", "_showLoginError", "_signInOriginElsewhere", "_addressFixable", "_noteSignInOrigin",
+            "_ssoReturnTo", "_initSsoSignIn", "_ssoStartHandOut", "_ssoOnSignInScreen", "_ssoResume")
 _STATE = ("_hashForSignIn", "_passwordStage")
 _CONSTANTS = ("SSO_BACK_SIGNED_OUT", "_SSO_BACK_OF_A_SESSION")
 
@@ -315,3 +315,37 @@ out({ resumed, refused: note() });
 """, _server_reasons())
     assert got["resumed"] == {"text": "", "shown": False}
     assert got["refused"] == {"text": _server_reasons()["busy"], "shown": True}
+
+
+# --------------------------------------------------------------------------- a page opened at another address
+
+THERE = "https://vault.example.test"
+
+
+@pytest.mark.parametrize("here, told", [
+    ({"origin": "http://localhost:8200", "hostname": "localhost", "protocol": "http:"}, True),
+    ({"origin": "https://vault.example.test:8443", "hostname": "vault.example.test", "protocol": "https:"}, True),
+    # No passkey and no provider's sign-in can work at an IP address or a name over plain http: that address is no
+    # fix for the vault's, and nothing points there.
+    ({"origin": "http://192.168.1.20:8200", "hostname": "192.168.1.20", "protocol": "http:"}, False),
+    ({"origin": "https://[fd00::1]:8443", "hostname": "[fd00::1]", "protocol": "https:"}, False),
+    ({"origin": "http://vault.lan", "hostname": "vault.lan", "protocol": "http:"}, False),
+], ids=["localhost", "a name over https", "an IP address", "an IPv6 address", "a name over http"])
+def test_a_page_opened_at_another_address_says_who_can_fix_the_vaults_address(here, told):
+    """The vault's address (the first ALLOWED_HOSTS entry) may be the wrong one, as on a vault set up on another port
+    with a bare host name: the page then sends people to an address where nothing answers. The note says what to
+    tell the administrator, where the address the page was opened at could be the vault's."""
+    got = _node(r"""
+Object.assign(location, PAGE_AT);
+_noteSignInOrigin({ methods: { passkeys: true, origin: VAULT_AT } }, ['a passkey']);
+const elsewhere = { text: originNote.textContent, hidden: originNote.hidden,
+                    link: originNote.querySelector('a') && originNote.querySelector('a').href };
+_noteSignInOrigin({ methods: { passkeys: true, origin: location.origin } }, ['a passkey']);
+out({ elsewhere, same: { text: originNote.textContent, hidden: originNote.hidden } });
+""".replace("PAGE_AT", json.dumps(here)).replace("VAULT_AT", json.dumps(THERE)))
+    said = f"Signing in with a passkey works at {THERE}. Open the vault there to use it."
+    if told:
+        said += (f" If nothing answers there, tell your administrator: the vault's address is set to {THERE}, and you "
+                 f"opened it at {here['origin']}.")
+    assert got["elsewhere"] == {"text": said, "hidden": False, "link": THERE + "/"}
+    assert got["same"] == {"text": "", "hidden": True}

@@ -741,8 +741,16 @@ def test_a_page_opened_at_another_address_offers_no_provider_and_follows_a_hand_
     page.route("https://vault.example.test/**", there)
     page.route(re.compile(r".*/auth/sso/[0-9a-f-]{36}/start$"), start)
     page.goto("/")
+    # The vault's address may be the wrong one: where this page's address could serve in its place (a host name over
+    # https, or localhost), the note says what to tell the administrator.
+    here, host = page.evaluate("location.origin"), page.evaluate("location.hostname")
+    told = ((here.startswith("https://") or host == "localhost")
+            and not (host.startswith("[") or host.replace(".", "").isdigit()))
+    tell = (f" If nothing answers there, tell your administrator: the vault's address is set to {elsewhere}, and you "
+            f"opened it at {here}.") if told else ""
     expect(page.locator("#login-origin-note")).to_have_text(
-        f"Signing in with your organisation's sign-in works at {elsewhere}. Open the vault there to use it.", timeout=15000)
+        f"Signing in with your organisation's sign-in works at {elsewhere}. Open the vault there to use it." + tell,
+        timeout=15000)
     expect(page.locator("#sso-sign-in .sso-sign-in-btn")).to_have_count(0)
     page.goto(f"/?sso={PROVIDER}")
     for _ in range(100):

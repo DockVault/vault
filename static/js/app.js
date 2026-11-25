@@ -1972,6 +1972,17 @@ function _signInOriginElsewhere(policy) {
     return origin && /^https?:\/\//.test(origin) && origin !== location.origin ? origin : '';
 }
 
+// Whether the address this page was opened at could serve as the vault's own for passkeys: a host name (not an IP
+// address, for which a browser makes no passkey) over https, or localhost. The vault's address is the first
+// ALLOWED_HOSTS entry, and may be the wrong one (a vault set up on another port with a bare host name): where this
+// page's address could serve in its place, the notes that send people to the vault's address say who can change it.
+// An address that could carry single sign-on alone (an IP address over https) is not suggested.
+function _addressFixable() {
+    const host = String(location.hostname || '');
+    if (!host || /^\d+(\.\d+){3}$/.test(host) || host.startsWith('[')) return false;
+    return location.protocol === 'https:' || host === 'localhost';
+}
+
 // Says where the ways to sign in named in ``kinds`` work, with a link there, when that is not this page's address.
 function _noteSignInOrigin(policy, kinds) {
     const note = document.getElementById('login-origin-note');
@@ -1985,6 +1996,10 @@ function _noteSignInOrigin(policy, kinds) {
     note.appendChild(document.createTextNode(`Signing in with ${kinds.join(' or ')} works at `));
     note.appendChild(link);
     note.appendChild(document.createTextNode('. Open the vault there to use it.'));
+    if (_addressFixable()) {
+        note.appendChild(document.createTextNode(' If nothing answers there, tell your administrator: the vault\'s '
+            + 'address is set to ' + elsewhere + ', and you opened it at ' + location.origin + '.'));
+    }
 }
 
 // The view a sign-in through a provider brings the page back to: the hash this page was loaded with (a link to Your
@@ -8480,9 +8495,18 @@ async function renderAccountPasskeys() {
     }
     body.appendChild(list);
     if (typeof data.origin === 'string' && data.origin && data.origin !== location.origin) {
-        // A passkey is made for one address: here the browser would refuse, with words that say nothing of why.
-        body.appendChild(_el('p', 'text-secondary text-sm', 'Passkeys are added and used at ' + data.origin
-            + '. Open the vault there to add one.'));
+        // A passkey is made for one address: here the browser would refuse, with words that say nothing of why. The
+        // vault's address may be the wrong one: where this page's could serve in its place, who can change it is said.
+        const note = _el('p', 'text-secondary text-sm', 'Passkeys are added and used at ' + data.origin
+            + '. Open the vault there to add one.');
+        if (_addressFixable()) {
+            note.appendChild(document.createTextNode(currentUser && currentUser.role === 'admin'
+                ? ' If people open the vault at ' + location.origin + ', put that address first in ALLOWED_HOSTS in '
+                  + '.env and run python dockvault.py restart.'
+                : ' If nothing answers there, tell your administrator: the vault\'s address is set to ' + data.origin
+                  + ', and you opened it at ' + location.origin + '.'));
+        }
+        body.appendChild(note);
         return;
     }
     if (!(window.Passkeys && Passkeys.supported())) {

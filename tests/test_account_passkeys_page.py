@@ -177,3 +177,40 @@ out({ rows: rows(), added: day('2026-03-02T10:00:00Z') });
         "tablet": f"Added {added} · never used · on one device · has not asked for your PIN, fingerprint or face yet",
         "old": f"Added {added} · never used · on one device",
         "plain": f"Added {added} · never used · synced across devices"}
+
+
+THERE = "https://vault.example.test"
+BASE = f"Passkeys are added and used at {THERE}. Open the vault there to add one."
+
+
+@pytest.mark.parametrize("here, role, more", [
+    ("https://vault.example.test:8443", "admin",
+     " If people open the vault at https://vault.example.test:8443, put that address first in ALLOWED_HOSTS in .env "
+     "and run python dockvault.py restart."),
+    ("https://vault.example.test:8443", "user",
+     " If nothing answers there, tell your administrator: the vault's address is set to https://vault.example.test, "
+     "and you opened it at https://vault.example.test:8443."),
+    ("http://localhost:8200", "admin",
+     " If people open the vault at http://localhost:8200, put that address first in ALLOWED_HOSTS in .env and run "
+     "python dockvault.py restart."),
+    # No passkey can be made at an IP address, nor at a name over plain http: that address is no fix.
+    ("http://192.168.1.20:8200", "admin", ""),
+    ("http://vault.lan", "user", ""),
+], ids=["administrator", "anyone else", "administrator at localhost", "an IP address", "a name over http"])
+def test_your_account_at_another_address_says_who_can_fix_the_vaults_address(here, role, more):
+    """The vault's address (the first ALLOWED_HOSTS entry) may be the wrong one: an administrator is told the setting
+    and the command that apply a change to it, anyone else what to tell the administrator; the Add button stays
+    away, as before."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(here)
+    got = account_node(r"""
+Object.assign(location, { origin: PAGE_AT, hostname: PAGE_HOST, protocol: PAGE_PROTOCOL });
+currentUser = { id: 'me', username: 'alice', role: ACCOUNT_ROLE };
+answers['GET /users/me/passkeys'] = LIST([KEY('works')], { origin: VAULT_AT });
+await renderAccountPasskeys();
+out({ said: body.children.filter((c) => c.localName === 'p').map((p) => p.textContent),
+      add: body.querySelectorAll('#us-passkey-add').length });
+""".replace("PAGE_AT", json.dumps(here)).replace("PAGE_HOST", json.dumps(parts.hostname))
+                       .replace("PAGE_PROTOCOL", json.dumps(parts.scheme + ":"))
+                       .replace("ACCOUNT_ROLE", json.dumps(role)).replace("VAULT_AT", json.dumps(THERE)))
+    assert got == {"said": [BASE + more], "add": 0}, got
