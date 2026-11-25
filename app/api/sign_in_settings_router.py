@@ -118,24 +118,52 @@ def put_sign_in_setting(setting: str, body: SignInValue, request: Request,
     return {"status": outcome.status, "setting": registry.describe([key])[0]}
 
 
+def _keys_of(db, codes) -> dict:
+    """{owner's id: [label, ...]} of the passkeys in use (not retired) whose signature algorithm is one of ``codes``,
+    oldest first, each label as Your account shows it ("Passkey" for a key with no name)."""
+    from datetime import datetime
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not codes or not has_table(db, WebAuthnCredential.__tablename__):
+        return {}
+    held = db.query(WebAuthnCredential).filter(WebAuthnCredential.retired_at.is_(None)).all()
+    owners = {}
+    for key in sorted(held, key=lambda k: getattr(k, "created_at", None) or datetime.min):
+        if getattr(key, "cose_alg", None) in codes:
+            owners.setdefault(key.user_id, []).append(getattr(key, "label", None) or "Passkey")
+    return owners
+
+
 def _tell_the_owners_of_keys_of_a_removed_algorithm(db, removed_algs) -> None:
-    """A signature algorithm was just removed: whoever holds a passkey of it is told now that the key is accepted
-    for 30 more days and until when. The setting promised a notice to the owners; it was sent only where the key
-    was used within those days, so an owner who signed in with a password and an authenticator code meanwhile met
-    the refusal on the day after with no word before it. Best effort: the change is saved, and the key says the
-    same when it is used."""
+    """A signature algorithm was just removed: whoever holds a passkey of it is told now which of their keys it is,
+    that they are accepted for 30 more days, and until when. The setting promised a notice to the owners; it was
+    sent only where the key was used within those days, so an owner who signed in with a password and an
+    authenticator code meanwhile met the refusal on the day after with no word before it. Best effort: the change
+    is saved, and the key says the same when it is used."""
     try:
         from datetime import datetime, timedelta
         from app.api import api_server as api
-        owners = [str(owner) for owner in ws_settings.owners_of_keys_of(db, removed_algs)]
-        if owners:
-            until = (datetime.utcnow() + timedelta(days=ws_settings.ALG_GRACE_DAYS)).date().isoformat()
-            api._notify_users(owners, "security", title="One of your passkeys needs replacing",
-                              body=("The signature algorithm one of your passkeys uses is no longer accepted by "
-                                    f"this vault. That passkey still works until {until}; register a new passkey "
-                                    "before then. Your list of passkeys shows which one."),
-                              target="#profile",
-                              dedup_prefix=f"passkey_alg_removed:{','.join(sorted(removed_algs))}:{until}")
+        codes = {ws_settings.ALG_CODES[name] for name in removed_algs or () if name in ws_settings.ALG_CODES}
+        owners = _keys_of(db, codes)
+        if not owners:
+            return
+        # The day the keys stop, from the removal just recorded: the day Your account shows on each key.
+        ends = [when for when in (ws_settings.algorithm_accepted_until(db, code) for code in codes) if when]
+        until = min(ends) if ends else datetime.utcnow() + timedelta(days=ws_settings.ALG_GRACE_DAYS)
+        day = api._cc_date(until)
+        dedup = f"passkey_alg_removed:{','.join(sorted(removed_algs))}:{until.date().isoformat()}"
+        for owner, labels in owners.items():
+            named = ", ".join(f"\"{label}\"" for label in labels)
+            if len(labels) == 1:
+                title = f"Your passkey {named} needs replacing"
+                body = (f"The signature algorithm of your passkey {named} is no longer accepted by this vault. It "
+                        f"works until {day}; register a new passkey before then, then remove it.")
+            else:
+                title = f"{len(labels)} of your passkeys need replacing"
+                body = (f"The signature algorithm of your passkeys {named} is no longer accepted by this vault. They "
+                        f"work until {day}; register a new passkey before then, then remove them.")
+            api._notify_users([str(owner)], "security", title=title, body=body, target="#profile",
+                              dedup_prefix=dedup)
     except Exception as exc:  # noqa: BLE001 -- the change is saved; nothing here may undo it
         log_failure("owners of passkeys of a removed algorithm were not told", exc)
 

@@ -623,8 +623,9 @@ def test_the_owners_of_keys_of_a_removed_algorithm_are_told_when_it_is_removed(m
     router._tell_the_owners_of_keys_of_a_removed_algorithm(db, ["RS256"])
     (ids, kind, title, said, dedup), = notices
     until = (datetime.utcnow() + timedelta(days=30)).date().isoformat()
-    assert ids == [str(ann)] and kind == "security" and title == "One of your passkeys needs replacing"
-    assert f"That passkey still works until {until}; register a new passkey before then." in said
+    assert ids == [str(ann)] and kind == "security" and title == "2 of your passkeys need replacing"
+    day = S._cc_date(datetime.utcnow() + timedelta(days=30))
+    assert f"They work until {day}; register a new passkey before then, then remove them." in said
     assert dedup == f"passkey_alg_removed:RS256:{until}"
     # Nobody holds such a key: nobody is told. And a failure to tell undoes nothing.
     del notices[:]

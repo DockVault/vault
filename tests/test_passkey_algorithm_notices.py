@@ -118,3 +118,37 @@ def test_a_second_removal_of_the_same_algorithm_is_told_again(monkeypatch):
     days = [S._cc_date(when + timedelta(days=30)) for when in (first, second)]
     assert [notice["body"].split("until ")[1].split(";")[0] for notice in written.values()] == days
     assert len(written) == 2
+
+
+def test_the_owners_are_told_at_the_removal_which_of_their_keys_stop_and_on_what_day(monkeypatch):
+    """At the removal each owner of a key of the algorithm is told, once, with the day the keys stop. The notice
+    named no key ("Your list of passkeys shows which one", and the list did not) and gave the day as 2026-12-25,
+    which read as a code. It names the owner's keys of the algorithm, as Your account shows them, and writes the day
+    in words."""
+    S, ws = _api()
+    from app.api import sign_in_settings_router as router
+    from app.core.models import SystemSetting, WebAuthnCredential
+    ann, ben, cy = (types.SimpleNamespace(id=uuid.uuid4()) for _ in range(3))
+    keys = [_key(ann, "A", alg=-7), _key(ann, "B", alg=-7), _key(ann, "C", alg=-257),     # two of the removed one
+            _key(ben, None, alg=-7), _key(cy, "D", alg=-257), _key(cy, "E", alg=-7)]
+    keys[-1].retired_at = datetime(2026, 11, 1)                                               # retired: not cy's
+    db = DB({SystemSetting: [], WebAuthnCredential: keys})
+    _allowing(monkeypatch, ws, ["ES256", "RS256"])
+    ws.record_algorithm_change(db, ["ES256", "RS256"], ["RS256"])
+    _allowing(monkeypatch, ws, ["RS256"])
+    sent = []
+    monkeypatch.setattr(S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
+        sent.append((list(ids), ntype, title, body, target, dedup_prefix)) or list(ids)))
+    router._tell_the_owners_of_keys_of_a_removed_algorithm(db, ["ES256"])
+    until = ws.algorithm_accepted_until(db, -7)
+    day = S._cc_date(until)
+    dedup = f"passkey_alg_removed:ES256:{until.date().isoformat()}"
+    assert sent == [
+        ([str(ann.id)], "security", "2 of your passkeys need replacing",
+         f'The signature algorithm of your passkeys "A", "B" is no longer accepted by this vault. They work until '
+         f"{day}; register a new passkey before then, then remove them.", "#profile", dedup),
+        ([str(ben.id)], "security", 'Your passkey "Passkey" needs replacing',
+         f'The signature algorithm of your passkey "Passkey" is no longer accepted by this vault. It works until '
+         f"{day}; register a new passkey before then, then remove it.", "#profile", dedup),
+    ]
+    assert until.date().isoformat() not in sent[0][3] + sent[1][3]                        # the day in words only
