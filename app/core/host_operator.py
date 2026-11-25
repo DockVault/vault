@@ -352,6 +352,28 @@ def _wait_for_background_work(started_before, timeout=30.0):
     audit_privacy.flush_alerts()
 
 
+SETTINGS_NOT_READ = ("The vault's saved settings could not be read, so nothing was done: this tool would have "
+                     "acted on the defaults in their place. Check that the database is reachable, then run it "
+                     "again.")
+
+
+def load_the_stored_settings() -> None:
+    """Read the settings an administrator saved into this process's copy, once, before anything is asked of
+    them. The web server loads them when it starts and keeps them fresh. This tool starts no server, and the
+    registry answers from its copy alone, which nothing else on the tool's path fills: every setting was its
+    default here, whatever was saved. Passkeys were "optional" to the tool in a vault that required them, so
+    lifting the requirement for an account was refused for every account ("there is nothing to lift"), and an
+    account's passkeys were reported usable in a vault that had turned them off.
+
+    A load that fails raises nothing and leaves the copy empty. The tool then refuses, in words, rather than act
+    on the defaults."""
+    from app.core import database
+    from app.core import settings_registry as registry
+    registry.refresh(database.SessionLocal)
+    if registry.stamp() is None:
+        _refuse(SETTINGS_NOT_READ)
+
+
 def run(argv=None) -> int:
     """Do what was asked and print the answer as the last line on standard output. Everything the web
     app prints while it works (start-up notes, a mail failure) is sent to standard error instead, so
@@ -369,6 +391,7 @@ def run(argv=None) -> int:
             import app.api.api_server as api
             started_before = set(threading.enumerate())
             try:
+                load_the_stored_settings()
                 _run(args, api)
             except _Answer as done:
                 answer, code = done.obj, done.code

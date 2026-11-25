@@ -170,3 +170,84 @@ def test_the_host_lists_who_may_manage_users_without_being_an_administrator(admi
     finally:
         admin.delete_user(former["id"])
         admin.delete_user(delegate["id"])
+
+
+SIGN_IN_SETTINGS = "admin.auth_policy.write"
+
+
+def _save_passkey_setting(client, setting, value):
+    """One passkey setting saved through the Sign-in page's route, behind its step-up."""
+    r = client.post("/auth/second-factor/step-up", json={"action": SIGN_IN_SETTINGS, "password": client.password})
+    assert r.status_code == 200, r.text
+    return client.put(f"/settings/sign-in/{setting}", json={"value": value},
+                      headers={"X-Second-Factor": r.json()["receipt"]})
+
+
+def test_the_tool_acts_on_the_passkey_settings_as_they_were_saved(admin, temp_user):
+    """The tool is a process of its own, started for one answer: it reads the settings an administrator saved
+    when it starts. It read none, so to the tool passkeys were always "optional" and on, whatever the Sign-in page
+    held:
+
+      * lifting a role's passkey requirement for one account (the way out for a person whose browser cannot make
+        a passkey) was refused for every account, "there is nothing to lift";
+      * an account's passkeys were reported usable, and passkeys "on", in a vault that had turned them off.
+
+    Here the settings are saved through the page's own route in the running server, and the tool is run in the
+    container as `dockvault.py accounts` runs it."""
+    from _webauthn_softauth import SoftAuthenticator
+    uid, name = temp_user["id"], temp_user["_username"]
+    boss_account = admin.create_user(role="admin")
+    boss = ApiClient()
+    boss.login(boss_account["_username"], boss_account["_password"])
+    boss.password = boss_account["_password"]
+    saved = []
+    try:
+        page = boss.get("/settings/sign-in").json()
+        if not page["readiness"].get("usable"):
+            pytest.skip("this stack has no address a passkey can be made at (ALLOWED_HOSTS is empty)")
+        before = {row["key"]: row["value"] for row in page["settings"]}
+        if before["webauthn_mode"] != "optional" or before["webauthn_required_roles"]:
+            pytest.skip("this stack's passkey settings are not the defaults this test starts from")
+        # The person registers a passkey while passkeys are on.
+        person = signed_in(temp_user)
+        r = person.post("/users/me/passkeys/register/options", json={"current_password": temp_user["_password"]})
+        assert r.status_code == 200, r.text
+        credential = SoftAuthenticator().make_credential(r.json()["options"], BASE_URL.rstrip("/"))
+        r = person.post("/users/me/passkeys/register/verify",
+                        json={"challenge_id": r.json()["challenge_id"], "credential": credential, "label": "Laptop"})
+        assert r.status_code == 201, r.text
+        assert tool("lookup", "--username", name)["account"]["passkeys_usable"] == 1
+        assert tool("passkey-addresses")["on"] is True
+
+        # No requirement names the role: nothing to lift, and the tool says so.
+        answer = tool("clear-passkey-requirement", "--username", name, "--confirm-username", name)
+        assert answer["ok"] is False and "there is nothing to lift" in answer["error"], answer
+
+        # Required for the role "user", saved through the route. The tool lifts it for the account.
+        for setting, value in (("webauthn_required_roles", ["user"]), ("webauthn_mode", "required_for_roles")):
+            r = _save_passkey_setting(boss, setting, value)
+            assert r.status_code == 200 and r.json()["status"] == "applied", r.text
+            saved.append(setting)
+        answer = tool("clear-passkey-requirement", "--username", name, "--confirm-username", name)
+        assert answer == {"ok": True, "account": name}, answer
+        assert psql(f"SELECT passkey_requirement_cleared_at IS NOT NULL FROM users WHERE id='{uid}'") == "t"
+        rows = _audit(admin, "passkey_requirement_cleared", uid)
+        assert rows and rows[0]["username"] == HOST
+        lifted = [row["username"] for row in boss.get("/settings/sign-in").json()["requirement_lifted_for"]]
+        assert name in lifted, lifted
+        # Lifted already: said as that, not as "nothing to lift".
+        answer = tool("clear-passkey-requirement", "--username", name, "--confirm-username", name)
+        assert answer["ok"] is False and "already lifted" in answer["error"], answer
+
+        # Passkeys turned off in the page: the tool reports none usable, and "off".
+        r = _save_passkey_setting(boss, "webauthn_mode", "off")
+        assert r.status_code == 200 and r.json()["status"] == "applied", r.text
+        assert tool("lookup", "--username", name)["account"]["passkeys_usable"] == 0
+        assert tool("passkey-addresses")["on"] is False
+    finally:
+        for setting in ("webauthn_mode", "webauthn_required_roles"):
+            if setting in saved:
+                restored = _save_passkey_setting(boss, setting, None)
+                assert restored.status_code == 200, restored.text
+        admin.delete_user(boss_account["id"])
+

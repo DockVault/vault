@@ -24,8 +24,8 @@ from app.core import audit_privacy  # noqa: E402
 from app.core import database  # noqa: E402
 from app.core import host_operator  # noqa: E402
 from app.core.config import settings  # noqa: E402
-from app.core.models import (AuditLog, File, Folder, Group, RoleEnum, SystemSetting, User,  # noqa: E402
-                             Vault, user_groups)
+from app.core.models import (AuditLog, File, Folder, Group, ManagedSetting, RoleEnum, SystemSetting,  # noqa: E402
+                             User, Vault, user_groups)
 
 pytestmark = pytest.mark.unit
 
@@ -33,7 +33,7 @@ KEYS = {"zero_knowledge_enabled", "must_use_zk", "plan_zero_knowledge", "max_zk_
         "zk_vaults", "files_unsealed", "folders_unsealed", "vaults_affected"}
 SWITCHES = {"zero_knowledge_enabled", "must_use_zk", "plan_zero_knowledge"}
 TABLES = (User.__table__, Group.__table__, user_groups, Vault.__table__, Folder.__table__, File.__table__,
-          SystemSetting.__table__, AuditLog.__table__)
+          SystemSetting.__table__, AuditLog.__table__, ManagedSetting.__table__)
 
 # Names a zero-knowledge vault could leak through a careless summary: none may reach the answer.
 NAMES = ("Quarterly-Plan-Owner-Copy.pdf", "Board Minutes 2026", "Payroll Vault Seven", "Legal Hold Archive",
@@ -66,6 +66,10 @@ def db(tmp_path, monkeypatch):
             session.close()
 
     monkeypatch.setattr(database, "get_db_context", context)
+    # The command reads the administrators' saved settings first, from this database, into a copy of its own.
+    from app.core import settings_registry
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    monkeypatch.setattr(settings_registry, "_cache", settings_registry._Cache())
     # The command says it writes a deployment's audit rows; this process is not one, so that is put back.
     monkeypatch.setattr(audit_privacy, "_required", audit_privacy._required)
     for name, value in (("plan_zero_knowledge", True), ("plan_force_zero_knowledge", False),

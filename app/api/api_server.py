@@ -29689,18 +29689,6 @@ END $$;""",
                 db.rollback()
                 print(f"⚠ webauthn_credentials.rp_id fill skipped: {e}")
                 recorder.record(address_step, SchemaStep.OUTCOME_FAILED, str(e))
-            # A passkey answers only at the address it was made at. The operator who changed the first entry of
-            # ALLOWED_HOSTS to another host name and started the vault again reads here what that did to the
-            # passkeys there are. Nothing is written, and a count that cannot be made stops nothing.
-            try:
-                from app.core import webauthn_settings as _passkey_settings
-                moved = _passkey_settings.made_at_another_address_line(_passkey_settings.made_at_another_address(db))
-                db.rollback()
-                if moved:
-                    print(f"⚠ {moved}")
-            except Exception as e:
-                db.rollback()
-                print(f"⚠ passkeys made at another address were not counted: {e}")
 
             # Whose password each account holds (app/core/password_origin.py): the two columns are added,
             # and filled from the audit log, once, in one transaction. Deliberately NOT a string in the
@@ -30234,6 +30222,26 @@ def _add_name_uniqueness():
         print(f"⚠ Name uniqueness index setup skipped: {e}")
 
 
+def _say_the_passkeys_made_at_another_address() -> None:
+    """A passkey answers only at the address it was made at. The operator who changed the first entry of
+    ALLOWED_HOSTS to another host name and started the vault again reads in the log what that did to the
+    passkeys there are. Nothing is written, and a count that cannot be made stops nothing.
+
+    Said once the stored settings are loaded, and not while the tables are brought up to date before that: the
+    line is left out while passkeys are turned off, and read before the load the switch was its default,
+    "optional", in a vault that had turned them off."""
+    from app.core import webauthn_settings as _passkey_settings
+    from app.core.database import get_db_context
+    try:
+        with get_db_context() as db:
+            moved = _passkey_settings.made_at_another_address_line(_passkey_settings.made_at_another_address(db))
+            db.rollback()
+        if moved:
+            print(f"⚠ {moved}")
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠ passkeys made at another address were not counted: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown."""
@@ -30357,6 +30365,7 @@ async def lifespan(app: FastAPI):
     # values, and keep them fresh in the background so no request reads them from the database.
     from app.core import settings_registry
     settings_registry.start()
+    _say_the_passkeys_made_at_another_address()
 
     # The audit log's integrity chain, read before the first request: which audit days are archived, the waiting
     # changes, erases and removals are known only from this process's view of it, which the pruner's first pass would

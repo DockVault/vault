@@ -502,10 +502,38 @@ def test_the_start_fills_the_addresses_in_a_step_of_its_own_after_the_column_is_
     assert step[called + 3] == "                if filled:"
     # Then, the addresses filled in, it says how many keys were made at another one: after the fill, so that a
     # key with no address on record is not said to be elsewhere, and in a step that stops nothing.
-    said = source.index("_passkey_settings.made_at_another_address_line(_passkey_settings.made_at_another_address(db))")
-    assert filled < said
-    step = source[said - 200:said + 400]
-    assert "try:" in step and "except Exception as e:" in step and 'print(f"⚠ {moved}")' in step
+    say = inspect.getsource(api_server._say_the_passkeys_made_at_another_address)
+    assert "_passkey_settings.made_at_another_address_line(_passkey_settings.made_at_another_address(db))" in say
+    assert "try:" in say and "except Exception as e:" in say and 'print(f"⚠ {moved}")' in say
+    # And only once the stored settings are loaded: the line is left out while passkeys are turned off, and the
+    # switch read before the load was its default in a vault that had turned them off. The step that brings the
+    # tables up to date runs before the load, so the line is not said there.
+    life = inspect.getsource(api_server.lifespan)
+    brought_up, loaded = life.index("_run_lightweight_migrations()"), life.index("    settings_registry.start()\n")
+    said = life.index("    _say_the_passkeys_made_at_another_address()\n")
+    assert brought_up < loaded < said
+    assert "made_at_another_address" not in inspect.getsource(api_server._run_lightweight_migrations)
+
+
+def test_the_line_at_the_start_is_said_or_not_and_a_failed_count_stops_nothing(monkeypatch, capsys):
+    import contextlib
+    from app.api import api_server
+    from app.core import database, webauthn_settings as wss
+
+    @contextlib.contextmanager
+    def context():
+        yield types.SimpleNamespace(rollback=lambda: None)
+    monkeypatch.setattr(database, "get_db_context", context)
+    monkeypatch.setattr(wss, "made_at_another_address", lambda db: {"passkeys": 3, "accounts": 2})
+    monkeypatch.setattr(wss, "made_at_another_address_line", lambda elsewhere: f"Passkeys: {elsewhere['passkeys']} moved")
+    api_server._say_the_passkeys_made_at_another_address()
+    assert capsys.readouterr().out == "⚠ Passkeys: 3 moved\n"
+    monkeypatch.setattr(wss, "made_at_another_address_line", lambda elsewhere: None)
+    api_server._say_the_passkeys_made_at_another_address()
+    assert capsys.readouterr().out == ""
+    monkeypatch.setattr(wss, "made_at_another_address", lambda db: (_ for _ in ()).throw(RuntimeError("no table")))
+    api_server._say_the_passkeys_made_at_another_address()
+    assert capsys.readouterr().out == "⚠ passkeys made at another address were not counted: no table\n"
 
 
 def test_the_start_says_how_many_passkeys_were_made_at_another_address(monkeypatch):

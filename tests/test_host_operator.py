@@ -190,6 +190,7 @@ def test_the_host_tool_answers_once_when_something_unexpected_stops_it(monkeypat
     else:
         def stops(args, api):
             raise RuntimeError("the database at db.example.internal is out of reach")
+        monkeypatch.setattr(host_operator, "load_the_stored_settings", lambda: None)
         monkeypatch.setattr(host_operator, "_run", stops)
     code = host_operator.run(["zk-status"])
     out, err = capsys.readouterr()
@@ -197,3 +198,113 @@ def test_the_host_tool_answers_once_when_something_unexpected_stops_it(monkeypat
     assert [json.loads(line) for line in out.splitlines() if line.strip()] == [STOPPED]
     assert "Traceback" in err and WHAT_STOPPED[where] in err
     assert "db.example.internal" not in out
+
+
+def _settings_database(tmp_path, monkeypatch, rows=()):
+    """A throwaway database holding the administrators' saved settings, as this process's database, and a copy
+    of the settings that holds nothing yet (as in a process that has just started)."""
+    import sqlalchemy as sa
+    from sqlalchemy.orm import sessionmaker
+    from app.core import database
+    from app.core import settings_registry as registry
+    import json
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'settings.db'}")
+    factory = sessionmaker(bind=engine)
+    with factory() as db:
+        # The table as the model reads it, without the reference to the accounts' table.
+        db.execute(sa.text("CREATE TABLE managed_settings (key VARCHAR(64) PRIMARY KEY, value JSON, version BIGINT "
+                           "NOT NULL, updated_by CHAR(32), updated_by_name VARCHAR(255), updated_at DATETIME NOT NULL)"))
+        for version, (key, value) in enumerate(rows, start=1):
+            db.execute(sa.text("INSERT INTO managed_settings (key, value, version, updated_at) "
+                               "VALUES (:key, :value, :version, '2026-11-25 10:00:00')"),
+                       {"key": key, "value": json.dumps(value), "version": version})
+        db.commit()
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    monkeypatch.setattr(registry, "_cache", registry._Cache())
+    registry.all_specs()
+    return registry
+
+
+def test_the_host_tool_reads_the_settings_an_administrator_saved_before_it_acts(tmp_path, monkeypatch):
+    """Passkeys are required for the role "user" in this vault. The tool starts no server, and the settings are
+    answered from a copy that only a server's start filled: to the tool passkeys were "optional", whatever was
+    saved. Lifting the requirement for an account whose browser cannot make a passkey (the break-glass the
+    setting's own help names) was refused for every account in every vault: "there is nothing to lift"."""
+    import types
+    from app.core import host_operator
+    from app.core import webauthn_settings as wss
+    registry = _settings_database(tmp_path, monkeypatch, rows=[
+        (wss.MODE, wss.REQUIRED_FOR_ROLES), (wss.REQUIRED_ROLES, ["user"])])
+    alice = types.SimpleNamespace(role="user", passkey_requirement_cleared_at=None)
+    # As the tool found it: nothing loaded, the defaults.
+    assert registry.stamp() is None and wss.mode() == wss.OPTIONAL
+    assert "there is nothing to lift" in wss.lifting_refusal(alice)
+    # Read through this process's own database sessions, named: the registry's usual way in waits for a server's
+    # start, which this tool never makes.
+    from app.core import database
+    asked, read = [], registry.refresh
+    monkeypatch.setattr(registry, "refresh", lambda factory=None: (asked.append(factory), read(factory))[1])
+    host_operator.load_the_stored_settings()
+    assert asked == [database.SessionLocal]
+    assert registry.stamp() == 2 and wss.mode() == wss.REQUIRED_FOR_ROLES and wss.required_roles() == ("user",)
+    assert wss.lifting_refusal(alice) is None
+    # A vault that saved nothing is read too: its settings are the defaults, and the tool goes on.
+    monkeypatch.setattr(registry, "_cache", registry._Cache())
+    import sqlalchemy as sa
+    from app.core import database
+    with database.SessionLocal() as db:
+        db.execute(sa.text("DELETE FROM managed_settings"))
+        db.commit()
+    host_operator.load_the_stored_settings()
+    assert registry.stamp() == 0 and wss.mode() == wss.OPTIONAL
+
+
+def test_the_host_tool_refuses_in_words_when_the_saved_settings_cannot_be_read(tmp_path, monkeypatch, capsys):
+    """The settings could not be read (the table out of reach). The read raises nothing and leaves the copy
+    empty: gone on, the tool would have acted on the defaults, which is what it did before. It refuses, and
+    says why; nothing of the action runs."""
+    import json
+    import sys
+    import types
+    from app.core import database, host_operator
+    registry = _settings_database(tmp_path, monkeypatch)
+
+    def out_of_reach():
+        raise RuntimeError("the database at db.example.internal is out of reach")
+    monkeypatch.setattr(database, "SessionLocal", out_of_reach)
+    with pytest.raises(host_operator._Answer) as refused:
+        host_operator.load_the_stored_settings()
+    assert refused.value.code == 2 and refused.value.obj == {"ok": False, "error": host_operator.SETTINGS_NOT_READ}
+    assert registry.stamp() is None
+    assert "could not be read, so nothing was done" in host_operator.SETTINGS_NOT_READ
+    capsys.readouterr()                # the registry's own warning, said where this test called it
+    # Through the whole command: the refusal is the one answer, with the refusal's exit status, and the action
+    # is never reached.
+    reached = []
+    monkeypatch.setitem(sys.modules, "app.api.api_server", types.ModuleType("app.api.api_server"))
+    monkeypatch.setattr(host_operator, "_run", lambda args, api: reached.append(args.action))
+    monkeypatch.setattr(host_operator, "_wait_for_background_work", lambda started_before: None)
+    code = host_operator.run(["clear-passkey-requirement", "--username", "alice", "--confirm-username", "alice"])
+    out, _err = capsys.readouterr()
+    assert code == 2 and reached == []
+    assert [json.loads(line) for line in out.splitlines() if line.strip()] == [
+        {"ok": False, "error": host_operator.SETTINGS_NOT_READ}]
+    assert "db.example.internal" not in out
+
+
+def test_the_host_tool_loads_the_settings_before_the_action_and_once(tmp_path, monkeypatch, capsys):
+    import sys
+    import types
+    from app.core import host_operator
+    order = []
+    monkeypatch.setitem(sys.modules, "app.api.api_server", types.ModuleType("app.api.api_server"))
+    monkeypatch.setattr(host_operator, "load_the_stored_settings", lambda: order.append("the settings"))
+
+    def action(args, api):
+        order.append("the action")
+        host_operator._answer({"ok": True})
+    monkeypatch.setattr(host_operator, "_run", action)
+    monkeypatch.setattr(host_operator, "_wait_for_background_work", lambda started_before: None)
+    assert host_operator.run(["lookup", "--username", "alice"]) == 0
+    assert order == ["the settings", "the action"]
+    capsys.readouterr()
