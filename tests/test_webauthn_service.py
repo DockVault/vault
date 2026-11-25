@@ -534,6 +534,10 @@ def _in_a_frame(credential, **said):
     ({"crossOrigin": True, "topOrigin": "https://attacker.example"}, True),
     ({"crossOrigin": False, "topOrigin": "https://attacker.example"}, True),      # a top page that is not the vault
     ({"crossOrigin": "yes"}, True),                                                # anything but false is not "no"
+    ({"crossOrigin": 0}, True),                                                    # nor is a number that equals it,
+    ({"crossOrigin": 0.0}, True),
+    ({"crossOrigin": None}, True),                                                 # or a null where a browser says
+    ({"crossOrigin": 1}, True),                                                    # true or false
     ({"crossOrigin": False}, False),
     ({"crossOrigin": ...}, False),                                                 # a browser that does not say
     ({"crossOrigin": False, "topOrigin": ORIGIN}, False),

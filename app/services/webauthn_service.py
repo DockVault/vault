@@ -417,7 +417,9 @@ def _refuse_a_ceremony_in_a_frame(rp: RelyingParty, credential: dict) -> None:
         raise _refused_for(exc) from exc
     if not isinstance(data, dict):
         raise Refused("malformed", "client data that is no object")
-    if data.get("crossOrigin") not in (None, False):
+    # Left out by a browser that does not say, it is taken as "no". Said, only the value false is "no": 0, 0.0 and
+    # null are not a browser's "no" (and compared with ==, 0 and 0.0 passed as false).
+    if data.get("crossOrigin", False) is not False:
         raise Refused("cross_origin", "made in a frame of another site")
     top = data.get("topOrigin")
     if top is not None and top != rp.origin:
