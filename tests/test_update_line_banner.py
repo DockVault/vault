@@ -2,7 +2,7 @@
 
 The words come from `lineBannerMessage` and `formatReleaseDay` in ``static/js/app.js``, lifted out
 verbatim, so the tests run the SHIPPED functions: the newest release of the install's own line, a
-notice once the line's security fixes have ended, and the key a dismissal remembers. What the browser
+notice once the line's support has ended, and the key a dismissal remembers. What the browser
 draws is the UI lane (``test_ui_update_check.py``).
 """
 import json
@@ -47,7 +47,7 @@ def _update(version="0.33.2", fixes=True, until="2027-06-10"):
 def test_a_security_update_on_the_installs_line_is_named_with_its_support_period():
     [message] = _messages({"latest": "v0.34.1", "line_update": _update()})
     assert message == {
-        "text": "Security update v0.33.2 is available for your release line (0.33, security fixes "
+        "text": "Security update v0.33.2 is available for your release line (0.33, supported "
                 "until 10 June 2027). The newest release is v0.34.1.",
         "key": "0.33.2|"}
 
@@ -59,13 +59,19 @@ def test_an_update_that_fixes_nothing_the_install_has_is_not_called_a_security_u
     assert message["text"].startswith("Update v0.33.2"), "only a real true is a security update"
 
 
-def test_a_line_whose_security_fixes_ended_says_so_and_points_to_a_newer_line():
+def test_a_line_whose_support_ended_says_so_and_points_to_a_newer_line():
     line = {"line": "0.33", "security_fixes_until": "2027-06-10", "ended": True}
-    [ended, both] = _messages({"latest": "0.35.0", "line": line},
-                              {"latest": "0.35.0", "line": line, "line_update": _update("0.33.3")})
-    assert ended == {"text": "Security fixes for your release line (0.33) ended on 10 June 2027; move "
+    [ended, both, undated] = _messages(
+        {"latest": "0.35.0", "line": line},
+        {"latest": "0.35.0", "line": line, "line_update": _update("0.33.3")},
+        {"line": dict(line, security_fixes_until="soon")})
+    assert ended == {"text": "Support for your release line (0.33) ended on 10 June 2027; move "
                              "to a newer line. The newest release is v0.35.0.",
                      "key": "|0.33"}
+    # The date names the last day the line is supported, which from 0.36.0 on is not the end of a period of
+    # security fixes (.github/SECURITY.md), so neither notice speaks of one.
+    assert undated["text"] == "Support for your release line (0.33) has ended; move to a newer line."
+    assert not any("security fixes" in m["text"].lower() for m in (ended, both, undated))
     assert both["text"].startswith("Security update v0.33.3 is available for your release line")
     assert "ended on 10 June 2027; move to a newer line." in both["text"]
     assert both["key"] == "0.33.3|0.33", "the line ending shows a dismissed banner again"

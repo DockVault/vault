@@ -11126,7 +11126,7 @@ function formatReleaseDay(iso) {
 function lineBannerMessage(us) {
     // What an install on an older release line is told, as {text, key}, or null. The newest release
     // of its own line (the server offers it only after fetching that release's own matrix), and a
-    // notice once the line's security fixes have ended. `key` is what a dismissal remembers: a newer
+    // notice once the line's support has ended. `key` is what a dismissal remembers: a newer
     // release on the line, or the line ending, shows the banner again.
     const lu = us && us.line_update;
     const line = us && us.line;
@@ -11136,14 +11136,14 @@ function lineBannerMessage(us) {
     const parts = [];
     if (lu) {
         const until = formatReleaseDay(lu.security_fixes_until);
-        const period = clip(lu.line, 16) + (until ? `, security fixes until ${until}` : '');
+        const period = clip(lu.line, 16) + (until ? `, supported until ${until}` : '');
         parts.push(`${lu.fixes_vulnerability === true ? 'Security update' : 'Update'} `
             + `v${clip(lu.version, 32)} is available for your release line (${period}).`);
     }
     if (ended) {
         const day = formatReleaseDay(line.security_fixes_until);
-        parts.push(`Security fixes for your release line (${clip(line.line, 16)}) `
-            + `${day ? `ended on ${day}` : 'have ended'}; move to a newer line.`);
+        parts.push(`Support for your release line (${clip(line.line, 16)}) `
+            + `${day ? `ended on ${day}` : 'has ended'}; move to a newer line.`);
     }
     if (us.latest) { parts.push(`The newest release is v${clip(us.latest, 32)}.`); }
     return {

@@ -468,7 +468,7 @@ configurable interval (`UPDATE_CHECK_INTERVAL_MINUTES`, default 360) — or on d
 updates** button — and shows a dismissible banner in **Settings → General** to every admin when a
 newer version exists (see [Upgrading](#upgrading) for how to apply it). On an older release line it
 also names the newest release of that line, once that release's own published upgrade matrix could
-be fetched, and says when the line's security fixes have ended; that banner is dismissed separately.
+be fetched, and says when the line's support has ended; that banner is dismissed separately.
 
 The check is privacy-preserving: it sends **no** identifier, account data, version, or telemetry —
 just an unauthenticated request to GitHub's public release API (the only thing GitHub sees is your
