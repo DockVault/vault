@@ -145,9 +145,9 @@ _TOP_KEYS = {"schema_version", "about", "kinds", "advisories", "versions", "edge
 # the releases an install can no longer move to or from. Lines start at 0.33, the first with a
 # support period (.github/SECURITY.md); older lines are unsupported by definition and are not
 # listed. The newest line's date is null, as its end is not known until the next minor ships. Every
-# other listed line's date is the published promise, checked here: from ONE_LINE_FROM on, only the
-# newest line is supported, and a line ends SUPPORT_DAYS days after the first release of the first
-# line from ONE_LINE_FROM on that follows it. Before that, a line was promised at least
+# other listed line's date is the published promise, checked here: from ONE_LINE_FROM on, a line's
+# support ends SUPPORT_DAYS days after the first release of the first line from ONE_LINE_FROM on that
+# follows it. Before that, a line was promised at least
 # SUPPORT_MONTHS after the next line's first release; that promise still holds for a line no line
 # from ONE_LINE_FROM on follows yet, so a matrix written under it stays valid.
 _FIRST_SUPPORTED_LINE = "0.33"
@@ -647,16 +647,16 @@ def _validate_lines(lines: object, versions: dict, advisories: dict) -> None:
     """The support period of each release line, and what it means for an unfixed advisory.
 
     Every line from the first listed one up to the newest declared line is listed. Only the newest
-    has no date. Every other date is the promise .github/SECURITY.md makes. From ONE_LINE_FROM on,
-    only the newest line is supported: a line ends SUPPORT_DAYS days after the first release of the
-    first line from ONE_LINE_FROM on that follows it. Never later, so the line just before that
+    has no date. Every other date is the promise .github/SECURITY.md makes. From ONE_LINE_FROM on, a
+    line's support ends SUPPORT_DAYS days after the first release of the first line from
+    ONE_LINE_FROM on that follows it. Never later, so the line just before that
     release has those days to upgrade, and no line has more. Never earlier either, except for a line
     two or more back when the rule began whose earlier promise, SUPPORT_MONTHS after the next line's
     first release, ended sooner: it ends no earlier than that promise. A line that no line from
     ONE_LINE_FROM on follows yet keeps the earlier promise. And an advisory that leaves the newest
     release of a line affected while that line was still supported (on the advisory's `published`
-    date) must say what to do meanwhile: a supported line is expected to be fixed, and when it is
-    not, the mitigation is all its operators have.
+    date) must say what to do meanwhile: while a line is supported its operators need a fix or a
+    mitigation, and without a fix the mitigation is all they have.
     """
     _require(isinstance(lines, dict) and lines, "upgrade matrix 'lines' must be a non-empty object")
     by_line: dict[str, list[str]] = {}
@@ -717,9 +717,9 @@ def _validate_lines(lines: object, versions: dict, advisories: dict) -> None:
             _require(ends >= promised, months_promise)
             continue
         _require(ends <= cutoff,
-                 f"lines[{line}].security_fixes_until is {date}, but from {ONE_LINE_FROM} on only the "
-                 f"newest line is supported: {first} was released on {first_released}, so {line} ends "
-                 f"{SUPPORT_DAYS} days later, on {cutoff.isoformat()}")
+                 f"lines[{line}].security_fixes_until is {date}, but from {ONE_LINE_FROM} on a line's "
+                 f"support ends {SUPPORT_DAYS} days after the next minor release: {first} was released "
+                 f"on {first_released}, so {line} ends on {cutoff.isoformat()}")
         if one_line[0] != later[0] and promised < cutoff:
             _require(ends >= promised, months_promise)
         else:

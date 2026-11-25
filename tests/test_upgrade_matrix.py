@@ -968,8 +968,8 @@ def test_six_calendar_months_end_on_the_last_day_of_a_shorter_month():
 
 
 # --- from 0.36 on, one supported line -------------------------------------------------------------
-# .github/SECURITY.md: from 0.36.0 on only the newest line is supported, and when the next minor release
-# ships, the line before it has 30 more days. Here 0.36.0 ships on 2027-02-01, so every line before it
+# .github/SECURITY.md: from 0.36.0 on, when the next minor release ships, the line before it has 30
+# more days, and every line before it ends then. Here 0.36.0 ships on 2027-02-01, so every line before it
 # ends on 2027-03-03. 0.34.0 and 0.35.0 shipped on 2026-11-09 and 2026-11-17, which had promised 0.33
 # and 0.34 six months, to 2027-05-09 and 2027-05-17.
 
@@ -1000,8 +1000,8 @@ def test_from_0_36_on_every_older_line_ends_30_days_after_the_newest_lines_first
 @pytest.mark.parametrize("date, expected", [
     ("2027-03-02", "but 0.36.0 was released on 2027-02-01, so the promise of 30 days after it runs to "
                    "2027-03-03"),                                                      # 29 days after
-    ("2027-03-04", "but from 0.36 on only the newest line is supported: 0.36.0 was released on "
-                   "2027-02-01, so {line} ends 30 days later, on 2027-03-03"),        # 31 days after
+    ("2027-03-04", "but from 0.36 on a line's support ends 30 days after the next minor release: "
+                   "0.36.0 was released on 2027-02-01, so {line} ends on 2027-03-03"),  # 31 days after
 ])
 def test_from_0_36_on_a_line_that_ends_a_day_early_or_a_day_late_is_refused(line, date, expected):
     lines = {"0.33": _ENDS, "0.34": _ENDS, "0.35": _ENDS, "0.36": None}
@@ -1041,8 +1041,9 @@ def test_the_day_a_line_was_given_stays_valid_when_the_next_line_ships():
                      newer={"0.37.0": "2027-06-01"})
     um.validate_matrix(data, released_ceiling=None)
     data["lines"]["0.35"]["security_fixes_until"] = "2027-07-01"
-    _reject(data, "lines[0.35].security_fixes_until is 2027-07-01, but from 0.36 on only the newest line is "
-                  "supported: 0.36.0 was released on 2027-02-01, so 0.35 ends 30 days later, on 2027-03-03")
+    _reject(data, "lines[0.35].security_fixes_until is 2027-07-01, but from 0.36 on a line's support ends 30 "
+                  "days after the next minor release: 0.36.0 was released on 2027-02-01, so 0.35 ends on "
+                  "2027-03-03")
     data["lines"]["0.35"]["security_fixes_until"] = _ENDS
     data["lines"]["0.36"]["security_fixes_until"] = "2027-06-30"
     _reject(data, "lines[0.36].security_fixes_until is 2027-06-30, but 0.37.0 was released on 2027-06-01, "
@@ -1059,8 +1060,8 @@ def test_a_line_whose_six_months_ended_sooner_than_the_30_days_keeps_them():
     _reject(data, "lines[0.33].security_fixes_until is 2027-05-08, but 0.34.0 was released on 2026-11-09, "
                   "so the promise of 6 months after the next minor release runs to 2027-05-09")
     data["lines"]["0.33"]["security_fixes_until"] = "2027-06-01"
-    _reject(data, "lines[0.33].security_fixes_until is 2027-06-01, but from 0.36 on only the newest line is "
-                  "supported")
+    _reject(data, "lines[0.33].security_fixes_until is 2027-06-01, but from 0.36 on a line's support ends 30 "
+                  "days after the next minor release")
     data["lines"]["0.33"]["security_fixes_until"] = "2027-05-09"
     data["lines"]["0.35"]["security_fixes_until"] = "2027-05-17"
     _reject(data, "lines[0.35].security_fixes_until is 2027-05-17, but 0.36.0 was released on 2027-05-01, "
@@ -1108,8 +1109,9 @@ def test_the_gate_warns_from_the_same_field():
 
     data = _lines(**{"0.33": "2027-06-10", "0.34": None})
     assert gate.line_support_warning(data, "0.33.3", datetime.date(2027, 6, 10)) is None
-    assert "ended on 2027-06-10" in gate.line_support_warning(data, "0.33.3",
-                                                              datetime.date(2027, 6, 11))
+    warning = gate.line_support_warning(data, "0.33.3", datetime.date(2027, 6, 11))
+    # The date is the last day the line is supported, which from 0.36.0 on is not the end of a period of fixes.
+    assert warning.startswith("the 0.33 line's support ended on 2027-06-10;"), warning
 
 
 def test_the_committed_matrix_takes_the_lines_map_its_next_release_writes():

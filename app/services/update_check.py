@@ -539,9 +539,9 @@ def _finding_key(v):
 # --- release lines ----------------------------------------------------------------------------------
 #
 # A line is every release sharing major.minor. From 0.33 on, the matrix's top-level `lines` map says
-# until when each line gets security fixes (null for the newest line). An install on an older line is
-# told about the newest release of its own line -- a smaller move than the newest release overall --
-# and when its line's fixes have ended. Main's copy is read add-only here too: a line it states is
+# until when each line is supported (null for the newest line). An install on an older line is told
+# about the newest release of its own line -- a smaller move than the newest release overall -- and
+# when its line's support has ended. Main's copy is read add-only here too: a line it states is
 # added, and where both copies state one, the earlier end wins. The host tool applies the same rules;
 # a test feeds both the same matrices.
 

@@ -3,8 +3,8 @@
 A release comes from one of two places:
 
 - `main`, the newest line. The tagged commit is an ancestor of origin/main.
-- a maintenance line `release/X.Y`, for security fixes to an older minor once a newer one has
-  shipped. The tagged commit is an ancestor of origin/release/X.Y and not of origin/main.
+- a maintenance line `release/X.Y`, for a fix to an older minor once a newer one has shipped, where
+  .github/SECURITY.md promises one. The tagged commit is an ancestor of origin/release/X.Y and not of origin/main.
 
 The gate says which, and derives from it what the publication may move: the version's own tag
 always, `:vX.Y` only for the newest release of its line, and `:latest` (and GitHub's "latest
@@ -375,7 +375,7 @@ def line_support_warning(data: dict, version: str, today: datetime.date) -> str 
         return None
     if ends >= today:
         return None
-    return (f"the {_line(version)} line's security fixes ended on {until}; this release is "
+    return (f"the {_line(version)} line's support ended on {until}; this release is "
             "published after its support period")
 
 

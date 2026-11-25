@@ -194,7 +194,7 @@ on a configurable interval (`UPDATE_CHECK_INTERVAL_MINUTES`, default 360; a shar
 requests to that rate no matter how often the UI polls) to GitHub's public API (`api.github.com` /
 `raw.githubusercontent.com`) to learn the latest published version, its upgrade matrix, the copy on
 `main`, and the matrix of the newest release of each older line that the copy on `main` lists (at
-most five, whether or not the line still gets security fixes); these are the same requests
+most five, whether or not the line is still supported); these are the same requests
 whatever version an install runs. It sends **no** instance identifier, account data, version,
 or other telemetry — only the request's egress IP reaches GitHub (inherent to any outbound HTTP).
 It is fail-closed-silent (never blocks a request, never errors), the "update available" status is

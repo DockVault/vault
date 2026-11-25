@@ -247,7 +247,7 @@ def test_the_security_policy_names_the_older_lines_the_check_fetches():
     section = " ".join(policy.split("## Update check", 1)[1].split("\n## ", 1)[0].split())
     assert uc._MAX_OLDER_LINES == 5
     assert ("each older line that the copy on `main` lists (at most five, whether or not the line "
-            "still gets security fixes)") in section
+            "is still supported)") in section
 
 
 def test_a_malformed_lines_map_never_breaks_the_status(monkeypatch):

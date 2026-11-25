@@ -3,7 +3,7 @@
 
 Prints two GitHub Actions outputs, each a JSON list of "X.Y" strings:
 
-- `maintenance`: the older lines that still get security fixes, one `release/X.Y` branch each. The
+- `maintenance`: the older lines that are still supported, one `release/X.Y` branch each. The
   nightly checks run the suites on these branches.
 - `published`: every supported line, the newest included. The weekly scan checks each line's
   published `:vX.Y` image.
