@@ -188,6 +188,20 @@ out(note());
     assert got == {"text": said, "shown": True}
 
 
+def test_a_sign_in_with_no_account_linked_names_the_accounts_your_account_cannot_link():
+    """Your account refuses the link for an account with no password anybody can type (one a provider made at a first
+    sign-in, or one that signs in only through providers), and for an administrator's or auditor's account when the
+    provider's people hold no password; it says to ask an administrator. The sign-in page's sentence names that
+    exception beside the link, so such a person is not sent to a page that only refuses them."""
+    from app.api import sso_router
+    said = _server_reasons()["no_account"]
+    assert ("link your organisation's sign-in under Your account (Single sign-on); if your account has no password "
+            "of its own, or the link is refused there, ask an administrator.") in said
+    assert "no password of its own" in sso_router.NO_PASSWORD_TO_LINK_TEXT
+    assert sso_router.NO_PASSWORD_TO_LINK_TEXT.endswith("Ask an administrator.")
+    assert said.endswith("Otherwise ask an administrator to invite you.")
+
+
 TWO = [{"id": "11111111-1111-4111-8111-111111111111", "label": "Company sign-in", "kind": "oidc", "icon": "microsoft",
         "order": 1},
        {"id": "22222222-2222-4222-8222-222222222222", "label": "Contractors", "kind": "oidc", "icon": "generic",

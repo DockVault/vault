@@ -84,10 +84,13 @@ REASON_TEXTS = {
     # Said for every refusal with no account linked (the provider makes no accounts and nobody invited the person, or
     # the account with the address never had it confirmed), so it says nothing of whether an account exists. An
     # invitation for an address already in use is refused: someone with an account links from it instead, which
-    # needs no confirmed address.
+    # needs no confirmed address. Your account refuses that link for an account with no password anybody can type,
+    # and for an administrator's or auditor's on a provider whose people hold none (app/api/sso_router.py,
+    # start_link and the identities list): those are sent to an administrator.
     NO_ACCOUNT: ("Your organisation's sign-in worked, but no account here is linked to it. If you already have an "
                  "account on this vault, sign in to it the way you usually do and link your organisation's sign-in "
-                 "under Your account (Single sign-on). Otherwise ask an administrator to invite you."),
+                 "under Your account (Single sign-on); if your account has no password of its own, or the link is "
+                 "refused there, ask an administrator. Otherwise ask an administrator to invite you."),
     ACCOUNT_DISABLED: "Your account cannot sign in. Contact your administrator.",
     ALREADY_LINKED: "That organisation identity is already linked to an account.",
     LINK_FROM_PROFILE: ("An account with your address is protected by its own second factor, so it is not linked on "
