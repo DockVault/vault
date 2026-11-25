@@ -118,6 +118,23 @@ SIGN_OUT_BUCKET = "auth_sign_out"
 SIGN_OUT_SESSION_PREFIX = "session:"
 
 
+# An identity provider's back-channel logout, POST /auth/sso/{provider}/backchannel-logout. It is not counted in the
+# auth class's bucket at all. That bucket is one per address for every /auth route, at the limit of a sign-in
+# form (ten a minute by default), and a provider sends its logouts from one address: when an administrator there
+# signs many people out, or ten people sign out within a minute, every later logout was answered 429 here, before
+# its route ran. The provider is not asked to send again and mostly does not, so those sessions stayed. Anybody
+# sending from the provider's address (the same office network, another tenant of a hosted provider) could use
+# the allowance up with requests to any /auth route. The route counts its logouts itself, in a bucket for each
+# provider and source and one for every address with no provider behind it (app/api/sso_router.py,
+# LOGOUT_LIMIT), fails closed without the limiter, and leaves a trace of a logout it turns away.
+def is_provider_logout_request(method: str, path: str) -> bool:
+    """Whether a request is an identity provider's back-channel logout (method and path as the middleware reads
+    them)."""
+    parts = ((path or "/").rstrip("/") or "/").split("/")
+    return ((method or "").upper() == "POST" and len(parts) == 5
+            and parts[:3] == ["", "auth", "sso"] and bool(parts[3]) and parts[4] == "backchannel-logout")
+
+
 def is_sign_out_request(method: str, path: str) -> bool:
     """Whether a request is the web app's sign-out (method and path as classify_api_rate_limit reads them)."""
     return (method or "").upper() == "POST" and ((path or "/").rstrip("/") or "/") == SIGN_OUT_PATH
@@ -907,6 +924,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         
         # Skip rate limiting for excluded paths
         if not self._should_rate_limit(path):
+            return await call_next(request)
+        # A provider's logout is counted by its own route, for each provider and source (see above).
+        if is_provider_logout_request(request.method, path):
             return await call_next(request)
         
         # Resolve one deterministic class, then one rule. The provider is a bounded

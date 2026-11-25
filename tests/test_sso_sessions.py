@@ -495,6 +495,53 @@ def test_a_logout_that_waits_for_an_accounts_turn_holds_up_no_other_request(monk
     assert not [s for s in h.active_sessions() if s.is_active and not s.revoked]
 
 
+def _counting_limiter(monkeypatch):
+    """The limiter the middleware and the routes share, made to count for real: {(bucket, who): requests}."""
+    from app.core import rate_limiter
+    counts = {}
+
+    def check(identifier, limit, window, prefix="rate_limit", fail_open=True):
+        counts[(prefix, identifier)] = counts.get((prefix, identifier), 0) + 1
+        return counts[(prefix, identifier)] <= limit, max(0, limit - counts[(prefix, identifier)]), 0
+    monkeypatch.setattr(rate_limiter.rate_limiter, "check_rate_limit", check)
+    return counts
+
+
+def test_a_providers_logouts_are_not_cut_off_by_the_sign_in_forms_limit(monkeypatch):
+    """A provider sends its logouts from one address: more of them in a minute than a sign-in form allows are all
+    taken. The general limit on /auth answered the later ones 429 before the route ran, and those sessions stayed
+    (a provider is not asked to send again). And requests to other /auth routes from that address do not use the
+    logouts' allowance up: the route counts its own, for each provider."""
+    from app.core import rate_limiter
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    limit = int(h.S.settings.rate_limit_api_auth)
+    many = limit + 3
+    for n in range(many):
+        waiting, _ = _sign_in(h, p, sid=f"s-{n}")
+        assert h.finish(waiting)[0] == 200
+    tokens = [h.logout_token(sid=f"s-{n}") for n in range(many)]
+    counts = _counting_limiter(monkeypatch)
+    # Somebody at the provider's address has used the sign-in form's allowance up first.
+    for _ in range(limit + 1):
+        last = _call(h.S, "POST", "/auth/login", {"username": "nobody", "password": "wrong"})[0]
+    assert last == 429 and max(n for (bucket, _who), n in counts.items() if bucket == "rate_limit:api:auth") > limit
+    assert [h.logout(p, token)[0] for token in tokens] == [200] * many
+    assert not [s for s in h.active_sessions() if s.is_active and not s.revoked]
+    # Counted by the route alone, for this provider and this address.
+    logouts = {key: n for key, n in counts.items() if key[0] == "sso_backchannel"}
+    assert list(logouts.values()) == [many] and str(p.id) in next(iter(logouts))[1]
+    # What the middleware reads as such a logout, and what it does not.
+    assert rate_limiter.is_provider_logout_request("POST", f"/auth/sso/{p.id}/backchannel-logout")
+    assert rate_limiter.is_provider_logout_request("post", f"/auth/sso/{p.id}/backchannel-logout/")
+    for method, path in (("GET", f"/auth/sso/{p.id}/backchannel-logout"), ("POST", "/auth/sso//backchannel-logout"),
+                         ("POST", f"/auth/sso/{p.id}/backchannel-logout/more"), ("POST", f"/auth/sso/{p.id}/start"),
+                         ("POST", f"/x/auth/sso/{p.id}/backchannel-logout"), ("POST", "/auth/login"), (None, None)):
+        assert not rate_limiter.is_provider_logout_request(method, path), (method, path)
+    # Every other /auth route is still counted in the class's bucket.
+    assert rate_limiter.classify_api_rate_limit("POST", f"/auth/sso/{p.id}/start") == "auth"
+
+
 def test_a_logout_waits_for_a_slot_that_frees_up(monkeypatch):
     """Every slot in use, then one freed within the wait: the logout is verified, not refused."""
     import asyncio
