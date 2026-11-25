@@ -1427,3 +1427,38 @@ def test_what_is_no_session_id_is_kept_as_none():
     assert 'sso.kept_sid(claims.get("sid"))' in inspect.getsource(sso_router._end_what_a_logout_names)
     for module in (sso_sign_in, sso_router):
         assert inspect.getsource(module).count('claims.get("sid")') == 1, module
+
+
+@pytest.mark.parametrize("step", ["finish", "in_the_accounts_turn"])
+@pytest.mark.parametrize("refusal", ["refuse_without_the_provider", "refuse_unless_the_provider_stands",
+                                     "refuse_unless_the_account_may_sign_in"])
+def test_a_password_stage_refused_for_its_provider_leaves_no_session_of_the_door(monkeypatch, step, refusal):
+    """An account held at the password stage after its provider sign-in types the right password: the password
+    door writes its session and commits it. Meanwhile the provider logged that session out, was turned off, or
+    the identity was unlinked, and the pipeline refuses the sign-in. No token was given, and the door's session
+    stayed among the account's. Each of these refusals, where the sign-in is judged first and where it is judged
+    again in the account's turn, takes that session with it."""
+    import types as _types
+    from fastapi import HTTPException
+    from app.api import api_server as api
+    from app.services import sign_in
+    user = _types.SimpleNamespace(id=uuid.uuid4(), username="alice", is_active=True, sessions_ended=0)
+    did = []
+    db = _types.SimpleNamespace(rollback=lambda: did.append("rolled back"))
+    monkeypatch.setattr(sign_in, "delete_session_by_token", lambda db_, token: did.append(("dropped", token)))
+    monkeypatch.setattr(sign_in, "hold_the_providers_row", lambda db_, result: None)
+    monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: None)
+    for name in ("refuse_unless_the_account_may_sign_in", "refuse_without_the_provider",
+                 "refuse_unless_the_provider_stands"):
+        monkeypatch.setattr(sign_in, name, lambda *a, **k: None)
+
+    def refused(*a, **k):
+        raise HTTPException(status_code=401, detail="This sign-in cannot be completed; start again.")
+    monkeypatch.setattr(sign_in, refusal, refused)
+    result = sign_in.SignInResult(user, [sign_in.PASSWORD], "203.0.113.9", session_token="the-doors",
+                                  sessions_ended=0, provider_id=str(uuid.uuid4()))
+    with pytest.raises(HTTPException) as answer:
+        getattr(sign_in, step)(db, result)
+    assert answer.value.status_code == 401
+    # What the refused sign-in had not committed is rolled back, then the door's session is deleted.
+    assert did == ["rolled back", ("dropped", "the-doors")] and result.session_token is None
