@@ -172,12 +172,21 @@ def holds_to_no_password(provider, user, linked_by) -> bool:
 def held_by_a_password_less_provider(db, user) -> bool:
     """Whether ``user`` is linked to a provider whose people hold no password at all: the one case in which an
     account that signs in only through its provider cannot be given a standing that needs a password."""
+    return bool(password_less_providers_of(db, user))
+
+
+def password_less_providers_of(db, user) -> List[str]:
+    """The names of the providers ``user`` is linked to whose people hold no password, each once, in the order
+    found: what an administrator is told to change before the account can be given a password."""
     from app.core.models import ExternalIdentity, SsoProvider
+    names = []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
         provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
         if provider is not None and password_less(provider):
-            return True
-    return False
+            name = (getattr(provider, "name", None) or "").strip() or "a provider"
+            if name not in names:
+                names.append(name)
+    return names
 
 
 def should_be_sso_only(db, user, *, also=None, also_by=None, without=None) -> bool:

@@ -281,13 +281,28 @@ def test_an_administrator_group_opens_one_held_request_and_grants_nothing(monkey
     assert any(a[0] == "sso_admin_requested" and a[2]["provider_group"] == "admins" for a in h.audits)
     assert ([str(root.id)], "An administrator request is waiting") in h.notices
     assert ([str(alice.id)], "Your administrator role waits for approval") in h.notices
-    # An account that signs in only through its provider raises no request: it could never type the password.
+    # An account that a provider whose people hold no password holds to none raises no request: it could never
+    # type the password an administrator needs.
     carol = _user("carol", sso_only=True)
-    from app.core.models import ExternalIdentity, RoleEnum, User
+    from app.core.models import ExternalIdentity, RoleEnum, SsoProvider, User
+    strict = _provider(name="strict", policy={"sso_password_login": "disabled"})
+    h.db.rows_of(SsoProvider).append(strict)
     h.db.rows_of(User).append(carol)
-    h.db.rows_of(ExternalIdentity).append(_identity(carol, p, subject="s-carol"))
+    h.db.rows_of(ExternalIdentity).extend([_identity(carol, p, subject="s-carol"),
+                                           _identity(carol, strict, subject="s-carol-strict")])
     _sign_in(h, p, sub="s-carol", email="carol@example.test", groups=["admins"])
     assert len(h.requests()) == 1 and carol.role == RoleEnum.USER
+    # An account that signs in only through its provider because it was made at its first sign-in there does:
+    # the approval is what gives such an account a password.
+    dave = _user("dave", sso_only=True)
+    h.db.rows_of(User).append(dave)
+    h.db.rows_of(ExternalIdentity).append(_identity(dave, p, subject="s-dave", linked_by="jit"))
+    told_before = len(h.notices)
+    _sign_in(h, p, sub="s-dave", email="dave@example.test", groups=["admins"])
+    assert [r.user_id for r in h.requests()] == [alice.id, dave.id] and dave.role == RoleEnum.USER
+    assert ([str(dave.id)], "Your administrator role waits for approval") in h.notices[told_before:]
+    h.requests().pop()
+    del h.notices[told_before:]
     # Signing in again while it waits: no second request, no second notice.
     _sign_in(h, p, groups=["admins"])
     assert len(h.requests()) == 1
@@ -427,10 +442,24 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
     assert status == 409 and body["detail"]["reason"] == "account_unusable", body
     bob.is_active = True
-    # ... with a password of its own, and under the promotion rules; both judged before the step-up is spent.
+    # ... not held to no password by a provider whose people hold none, and under the promotion rules; both
+    # judged before the step-up is spent.
+    from app.core.models import ExternalIdentity, SsoProvider
+    strict = _provider(name="strict", policy={"sso_password_login": "disabled"})
+    h.db.rows_of(SsoProvider).append(strict)
+    there = _identity(bob, strict, subject="s-bob-strict")
+    h.db.rows_of(ExternalIdentity).append(there)
     bob.sso_only = True
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
     assert status == 409 and body["detail"]["reason"] == "sso_only" and h.step_ups == [], body
+    assert body["detail"]["message"] == (
+        "The account is linked to strict, whose people hold no password, and an administrator needs one. Allow "
+        "password sign-in for strict (its Access settings) before granting the administrator role.")
+    # Flagged only because it was made at its first sign-in: that does not stand in the way (it ends with the
+    # approval, which hands over a link to choose a password).
+    h.db.rows_of(ExternalIdentity).remove(there)
+    from app.services import sso_groups
+    assert sso_groups.decision_refusal(h.db, request, root) is None
     bob.sso_only = False
     from app.core import auditor_rights
     monkeypatch.setattr(auditor_rights, "promotion_refusal", lambda db, user: "bob holds the auditor right")

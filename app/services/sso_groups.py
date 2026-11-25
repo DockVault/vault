@@ -118,9 +118,12 @@ def apply(db, row, user, answer) -> Applied:
         if maps_admin and admin_group is None and made_administrator_through(db, user, row):
             _demote(db, row, user, roles, applied)
         return applied
-    if admin_group is not None and policy["sso_admin_mapping"] and not getattr(user, "sso_only", False):
-        # An account that signs in only through its provider holds no password, and an administrator needs one for
-        # the fixed step-ups: no request is raised for it (the provider's password sign-in comes first).
+    if admin_group is not None and policy["sso_admin_mapping"] and not _providers_without_passwords(db, user):
+        # An account that a provider whose people hold no password holds to none could never type the password an
+        # administrator needs for the fixed step-ups: no request is raised for it (that provider's password
+        # sign-in comes first). An account that signs in only through its provider because it was made at its
+        # first sign-in is another matter: the approval is an administrator's word for the person, ends that for
+        # the account and hands over a link to choose a password (app/api/api_server.py, _record_admin_grant).
         applied.request = _request_admin(db, user, row, admin_group)
     lesser = "user" if "user" in roles else ("external" if "external" in roles else None)
     if lesser is not None and getattr(user.role, "value", user.role) != lesser:
@@ -128,6 +131,14 @@ def apply(db, row, user, answer) -> Applied:
         applied.permissions_removed = _api()._set_role(db, user, RoleEnum(lesser), actor=None)
         applied.role_change = (old, lesser)
     return applied
+
+
+def _providers_without_passwords(db, user) -> list:
+    """The providers ``user`` is linked to whose people hold no password (their names): they hold the account to
+    none. None for an account that signs in only through its provider because it was made at its first sign-in
+    there. Asked of the links, not of the account's flag, which follows them."""
+    from app.core import sso_only
+    return sso_only.password_less_providers_of(db, user)
 
 
 def _join(db, row, user, group_ids, applied: Applied) -> None:
@@ -398,9 +409,12 @@ def decision_refusal(db, request, approver, *, now: Optional[datetime] = None) -
         return Conflict("account_unusable", "The account this request is about cannot sign in.")
     if getattr(user, "role", None) == RoleEnum.ADMIN:
         return Conflict("already_admin", "The account is an administrator already.")
-    if getattr(user, "sso_only", False):
-        return Conflict("sso_only", "The account signs in only through its provider and holds no password; allow "
-                                    "password sign-in on the provider before granting the administrator role.")
+    without = _providers_without_passwords(db, user)
+    if without:
+        named = " and ".join(without)
+        return Conflict("sso_only", (
+            f"The account is linked to {named}, whose people hold no password, and an administrator needs one. "
+            f"Allow password sign-in for {named} (its Access settings) before granting the administrator role."))
     from app.core import auditor_rights
     held_by_rule = auditor_rights.promotion_refusal(db, user)
     if held_by_rule:
