@@ -6519,6 +6519,11 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     return result
 
 
+RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT = (
+    "This account signs in only through its organisation's provider and holds no password. Allow password "
+    "sign-in on the provider before sending a reset link.")
+
+
 def _signs_in_only_through_its_provider_now(db, account) -> bool:
     """Whether ``account`` signs in only through its provider, read again as it is committed. For what sets a
     password, asked once it holds the account's turn: nothing the caller set on the account is touched but the
@@ -6564,6 +6569,12 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         sign_in.spend_sign_ins_under_way(db, target.id)
         return {}
     if kind == cc.RESET_LINK:
+        # Asked while the account could hold a password and approved after its provider stopped that (a request
+        # held for a second administrator), or made by a caller that did not look: no link is made for an account
+        # that signs in only through its provider. The link was refused as "invalid or expired" when the person
+        # used it, after the change had been recorded and the person told to expect it.
+        if _signs_in_only_through_its_provider_now(db, target):
+            raise HTTPException(status_code=409, detail=RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT)
         base_url = _public_base_url()
         # Made by another account (an administrator, or a user who manages users, or the administrator who
         # approved a held request): judged again when it is used. Not one the server's operator makes.
@@ -7733,9 +7744,7 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     if getattr(user, "sso_only", False):
-        raise HTTPException(status_code=409, detail=(
-            "This account signs in only through its organisation's provider and holds no password. Allow password "
-            "sign-in on the provider before sending a reset link."))
+        raise HTTPException(status_code=409, detail=RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT)
     _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not (user.email or "").strip():
         raise HTTPException(status_code=400, detail="That user has no email address to send a reset link to.")
@@ -7787,9 +7796,7 @@ async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     if getattr(user, "sso_only", False):
-        raise HTTPException(status_code=409, detail=(
-            "This account signs in only through its organisation's provider and holds no password. Allow password "
-            "sign-in on the provider before sending a reset link."))
+        raise HTTPException(status_code=409, detail=RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT)
     _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not getattr(user, "is_active", True):
         raise HTTPException(status_code=400,

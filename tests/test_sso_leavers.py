@@ -856,3 +856,36 @@ def test_the_host_tool_refuses_a_reset_for_a_provider_only_account_before_anythi
     assert host_operator.linked_providers(MemoryDB({}), bob) == []
     described = inspect.getsource(host_operator._describe)
     assert '"sso_only": bool(getattr(user, "sso_only", False))' in described and '"providers": linked_providers(db, user)' in described
+
+
+def test_no_reset_link_is_made_for_an_account_that_signs_in_only_through_its_provider(monkeypatch):
+    """A reset link asked for an account while it could hold a password, held for a second administrator, and
+    approved after its provider stopped passwords: the link was made, the change recorded and the person told,
+    and the link then answered "invalid or expired". The change itself refuses, in the words the two routes
+    that ask for a link use, and makes nothing. An account that may hold a password gets its link as before."""
+    from fastapi import HTTPException
+    from app.core import credential_changes as cc
+    import app.api.api_server as S
+    minted = []
+    monkeypatch.setattr(S, "_mint_reset_link", lambda db, target, base_url, **kw: minted.append(target.username) or "the-link")
+    monkeypatch.setattr(S, "_public_base_url", lambda: "https://vault.example.test")
+    root = _user("root", role="admin")
+    held, _p, _i, db = _world(sso_only=True)
+    with pytest.raises(HTTPException) as refused:
+        S._make_credential_change(db, cc.RESET_LINK, held, {"delivery": "copy"}, actor_id=root.id, actor_name="root")
+    assert refused.value.status_code == 409 and minted == []
+    assert refused.value.detail == S.RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT == (
+        "This account signs in only through its organisation's provider and holds no password. Allow password "
+        "sign-in on the provider before sending a reset link.")
+    # Emailed or copied: refused before either.
+    with pytest.raises(HTTPException) as refused:
+        S._make_credential_change(db, cc.RESET_LINK, held, {"delivery": "email"}, actor_id=root.id, actor_name="root")
+    assert refused.value.status_code == 409 and minted == []
+    free, _q, _j, db2 = _world(sso_only=False, username="bob")
+    made = S._make_credential_change(db2, cc.RESET_LINK, free, {"delivery": "copy"}, actor_id=root.id, actor_name="root")
+    assert minted == ["bob"] and made["reset_link"] == "the-link"
+    # The two routes that ask for a link say the same sentence, and nothing else writes it.
+    import inspect
+    source = inspect.getsource(S)
+    assert source.count("raise HTTPException(status_code=409, detail=RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT)") == 3
+    assert source.count("before sending a reset link.") == 1
