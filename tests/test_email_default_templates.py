@@ -345,3 +345,13 @@ class _FakeTemplate:
         import uuid
         self.id = uuid.uuid4()
         self.default_key = default_key
+
+
+def test_the_sign_in_method_email_is_described_by_everything_it_is_sent_for():
+    """The administrator who reads the list of emails sees what this one tells a user of: it is sent for a
+    passkey added or removed, an authenticator app set up, and a change to how the account signs in through a
+    provider. A description that names only the first hides the others from the one who edits its template."""
+    described = ea.SPEC_BY_KEY["sign_in_method_changed"]["description"]
+    for sent_for in ("a passkey is added to or removed from", "an authenticator app is set up",
+                     "single sign-on provider", "an identity linked or unlinked"):
+        assert sent_for in described, sent_for
