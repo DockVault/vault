@@ -100,6 +100,10 @@ def test_one_providers_accounts_are_never_listed_under_another(monkeypatch):
 def test_the_page_says_nothing_of_the_persons_identifier_address_or_name_at_the_provider(monkeypatch):
     w = _world(monkeypatch)
     status, out = _list(w.h, w.p.id)
+    # The rows came back, so what is absent below is absent from the list and not from a refusal.
+    assert status == 200, out
+    assert {r["id"] for r in out["identities"]} == {str(w.fresh.id), str(w.gone.id), str(w.refused.id),
+                                                     str(w.answered.id), str(w.admin_lapsed.id)}
     text = str(out)
     for kept in ("s-alice", "s-bob", "tenant-1", "alice@corp.example", "Alice Corp", w.p.issuer, w.p.client_id):
         assert kept not in text, kept
@@ -125,8 +129,9 @@ def test_the_page_pages_and_keeps_one_state(monkeypatch):
 
 def test_an_unknown_provider_is_not_found(monkeypatch):
     w = _world(monkeypatch)
-    assert _list(w.h, uuid.uuid4())[0] == 404
-    assert _list(w.h, "not-an-id")[0] == 404
+    # The page's own answer, not the 404 of a path no route serves.
+    assert _list(w.h, uuid.uuid4()) == (404, {"detail": "Unknown provider."})
+    assert _list(w.h, "not-an-id") == (404, {"detail": "Unknown provider."})
 
 
 def test_the_read_asks_no_step_up_and_records_nothing(monkeypatch):
