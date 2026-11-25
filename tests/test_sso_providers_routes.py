@@ -1697,3 +1697,30 @@ def test_a_provider_is_not_removed_while_sessions_that_came_through_it_still_sta
     monkeypatch.setattr(h.R, "_sessions_standing", real)
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
     assert status == 200 and out == {"removed": True} and h.rows() == []
+
+
+def test_the_newly_held_are_told_what_was_changed(monkeypatch):
+    """The days stay 30, and an administrator makes running out of them stop the password too. The two accounts
+    past the days were told that the administrator "changed how often Contoso must have seen you": nothing about
+    how often had changed. They are told what did. A change of the days themselves is said as that."""
+    h, row, (ann, ben, cy) = _linked_since(monkeypatch, [1, 40, 50], policy={"sso_freshness_days": 30,
+                                                                           "sso_lapse_ends_sign_in": False})
+    label = row.label or row.name
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": True}})
+    assert status == 200 and out["newly_held"] == 2, out
+    (told,) = h.accounts_told
+    assert told[0] == ["ben", "cy"] and told[2] == (
+        f"An administrator changed what stops when {label} has not seen you within its days: your password and "
+        f"passkeys now stop as well as your keys. Your last sign-in through {label} is older than that: your "
+        f"password and passkeys do not sign you in to this vault until you have signed in through {label} again.")
+    del h.accounts_told[:]
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 0}})
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 20}})
+    assert status == 200 and out["newly_held"] == 2, out
+    assert h.accounts_told[-1][2].startswith(f"An administrator changed how often {label} must have seen you. Your last ")
+    # Both changed in one save: the days are what is named.
+    del h.accounts_told[:]
+    h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": False}})
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}",
+                         {"policy": {"sso_lapse_ends_sign_in": True, "sso_freshness_days": 10}})
+    assert status == 200 and h.accounts_told[-1][2].startswith(f"An administrator changed how often {label} must have")

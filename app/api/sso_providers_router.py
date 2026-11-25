@@ -420,10 +420,15 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     label = row.label or row.name
     # The people the change holds from this moment had no warning of it (the warning counts five days down to the
     # days as they were): each is told now, in the app and by email, what stopped and what brings it back.
+    # Said as what was changed: the days themselves, or what running out of them stops (with the days as they
+    # were, "changed how often it must have seen you" was not true).
+    what_changed = (f"An administrator changed how often {label} must have seen you."
+                    if "policy.sso_freshness_days" in outcome["changed"] else
+                    f"An administrator changed what stops when {label} has not seen you within its days: your "
+                    "password and passkeys now stop as well as your keys.")
     _tell_accounts(newly_by_days, f"Sign in through {label} to keep signing in here", (
-        f"An administrator changed how often {label} must have seen you. Your last sign-in through {label} is older "
-        f"than that: your password and passkeys do not sign you in to this vault until you have signed in through "
-        f"{label} again."))
+        f"{what_changed} Your last sign-in through {label} is older than that: your password and passkeys do not "
+        f"sign you in to this vault until you have signed in through {label} again."))
     _tell_accounts(newly_by_a_refusal, f"Sign in through {label} to keep signing in here", (
         f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
         f"sign-in through {label}: its password and passkeys do not sign it in to this vault until {label} has "
