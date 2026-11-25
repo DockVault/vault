@@ -40,6 +40,7 @@ NOT_CONFIGURED = "not_configured"
 STILL_ON = "still_on"
 ONLY_WAY_IN = "only_way_in"
 REFUSALS_IN_FORCE = "refusals_in_force"
+DAYS_RAN_OUT = "days_ran_out"
 TOO_MANY = "too_many_providers"
 NAME_TAKEN = "name_taken"
 NEEDS_RESTRICTION = "needs_restriction"
@@ -227,11 +228,19 @@ def hold_lapsed(db, row, *, now=None) -> int:
     the people who stopped signing in there (the ones the window is for) would get their SSH keys, temporary
     credentials and devices back for good once it is removed. A held identity is lifted as a refusal is: by a
     later sign-in the provider admits, or by another administrator; and a provider is not removed while it holds
-    one. Returns how many were held."""
+    one. Returns how many were held.
+
+    Nothing is written for a provider that is off and closes the other ways in after its days
+    (``sso_lapse_ends_sign_in``). There a hold also ends the person's password, and while a provider is off its
+    days end no password: nobody could sign in through it. A removal that was then refused had ended the
+    password of everybody whose days ran out while the provider was off, and told nobody. Such a provider is not
+    removed while days have run out (:func:`remove_refusal` says how it can be)."""
     from datetime import datetime
     from app.core.models import ExternalIdentity
     from app.services import sso_freshness
     now = now or datetime.utcnow()
+    if getattr(row, "state", None) != ENABLED and sso_policy.effective(getattr(row, "policy", None))["sso_lapse_ends_sign_in"]:
+        return 0
     held = 0
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
         standing = sso_freshness.deadline_of(identity, row)
@@ -239,6 +248,20 @@ def hold_lapsed(db, row, *, now=None) -> int:
             identity.refused_at = now
             held += 1
     return held
+
+
+def days_ran_out(db, row, *, now=None) -> int:
+    """How many identities of ``row`` are past its days and not held by a refusal. Nothing is written."""
+    from datetime import datetime
+    from app.core.models import ExternalIdentity
+    from app.services import sso_freshness
+    now = now or datetime.utcnow()
+    count = 0
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
+        standing = sso_freshness.deadline_of(identity, row)
+        if standing is not None and not standing.refused and standing.due <= now:
+            count += 1
+    return count
 
 
 def due_at_turn_on(db, row, *, now=None) -> int:
@@ -520,4 +543,17 @@ def remove_refusal(db, row) -> Optional[Conflict]:
             f"{n} account{'s are' if n != 1 else ' is'} held by a refusal this provider recorded. Clear "
             f"{'each' if n != 1 else 'it'} under Identities first: removing the provider would lift "
             f"{'them' if n != 1 else 'it'} unseen."))
+    lapsed = days_ran_out(db, row)
+    if lapsed:
+        # Past their days, and not held: this provider closes the other ways in after its days, so a hold written
+        # now, while it is off, would end these people's passwords (hold_lapsed writes none). Removed, the provider
+        # would give them their paused keys back unseen. The sentence names the two ways on.
+        n = lapsed
+        return Conflict(DAYS_RAN_OUT, (
+            f"{n} account{'s have' if n != 1 else ' has'} not signed in through this provider within its days, so "
+            f"{'their' if n != 1 else 'its'} SSH keys, temporary credentials and devices are paused. Removing the "
+            "provider would lift that unseen. Turn the provider on so that they can sign in through it again. Or "
+            "turn off “After those days, or a refusal, the account signs in only through a provider” for it "
+            f"(Access) and remove it again: {'they are' if n != 1 else 'it is'} then held, for you to clear under "
+            "Identities, and nobody's password stops."))
     return None

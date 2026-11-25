@@ -395,7 +395,9 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     row = _row_or_404(db, provider_id)
     if row.state != providers.ENABLED and providers.hold_lapsed(db, row):
         # People whose days ran out while the provider was off: held now, so the removal does not lift the pause
-        # unseen. The holds stand whatever becomes of this request.
+        # unseen. The holds stand whatever becomes of this request. None is written where a hold would also end
+        # the person's password (a provider that closes the other ways in after its days): the removal is then
+        # refused with the ways on, and nobody's sign-in changes because somebody tried to remove a provider.
         db.commit()
         row = _row_or_404(db, provider_id)
     refusal = providers.remove_refusal(db, row)

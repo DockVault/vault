@@ -338,11 +338,12 @@ def test_a_removal_tells_an_account_left_with_no_way_in_how_to_get_a_password(mo
 
 def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_was_off(monkeypatch):
     """A removed provider has no identities left to count days for. A person whose days ran out while it was off
-    would get their keys back for good, unseen: the removal holds them first, the hold is kept whatever becomes of
-    the request, and the removal is refused until an administrator has cleared it."""
+    would get their keys back for good, unseen. Where the days only pause keys, the removal holds them first, the
+    hold is kept whatever becomes of the request, and the removal is refused until an administrator has cleared
+    it."""
     from datetime import datetime, timedelta
     row = _provider(state="disabled", created_at=None, updated_at=None)
-    row.policy = {"sso_freshness_days": 7}
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
     alice, bob = _user("alice"), _user("bob")
     now = datetime.utcnow()
     lapsed = _identity(alice, row, last_sign_in_at=now - timedelta(days=30), linked_at=now - timedelta(days=60),
@@ -355,6 +356,49 @@ def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_
     assert lapsed.refused_at is not None and inside.refused_at is None and h.rows() == [row] and h.order == []
     lapsed.refused_at = None                                    # cleared, and signed in since
     lapsed.last_sign_in_at = now
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 200 and out == {"removed": True}, out
+
+
+def test_a_removal_that_is_refused_ends_nobodys_password(monkeypatch):
+    """A provider that closes the other ways in after its days: while it is off, its days end no password (nobody
+    could sign in through it). A hold does, so the removal writes none there: it is refused, with the two ways on,
+    and the people whose days ran out while it was off go on signing in as they did. It held each of them before
+    it refused, ahead of any step-up, and nobody was told."""
+    from datetime import datetime, timedelta
+    from app.services import sso_freshness as F
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    row.policy = {"sso_freshness_days": 7}                      # the other setting as it stands: on
+    alice, bob = _user("alice"), _user("bob")
+    now = datetime.utcnow()
+    lapsed = _identity(alice, row, last_sign_in_at=now - timedelta(days=30), linked_at=now - timedelta(days=60),
+                       refused_at=None)
+    inside = _identity(bob, row, last_sign_in_at=now - timedelta(days=1), linked_at=now - timedelta(days=60),
+                       refused_at=None)
+    h = Admin(monkeypatch, [row], users=[alice, bob], identities=[lapsed, inside])
+    before = F.held_to_a_provider(h.db, alice)
+    assert before is None or not F.closes_now(before, now)
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and out["detail"]["reason"] == "days_ran_out", out
+    assert out["detail"]["message"] == (
+        "1 account has not signed in through this provider within its days, so its SSH keys, temporary credentials "
+        "and devices are paused. Removing the provider would lift that unseen. Turn the provider on so that they can "
+        "sign in through it again. Or turn off “After those days, or a refusal, the account signs in only through a "
+        "provider” for it (Access) and remove it again: it is then held, for you to clear under Identities, and "
+        "nobody's password stops.")
+    assert lapsed.refused_at is None and inside.refused_at is None and h.rows() == [row] and h.order == []
+    after = F.held_to_a_provider(h.db, alice)
+    assert after is None or not F.closes_now(after, now)        # her password signs in as before
+    assert ("commit",) not in h.db.log
+    # The second way on: the setting turned off, the removal holds her (keys only) and waits for it to be cleared.
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and out["detail"]["reason"] == "refusals_in_force", out
+    held = F.held_to_a_provider(h.db, alice)
+    assert lapsed.refused_at is not None and (held is None or not F.closes_now(held, now))
+    # The first way on, instead: turned on, she signs in through it, and it is turned off and removed.
+    lapsed.refused_at, lapsed.last_sign_in_at = None, now
+    row.policy = {"sso_freshness_days": 7}
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
     assert status == 200 and out == {"removed": True}, out
 

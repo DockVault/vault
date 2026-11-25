@@ -361,8 +361,16 @@ def test_turning_a_provider_off_holds_the_accounts_whose_sign_in_there_had_lapse
     assert P.remove_refusal(db, row).reason == P.REFUSALS_IN_FORCE
     assert P.hold_lapsed(db, row, now=now) == 0                  # nothing more to hold today
     later = now + timedelta(days=8)                              # its days ran out while the provider was off
+    # Off, and its days close the other ways in: a hold would end a password the days do not end while it is
+    # off. None is written, and the count says who stands in the way of a removal.
+    assert P.hold_lapsed(db, row, now=later) == 0 and here.refused_at is None
+    assert P.days_ran_out(db, row, now=later) == 1 and P.days_ran_out(db, row, now=now) == 0
+    # Where the days only pause keys, the hold is written as ever.
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
     assert P.hold_lapsed(db, row, now=later) == 1 and here.refused_at == later
+    assert P.days_ran_out(db, row, now=later) == 0               # held now: counted as a refusal, not twice
     here.refused_at = None
+    row.policy = {"sso_freshness_days": 7}
     # A provider that asks for no window holds nobody.
     other = _ready(P, db, name="no-window")
     other.state = "enabled"
