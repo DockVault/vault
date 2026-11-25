@@ -14,6 +14,9 @@ network::
     python -m app.core.host_operator zk-status
     python -m app.core.host_operator downgrade-blockers --target 0.33.2
     python -m app.core.host_operator release-key-hold --username alice --confirm-username alice
+    python -m app.core.host_operator clear-passkey-requirement --username alice --confirm-username alice
+    python -m app.core.host_operator restore-passkey-requirement --username alice --confirm-username alice
+    python -m app.core.host_operator passkey-addresses
 
 It is the way round the rule that a second change to someone's sign-in details within 14 days needs a
 second administrator (app/core/credential_changes.py): on a deployment with one administrator, or
@@ -23,6 +26,11 @@ exactly as an administrator's would be, under the name ``operator@host``.
 
 ``zk-status`` is for a managing operator's tooling: the deployment's zero-knowledge state in counts and
 switches, read without an account or a password and without changing anything (see zk_status).
+
+``clear-passkey-requirement`` lets an account whose role must hold a passkey sign in without one (a browser
+that cannot make one). It applies again when the account adds a passkey or its role changes, or when
+``restore-passkey-requirement`` puts it back (app/core/webauthn_settings.py). ``passkey-addresses`` is for
+dockvault.py: where the passkeys in use were made, read without changing anything (see passkey_addresses).
 
 Safety:
   * every change names the account twice (``--username`` or the request's account, and

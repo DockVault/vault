@@ -295,6 +295,18 @@ or when reset links are not configured, a temporary password) is shown once on y
 nowhere else. Each change is recorded and audited as the host operator's (`operator@host`), and the
 user is told.
 
+When a role must hold a passkey (Roles that must have a passkey, under Settings, Sign-in methods) and
+someone's browser cannot make one, `clear-passkey-requirement` lets that account sign in without it:
+
+```bash
+python dockvault.py accounts --action clear-passkey-requirement --username alice --confirm-username alice
+```
+
+The requirement applies again when the account adds a passkey or its role changes, or with
+`--action restore-passkey-requirement`. The person and the administrators are told. Before it changes an
+account, the tool shows it, and when its requirement was lifted if it is. It refuses an account whose
+role is not required to hold a passkey, or one whose requirement is already lifted.
+
 Compliance access (the Compliance page: cases, legal holds and the auditor right; see the
 [hardening guide](docs/guides/hardening.md) and the [DPIA template](docs/guides/dpia-compliance-access.md)) has a
 host side too: an auditor right is granted by two people, and a case is approved by a second one. When no administrator is independent enough to be that second person, `python dockvault.py

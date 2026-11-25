@@ -11,7 +11,8 @@ Run with NO arguments for the interactive menu:
   Reset            tear down (optionally destroy data)
   Update           upgrade / downgrade the running image
   Logs             enable + pull the authenticated log endpoint
-  Accounts         reset a user's password or second factor, approve a change held for approval
+  Accounts         reset a user's password or second factor, approve a change held for approval,
+                   lift or put back a passkey requirement
 
 Or run a subcommand directly for unattended use:
 
@@ -53,7 +54,7 @@ MENU = [
     ("update",  "Update - upgrade / downgrade the running image"),
     ("logs",    "Logs - enable + pull the authenticated log endpoint"),
     ("accounts", "Accounts - reset a user's password or second factor, unlock, approve a held change, "
-                 "release a held encryption key"),
+                 "release a held encryption key, lift a passkey requirement"),
     ("cases", "Cases - compliance access: approve an auditor right or a case when no administrator can"),
     ("audit", "Audit log - retention, verify the integrity chain, unarchive, compact"),
 ]

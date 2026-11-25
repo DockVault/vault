@@ -291,6 +291,24 @@ def test_every_menu_entry_has_its_expected_calls_and_is_an_action_of_the_tool():
             host_operator.build_parser().parse_args(call)     # the tool in the container accepts it
 
 
+def test_every_action_of_the_tool_is_in_the_usage_at_its_top():
+    # The usage listed eleven actions; clear-passkey-requirement, restore-passkey-requirement and
+    # passkey-addresses, which the tool also takes, were not among them.
+    from app.core import host_operator
+    assert [name for name in host_operator.ACTIONS if f"host_operator {name}" not in host_operator.__doc__] == []
+
+
+def test_the_passkey_requirement_is_named_where_an_operator_looks_for_it():
+    # Someone whose role must hold a passkey and whose browser cannot make one asks an administrator, who
+    # looks in the README and the top menu: neither said that the host tool lifts the requirement.
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert ("python dockvault.py accounts --action clear-passkey-requirement --username alice "
+            "--confirm-username alice") in readme
+    assert "--action restore-passkey-requirement" in readme
+    assert "passkey" in dict(dv.MENU)["accounts"]
+    assert "passkey requirement" in dv.__doc__
+
+
 @pytest.mark.parametrize("action", MENU_KEYS)
 def test_each_entry_by_its_action_sends_its_arguments(app, monkeypatch, action):
     options, _typed, calls = EXPECTED_CALLS[action]
