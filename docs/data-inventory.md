@@ -300,11 +300,19 @@ files except to serve them, and cannot read zero-knowledge ones.
 - **Container output** (`docker logs`): the web access log (client address and port, method, path
   with any link, invitation or reset token in it redacted, the query's parameter names but never their
   values, status; a WebSocket handshake's line the same way) and the application's own lines
-  (startup, counts from the cleanups, warnings). Those lines name accounts by id and carry no file
-  names or passwords. A database error's text leaves out the statement's values (**new in 0.33.0**),
-  and an unexpected error, or a failed audit, notification or security-event write, is logged by its
-  class and where it was raised. The database driver's own text can still name a value that broke a
-  uniqueness rule (a username, an address), and some older error lines print it. **Changed in 0.34.0:**
+  (startup, counts from the cleanups, warnings). Those lines name an account by its id and a session by
+  the start of its stored token's hash; apart from an error's text (below), they carry no username,
+  email address, display name, provider's identifier for the person, name typed at sign-in, file name
+  or password. **Changed in 0.36.0:** some lines named a person by username, address or the name typed
+  (a sign-out, a locked or deactivated account's sessions and keys, the close of a session's live SFTP
+  connection, the end of a live-monitor connection, the first administrator made from the environment,
+  a start that found an address held by accounts differing only in case, a failed sign-in, the
+  administrator who resolved a security alert); they now give the account's id, or no name. A database
+  error's text leaves out the statement's values (**new in 0.33.0**), and an unexpected error, or a
+  failed audit, notification or security-event write, is logged by its class and where it was raised.
+  Some older error lines still print an error's text (a failed step at start or of the session cleanup,
+  among others), and the database driver's text for a broken uniqueness rule names the value that broke
+  it (a username, an email address). **Changed in 0.34.0:**
   a query's values were printed, so a search sent in the query (an Activity search for a name, an
   address or free text) reached this log; now only the names are, a WebSocket handshake's line
   included, and a line read back through log access from before the change serves only the names too,

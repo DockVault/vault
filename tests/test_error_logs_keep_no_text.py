@@ -11,7 +11,8 @@ sent) and never a part of a session's token:
   the encryption keys too);
 - a failed upload or download tells the live monitor the error's class, never its text;
 - a failed pass of the audit chain's sealer is logged with an error id, its class and place;
-- a sign-out logs the prefix of the token's hash, as it is stored, never of the token.
+- a sign-out logs the prefix of the token's hash, as it is stored, never of the token, and names the account by its
+  id, never its username.
 
 test_managed_settings_routes.py checks a failed managed-setting change or cancel; test_reset_ends_sessions_with_the_
 password.py a failed password reset; test_email_send.py and test_settings_test_email_tls.py a failed send of mail.
@@ -242,13 +243,15 @@ def test_a_sign_out_logs_the_prefix_of_the_tokens_hash_never_of_the_token(monkey
     monkeypatch.setattr(api, "broadcast_event", lambda event: None)
     row = SimpleNamespace(id=7, is_active=True, revoked=False, temp_credential_id=None) if found else None
     request = SimpleNamespace(headers={"Authorization": "Bearer signed"}, client=SimpleNamespace(host="192.0.2.7"))
+    person = SimpleNamespace(id="5b0c1f2e-9d3a-4e7b-8c61-2f4a9e0d7b13", username="ada.k-0517")
     capsys.readouterr()
-    run_coroutine(api.logout(request=request, response=Response(), current_user=SimpleNamespace(username="ada"),
-                             db=_Db(row)))
+    run_coroutine(api.logout(request=request, response=Response(), current_user=person, db=_Db(row)))
     logged = _logged(capsys)
     assert api.hash_session_token(token)[:8] in logged
     assert token[:8] not in logged, "no part of the token itself"
-    assert (row.revoked is True and row.is_active is False) if found else ("not found" in logged)
+    assert person.username not in logged, "the account by its id, never its username"
+    assert (row.revoked is True and row.is_active is False and person.id in logged) if found \
+        else ("not found" in logged)
 
 
 def test_a_failed_pass_of_the_audit_chains_sealer_logs_an_id_and_where_never_the_text(monkeypatch, capsys):

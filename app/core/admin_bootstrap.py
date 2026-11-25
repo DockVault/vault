@@ -72,5 +72,5 @@ def bootstrap_admin(db) -> str:
     )
     _mark("seeded")
     db.commit()
-    print(f"[OK] Bootstrapped admin user '{settings.admin_username}' from environment")
+    print("[OK] Bootstrapped the first admin user from environment")
     return "seeded"

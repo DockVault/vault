@@ -9803,26 +9803,27 @@ def _guard_temp_session_cred_mutation(current_user, temp_cred, perm: str):
 _FORCE_CLOSE_WORK = "sftp_force_close"
 
 
-def _force_close_after_commit(db, message: dict, actor_username: str) -> None:
+def _force_close_after_commit(db, message: dict) -> None:
     """Send the SFTP server the force-close signal ``message`` (one session's) once ``db``'s transaction commits,
     and none when it rolls back. The signal tears down a live transport at once; sent before the commit, a change
     that then rolled back (a reset whose transaction failed, answered "nothing changed") had already cut the
     person's live SFTP transfers. Sent after it, the session's row is ended by the time a client that reconnects
     is checked again."""
-    _after_commit_work.later(db, _FORCE_CLOSE_WORK, (message, actor_username))
+    _after_commit_work.later(db, _FORCE_CLOSE_WORK, message)
 
 
 def _send_force_closes(items) -> None:
-    """After a commit: the force-close signals its transaction gathered. Never raises (the change is committed)."""
-    for message, actor_username in items:
+    """After a commit: the force-close signals its transaction gathered. Never raises (the change is committed).
+    The lines name the session by the start of its stored token, never who ended it: the audit log says that."""
+    for message in items:
         try:
             sent = _guarded_publish_force('session_terminations', json.dumps(message))
             if sent:
-                print(f"📢 Force-closed session {message['session_token'][:8]}... ({actor_username})")
+                print(f"📢 Force-closed session {message['session_token'][:8]}...")
             else:
                 # Durable revocation is committed; only the live teardown signal was skipped while a
                 # cache failure sits inside its cooldown.
-                print(f"↩ Revoked session {message['session_token'][:8]}... ({actor_username}); live signal "
+                print(f"↩ Revoked session {message['session_token'][:8]}...; live signal "
                       f"skipped (cache guard), teardown falls to the session's own recheck")
         except Exception as e:  # noqa: BLE001
             print(f"❌ Failed to publish termination signal ({type(e).__name__})")
@@ -9963,7 +9964,7 @@ def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_usernam
             'session_token': s.session_token,
             'session_id': str(s.id),
             'terminated_by': actor_username,
-        }, actor_username)
+        })
     if handled_ids and durable:
         # A revoked session makes no provider logout: its logout hint (the encrypted ID token) goes with it. Not for
         # a revocation that is not durable (turning SFTP off): its web sessions are marked inactive, not revoked, and
@@ -10682,7 +10683,7 @@ async def terminate_temp_credential_sessions(
             'session_id': str(session.id),
             'temp_username': temp_username,
             'terminated_by': current_user.username
-        }, current_user.username)
+        })
 
         # Log the termination
         audit_logger.log_action(
@@ -11109,7 +11110,7 @@ async def websocket_monitor_endpoint(websocket: WebSocket):
             task.cancel()
         
     except WebSocketDisconnect:
-        print(f"WebSocket disconnected for user {username if 'username' in locals() else 'unknown'}")
+        print(f"WebSocket disconnected for user {user_id if 'user_id' in locals() else 'unknown'}")
     except Exception as e:
         # str(e) can carry SQL/schema/host internals; log it server-side but never frame it to the
         # client (WebSocket frames don't pass through the HTTP 500-sanitizer).
@@ -13966,7 +13967,7 @@ async def update_user(
             revoked = _revoke_sessions(db, user_id=user.id, actor_username=current_user.username)
             sign_in.spend_sign_ins_under_way(db, user.id)
             if revoked:
-                print(f"🔒 Revoked {revoked} live session(s) for locked/deactivated user {user.username}")
+                print(f"🔒 Revoked {revoked} live session(s) for locked/deactivated user {user.id}")
 
         # Per-account storage budget. Admin-only and deliberately outside the self-service
         # branch above: a user who could raise their own quota would make the deployment
@@ -13984,7 +13985,7 @@ async def update_user(
     db.commit()
     db.refresh(user)
     if n_bl:
-        print(f"🔑 Blacklisted {n_bl} ZK key(s) for deactivated user {user.username}")
+        print(f"🔑 Blacklisted {n_bl} ZK key(s) for deactivated user {user.id}")
     
     # Audit log
     audit_logger = AuditLogger(db)
@@ -28025,7 +28026,7 @@ async def logout(
                     db.rollback()
             if session:
                 session_invalidated = True
-                print(f"🔓 Session invalidated for user {current_user.username} (session {hash_session_token(session_token)[:8]}..., as stored)")
+                print(f"🔓 Session invalidated for user {current_user.id} (session {hash_session_token(session_token)[:8]}..., as stored)")
             else:
                 print(f"⚠️ Session not found in database for token {hash_session_token(session_token)[:8]}... (as stored)")
             # Denylist the token so it stops working IMMEDIATELY for the rest of its life
@@ -28035,7 +28036,7 @@ async def logout(
             _ttl = int(payload.get("exp", 0) - _time.time())
             denylist_token(session_token, _ttl if _ttl > 0 else 1800)
         else:
-            print(f"⚠️ No session_token in JWT payload for user {current_user.username}")
+            print(f"⚠️ No session_token in JWT payload for user {current_user.id}")
     
     # Clear all site data using Clear-Site-Data header
     response.headers["Clear-Site-Data"] = '"cache", "cookies", "storage"'
@@ -28810,6 +28811,11 @@ def _seed_admin_user(db=None):
         from app.core.database import get_db_context
         with get_db_context() as session:
             return bootstrap_admin(session)
+    except ValueError:
+        # The account's refusal names the account ("Username '...' already exists"); this line does not.
+        print("⚠ Admin bootstrap skipped: the account was refused (ADMIN_USERNAME or ADMIN_EMAIL is another "
+              "account's, or ADMIN_USERNAME is a name kept for the server's own records)")
+        return "error"
     except Exception as e:
         print(f"⚠ Admin bootstrap skipped: {e}")
         return "error"
@@ -29814,7 +29820,7 @@ END $$;""",
             # above, because it is conditional: a deployment that already holds two addresses
             # differing only in case cannot build this index at all.
             #
-            # Such a deployment BOOTS anyway, with a warning naming the accounts.
+            # Such a deployment BOOTS anyway, with a warning naming the accounts by id.
             # Refusing to start would take a self-hosted vault down in the middle of an unattended
             # update and keep it down until someone hand-edited the database; nulling the newer
             # duplicate would silently destroy an address that may be that person's only way in.
@@ -29839,10 +29845,10 @@ END $$;""",
                         f"account differing only in case, so the case-insensitive unique index "
                         f"({EMAIL_LOWER_UNIQUE_INDEX}) was NOT created. Uniqueness is still enforced "
                         f"by the application, but two concurrent requests could still race. "
-                        f"Resolve these accounts and restart:"
+                        f"Resolve these accounts and restart (each line is one address's accounts, by id):"
                     )
-                    for normalized, usernames in collisions:
-                        print(f"    {normalized}  ->  {usernames}")
+                    for account_ids in collisions:
+                        print(f"    {account_ids}")
                 else:
                     # Canonicalize what is already there before indexing it. Rows written by an
                     # older release kept whatever case the caller typed, so without this an

@@ -120,7 +120,8 @@ def find_email_collisions(db):
     """Groups of existing accounts whose emails differ only in case.
 
     Used at boot to decide whether the functional unique index can be built at all. Returns a list
-    of `(normalized_address, "user_a, user_b")`, empty when the data is clean.
+    with one `"id_a, id_b"` per address, the ids of the accounts that hold it, empty when the data is
+    clean. The boot prints them, and the container output names accounts by id, never by address.
 
     Takes anything with `.execute` — a Session during boot, a Connection in a test — so it does not
     care which layer the caller happens to hold.
@@ -130,15 +131,14 @@ def find_email_collisions(db):
         -- Groups on lower(email), the EXACT expression the unique index uses. Grouping on
         -- lower(trim(email)) instead would report a collision for two rows that differ only in
         -- surrounding whitespace, which the index would happily accept -- skipping the index
-        -- forever on a database that could build it, and naming two accounts whose addresses
-        -- print identically so the operator has nothing to act on.
-        SELECT lower(email) AS normalized,
-               string_agg(username, ', ' ORDER BY username) AS usernames
+        -- forever on a database that could build it, and naming two accounts the operator has
+        -- nothing to resolve between.
+        SELECT string_agg(id::text, ', ' ORDER BY id::text) AS account_ids
           FROM users
          WHERE email IS NOT NULL AND email <> ''
          GROUP BY lower(email)
         HAVING count(*) > 1
-         ORDER BY normalized
+         ORDER BY lower(email)
         """
     )).fetchall()
-    return [(row[0], row[1]) for row in rows]
+    return [row[0] for row in rows]

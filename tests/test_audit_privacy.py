@@ -1209,7 +1209,7 @@ def test_the_row_is_built_from_the_callers_details_and_the_callers_dict_is_untou
 
 # --------------------------------------------------------------------------- the container's output
 
-def test_the_failed_sign_in_line_shows_name_and_address_at_their_levels(monkeypatch):
+def test_the_failed_sign_in_line_shows_no_name_and_the_address_at_its_level(monkeypatch):
     ap.use(ap.Policy(2, _levels(signin_names="none", ip="shortened")))
     assert ap.for_output(ap.SIGNIN_NAME, "eve") == "(not recorded)"
     assert ap.for_output(ap.ADDRESS, "198.51.100.4") == "198.51.100.0/24"
@@ -1219,8 +1219,8 @@ def test_the_failed_sign_in_line_shows_name_and_address_at_their_levels(monkeypa
     source = inspect.getsource(security_monitor.SecurityMonitor.record_failed_login)
     line = source[source.index('logger.info(f"Failed login recorded'):]
     line = line[:line.index("\n\n") if "\n\n" in line else len(line)]
-    assert "for_output(SIGNIN_NAME, username)" in line and "for_output(ADDRESS, ip_address)" in line
-    assert "{username}" not in line and "{ip_address}" not in line
+    assert "for_output(ADDRESS, ip_address)" in line and "{ip_address}" not in line
+    assert "username" not in line and "SIGNIN_NAME" not in line, "the name typed reached the container's output"
 
 
 def test_for_output_never_raises(monkeypatch):
