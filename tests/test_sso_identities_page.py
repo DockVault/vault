@@ -196,6 +196,27 @@ def test_where_each_account_stands_is_what_the_sign_in_and_the_keys_hold_it_to(m
     assert by_name["erin"]["holds_sign_in"] is False                # an administrator keeps the password
 
 
+@pytest.mark.parametrize("status, held", [("proposed", True), ("suspended", True), ("active", False)])
+def test_only_an_auditor_right_in_force_keeps_an_account_out_of_the_hold_here_as_at_the_sign_in(
+        monkeypatch, status, held):
+    """The sign-in holds every account but one that keeps a password of its own in use now: an administrator, or the
+    holder of an auditor right in force. A proposal for the right, or a right that is suspended, keeps nobody out of
+    the hold. The page says the password and passkeys do not sign an account in, and what a lift would leave, by the
+    same rule (sso_freshness.held_to_a_provider)."""
+    from app.core.models import AuditorGrant
+    from app.services import sso_freshness
+    w = _world(monkeypatch)
+    w.gone.refused_at = NOW - timedelta(days=1)          # refused after the days had run out: a lift leaves it lapsed
+    for user in (w.bob, w.carol):
+        w.h.db.rows_of(AuditorGrant).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, status=status))
+    rows = {r["username"]: r for r in _list(w.h, w.p.id)[1]["identities"]}
+    for name, user in (("Bob", w.bob), ("carol", w.carol)):
+        assert (sso_freshness.held_to_a_provider(w.h.db, user) is not None) is held, name
+        assert rows[name]["state"] == "refused" and rows[name]["holds_sign_in"] is held, (name, rows[name])
+    assert rows["Bob"]["after_lift"] == {"state": "lapsed", "holds_sign_in": held}
+    assert rows["carol"]["after_lift"] == {"state": "linked", "holds_sign_in": False}
+
+
 def test_a_refusal_on_a_provider_that_counts_no_days_has_no_date_for_its_days(monkeypatch):
     """With the days at 0 only a refusal holds anybody, and its deadline is the refusal itself: the page gives the
     refusal's date, and no date for days that are not counted."""

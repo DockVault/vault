@@ -195,7 +195,6 @@ def list_provider_identities(provider_id: str, skip: int = Query(0, ge=0, le=1_0
     Refused first, then lapsed, then by username; ``state`` keeps one of the three. ``skip`` and ``limit`` page through
     them; ``total`` counts them all, ``counts`` each state. Never the provider's identifier for the person, the address
     or name it sent, or what a token claimed. A read, like the provider list: no step-up, nothing recorded."""
-    from app.core import privileged_accounts
     from app.core.models import ExternalIdentity
     from app.services import sso_freshness
     row = _provider_or_404(db, provider_id)
@@ -218,8 +217,10 @@ def list_provider_identities(provider_id: str, skip: int = Query(0, ge=0, le=1_0
         return value.isoformat() + "Z" if value else None
 
     def holds(user, found):
-        return bool(found is not None and sso_freshness.closes_now(found, now) and user is not None
-                    and privileged_accounts.kind(db, user) is None)
+        # The sign-in's own rule for who a hold reaches (sso_freshness.may_be_held): an administrator and the holder
+        # of an auditor right in force keep their password; a proposal for the right, or a suspended one, does not.
+        return bool(found is not None and sso_freshness.closes_now(found, now)
+                    and sso_freshness.may_be_held(db, user))
 
     def shown(identity, held, found):
         user = users.get(identity.user_id)
