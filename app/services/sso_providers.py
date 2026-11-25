@@ -304,8 +304,8 @@ def held_by_the_removal(n: int) -> Conflict:
     return Conflict(REFUSALS_IN_FORCE, (
         f"{n} account{'s have' if n != 1 else ' has'} not signed in through this provider within its days. "
         f"{'They are' if n != 1 else 'It is'} held now, so that removing the provider does not give "
-        f"{'them their' if n != 1 else 'it its'} SSH keys, temporary credentials and devices back unseen. Clear "
-        f"{'each' if n != 1 else 'it'} under Identities when {'they' if n != 1 else 'it'} should have them back, "
+        f"{'them their' if n != 1 else 'it its'} SSH keys, temporary credentials and devices back unseen. Lift "
+        f"{'each' if n != 1 else 'it'} on this provider's Identities page when {'they' if n != 1 else 'it'} should have them back, "
         "then remove the provider again."))
 
 
@@ -655,9 +655,9 @@ def remove_refusal(db, row) -> Optional[Conflict]:
             f"{n} account{'s have' if many else ' has'} not signed in through this provider within its days, so "
             f"{'their' if many else 'its'} SSH keys, temporary credentials and devices are paused. Removing the "
             "provider would lift that unseen. The ways on: turn the provider on so that "
-            f"{'they sign' if many else 'it signs'} in through it again; unlink {'each' if many else 'it'} under the "
-            f"provider's Identities; or delete the account{'s' if many else ''}. Or turn off “After those days, or a "
+            f"{'they sign' if many else 'it signs'} in through it again; unlink {'each' if many else 'it'} on the "
+            f"provider's Identities page; or delete the account{'s' if many else ''}. Or turn off “After those days, or a "
             "refusal, the account signs in only through a provider” for it (Access) and remove it again: "
-            f"{'they are' if many else 'it is'} then held, to be lifted under Identities, and nobody's password "
+            f"{'they are' if many else 'it is'} then held, to be lifted on its Identities page, and nobody's password "
             "stops."))
     return None

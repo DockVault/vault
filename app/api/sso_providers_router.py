@@ -537,8 +537,8 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
             said += (" Its connection changed, so it was turned off until a test sign-in passes again"
                      + (f", and {ended} session(s) that came through it were ended." if ended else "."))
             if held:
-                said += (f" {held} account(s) whose sign-in there had lapsed stay held: lift each under Identities "
-                         "when it should have its keys back.")
+                said += (f" {held} account(s) whose sign-in there had lapsed stay held: lift each on this provider's "
+                         "Identities page when it should have its keys back.")
             said += _said_of_sessions_standing(standing)
         _tell_administrators(current_user.username, "A single sign-on provider was changed", said)
     return {"provider": providers.public(db, row), **outcome}
@@ -675,8 +675,8 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
         _tell_administrators(current_user.username, "Accounts were held before a provider's removal", (
             f"{current_user.username} began to remove the single sign-on provider {name}. {held} account(s) had not "
             "signed in through it within its days and are held now, so that the removal does not give them their "
-            "SSH keys, temporary credentials and devices back unseen. Lift each under Identities when it should "
-            "have them back; the provider can be removed then."
+            "SSH keys, temporary credentials and devices back unseen. Lift each on this provider's Identities page "
+            "when it should have them back; the provider can be removed then."
             + (f" {turned_off} of them are turned off: held as the others are, and not told." if turned_off else "")))
         paused = (f"You have not signed in through {shown} within the time your organisation allows, and {shown} is "
                   "being removed from this vault. Your SSH keys, temporary credentials and devices stay paused until "

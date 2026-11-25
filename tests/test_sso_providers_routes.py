@@ -380,8 +380,8 @@ def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_
     assert status == 409 and out["detail"]["reason"] == "refusals_in_force", out
     assert out["detail"]["message"] == (
         "1 account has not signed in through this provider within its days. It is held now, so that removing the "
-        "provider does not give it its SSH keys, temporary credentials and devices back unseen. Clear it under "
-        "Identities when it should have them back, then remove the provider again.")
+        "provider does not give it its SSH keys, temporary credentials and devices back unseen. Lift it on this "
+        "provider's Identities page when it should have them back, then remove the provider again.")
     assert lapsed.refused_at is not None and inside.refused_at is None and h.rows() == [row]
     assert h.order == ["step_up"]                               # held after the step-up, and not before
     # Recorded in the transaction that wrote the hold, and told: the administrators and the person held.
@@ -396,7 +396,7 @@ def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_
         "stay paused until an administrator lifts that. Your password signs you in as before."))]
     # Tried again while she is held: the recorded refusal stands in the way, and nothing is held or told twice.
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
-    assert status == 409 and out["detail"]["reason"] == "refusals_in_force" and "Clear it under Identities first" in out["detail"]["message"]
+    assert status == 409 and out["detail"]["reason"] == "refusals_in_force" and "Lift it on this provider's Identities page first" in out["detail"]["message"]
     assert len(h.audit("sso_provider_updated")) == 1 and len(h.accounts_told) == 1
     lapsed.refused_at = None                                    # cleared, and signed in since
     lapsed.last_sign_in_at = now
@@ -469,7 +469,7 @@ def test_a_removal_goes_through_once_an_administrator_has_lifted_the_holds_it_ma
         f"stay paused until a sign-in through {row.name}. A removal of {row.name} no longer waits for this "
         f"account: once {row.name} is removed, its keys wait for a sign-in there no more.")
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
-    assert status == 409 and "Clear it under Identities first" in out["detail"]["message"], out
+    assert status == 409 and "Lift it on this provider's Identities page first" in out["detail"]["message"], out
     assert lapsed.refused_at is None and len(h.accounts_told) == told and len(h.audit("sso_provider_updated")) == recorded
     # Both lifted: the removal goes through, and nobody is held, recorded or told again.
     status, out = h.call("POST", f"/admin/sso/identities/{other.id}/clear-refusal")
@@ -550,9 +550,9 @@ def test_a_removal_that_is_refused_ends_nobodys_password(monkeypatch):
     assert out["detail"]["message"] == (
         "1 account has not signed in through this provider within its days, so its SSH keys, temporary credentials "
         "and devices are paused. Removing the provider would lift that unseen. The ways on: turn the provider on so "
-        "that it signs in through it again; unlink it under the provider's Identities; or delete the account. Or "
+        "that it signs in through it again; unlink it on the provider's Identities page; or delete the account. Or "
         "turn off “After those days, or a refusal, the account signs in only through a provider” for it (Access) "
-        "and remove it again: it is then held, to be lifted under Identities, and nobody's password stops.")
+        "and remove it again: it is then held, to be lifted on its Identities page, and nobody's password stops.")
     # For several accounts it is said in the plural.
     from app.services import sso_providers
     also = _identity(bob, row, subject="s-9", last_sign_in_at=now - timedelta(days=40), linked_at=now - timedelta(days=60),
@@ -563,9 +563,9 @@ def test_a_removal_that_is_refused_ends_nobodys_password(monkeypatch):
     h.db.rows_of(ExternalIdentity).append(also)
     said = str(sso_providers.remove_refusal(h.db, row))
     assert said.startswith("2 accounts have not signed in through this provider within its days, so their SSH keys")
-    assert "so that they sign in through it again; unlink each under the provider's Identities; or delete the accounts." in said
-    assert "they are then held, to be lifted under Identities" in said
-    # A way it names works: unlinked under Identities, that account no longer stands in the way.
+    assert "so that they sign in through it again; unlink each on the provider's Identities page; or delete the accounts." in said
+    assert "they are then held, to be lifted on its Identities page" in said
+    # A way it names works: unlinked on the Identities page, that account no longer stands in the way.
     h.db.rows_of(ExternalIdentity).remove(also)
     assert sso_providers.days_ran_out(h.db, row) == 1
     assert lapsed.refused_at is None and inside.refused_at is None and h.rows() == [row] and h.order == []
@@ -1813,8 +1813,8 @@ def test_a_save_that_changes_the_connection_and_the_days_tells_whom_it_holds(mon
         f"An administrator changed {label}, which is turned off until it has been tested again. You have not signed "
         f"in through {label} within the time your organisation allows: your SSH keys, temporary credentials and "
         "devices stay paused until an administrator lifts that. Your password signs you in as before.")
-    assert ("2 account(s) whose sign-in there had lapsed stay held: lift each under Identities when it should have "
-            "its keys back.") in h.told[-1][2]
+    assert ("2 account(s) whose sign-in there had lapsed stay held: lift each on this provider's Identities page "
+            "when it should have its keys back.") in h.told[-1][2]
 
 
 def test_who_is_told_of_a_turn_offs_hold_and_in_which_words(monkeypatch):
