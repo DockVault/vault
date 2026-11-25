@@ -7678,6 +7678,11 @@ function signInMethods(u) {
     const passkeys = Number(u.passkey_count) || 0;
     if (passkeys === 1) methods.push('Passkey');
     else if (passkeys > 1) methods.push(`${passkeys} passkeys`);
+    // Keys the account holds that are no factor now (made at another address, of an algorithm no longer accepted,
+    // or never verified the person while the vault asks for that); 0 while passkeys are off.
+    const unusable = Number(u.passkey_unusable_count) || 0;
+    if (unusable === 1) methods.push('1 passkey not usable');
+    else if (unusable > 1) methods.push(`${unusable} passkeys not usable`);
     return methods;
 }
 

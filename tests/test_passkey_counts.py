@@ -310,11 +310,17 @@ def test_the_page_names_the_ways_an_account_signs_in():
     rows = _page_words([{}, {"second_factor_enabled": True}, {"passkey_count": 1},
                         {"passkey_count": 3, "second_factor_enabled": True}, {"passkey_count": "2"},
                         {"passkey_count": "<img src=x>"}, {"passkey_count": 0, "second_factor_enabled": False},
-                        {"passkey_count": "1"}])
+                        {"passkey_count": "1"},
+                        # Keys held that are no factor now (made at another address, of an algorithm no longer
+                        # accepted, or never verified the person while the vault asks for that) are named apart.
+                        {"passkey_unusable_count": 1}, {"passkey_count": 1, "passkey_unusable_count": 2},
+                        {"passkey_unusable_count": "<img src=x>"}, {"passkey_unusable_count": 0}])
     assert [r["words"] for r in rows] == [
         ["Password"], ["Password", "Authenticator"], ["Password", "Passkey"],
         ["Password", "Authenticator", "3 passkeys"], ["Password", "2 passkeys"], ["Password"], ["Password"],
-        ["Password", "Passkey"]]
+        ["Password", "Passkey"],
+        ["Password", "1 passkey not usable"], ["Password", "Passkey", "2 passkeys not usable"], ["Password"],
+        ["Password"]]
     # Each word is its own badge, in order, and passes through the page's escaping on its way into the markup.
     for row in rows:
         assert row["escaped"] == row["words"]
