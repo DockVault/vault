@@ -13,7 +13,7 @@ test_auditor_grants.py covers the rules offline.
 import pytest
 
 from _account_change_helpers import notifications, own_password, psql, second_admin, signed_in
-from _auditor_helpers import audit_rows, compliance_receipt, run_pass
+from _auditor_helpers import audit_rows, compliance_receipt, run_pass, sign_in_after_the_approval
 from _sf_helpers import enroll_totp
 
 pytestmark = pytest.mark.integration
@@ -32,9 +32,10 @@ def auditors(admin):
         _bob_secret, bob_codes = enroll_totp(bob, bob_c)
         uma = own_password(admin.create_user(role="user"))
         uma_c = signed_in(uma)
-        enroll_totp(uma, uma_c)
+        _uma_secret, uma_codes = enroll_totp(uma, uma_c)
         try:
-            yield {"ada": (ada, ada_c, ada_codes), "bob": (bob, bob_c, bob_codes), "uma": (uma, uma_c)}
+            yield {"ada": (ada, ada_c, ada_codes), "bob": (bob, bob_c, bob_codes), "uma": (uma, uma_c),
+                   "uma_codes": uma_codes}
         finally:
             psql(f"DELETE FROM auditor_grants WHERE user_id IN ('{uma['id']}', '{ada['id']}', '{bob['id']}')")
             admin.delete_user(uma["id"])
@@ -74,6 +75,9 @@ def test_the_full_flow_two_people_bound_to_the_authenticator_recorded_and_told(a
     assert psql(f"SELECT second_factor_enrollment_id, confirmed_role, approved_by_operator, "
                 f"(expires_at - approved_at) = interval '365 days' FROM auditor_grants WHERE id='{grant['id']}'") == \
         f"{enrollment}|user|f|t"
+    # The approval ended the holder's sessions: one made before it does not carry the right. Signed in again,
+    # with the password and the authenticator, the holder has it.
+    sign_in_after_the_approval(uma, uma_c, auditors["uma_codes"])
     assert uma_c.get("/compliance/me").json()["grant"]["status"] == "active"
     for action, who in (("auditor_grant_proposed", ada), ("auditor_granted", bob)):
         rows = _audit(admin, action, uma["id"])

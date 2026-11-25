@@ -17,11 +17,13 @@ def compliance_receipt(client, action, password, codes):
     return {"X-Second-Factor": r.json()["receipt"]}
 
 
-def signed_in_with_code(user, codes):
+def signed_in_with_code(user, codes, client=None):
     """A client signed in as ``user``, whose account has an authenticator: the password, then one of its
-    recovery codes (``codes``, consumed)."""
+    recovery codes (``codes``, consumed). ``client``: sign this one in again, in place of making another (its
+    session was ended, and every reference a test holds to it goes on working)."""
     from conftest import ApiClient, BASE_URL
-    client = ApiClient(BASE_URL)
+    client = client or ApiClient(BASE_URL)
+    client.session.headers.pop("Authorization", None)
     r = client.session.post(f"{BASE_URL}/auth/login",
                             json={"username": user["_username"], "password": user["_password"]}, timeout=15)
     assert r.status_code == 200 and r.json().get("second_factor_required"), r.text
@@ -64,12 +66,28 @@ def two_admins(admin):
         yield {"ada": (ada, ada_c, ada_codes), "bob": (bob, bob_c, bob_codes)}
 
 
+# The accounts made here, by id: (account, client, recovery codes). The approval of an auditor right ends the
+# holder's sessions (a session made before it does not carry the right), so the holder's client signs in again
+# where the right is granted.
+_HOLDERS = {}
+
+
 def new_auditor_account(admin):
     """An account that set its own password and has an authenticator: (account, client, recovery codes)."""
     uma = own_password(admin.create_user(role="user"))
     uma_c = signed_in(uma)
     _s, codes = enroll_totp(uma, uma_c)
+    _HOLDERS[str(uma["id"])] = (uma, uma_c, codes)
     return uma, uma_c, codes
+
+
+def sign_in_after_the_approval(user, client, codes):
+    """The holder's sessions ended when their right was approved, a moment after the approval's answer: wait for
+    that, then sign ``client`` in again with the password and a recovery code."""
+    deadline = time.time() + 15
+    while time.time() < deadline and client.get("/compliance/me").status_code != 401:
+        time.sleep(0.2)
+    return signed_in_with_code(user, codes, client=client)
 
 
 def grant_right(admins, user_id):
@@ -83,6 +101,9 @@ def grant_right(admins, user_id):
     r = bob_c.post(f"/compliance/auditor-grants/{grant_id}/approve",
                    headers=compliance_receipt(bob_c, "compliance.grant.approve", bob["_password"], bob_codes))
     assert r.status_code == 200 and r.json()["status"] == "active", r.text
+    held = _HOLDERS.get(str(user_id))
+    if held is not None:
+        sign_in_after_the_approval(*held)
     return grant_id
 
 
