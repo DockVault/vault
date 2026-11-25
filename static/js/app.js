@@ -9471,6 +9471,17 @@ async function openGroupDetail(id) {
                         <button class="btn btn-sm btn-ghost member-remove" data-user-id="${m.id}" title="Remove from department">${iconSvg('x', 'icon-sm')}</button>
                     </div>`).join('') : '<div class="text-tertiary text-sm p-sm">No members yet.</div>'}
             </div>`;
+        // The single sign-on group mappings that name this department, which go with it when it is deleted.
+        const mapped = Number(g.sso_group_mappings) || 0;
+        const stats = el.querySelector('.group-stats');
+        if (stats && mapped > 0) {
+            const item = _el('span', 'meta-item');
+            const icon = _svgIcon('link', 'icon-sm');
+            icon.setAttribute('aria-hidden', 'true');
+            item.append(icon, _el('span', 'meta-label', 'Single sign-on group mappings'),
+                _el('span', 'meta-value', String(mapped)));
+            stats.appendChild(item);
+        }
         document.getElementById('group-edit-btn').onclick = () => openGroupModal(g);
         document.getElementById('group-delete-btn').onclick = () => deleteGroup(g);
         document.getElementById('group-subgroup-btn').onclick = () => openGroupModal(null, g.id);
@@ -9555,15 +9566,28 @@ async function confirmAddMembers() {
     } catch (e) { showError('Failed to add members: ' + e.message); }
 }
 
+// The single sign-on group mappings that name a department go with it (GET /groups/{id} counts them, and DELETE
+// answers how many went): the question says so first, and the toast says how many.
+function _groupMappingsText(n) {
+    return n === 1 ? '1 single sign-on group mapping names this department and is removed with it, any role it '
+        + 'gives included. You find it on its provider\'s Groups page, under Settings, Sign-in methods.'
+        : `${n} single sign-on group mappings name this department and are removed with it, any role they give `
+        + 'included. You find them on their provider\'s Groups page, under Settings, Sign-in methods.';
+}
+
 async function deleteGroup(g) {
+    const mapped = Number(g.sso_group_mappings) || 0;
     const confirmed = await showConfirm(
-        `Delete department “${g.name}”? Members are kept; any sub-groups move up to its parent.`,
+        `Delete department “${g.name}”? Members are kept; any sub-groups move up to its parent.`
+            + (mapped > 0 ? ' ' + _groupMappingsText(mapped) : ''),
         'Delete department?'
     );
     if (!confirmed) return;
     try {
-        await apiRequest(`/groups/${g.id}`, { method: 'DELETE' });
-        showSuccess('Department deleted');
+        const out = await apiRequest(`/groups/${g.id}`, { method: 'DELETE' });
+        const removed = Number(out && out.sso_group_mappings_removed) || 0;
+        showSuccess('Department deleted' + (removed > 0
+            ? `, with ${removed} single sign-on group mapping${removed === 1 ? '' : 's'}` : ''));
         if (groupsView.selectedId === g.id) groupsView.selectedId = null;
         await loadGroups();
     } catch (e) { showError('Failed to delete department: ' + e.message); }
