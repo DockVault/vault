@@ -11,6 +11,11 @@
  * Every row is marked data-setting="<key>", so the levels (essential, advanced, set by the provider) and the
  * search treat it as they treat every other setting (static/js/settings-levels.js).
  *
+ * Under two rows the page says what the counts the server reads mean for them: the passkeys in use that never
+ * checked a PIN, fingerprint or face (under the rule that asks for one), and the accounts whose only second factor
+ * is a passkey (under the Passkeys switch). A save that applies redraws its own row and reads the page again for
+ * everything said around the rows; the other rows are left as they are, with whatever is typed in them.
+ *
  * Uses app.js's apiRequest and showToast. Builds everything with createElement and textContent.
  */
 (function () {
@@ -79,6 +84,16 @@
     }
 
     const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+    // The value in force of one setting, as a read of the page gives it.
+    const valueOf = (data, key) => {
+        const row = ((data && data.settings) || []).find((one) => one.key === key);
+        return row ? row.value : undefined;
+    };
+    // The row of one setting as the page shows it now.
+    const rowOf = (key) => {
+        const box = byId('signin-passkey-settings');
+        return box ? box.querySelector(`[data-setting="${key}"]`) : null;
+    };
 
     function drawRow(row) {
         const id = `signin-setting-${row.key}`;
@@ -139,6 +154,7 @@
                 if (out && out.status === 'applied') {
                     showToast(`${row.label}: saved.`, 'success');
                     item.replaceWith(drawRow(out.setting));
+                    reread();
                     return;
                 }
                 // Held for another administrator, or waiting out its delay: nothing changed yet.
@@ -192,6 +208,63 @@
             + (count === 1 ? 'its owner adds it' : 'their owners add them') + ' again.';
     }
 
+    // What the counts mean for two rows: the passkeys that never checked a PIN, fingerprint or face, under the rule
+    // that asks for one (app/core/webauthn_settings.never_verified), and the accounts whose only second factor is a
+    // passkey, under the Passkeys switch (only_a_passkey). Nothing is said where a count is 0.
+    function drawCounts(data) {
+        document.querySelectorAll('#signin-passkey-settings .signin-setting-note').forEach((note) => note.remove());
+        const say = (key, text) => {
+            const row = rowOf(key);
+            if (row) row.appendChild(el('p', 'text-secondary text-sm mt-xs signin-setting-note', text));
+        };
+        const never = Number(data.passkeys_without_verification) || 0;
+        const noOther = Number(data.accounts_with_only_such_passkeys) || 0;
+        if (never > 0) {
+            const one = never === 1;
+            const keys = (one ? '1 passkey in use' : `${never} passkeys in use`)
+                + ' never checked a PIN, fingerprint or face';
+            const holders = noOther === 1 ? '1 account holds' : `${noOther} accounts hold`;
+            if (valueOf(data, 'webauthn_require_uv')) {
+                say('webauthn_require_uv', `${keys}: while this is on, ${one ? 'it counts' : 'they count'} as no `
+                    + `second factor and ${one ? 'is' : 'are'} refused at any use that does not check one.`
+                    + (noOther > 0 ? ` ${holders} no passkey that did: `
+                        + (noOther === 1 ? 'without an authenticator app, it sets a second factor up again at its'
+                            : 'those without an authenticator app set a second factor up again at their')
+                        + ' next sign-in.' : ''));
+            } else {
+                say('webauthn_require_uv', `${keys}: turned on, this makes ${one ? 'it' : 'them'} count as no `
+                    + `second factor and refuses ${one ? 'it' : 'them'} at any use that does not check one`
+                    + (noOther > 0 ? `; ${holders} no passkey that did.` : '.'));
+            }
+        }
+        const alone = Number(data.accounts_with_only_a_passkey) || 0;
+        const admins = Number(data.administrators_with_only_a_passkey) || 0;
+        if (alone > 0) {
+            const one = alone === 1;
+            let who = one ? '1 account' : `${alone} accounts`;
+            if (admins > 0) {
+                who += one ? ' (an administrator)'
+                    : ` (${admins} of them ${admins === 1 ? 'an administrator' : 'administrators'})`;
+            }
+            if (valueOf(data, 'webauthn_mode') === 'off') {
+                say('webauthn_mode', `${who} had a passkey as ${one ? 'its' : 'their'} only second factor: `
+                    + `${one ? 'it sets' : 'they set'} an authenticator app up at ${one ? 'its' : 'their'} next `
+                    + 'sign-in, and the passkeys count again when passkeys are turned back on.');
+            } else {
+                say('webauthn_mode', `${who} ${one ? 'has' : 'have'} a passkey as ${one ? 'its' : 'their'} only `
+                    + `second factor. With Passkeys set to Off, ${one ? 'it sets' : 'they set'} an authenticator app `
+                    + `up at ${one ? 'its' : 'their'} next sign-in.`);
+            }
+        }
+    }
+
+    // Everything said around the rows, from one read of the page.
+    function drawAround(data) {
+        drawReadiness(data);
+        drawOlder(data);
+        drawCounts(data);
+    }
+
     async function load() {
         const box = byId('signin-passkey-settings');
         if (!box) return;
@@ -207,9 +280,22 @@
             return;
         }
         if (mine !== loads) return;
-        drawReadiness(data);
-        drawOlder(data);
         box.replaceChildren(...(data.settings || []).map(drawRow));
+        drawAround(data);
+    }
+
+    // After a save that applied: the page read again for what is said around the rows (the counts, and what the
+    // setting just saved changed in them), without drawing the rows again. A read that fails leaves the page as it is.
+    async function reread() {
+        const mine = ++loads;
+        let data;
+        try {
+            data = await apiRequest('/settings/sign-in', { silent: true });
+        } catch (e) {
+            return;
+        }
+        if (mine !== loads) return;
+        drawAround(data);
     }
 
     // Nothing of one administrator's page is left for the next person on the tab.

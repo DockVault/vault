@@ -155,3 +155,74 @@ def test_the_page_says_that_a_requirement_waits_and_how_many_older_passkeys_ther
     _open_page(page)
     expect(page.locator("#signin-passkey-readiness")).not_to_contain_text("paused")
     expect(page.locator("#signin-passkey-older")).to_be_hidden()
+
+
+MODE = '#signin-passkey-settings [data-setting="webauthn_mode"]'
+
+
+def _value(body, key, value):
+    """The value in force of ``key`` in an answer of the Sign-in settings, changed to ``value``."""
+    for row in body["settings"]:
+        if row["key"] == key:
+            row["value"] = value
+
+
+def test_the_page_says_under_two_rows_what_the_counts_mean(page: Page, admin_creds):
+    def counted(body):
+        _value(body, "webauthn_require_uv", True)
+        _value(body, "webauthn_mode", "optional")
+        body["passkeys_without_verification"] = 3
+        body["accounts_with_only_such_passkeys"] = 1
+        body["accounts_with_only_a_passkey"] = 2
+        body["administrators_with_only_a_passkey"] = 1
+    _with_the_answer_changed(page, counted)
+    _open(page, admin_creds)
+    expect(page.locator(VERIFY + " .signin-setting-note")).to_have_text(
+        "3 passkeys in use never checked a PIN, fingerprint or face: while this is on, they count as no second factor "
+        "and are refused at any use that does not check one. 1 account holds no passkey that did: without an "
+        "authenticator app, it sets a second factor up again at its next sign-in.")
+    expect(page.locator(MODE + " .signin-setting-note")).to_have_text(
+        "2 accounts (1 of them an administrator) have a passkey as their only second factor. With Passkeys set to "
+        "Off, they set an authenticator app up at their next sign-in.")
+    page.unroute_all(behavior="ignoreErrors")
+
+    def none(body):
+        for key in ("passkeys_without_verification", "accounts_with_only_such_passkeys",
+                    "accounts_with_only_a_passkey", "administrators_with_only_a_passkey"):
+            body[key] = 0
+    _with_the_answer_changed(page, none)
+    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    expect(page.locator(VERIFY + " .signin-setting-note")).to_have_count(0, timeout=10000)
+    expect(page.locator("#signin-passkey-settings .signin-setting-note")).to_have_count(0)
+    page.unroute_all(behavior="ignoreErrors")
+
+
+def test_a_save_reads_the_page_again_and_draws_the_counts_it_changed(page: Page, admin_creds):
+    reads = []
+
+    def counted(body):
+        reads.append(1)
+        body["passkeys_without_verification"] = 3 if len(reads) == 1 else 4
+        body["accounts_with_only_such_passkeys"] = 0
+    _with_the_answer_changed(page, counted)
+    _open(page, admin_creds)
+    expect(page.locator(VERIFY + " .signin-setting-note")).to_contain_text("3 passkeys in use never checked")
+    box = page.locator(VERIFY + " input[type=checkbox]")
+    expect(box).to_be_checked()
+    try:
+        with page.expect_request(lambda r: r.method == "GET" and r.url.endswith("/settings/sign-in"), timeout=15000):
+            box.uncheck()
+            _save_with_the_password(page, page.locator(VERIFY), admin_creds)
+        # The rule is off now: the count read again is said as what turning it on would do.
+        expect(page.locator(VERIFY + " .signin-setting-note")).to_have_text(
+            "4 passkeys in use never checked a PIN, fingerprint or face: turned on, this makes them count as no "
+            "second factor and refuses them at any use that does not check one.", timeout=10000)
+    finally:
+        back = page.locator(VERIFY).get_by_role("button", name="Use the default")
+        if back.count():
+            back.click()
+            expect(page.locator("#stepup-modal.active")).to_be_visible(timeout=10000)
+            page.fill("#stepup-password-input", admin_creds["password"])
+            page.locator("#stepup-modal-body .btn-primary").click()
+            expect(page.locator(VERIFY + " input[type=checkbox]")).to_be_checked(timeout=10000)
+        page.unroute_all(behavior="ignoreErrors")
