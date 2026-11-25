@@ -1085,6 +1085,15 @@ def test_a_logged_out_session_is_asked_about_only_where_the_providers_logouts_ar
     status, body = h.finish(waiting)
     assert status == 503 and "busy" in body["detail"], body
     assert not h.active_sessions()
+    # The refusal says when to come back, as every busy answer does.
+    import types as _types
+    from fastapi import HTTPException
+    from app.services import sign_in
+    asked = _types.SimpleNamespace(pending=None, provider_sid="s-1", provider_sub=None, provider_answered_at=1.0)
+    with pytest.raises(HTTPException) as busy:
+        sign_in.logged_out_at_the_provider(p, asked)
+    assert (busy.value.status_code, busy.value.detail) == (503, sign_in.PROVIDER_BUSY)
+    assert busy.value.headers == {"Retry-After": "5"}
     p.policy = {"sso_backchannel_logout": False}
     assert h.finish(again)[0] == 200 and len(h.active_sessions()) == 1
 
@@ -1342,3 +1351,27 @@ def test_the_memory_of_logouts_says_from_when_it_is_whole(monkeypatch):
     with pytest.raises(HTTPException) as busy:
         sign_in.begun_before_the_logout_memory(p, held(1.0))
     assert busy.value.status_code == 503 and "busy" in busy.value.detail
+    assert busy.value.detail == sign_in.PROVIDER_BUSY and busy.value.headers == {"Retry-After": "5"}
+
+
+def test_every_busy_refusal_of_a_provider_sign_in_is_the_one_answer_with_the_wait():
+    """The provider's row held by a save, and the memory of its logouts out of reach where a sign-in is judged:
+    three places refuse as busy. Two of them gave no time to come back. They share one answer now, and no other
+    503 is written by hand in the pipeline."""
+    import inspect
+    from app.core import sign_in_lockout
+    from app.services import sign_in
+    answer = sign_in.provider_busy()
+    assert (answer.status_code, answer.detail) == (
+        503, "Signing in through your organisation is busy right now. Try again in a moment.")
+    assert answer.headers == {"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}
+    source = inspect.getsource(sign_in)
+    assert source.count("raise provider_busy() from None") == 3
+    assert source.count("is busy right now") == 3                 # the three sentences, each written once
+    for step in (sign_in.hold_the_providers_row, sign_in.logged_out_at_the_provider,
+                 sign_in.begun_before_the_logout_memory):
+        assert inspect.getsource(step).count("raise provider_busy() from None") == 1, step
+    # Every 503 the pipeline raises carries the wait.
+    import re
+    for raised in re.finditer(r"raise HTTPException\(status_code=503.*?\) from None", source, re.S):
+        assert "Retry-After" in raised.group(0), raised.group(0)

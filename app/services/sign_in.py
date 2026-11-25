@@ -75,6 +75,16 @@ BUSY = "Signing in is busy right now. Try again in a moment."
 # The same, where what carried the sign-in was spent by the try (a one-time sign-in code): there is nothing to
 # send again, so the answer says what works and gives no wait.
 BUSY_START_AGAIN = "Signing in is busy right now. Start the sign-in again in a moment."
+PROVIDER_BUSY = "Signing in through your organisation is busy right now. Try again in a moment."
+
+
+def provider_busy() -> HTTPException:
+    """The refusal of a provider sign-in that could not be judged now and can be a moment later (the provider's
+    row held by a save, the memory of the provider's logouts out of reach): 503 with the wait, as every busy
+    answer carries it. One answer for all of them, so that none goes without the wait."""
+    from app.core import sign_in_lockout
+    return HTTPException(status_code=503, detail=PROVIDER_BUSY,
+                         headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)})
 EXPIRED = "This login attempt has expired; start again."
 
 # The order of the locks.
@@ -732,10 +742,7 @@ def hold_the_providers_row(db, result: "SignInResult") -> None:
             raise
         db.rollback()
         drop_the_session_the_proof_made(db, result)
-        from app.core import sign_in_lockout
-        raise HTTPException(status_code=503, detail=(
-            "Signing in through your organisation is busy right now. Try again in a moment."),
-            headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}) from None
+        raise provider_busy() from None
 
 
 def refuse_unless_the_provider_stands(db, result: SignInResult) -> None:
@@ -798,8 +805,7 @@ def logged_out_at_the_provider(row, result: SignInResult) -> bool:
     try:
         since = sso_state.logged_out_since(scope=str(row.id), sid=sid, sub=sub)
     except sso_state.Unavailable:
-        raise HTTPException(status_code=503, detail=(
-            "Signing in through your organisation is busy right now. Try again in a moment.")) from None
+        raise provider_busy() from None
     if since is None:
         return False
     answered = result.provider_answered_at
@@ -1083,8 +1089,7 @@ def begun_before_the_logout_memory(row, result: SignInResult) -> bool:
     try:
         return begun < sso_state.logout_memory_reaches()
     except sso_state.Unavailable:
-        raise HTTPException(status_code=503, detail=(
-            "Signing in through your organisation is busy right now. Try again in a moment.")) from None
+        raise provider_busy() from None
 
 
 def complete_sign_in(db, result: SignInResult) -> SignedIn:
