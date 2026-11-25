@@ -122,3 +122,31 @@ out({ drawn, confirms, asked, left });
     assert "POST /users/me/identities/p-keeps/start" in got["asked"]
     assert not [a for a in got["asked"] if "p-none" in a]
     assert got["left"] == ["https://idp.example.test/authorize"]
+
+
+NO_PASSWORD = ("Your account has no password of its own, so another provider cannot be linked to it from here. Ask an "
+               "administrator.")
+
+
+def test_an_account_that_cannot_link_from_this_session_is_told_why_and_not_sent_to_link_instead_of_a_code():
+    """Where no provider can be linked from here, the box about the email address does not tell the person to link
+    their organisation's sign-in above instead; where one can, it does."""
+    got = _node(r"""
+const email = { address: 'alice@example.test', can_send_code: false, factor_here: true };
+answers['GET ' + LIST] = { identities: [], email, providers: [
+    { id: 'p-1', label: 'Contoso', icon: 'generic', linked: false, ends_password: false, reauth: false,
+      link_refusal: { reason: 'no_password', message: 'NO_PASSWORD' } }] };
+await window.Sso.renderAccount();
+const refusedOnly = page();
+answers['GET ' + LIST].providers.push({ id: 'p-2', label: 'Fabrikam', icon: 'generic', linked: false,
+    ends_password: false, reauth: false, link_refusal: null });
+await window.Sso.renderAccount();
+out({ refusedOnly, oneLinkable: page() });
+""".replace("NO_PASSWORD", NO_PASSWORD))
+    refused_only, one = got["refusedOnly"], got["oneLinkable"]
+    assert refused_only["links"] == []
+    assert refused_only["linkRefused"] == ["Contoso: " + NO_PASSWORD]
+    assert "This vault sends no email" in refused_only["text"]
+    assert "Link your organisation's sign-in above instead" not in refused_only["text"]
+    assert one["links"] == ["Link Fabrikam"] and one["linkRefused"] == ["Contoso: " + NO_PASSWORD]
+    assert "Link your organisation's sign-in above instead" in one["text"]

@@ -361,7 +361,9 @@
             });
             body.appendChild(link);
         });
-        if (email) body.appendChild(emailConfirmation(email, linkable.length > 0));
+        // A provider can be linked from here only where the server would start the link (link_refusal).
+        const canLink = providers.some((p) => p && !p.linked && !p.link_refusal);
+        if (email) body.appendChild(emailConfirmation(email, canLink));
     }
 
     // The address an account holds is its owner's own claim until the vault confirmed it, and the organisation's

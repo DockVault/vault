@@ -77,3 +77,49 @@ def test_an_administrators_invitation_says_a_provider_is_linked_afterwards_only_
     assert said.endswith("Where your organisation's sign-in lets accounts keep a password, you can link it from Your "
                          "account afterwards."), said
     assert "you can link your organisation's sign-in from Your account afterwards" not in said
+
+
+NO_PASSWORD = ("Your account has no password of its own, so another provider cannot be linked to it from here. Ask an "
+               "administrator.")
+SIGN_IN_WITH_THE_PASSWORD = "To link another provider, sign out and sign in with your password first."
+
+
+def test_an_account_with_no_password_it_can_type_is_told_it_cannot_link_from_here_and_its_start_says_the_same(
+        monkeypatch):
+    """A link is started only from a session the password made. An account that signs in only through its provider,
+    or one whose password nobody knows, never has such a session (a sign-in through a provider names no proof of
+    its own): the list says so in place of the Link button, and the start answers the same sentence."""
+    from app.core import password_origin
+    alice = _user(sso_only=True)
+    linked, other = _provider(name="linked", label="Linked"), _provider(name="other", label="Other")
+    h = Harness(monkeypatch, [alice], [linked, other], identities=[_identity(alice, linked)])
+    h.session_claims = {"amr": []}                     # what a sign-in through the provider carries
+    offered = _offered(_listed(h))
+    assert offered[str(other.id)]["link_refusal"] == {"reason": "no_password", "message": NO_PASSWORD}
+    assert offered[str(linked.id)]["link_refusal"] is None            # already linked: nothing to start
+    status, out = h.start_link(other)
+    assert status == 403 and out["detail"] == {"reason": "no_password", "message": NO_PASSWORD}, out
+    assert h.step_ups == [] and not [key for key in h.redis.rows if key.startswith("sso:state:")]
+    # An account whose password nobody knows (made at a first sign-in) is told the same.
+    alice.sso_only = False
+    password_origin.mark_nobody_knows(alice)
+    assert _offered(_listed(h))[str(other.id)]["link_refusal"]["reason"] == "no_password"
+    assert h.start_link(other)[1]["detail"]["reason"] == "no_password"
+
+
+def test_an_account_with_a_password_is_told_to_sign_in_with_it_before_a_link_and_one_that_did_is_offered_it(
+        monkeypatch):
+    alice = _user()
+    p = _provider(name="other", label="Other")
+    h = Harness(monkeypatch, [alice], [p])
+    h.session_claims = {"amr": ["hwk"]}                 # a passkey made this session, not the password
+    assert _offered(_listed(h))[str(p.id)]["link_refusal"] == {"reason": "password_proof_required",
+                                                               "message": SIGN_IN_WITH_THE_PASSWORD}
+    status, out = h.start_link(p)
+    assert status == 403 and out["detail"]["reason"] == "password_proof_required", out
+    h.session_claims = {"amr": ["pwd"]}
+    assert _offered(_listed(h))[str(p.id)]["link_refusal"] is None
+    assert h.start_link(p)[0] == 200
+    # A token from before tokens named their proofs began with the password.
+    h.session_claims = {"sub": str(alice.id)}
+    assert _offered(_listed(h))[str(p.id)]["link_refusal"] is None

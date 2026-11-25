@@ -1531,6 +1531,7 @@ def _tell_owner(db, user, row, title: str, change: str, *, advice: Optional[str]
 
 @router.get("/users/me/identities")
 async def list_my_identities(
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -1562,6 +1563,9 @@ async def list_my_identities(
     # An administrator's or auditor's account keeps a password of its own: a provider whose people hold none never
     # takes it (sso._password_less_refusal), and its start refuses it at once (start_link).
     privileged = privileged_accounts.kind(db, current_user) is not None
+    # A link starts only from a session the password made, as start_link tells it.
+    has_pwd = _password_made_this_session(request)
+    from app.services import sign_in
 
     def link_refusal(p):
         """Why the start of a link to ``p`` would be refused whatever the provider says, or None: shown in place of
@@ -1570,6 +1574,10 @@ async def list_my_identities(
             return None
         if privileged and sso_only.password_less(p):
             return {"reason": sso.PRIVILEGED_ON_PASSWORD_LESS, "message": sso.reason_text(sso.PRIVILEGED_ON_PASSWORD_LESS)}
+        if not has_pwd and not sign_in.has_a_password_it_can_type(current_user):
+            return {"reason": NO_PASSWORD_TO_LINK, "message": NO_PASSWORD_TO_LINK_TEXT}
+        if not has_pwd:
+            return {"reason": PASSWORD_PROOF_REQUIRED, "message": SIGN_IN_WITH_THE_PASSWORD_TO_LINK}
         return None
 
     def offered_one(p):
@@ -1636,10 +1644,13 @@ async def start_link(
     _limit_start(client_ip)
     claims = _session_claims(request)
     from app.services import sign_in
-    # No token read is no proof; a token that names no proofs is from before they were named, and a password's.
-    if not claims or sign_in.PASSWORD not in sign_in.proofs_of(claims):
+    if not _password_made_this_session(request, claims):
+        # An account with no password anybody can type never has a session its password made.
+        if not sign_in.has_a_password_it_can_type(current_user):
+            raise HTTPException(status_code=403, detail={"reason": NO_PASSWORD_TO_LINK,
+                                                         "message": NO_PASSWORD_TO_LINK_TEXT})
         raise HTTPException(status_code=403, detail={
-            "reason": "password_proof_required",
+            "reason": PASSWORD_PROOF_REQUIRED,
             "message": "Sign in with your password before adding a sign-in method."})
     from app.core.active_factors import active_factors
     if (active_factors(db, current_user.id).any and not claims.get("mfa_at")
@@ -1684,6 +1695,21 @@ def _the_factor_is_given_for_a_link(api, db, user) -> bool:
         return True
     sign_in_asks, _password = api._sf_action_toggles(db, "login")
     return not sign_in_asks
+
+
+# Why a link cannot start from this session, as the list of the caller's identities says it beside each provider.
+NO_PASSWORD_TO_LINK, PASSWORD_PROOF_REQUIRED = "no_password", "password_proof_required"
+NO_PASSWORD_TO_LINK_TEXT = ("Your account has no password of its own, so another provider cannot be linked to it from "
+                            "here. Ask an administrator.")
+SIGN_IN_WITH_THE_PASSWORD_TO_LINK = "To link another provider, sign out and sign in with your password first."
+
+
+def _password_made_this_session(request, claims=None) -> bool:
+    """Whether the current session's token names the password among its proofs. No token read is no proof; a token
+    that names no proofs is from before they were named, and a password's."""
+    from app.services import sign_in
+    claims = _session_claims(request) if claims is None else claims
+    return bool(claims) and sign_in.PASSWORD in sign_in.proofs_of(claims)
 
 
 def _session_claims(request) -> dict:
