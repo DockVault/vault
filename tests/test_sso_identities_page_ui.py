@@ -456,6 +456,64 @@ out({ first: rows()[0].name, count: rows().length, said: pager().children[1].tex
     assert got == {"first": "user0", "count": 50, "said": "1 to 50 of 70"}
 
 
+def test_an_answer_for_a_page_no_longer_shown_draws_nothing():
+    """The person presses Next and moves on to the Connection page of the dialog before the list came: the answer
+    changes nothing the dialog shows, leaves the keyboard where it was, and throws nothing."""
+    got = _node(FOCUSED + r"""
+const page = (skip, count, total) => ({ provider_id: 'p-1', total, skip, limit: 50, counts: { refused: 0, lapsed: 0, linked: total },
+    identities: Array.from({ length: count }, (_, i) => ({ id: 'i-' + (skip + i), user_id: 'u-' + (skip + i),
+        username: 'user' + (skip + i), linked_by: 'self', linked_at: null, last_sign_in_at: null, state: 'linked',
+        refused_at: null, due_at: null, holds_sign_in: false, own: false })) });
+answers[IDS] = page(0, 50, 70);
+await openIdentities();
+let release;
+answers['/admin/sso/providers/p-1/identities?skip=50&limit=50'] = () => new Promise((resolve) => {
+    release = () => resolve(page(50, 20, 70)); });
+press(document.querySelector('.sso-identities-pager').children[2]);   // Next, and the page is slow to come
+await tick();
+press(byId('sso-tab-connection'));           // the person moved on before the list came
+await tick(); await tick();
+const shown = byId('sso-provider-body').textContent;
+const keyboard = document.activeElement;
+release();
+await tick(); await tick();
+out({ same: byId('sso-provider-body').textContent === shown, keyboard: document.activeElement === keyboard,
+      on: keyboard.id, rows: rows().length, identities: byId('sso-identities') === null,
+      connection: byId('sso-page-connection') !== null });
+""")
+    assert got == {"same": True, "keyboard": True, "on": "sso-tab-connection", "rows": 0, "identities": True,
+                   "connection": True}
+
+
+def test_an_answer_for_a_provider_no_longer_open_is_not_drawn_under_another():
+    """The person opens another provider's Identities page before the first one's list came: the late answer is not
+    drawn under the provider now open, and throws nothing."""
+    got = _node(r"""
+const OTHER = Object.assign({}, PROVIDER, { id: 'p-2', name: 'fabrikam', label: 'Fabrikam' });
+answers['/admin/sso/providers'].providers = [PROVIDER, OTHER];
+answers['/admin/sso/providers/p-2'] = { provider: OTHER };
+answers['/admin/sso/providers/p-2/identities?skip=0&limit=50'] = { provider_id: 'p-2', total: 1, skip: 0, limit: 50,
+    counts: { refused: 0, lapsed: 0, linked: 1 },
+    identities: [{ id: 'i-erin', user_id: 'u-erin', username: 'erin', linked_by: 'self', linked_at: null,
+                   last_sign_in_at: null, state: 'linked', refused_at: null, due_at: null, holds_sign_in: false,
+                   own: false }] };
+let release;
+answers[IDS] = () => new Promise((resolve) => { release = () => resolve(LIST); });
+await openIdentities();                      // Contoso's list is slow to come
+document.querySelectorAll('.sso-provider-row button')[1].click();   // the person opens Fabrikam meanwhile
+await tick(); await tick();
+byId('sso-tab-identities').click();
+await tick(); await tick();
+const shown = byId('sso-provider-body').textContent;
+release();                                   // Contoso's list comes last
+await tick(); await tick();
+out({ title: byId('sso-provider-title').textContent, rows: rows().map((r) => r.name),
+      same: byId('sso-provider-body').textContent === shown, counts: byId('sso-identities-counts').textContent });
+""")
+    assert got == {"title": "Fabrikam", "rows": ["erin"], "same": True,
+                   "counts": "1 linked account: 0 refused or held, 0 with their days run out."}
+
+
 LOCKED = ("Single sign-on is locked in this deployment (SETTINGS_LOCKED_KEYS): the providers are kept as they are and "
           "nothing can be changed here. Whoever runs the vault lifts the lock to change them.")
 
