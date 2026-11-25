@@ -855,3 +855,27 @@ def test_a_denial_of_a_request_that_can_be_approved_is_judged_as_before(monkeypa
     request.state = "approved"
     assert sso_groups.denial_refusal(h.db, request, root).code == "decided"
     assert sso_groups.NO_LONGER_GRANTABLE == frozenset({"provider_gone", "mapping_off", "mapping_gone"})
+
+
+def test_more_groups_than_the_vault_reads_is_no_group_information(monkeypatch):
+    """The provider sends group ids, and Alice is in 1001 of them. The claim was cut to its first thousand and
+    read as her whole membership: Legal, mapped from the id that came last, was "not in the token", and she left
+    the department at that sign-in. A list that is not whole is no group information: nothing is changed, and the
+    administrators are told, as for the provider's own marker. A thousand are read whole."""
+    from app.services import sso_sign_in as sso_rules
+    alice, root = _user("alice"), _user("root", role="admin")
+    p = _provider()
+    h = Grouping(monkeypatch, [alice, root], [p], identities=[_identity(alice, p)])
+    legal = h.department("Legal", alice)
+    h.mapping(p, "5000", legal)
+    many = list(range(sso_rules.GROUPS_KEPT)) + [5000]                # 1001 ids, the mapped one last
+    _sign_in(h, p, groups=many)
+    assert _names(alice.groups) == ["Legal"] and h.membership_audits() == []
+    assert any(a[0] == "sso_groups_missing" for a in h.audits)
+    # Exactly as many as are read, the mapped one last: read whole, and she stays because it is there.
+    del h.audits[:]
+    _sign_in(h, p, groups=many[1:])
+    assert _names(alice.groups) == ["Legal"] and not any(a[0] == "sso_groups_missing" for a in h.audits)
+    # Read whole without it: she leaves, as the mapping says.
+    _sign_in(h, p, groups=many[1:-1])
+    assert _names(alice.groups) == [] and sso_rules.GROUPS_KEPT == 1000

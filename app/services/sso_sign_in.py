@@ -309,10 +309,16 @@ def verified_answer(row, state: sso_state.LoginState, *, code: str, fetch=None, 
     hosted = claims.get(claim_name(row, "domain", "hd"))
     groups_name = claim_name(row, "groups", "groups")
     raw_groups = claims.get(groups_name)
-    groups = ([str(g)[:255] for g in raw_groups if isinstance(g, (str, int)) and not isinstance(g, bool)][:1000]
+    groups = ([str(g)[:255] for g in raw_groups if isinstance(g, (str, int)) and not isinstance(g, bool)]
               if isinstance(raw_groups, list) else None)
     names = claims.get("_claim_names")
     overage = isinstance(names, dict) and groups_name in names     # a marker makes any list beside it partial
+    if groups is not None and len(groups) > GROUPS_KEPT:
+        # More groups than the vault reads: "too many to say", as the provider's own marker says it. Cut to the
+        # first thousand and read as the whole membership, a person whose mapped group came after them left its
+        # department at that sign-in, an administrator approved through it was demoted, and a provider that
+        # requires the group refused them: a list that is not whole never means "member of nothing".
+        groups, overage = None, True
     return ProviderAnswer(claims=claims, subject=str(claims["sub"]), issuer=str(claims["iss"]), tenant_id=tenant,
                           email=email, email_verified=claims.get(verified_name) is True, display_name=display,
                           auth_time=auth_time, amr=amr, acr=acr if isinstance(acr, str) else None,
