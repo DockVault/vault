@@ -5650,11 +5650,17 @@ class DockVault:
         that builds from source is built from the checkout as it is, BEFORE anything is taken down, for the same
         reason: a build that fails (no network for the base image or the packages, a broken checkout) leaves the
         deployment running as it is. A checkout older than the version the deployment has run is refused before
-        that (_refuse_older_build): its image would not start on the newer data."""
+        that (_refuse_older_build): its image would not start on the newer data. Before anything is built or taken
+        down, it says what the address .env gives now turns off, and which passkeys in use it leaves unusable
+        (_say_sign_in_address): at a terminal, the operator confirms before an account is left with no second factor."""
         if not self._container_logs_readable():
             raise SystemExit(1)
         if os.path.exists(self._env_path()):
             self._refuse_incomplete_restore("restart")
+            # Before anything is built or taken down: the address .env gives now may strand passkeys.
+            terminal = sys.stdin is not None and sys.stdin.isatty()
+            self._say_sign_in_address(self._load_env().get("ALLOWED_HOSTS"),
+                                      terminal and not getattr(args, "non_interactive", False))
             if uses_release_image(self._load_env()):
                 if not self._ensure_release_image():
                     print(self.pal.paint("  Nothing was taken down: the deployment keeps running as it is.",
@@ -5955,6 +5961,10 @@ class DockVault:
                 else None
             ),
         })
+        # A re-run starts the vault at the address .env gives now, which an operator may have changed by hand: what it
+        # turns off, and the passkeys it leaves unusable, are said while the running container can still be asked.
+        if reusing:
+            self._say_sign_in_address(env_now.get("ALLOWED_HOSTS"), interactive)
         # Port preflight: warn (don't block) if the chosen web port is held by something ELSE.
         # A re-run over a running deployment finds its OWN container on the port - the one compose
         # is about to recreate - and warning there is just noise the operator has to second-guess.
@@ -6169,11 +6179,8 @@ class DockVault:
         passkey_note = sign_in_address_note(address)
         if passkey_note:
             print(pal.paint("  Note: %s" % passkey_note, "yellow"))
-        # A passkey answers only at the address it was made at: when the address changes while passkeys exist,
-        # say how many stop working and what their holders do next.
-        elsewhere = passkeys_elsewhere_note(self._passkey_addresses(), passkey_host(address))
-        if elsewhere:
-            print(pal.paint("  Note: with this address, %s%s" % (elsewhere[0].lower(), elsewhere[1:]), "yellow"))
+        # (No deployment of this checkout runs to be asked about the passkeys made elsewhere: there is no .env yet. A
+        # re-run and restart say that, _say_sign_in_address.)
 
         return {
             "server_name": server,
@@ -9498,6 +9505,34 @@ class DockVault:
         # image previously pulled by the Update menu with a local build).
         self._recreate_stack(build=False)
         print(pal.paint("  Applied.\n", "green"))
+
+    def _say_sign_in_address(self, allowed_hosts, interactive):
+        """What setup's re-run and restart say before the vault is recreated at the address ``allowed_hosts`` gives
+        (ALLOWED_HOSTS in .env now): what that address turns off (sign_in_address_note), and the passkeys in use that
+        were made at another one (passkeys_elsewhere_note), which the running deployment, still the one before the
+        change, is asked about. When ``interactive`` and an account would be left with no second factor at the new
+        address while passkeys are on, the operator confirms first: No stops the command, with nothing taken down."""
+        pal = self.pal
+        note = sign_in_address_note(allowed_hosts)
+        if note:
+            print(pal.paint("  Sign-in: %s" % note, "yellow"))
+        # Only a running deployment can be asked (a stopped one is not, and loses nothing by it).
+        if not any(container_running(name) for name in ("vault", "vault-api")):
+            return
+        answer = self._passkey_addresses()
+        host = passkey_host(allowed_hosts)
+        elsewhere = passkeys_elsewhere_note(answer, host)
+        if not elsewhere:
+            return
+        print(pal.paint("  Passkeys: %s" % elsewhere, "yellow"))
+        counted = _holders_of_passkeys_elsewhere(answer.get("holders"), host)
+        without = counted[1] if counted else 0
+        if interactive and without > 0 and answer.get("on") is not False:
+            if not confirm("Start the vault at this address anyway? Those passkeys cannot be used until the address "
+                           "goes back.", pal, default=False):
+                print(pal.paint("  The deployment was not restarted. Change ALLOWED_HOSTS back in .env, or run this "
+                                "again to go on.", "yellow"))
+                raise SystemExit(1)
 
     def _passkey_addresses(self):
         """Where the passkeys in use were made, as the running deployment says (python -m app.core.host_operator

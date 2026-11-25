@@ -165,15 +165,154 @@ def test_status_says_passkeys_are_hidden_at_an_ip(monkeypatch, tmp_path):
         assert not any("Passkeys" in line or "Sign-in" in line for line in printed), (named, printed)
 
 
-def test_setup_says_it_once_the_address_is_known():
-    source = io.open(ROOT / "dockvault.py", encoding="utf-8").read()
-    setup = source[source.index("def _collect_setup_config"):source.index("def _resolve_cert_cfg")]
-    # The address as it will be written, made once and judged twice: whether passkeys can be made there, and
-    # which of the passkeys that exist were made somewhere else.
-    assert setup.count("address = allowed_hosts_value(") == 1
-    assert "sign_in_address_note(address)" in setup and "passkey_host(address)" in setup
-    assert (setup.index("web_public = public_web_address(") < setup.index("address = allowed_hosts_value(")
-            < setup.index("sign_in_address_note(address)") < setup.index("passkey_host(address)"))
+# The running deployment's account of its passkeys, while .env already names the vault's new address: two keys of one
+# account were made at the old name, and that account holds no other second factor.
+STRANDED = {"ok": True, "on": True, "made_at": [{"address": "old.example.com", "passkeys": 2, "accounts": 1}],
+            "holders": [{"made_at": ["old.example.com"], "usable_at": ["old.example.com"], "other_factor": False,
+                         "accounts": 1}]}
+
+
+def _moved_tool(tmp_path, monkeypatch, answer, events):
+    """A deployment whose .env names new.example.com while its running container (still at the old name) answers
+    ``answer`` about its passkeys. ``events`` notes, in order, what is printed and which step runs."""
+    import argparse  # noqa: F401
+    cfg = {"server_name": "new.example.com", "encryption_key": dv.gen_fernet_key(), "jwt_secret_key": dv.gen_hex(32),
+           "vault_db_password": dv.gen_hex(16), "redis_password": dv.gen_hex(24), "admin_username": "admin",
+           "admin_email": "a@example.com", "admin_password": "Strong-Pass-1234", "compose_profiles": "combined",
+           "deployment_id": "d1"}
+    (tmp_path / ".env").write_text("\n".join(dv.build_env_lines(cfg)) + "\n", encoding="utf-8")
+    assert dv.parse_env((tmp_path / ".env").read_text(encoding="utf-8"))["ALLOWED_HOSTS"] == "new.example.com"
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    monkeypatch.setattr("builtins.print", lambda *a, **k: events.append(("said", " ".join(str(x) for x in a))))
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: name == "vault")
+    monkeypatch.setattr(tool, "_passkey_addresses", lambda: events.append(("asked",)) or answer)
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda _path: True)
+    # setup's start, with nothing run
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "_cert_pair_present", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "refresh_renewal_hook", lambda *a, **k: (None, ""))
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(dv, "cert_readable_by_app_uid", lambda *a, **k: True)
+    monkeypatch.setattr(dv, "cert_self_issued", lambda path: None)
+    monkeypatch.setattr(dv, "port_free", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_guard_db_secret", lambda env, **k: True)
+    monkeypatch.setattr(tool, "_note_host_log_driver", lambda: None)
+    monkeypatch.setattr(tool, "_resolve_rerun_image_source", lambda *a, **k: None)
+    monkeypatch.setattr(tool, "_wait_secure_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(tool, "_strip_spent_admin_password", lambda *a, **k: None)
+    monkeypatch.setattr(tool, "_start_secure_stack", lambda: events.append(("start",)) or True)
+    # restart's own steps, with nothing run
+    monkeypatch.setattr(tool, "_container_logs_readable", lambda: True)
+    monkeypatch.setattr(tool, "_build_checkout", lambda: True)
+    monkeypatch.setattr(tool, "_tear_down_containers", lambda: events.append(("down",)) or True)
+    monkeypatch.setattr(tool, "start", lambda args=None: events.append(("start",)))
+    return tool
+
+
+def _first(events, step):
+    return events.index((step,))
+
+
+def _said_at(events, words):
+    return next(i for i, e in enumerate(events) if e[0] == "said" and words in e[1])
+
+
+def _answering(monkeypatch, answer):
+    """A terminal on which the operator answers ``answer`` to every question."""
+    import types as _types
+    monkeypatch.setattr(dv.sys, "stdin", _types.SimpleNamespace(isatty=lambda: True))
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or answer)
+    return asked
+
+
+def test_a_setup_re_run_says_which_passkeys_the_new_address_strands_before_it_starts_the_vault(tmp_path, monkeypatch):
+    import argparse
+    events = []
+    tool = _moved_tool(tmp_path, monkeypatch, STRANDED, events)
+    tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    said = _said_at(events, "made at old.example.com")
+    assert events[said][1].startswith("  Passkeys: 2 passkeys (of 1 account) were made at old.example.com and "
+                                      "cannot be used at new.example.com."), events[said]
+    assert _first(events, "asked") < said < _first(events, "start"), events
+    # An address no passkey can be made at is said there too, before the start.
+    events.clear()
+    tool._set_env_key(str(tmp_path / ".env"), "ALLOWED_HOSTS", "'https://203.0.113.9:8443'")
+    tool.setup(argparse.Namespace(no_start=False, non_interactive=True))
+    assert _said_at(events, "Sign-in: passkeys stay hidden at this address") < _first(events, "start"), events
+
+
+def test_a_restart_says_which_passkeys_the_new_address_strands_before_it_takes_the_vault_down(tmp_path, monkeypatch):
+    events = []
+    tool = _moved_tool(tmp_path, monkeypatch, STRANDED, events)
+    tool.restart(None)
+    assert _first(events, "asked") < _said_at(events, "made at old.example.com") < _first(events, "down") \
+        < _first(events, "start"), events
+
+
+def test_no_at_the_question_leaves_the_vault_as_it_runs(tmp_path, monkeypatch):
+    import argparse
+    for run in ("setup", "restart"):
+        events = []
+        tool = _moved_tool(tmp_path, monkeypatch, STRANDED, events)
+        asked = _answering(monkeypatch, "n")
+        with pytest.raises(SystemExit):
+            if run == "setup":
+                tool.setup(argparse.Namespace(no_start=False, non_interactive=False))
+            else:
+                tool.restart(argparse.Namespace())
+        assert [p for p in asked if "Start the vault at this address anyway? Those passkeys cannot be used until the "
+                "address goes back." in p], (run, asked)
+        assert ("start",) not in events and ("down",) not in events, (run, events)
+        assert _said_at(events, "The deployment was not restarted. Change ALLOWED_HOSTS back in .env, or run this "
+                                "again to go on.") > _said_at(events, "made at old.example.com"), (run, events)
+        # Yes goes on.
+        events.clear()
+        _answering(monkeypatch, "y")
+        if run == "setup":
+            tool.setup(argparse.Namespace(no_start=False, non_interactive=False))
+        else:
+            tool.restart(argparse.Namespace())
+        assert ("start",) in events, (run, events)
+
+
+def test_no_question_when_nobody_is_left_without_a_second_factor(tmp_path, monkeypatch):
+    import argparse
+    import copy
+    covered = copy.deepcopy(STRANDED)
+    covered["holders"][0]["other_factor"] = True
+    off = copy.deepcopy(STRANDED)
+    off["on"] = False
+    for answer in (covered, off, None):
+        events = []
+        tool = _moved_tool(tmp_path, monkeypatch, answer, events)
+        asked = _answering(monkeypatch, "n")
+        tool.setup(argparse.Namespace(no_start=False, non_interactive=False))
+        tool.restart(argparse.Namespace())
+        assert asked == [] and events.count(("start",)) == 2, (answer, asked, events)
+    # A deployment that is not running is not asked: there is nothing to ask.
+    events = []
+    tool = _moved_tool(tmp_path, monkeypatch, STRANDED, events)
+    monkeypatch.setattr(dv, "container_running", lambda name, **k: False)
+    tool.restart(None)
+    assert ("asked",) not in events and ("down",) in events, events
+
+
+def test_a_first_setup_says_the_note_on_the_address_and_asks_no_deployment(tmp_path, monkeypatch):
+    """A first setup has no .env, so no deployment of this checkout runs to be asked about its passkeys: it says only
+    whether passkeys can be made at the address it writes."""
+    import argparse
+    tool = dv.DockVault(dv.Palette(False), root=str(tmp_path))
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+    monkeypatch.setattr(tool, "_passkey_addresses", lambda: pytest.fail("a first setup asked a deployment"))
+    monkeypatch.setattr(dv, "tighten_secret_file", lambda _path: True)
+    monkeypatch.setattr(dv, "docker_available", lambda *a, **k: (False, "not in a unit test"))
+    monkeypatch.setattr(dv, "generate_self_signed_cert", lambda cert_dir, *a, **k: (True, "made the pair"))
+    monkeypatch.setattr(dv, "apply_cert_owner", lambda *a, **k: (True, ""))
+    tool.setup(argparse.Namespace(no_start=True, non_interactive=True, cert_mode="selfsigned",
+                                  server_name="203.0.113.9"))
+    assert any(line.startswith("  Note: passkeys stay hidden at this address") for line in printed), printed
 
 
 def test_the_example_environment_says_it_beside_the_address():
