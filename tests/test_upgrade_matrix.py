@@ -1068,6 +1068,27 @@ def test_a_line_whose_six_months_ended_sooner_than_the_30_days_keeps_them():
                   "so the promise of 30 days after it runs to 2027-05-31")
 
 
+def test_the_first_release_of_each_line_from_0_36_on_says_until_when_the_lines_before_it_are_supported():
+    """Its note names the day the `lines` map gives the lines before it, SUPPORT_DAYS after its release, and never
+    the six months the lines before 0.36 were given. A matrix that declares no line from 0.36 on has none."""
+    import datetime
+
+    data = um.load_matrix(MATRIX_PATH)
+    first: dict[str, str] = {}
+    for version in data["versions"]:
+        line = um._line(version)
+        if um._sort_key(line + ".0") >= um._sort_key(um.ONE_LINE_FROM + ".0"):
+            first[line] = min(first.get(line, version), version, key=um._sort_key)
+    for line, version in first.items():
+        entry = data["versions"][version]
+        ends = (datetime.date.fromisoformat(entry["released"])
+                + datetime.timedelta(days=um.SUPPORT_DAYS)).isoformat()
+        assert any(um._sort_key(name + ".0") < um._sort_key(line + ".0") and given["security_fixes_until"] == ends
+                   for name, given in data["lines"].items()), (line, ends)
+        assert f"supported until {ends}" in entry["notes"], version
+        assert "six months" not in entry["notes"], version
+
+
 def test_the_matrix_about_states_the_promise_the_validator_checks():
     about = um.load_matrix(MATRIX_PATH)["about"]
     assert (f"null for the newest line, whose end is set when the next minor release ships: from "

@@ -211,30 +211,45 @@ def _public(name: str) -> str:
     return (ROOT / name).read_text(encoding="utf-8")
 
 
+def _line_key(line: str) -> tuple:
+    return tuple(int(part) for part in line.split("."))
+
+
 def test_the_security_policy_states_the_lines_the_tags_and_the_support_rule():
     policy = _public(".github/SECURITY.md")
-    # The newest line of the upgrade matrix's `lines` is the latest, and each line before it has its row with the
-    # last day the matrix gives it.
+    flat = " ".join(policy.split())        # what a reader sees, however the lines are wrapped
+    # The table is the upgrade matrix's `lines`, newest first: the newest line is the latest, each line before it
+    # has one row with the last day the matrix gives it, and nothing else is in it.
     lines = json.loads(_public("docs/upgrade-matrix.json"))["lines"]
-    newest = max(lines, key=lambda line: tuple(int(part) for part in line.split(".")))
-    assert "| Release line | Supported |" in policy
-    assert f"| {newest}.x, the latest line | Yes |" in policy
-    for line, entry in lines.items():
-        if line != newest:
-            assert f"| {line}.x | Yes, until {entry['security_fixes_until']} |" in policy, line
+    newest = max(lines, key=_line_key)
+    older = sorted((line for line in lines if line != newest), key=_line_key, reverse=True)
+    table = policy[policy.index("| Release line | Supported |"):].split("\n\n", 1)[0].splitlines()
+    assert table == (["| Release line | Supported |", "|---|---|", f"| {newest}.x, the latest line | Yes |"]
+                     + [f"| {line}.x | Yes, until {lines[line]['security_fixes_until']} |" for line in older]
+                     + ["| 0.32.x and earlier | No. Upgrade to the latest release. |"])
     # The row it replaces read "The minor line before the latest, 0.33.x and later lines only".
     assert "0.33.x and later lines only" not in policy
     # One sentence states the rule; the matrix's dates, the validator and the host tool follow it.
-    assert ("From 0.36.0 on, only the latest release line receives security fixes: when the next minor release\n"
-            "ships, the line before it has 30 more days to upgrade, and is end-of-life after that.") in policy
-    assert "This replaces the six months of security fixes each line from 0.33 on was given before." in policy
-    assert "until six\nmonths after the next minor release ships" not in policy
-    # Until 0.36.0 ships, the lines before it keep what they were promised: their end is announced without its
-    # day, and a Low finding is still fixed on them. The release of 0.36.0 dates both.
-    assert ("0.34.x and 0.35.x, which are supported side by side, all reach their end 30 days after 0.36.0\n"
-            "ships, instead of 2027-05-09 (0.33.x) and 2027-05-17 (0.34.x).") in policy
-    assert ("Low\n  findings are fixed in the next regular release, and in the supported previous lines in the same\n"
-            "  release window.") in policy
+    assert ("From 0.36.0 on, only the latest release line receives security fixes: when the next minor release "
+            "ships, the line before it has 30 more days to upgrade, and is end-of-life after that.") in flat
+    assert "This replaces the six months of security fixes each line from 0.33 on was given before." in flat
+    assert "until six months after the next minor release" not in flat
+    assert flat.count("reach their end") == 1
+    if _line_key(newest) >= (0, 36):       # ONE_LINE_FROM in .github/scripts/upgrade_matrix.py
+        # From the release of 0.36.0, every line before it ends on one day, which the paragraph names as the table
+        # does, and no fix is promised to an older line.
+        (ends,) = {lines[line]["security_fixes_until"] for line in older}
+        assert (f"0.33.x, 0.34.x and 0.35.x, which were supported side by side, all reach their end on {ends}, 30 "
+                "days after 0.36.0 shipped, instead of 2027-05-09 (0.33.x) and 2027-05-17 (0.34.x).") in flat
+        assert "Low findings are fixed in the next regular release. We will keep you informed" in flat
+        assert "release window" not in flat
+    else:
+        # Until 0.36.0 ships, the lines before it keep what they were promised: their end is announced without its
+        # day, and a Low finding is still fixed on them.
+        assert ("0.33.x, 0.34.x and 0.35.x, which are supported side by side, all reach their end 30 days after "
+                "0.36.0 ships, instead of 2027-05-09 (0.33.x) and 2027-05-17 (0.34.x).") in flat
+        assert ("Low findings are fixed in the next regular release, and in the supported previous lines in the "
+                "same release window.") in flat
     assert "`ghcr.io/dockvault/vault:vX.Y.Z`, which never changes" in policy
     assert "tagged `:vX.Y` (for example `:v0.33`)" in policy
     assert "so a patch release of an older line never moves them" in policy
