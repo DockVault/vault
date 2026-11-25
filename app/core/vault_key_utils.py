@@ -1,20 +1,24 @@
-"""
-Vault Key Management Utilities
-===============================
+"""The key record each vault is given when it is made.
 
-Handles vault-specific encryption key generation, derivation, and encryption.
+A random key is generated for each new vault, a zero-knowledge one included, and stored wrapped in
+``vaults.encrypted_vault_key``: under a key derived from the vault password (PBKDF2) when the vault has one,
+else under ``ENCRYPTION_KEY``. The wraps an older release's key rotation replaced are kept in
+``vault_key_history``.
 
-This module provides cryptographic functions for implementing per-vault encryption keys:
-1. Each vault has a unique encryption key
-2. Vault keys are encrypted with either vault password or master key
-3. Password-protected vaults use PBKDF2 key derivation
-4. Non-password-protected vaults are encrypted with master ENCRYPTION_KEY
+No read or write of a vault's content uses this key. A Standard vault's file contents are encrypted under a
+key per file, derived from ``ENCRYPTION_KEY`` (app/core/security.py, ``_gcm_stream_subkey``; a file an older
+release wrote under ``ENCRYPTION_KEY`` itself is still read), and names, MIME types, vault names and note text
+under keys derived from it too. So:
 
-Security Benefits:
-- Vault isolation: Compromising one vault doesn't expose others
-- Defense in depth: Password + encryption layers
-- Key rotation: Can rotate keys per-vault
-- Least privilege: Each vault has minimum necessary access
+- a vault password decides who may open the vault (``vaults.password_hash``); it adds no layer of encryption,
+  and ``ENCRYPTION_KEY`` opens a password vault's files without it;
+- vaults are not isolated from each other by their keys: whoever holds ``ENCRYPTION_KEY`` and the volumes reads
+  every Standard vault;
+- rotating this key would protect no content, which is why the rotation route refuses
+  (``rotate_vault_encryption_key`` in app/api/api_server.py).
+
+A zero-knowledge vault's content key is held in the browser and never reaches the server; the key this module
+stores for such a vault is unused too.
 """
 
 import os
