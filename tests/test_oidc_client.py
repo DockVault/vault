@@ -1084,3 +1084,25 @@ def test_an_issue_time_ahead_names_the_clock_for_an_id_token_and_stays_an_invali
     with pytest.raises(oc.OidcError) as e:
         oc._check_times({"exp": NOW - 61, "iat": NOW - 300}, NOW, oc.PROVIDER_CLOCK_AHEAD)
     assert e.value.code == oc.TOKEN_INVALID
+
+
+@pytest.mark.parametrize("alg", ["RS256", "PS256"])
+def test_a_provider_key_too_short_to_trust_verifies_no_token(alg):
+    """A provider publishes an RSA signing key of 1024 bits (a misconfigured realm, a legacy key). The library
+    verified with it and only warned. A provider's logout is posted to an address open to anyone: whoever
+    factored such a key could end any linked person's sessions. A key under 2048 bits verifies nothing, for an ID
+    token and for a logout token alike; the provider's other keys are not touched by it."""
+    oc = _oc()
+    signer = Signer()
+    signer.rsa = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+    with pytest.raises(oc.OidcError) as refused:
+        _verify(oc, signer, signer.token(signer.id_claims(), alg=alg))
+    assert refused.value.code == oc.TOKEN_INVALID and refused.value.detail == "InvalidKeyError"
+    with pytest.raises(oc.OidcError) as refused:
+        oc.verify_logout_token(_provider(oc), _disc(oc, signer), signer.token(_logout_claims(signer), alg=alg),
+                               seen_jti=lambda jti, ttl: False, fetch=_fetch_for(signer), resolve=_PUBLIC, now=NOW)
+    assert refused.value.code == oc.TOKEN_INVALID and refused.value.detail == "InvalidKeyError"
+    # The provider's elliptic-curve key is as it was.
+    assert _verify(oc, signer, signer.token(signer.id_claims(), alg="ES256", kid="ec1"))["sub"] == "user-1"
+    # (A key of 2048 bits verifies: every other test here signs with one.)
+    assert Signer().rsa.key_size == 2048

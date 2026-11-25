@@ -752,11 +752,16 @@ def _key_for(provider, discovery, header, *, fetch, cache, resolve, now, stale_o
 def _decode(token: str, key, alg: str, *, issuer: str, audience: str, now: float, require: Iterable[str],
             ahead: str = TOKEN_INVALID) -> dict:
     """Signature, required claims, issuer and audience by PyJWT; the time claims by :func:`_check_times` against
-    the caller's clock (PyJWT would read the wall clock itself, and one clock must rule every check)."""
+    the caller's clock (PyJWT would read the wall clock itself, and one clock must rule every check).
+
+    A key too short to be trusted verifies nothing: an RSA key under 2048 bits (PyJWT's own floor) is refused as
+    an invalid token, where the library by itself only warns. A provider's logout is posted to an address open to
+    anyone, so whoever factored a short key the provider published could end any linked person's sessions."""
     try:
         claims = jwt.decode(token, key=key, algorithms=[alg], issuer=issuer, audience=audience,
                             options={"require": list(require), "verify_signature": True, "verify_exp": False,
-                                     "verify_iat": False, "verify_nbf": False, "verify_iss": True, "verify_aud": True})
+                                     "verify_iat": False, "verify_nbf": False, "verify_iss": True, "verify_aud": True,
+                                     "enforce_minimum_key_length": True})
     except jwt.InvalidIssuerError as exc:
         raise OidcError(ISSUER_MISMATCH, "the token's issuer is not the provider's") from exc
     except jwt.PyJWTError as exc:
