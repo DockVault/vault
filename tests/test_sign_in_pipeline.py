@@ -312,7 +312,7 @@ def test_only_the_two_stages_can_be_pending():
 def quiet_records(monkeypatch):
     """The records of a finished sign-in, observed instead of made."""
     S = _api()
-    made = {"audit": [], "events": [], "notices": [], "emails": []}
+    made = {"audit": [], "events": [], "notices": [], "emails": [], "details": []}
 
     class _Audit:
         def __init__(self, db):
@@ -323,6 +323,7 @@ def quiet_records(monkeypatch):
 
         def log_action(self, **kw):
             made["audit"].append(("action", kw.get("action")))
+            made["details"].append((kw.get("action"), kw.get("details")))
 
     monkeypatch.setattr(S, "AuditLogger", _Audit)
     monkeypatch.setattr(S, "_fire_offloop", lambda fn, *a, **kw: made["events"].append((fn, a, kw)))
@@ -503,9 +504,48 @@ def test_a_step_that_follows_deletes_the_session_the_password_made_and_records_t
     # No usable session stands while the step is pending.
     assert db.tables[ActiveSession] == []
     assert ("action", "login_password_ok") in quiet_records["audit"]
+    assert ("login_password_ok", {"methods": ["pwd"]}) in quiet_records["details"]
+    assert ("action", "sign_in_held") not in quiet_records["audit"]
     # ... and nothing of a finished sign-in was recorded.
     assert quiet_records["events"] == [] and quiet_records["emails"] == []
     assert not [a for a in quiet_records["audit"] if a[0] == "alice"]
+
+
+def test_a_provider_sign_in_held_for_another_step_is_recorded(quiet_records, monkeypatch):
+    """A person signed in through the provider and is held for the account's second factor. Should they give up
+    there, the record still shows that the provider's sign-in was accepted, as a password's is."""
+    s = _sign_in()
+    user = _user()
+    _policy(monkeypatch, in_effect=True)
+    outcome = s.finish(_finish_db(user, enrollment="totp"), s.SignInResult(user, [], "10.0.0.1", provider_id="p1"))
+    assert isinstance(outcome, s.PendingStep) and outcome.stage == "second_factor"
+    assert ("action", "sign_in_held") in quiet_records["audit"]
+    assert ("action", "login_password_ok") not in quiet_records["audit"]
+    assert ("sign_in_held", {"methods": [], "provider_id": "p1"}) in quiet_records["details"]
+    assert quiet_records["events"] == [] and not [a for a in quiet_records["audit"] if a[0] == "alice"]
+
+
+@pytest.mark.parametrize("role", ["user", "admin"])
+def test_a_passkey_sign_in_held_for_another_step_is_recorded(quiet_records, monkeypatch, role):
+    """A passkey by itself, where the account may not sign in with one alone: held for the password."""
+    s = _sign_in()
+    user = _user(role=role)
+    _policy(monkeypatch, in_effect=True)
+    outcome = s.finish(_finish_db(user, enrollment="totp"),
+                       s.SignInResult(user, ["swk"], "10.0.0.1", user_verified=True, passwordless_allowed=False))
+    assert isinstance(outcome, s.PendingStep) and outcome.stage == "password"
+    assert ("sign_in_held", {"methods": ["swk"]}) in quiet_records["details"]
+    assert ("action", "login_password_ok") not in quiet_records["audit"]
+
+
+def test_a_sign_in_that_finishes_records_no_held_step(quiet_records, monkeypatch):
+    s = _sign_in()
+    user = _user()
+    _policy(monkeypatch, in_effect=False)
+    for result in (s.SignInResult(user, [], "10.0.0.1", provider_id="p1"),
+                   s.SignInResult(user, ["swk"], "10.0.0.1", user_verified=True, passwordless_allowed=True)):
+        assert isinstance(s.finish(_finish_db(user), result), s.SignedIn)
+    assert [a for a in quiet_records["audit"] if a[0] == "action"] == []
 
 
 def test_an_enrollment_step_follows_when_the_factor_is_required_but_not_set_up(quiet_records, monkeypatch):

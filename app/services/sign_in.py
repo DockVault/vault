@@ -881,7 +881,8 @@ def finish(db, result: SignInResult):
     """Finish a sign-in or hold it for its next step: a :class:`SignedIn` or a :class:`PendingStep`.
 
     A step that follows deletes the session the proof made (none may exist before the sign-in is
-    whole) and records that the password was accepted when it was one of the proofs.
+    whole) and records the first proof that was accepted: the password when it was one of the proofs,
+    else the provider's sign-in or the passkey.
     """
     from app.api import api_server as api
     user = result.user
@@ -970,10 +971,19 @@ def finish(db, result: SignInResult):
     if result.session_token:
         delete_session_by_token(db, result.session_token)
         result.session_token = None
+    # A first proof accepted and held for its next step: recorded, so that a sign-in abandoned there leaves a trace
+    # whatever its first proof was. Counted as no sign-in attempt: the attempt counts when it succeeds or fails.
+    held = {"methods": list(result.methods), **({"provider_id": str(result.provider_id)} if result.provider_id else {})}
     if PASSWORD in result.methods:
         try:
             api.AuditLogger(db).log_action(action="login_password_ok", status="success", user=user,
-                                           ip_address=result.client_ip, details={})
+                                           ip_address=result.client_ip, details=held)
+        except Exception:  # noqa: BLE001 -- the hold stands without its row
+            pass
+    elif result.provider_id or (set(result.methods) & PASSKEYS):
+        try:
+            api.AuditLogger(db).log_action(action="sign_in_held", status="success", user=user,
+                                           ip_address=result.client_ip, details=held)
         except Exception:  # noqa: BLE001 -- the hold stands without its row
             pass
     if stage == ENROLL:

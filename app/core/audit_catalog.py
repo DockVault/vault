@@ -56,6 +56,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("account_auto_unlocked", "sign_in", "Sign-ins resumed", "info"),
     AuditAction("login_failure", "sign_in", "Sign-in failed", "warning", typed_name=True),
     AuditAction("login_password_ok", "sign_in", "Password accepted, second factor pending", "info"),
+    # A provider's sign-in or a passkey accepted, and the sign-in held for a password, a second factor or a set-up.
+    AuditAction("sign_in_held", "sign_in", "Provider or passkey accepted, another step pending", "info"),
     AuditAction("login_success", "sign_in", "Signed in", "info"),
     # A user said they had read the notice of what this vault records, after a change (reading, not consent).
     AuditAction("privacy_notice_seen", "sign_in", "Recording notice read", "info"),
