@@ -352,7 +352,8 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
     ("login_alert", "New sign-in alert",
      "Optional — notify a user when their account signs in.", OPTIONAL),
     ("sign_in_method_changed", "Sign-in method changed",
-     "Sent to a user when a passkey is added to or removed from their own account — says what and when.",
+     "Sent to a user when a passkey is added to or removed from their own account, or an authenticator app is "
+     "set up for it — says what and when.",
      SYSTEM),
     ("share_created", "File / folder shared",
      "Optional — notify a recipient when something is shared with them.", OPTIONAL),

@@ -243,10 +243,19 @@ def test_an_authenticator_set_up_at_a_held_sign_in_is_recorded_whatever_the_sign
     built, logged = [], []
     monkeypatch.setattr(S.AuditLogger, "build_row", lambda self, **kw: built.append(kw) or ("the record", kw["action"]))
     monkeypatch.setattr(S.AuditLogger, "log_action", lambda self, **kw: logged.append(kw))
+    notices, emails = [], []
+    monkeypatch.setattr(S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
+        notices.append({"ids": list(ids), "type": ntype, "title": title, "body": body, "target": target,
+                        "committed": ("commit",) in db.log, "active": enrollment.status})))
+    monkeypatch.setattr(S, "_fire_action_email", lambda db, key, *, email, username=None, action_context=None: (
+        emails.append({"key": key, "email": email, "username": username, "change": action_context["change"]})))
+    user.email = "alice@example.test"
 
     def finish(db_, result):
         # By now the enrollment and its record are committed together.
         assert db.log.index(("add", ("the record", "second_factor_enrolled"))) < db.log.index(("commit",))
+        # ...and the owner was told: the sign-in may end here in a refusal, and the factor stands all the same.
+        assert len(notices) == 1 and len(emails) == 1
         if then == "another step":
             return sign_in.PendingStep("password", {"stage": "password", "pre_auth_token": "held-again"})
         if then == "a refusal":
@@ -269,6 +278,17 @@ def test_an_authenticator_set_up_at_a_held_sign_in_is_recorded_whatever_the_sign
     assert row["action"] == "second_factor_enrolled" and row["status"] == "success" and row["user"] is user
     assert row["ip_address"] == "203.0.113.9" and row["details"] == {"method": "totp", "forced": True}
     assert logged == [], "written once, with the enrollment"
+    # The owner is told once, in the app and by email, after the factor stood: whoever set it up after the
+    # password alone is not the only one who knows.
+    (notice,), (email,) = notices, emails
+    assert notice["ids"] == [str(user.id)] and notice["type"] == "account_changed" and notice["target"] == "#profile"
+    assert notice["title"] == "An authenticator app was set up for your account"
+    assert notice["body"] == ("An authenticator app was set up for your account while signing in. If you did not do "
+                              "this, remove what you do not recognize and change your password.")
+    assert notice["committed"] is True and notice["active"] == "active"
+    assert email == {"key": "sign_in_method_changed", "email": "alice@example.test", "username": user.username,
+                     "change": "An authenticator app was set up for your account while signing in."}
+    del notices[:], emails[:]
     # From a session there is no held sign-in to go on: recorded after the other sessions are ended, as before.
     del built[:]
     enrollment.status = "unconfirmed"
@@ -282,3 +302,18 @@ def test_an_authenticator_set_up_at_a_held_sign_in_is_recorded_whatever_the_sign
     assert out == {"enrolled": True, "method": "totp"} and built == []
     (row,) = logged
     assert row["action"] == "second_factor_enrolled" and row["details"] == {"method": "totp"}
+    # From a session the owner is told too, in words for what they did; an account with no address gets the
+    # notice in the app alone.
+    (notice,), (email,) = notices, emails
+    assert notice["body"].startswith("You set up an authenticator app for your account. If you did not do this,")
+    assert email["change"] == "You set up an authenticator app for your account."
+    del notices[:], emails[:]
+    enrollment.status, user.email = "unconfirmed", None
+    run_coroutine(S.acknowledge_recovery_codes(request=None, principal=(user, None), db=db), timeout=30)
+    assert len(notices) == 1 and emails == []
+    # A set-up that is refused tells nobody: nothing was set up.
+    del notices[:]
+    enrollment.status, enrollment.confirmed_at = "unconfirmed", None       # its code was never confirmed
+    with pytest.raises(HTTPException):
+        run_coroutine(S.acknowledge_recovery_codes(request=None, principal=(user, None), db=db), timeout=30)
+    assert notices == [] and emails == []

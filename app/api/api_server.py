@@ -11440,6 +11440,13 @@ async def acknowledge_recovery_codes(
         db.add(AuditLogger(db).build_row(action="second_factor_enrolled", status="success", user=current_user,
                                          ip_address=get_client_ip(request), details={"method": "totp", "forced": True}))
     db.commit()
+    # The owner is told, as for a passkey. A sign-in held for a set-up comes after the password alone: whoever
+    # knew the password of an account whose passkeys stopped working (the vault moved to another address) set an
+    # authenticator of their own up there, and the owner learned of it only when asked for a code they did not
+    # have. Sent once the factor stands and before the held sign-in goes on: it stands whatever that then does.
+    _passkey_notice(db, current_user, "An authenticator app was set up for your account",
+                    "An authenticator app was set up for your account while signing in." if pending is not None
+                    else "You set up an authenticator app for your account.")
 
     if pending is not None:
         # Forced-enrollment login: the pipeline spends the pending row (single winner) and mints the real
@@ -11768,8 +11775,9 @@ def _passkey_first_proof(db, user, request, current_password) -> None:
 
 
 def _passkey_notice(db, user, title: str, change: str) -> None:
-    """Tell the owner what they just did to their own passkeys: in the app, and by email when the account has an
-    address and email is configured. Best-effort, after the commit."""
+    """Tell the owner what was just done to the factors of their own account (a passkey added or removed, an
+    authenticator app set up): in the app, and by email when the account has an address and email is configured.
+    Best-effort, after the commit."""
     try:
         _notify_users([str(user.id)], "account_changed", title=title,
                       body=f"{change} If you did not do this, remove what you do not recognize and change your password.",
