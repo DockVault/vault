@@ -86,6 +86,7 @@ def test_a_held_sign_in_makes_no_factor_active_for_an_account_that_may_not_sign_
     monkeypatch.setattr(S, "_sf_recovery_remaining", lambda db, user_id: 10)
     monkeypatch.setattr(S, "get_client_ip", lambda request: "203.0.113.9")
     monkeypatch.setattr(sign_in, "finish", lambda db, result: asked.append(result.methods) or sign_in.SignedIn("token", user))
+    monkeypatch.setattr(S.AuditLogger, "build_row", lambda self, **kw: ("the record", kw["action"]))
     lock = types.SimpleNamespace(locked_until=datetime.utcnow() + timedelta(minutes=5), scope="address")
     monkeypatch.setattr(sign_in_lockout, "lock_in_force",
                         lambda db, user_id, ip: lock if state == "locked out here" and ip == "203.0.113.9" else None)
@@ -214,3 +215,62 @@ def test_an_account_made_an_administrator_mid_sign_in_still_types_the_password(v
     assert body["access_token"] is None and body["stage"] == "password" and body["username"] == "alice"
     assert _claims(body["pre_auth_token"])["methods_so_far"] == ["totp"]
     assert pending.consumed_at is not None and v.made["sessions"] == []
+
+
+@pytest.mark.parametrize("then", ["a session", "another step", "a refusal"])
+def test_an_authenticator_set_up_at_a_held_sign_in_is_recorded_whatever_the_sign_in_then_does(monkeypatch, then):
+    """The enrollment is made active and committed, and only then does the sign-in go on. It may be held for
+    another step (the password, for an account made an administrator meanwhile; a passkey its role owes) or be
+    refused: the factor stands all the same. Its record is written with it, in one transaction, and not after
+    the sign-in finished, where those two ways out never reached it."""
+    from fastapi import HTTPException
+    S = _api()
+    from app.core.models import SecondFactorEnrollment, User
+    from app.services import sign_in
+    user = _user()
+    user.second_factor_reset_at = None
+    enrollment = types.SimpleNamespace(user_id=user.id, status="unconfirmed", method="totp",
+                                       confirmed_at=datetime.utcnow())
+    db = MemoryDB({User: [user], SecondFactorEnrollment: [enrollment]})
+    pending = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, _methods_so_far=("password",))
+    monkeypatch.setattr(S, "_sf_recovery_remaining", lambda db, user_id: 10)
+    monkeypatch.setattr(S, "get_client_ip", lambda request: "203.0.113.9")
+    monkeypatch.setattr(sign_in, "refuse_a_factor_the_sign_in_could_not_finish", lambda *a, **k: None)
+    built, logged = [], []
+    monkeypatch.setattr(S.AuditLogger, "build_row", lambda self, **kw: built.append(kw) or ("the record", kw["action"]))
+    monkeypatch.setattr(S.AuditLogger, "log_action", lambda self, **kw: logged.append(kw))
+
+    def finish(db_, result):
+        # By now the enrollment and its record are committed together.
+        assert db.log.index(("add", ("the record", "second_factor_enrolled"))) < db.log.index(("commit",))
+        if then == "another step":
+            return sign_in.PendingStep("password", {"stage": "password", "pre_auth_token": "held-again"})
+        if then == "a refusal":
+            raise HTTPException(status_code=403, detail="This account signs in through its provider.")
+        return sign_in.SignedIn("token", user)
+    monkeypatch.setattr(sign_in, "finish", finish)
+
+    def acknowledge():
+        return run_coroutine(S.acknowledge_recovery_codes(request=None, principal=(user, pending), db=db), timeout=30)
+    if then == "a refusal":
+        with pytest.raises(HTTPException):
+            acknowledge()
+    else:
+        out = acknowledge()
+        assert out["enrolled"] is True and out["method"] == "totp"
+        assert (out.get("access_token") == "token") is (then == "a session")
+        assert (out.get("stage") == "password") is (then == "another step")
+    assert enrollment.status == "active"
+    (row,) = built
+    assert row["action"] == "second_factor_enrolled" and row["status"] == "success" and row["user"] is user
+    assert row["ip_address"] == "203.0.113.9" and row["details"] == {"method": "totp", "forced": True}
+    assert logged == [], "written once, with the enrollment"
+    # From a session there is no held sign-in to go on: recorded after the other sessions are ended, as before.
+    del built[:]
+    enrollment.status = "unconfirmed"
+    monkeypatch.setattr(S, "_revoke_sessions", lambda *a, **kw: 0)
+    monkeypatch.setattr(S, "_current_session_token", lambda request: "the-session")
+    out = run_coroutine(S.acknowledge_recovery_codes(request=None, principal=(user, None), db=db), timeout=30)
+    assert out == {"enrolled": True, "method": "totp"} and built == []
+    (row,) = logged
+    assert row["action"] == "second_factor_enrolled" and row["details"] == {"method": "totp"}

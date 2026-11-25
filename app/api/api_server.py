@@ -11199,6 +11199,12 @@ async def acknowledge_recovery_codes(
     enr.status = "active"
     # Set up again after an administrator's reset: the requirement that asked for it is met.
     current_user.second_factor_reset_at = None
+    if pending is not None:
+        # Recorded with the enrollment itself, in its transaction. The sign-in it was set up at may be held for
+        # another step after this, or refused: the factor stands on the account all the same, and a record
+        # written only once the sign-in had finished left it in use with nothing saying it was ever set up.
+        db.add(AuditLogger(db).build_row(action="second_factor_enrolled", status="success", user=current_user,
+                                         ip_address=get_client_ip(request), details={"method": "totp", "forced": True}))
     db.commit()
 
     if pending is not None:
@@ -11214,13 +11220,7 @@ async def acknowledge_recovery_codes(
             # The table asks for one more step (the password, for an account made an administrator during
             # its sign-in): the enrollment stands, the sign-in is held again.
             return {"enrolled": True, "method": "totp", **outcome.body}
-        access_token = outcome.access_token
-        try:
-            AuditLogger(db).log_action(action="second_factor_enrolled", status="success", user=current_user,
-                                       ip_address=client_ip, details={"method": "totp", "forced": True})
-        except Exception:      # noqa: BLE001
-            pass
-        return {"enrolled": True, "method": "totp", "access_token": access_token, "token_type": "bearer"}
+        return {"enrolled": True, "method": "totp", "access_token": outcome.access_token, "token_type": "bearer"}
 
     # Normal (already-signed-in) path: a change to how the account authenticates should not leave older
     # sessions standing — but keep the session that just did the enrollment (the user stays logged in).
