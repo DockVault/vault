@@ -362,7 +362,7 @@
         const order = input('sso-order', provider.sort_order, 'number');
         order.min = 0; order.max = 999;
         const shown = tick('sso-show', 'Show a button on the sign-in page', provider.show_on_sign_in,
-            'Without the button, people use the sign-in link above.');
+            'Without the button, people use the sign-in link above, or link it under Your account.');
         const issuer = input('sso-issuer', provider.issuer);
         issuer.placeholder = preset.issuer_example || 'https://';
         const clientId = input('sso-client-id', provider.client_id);

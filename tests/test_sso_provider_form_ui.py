@@ -170,3 +170,13 @@ await tick(); await tick();
 out(patches());
 """ % json.dumps(DN_GROUP))
     assert got == [{"policy": {"sso_allowed_tenants": ["t-1"]}}]
+
+
+def test_a_provider_without_a_button_is_still_linked_under_your_account():
+    """The sign-in page's button is about the sign-in page only: a person still links the provider under Your
+    account, which offers every provider that can be linked."""
+    got = _node(r"""
+await openPage('connection');
+out(helpOf('sso-show'));
+""")
+    assert got == "Without the button, people use the sign-in link above, or link it under Your account."
