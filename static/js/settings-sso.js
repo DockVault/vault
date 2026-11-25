@@ -34,6 +34,7 @@
     let fresh = {};             // the values the page on screen was built with
     let identitiesFrom = 0;     // where the Identities page starts in the provider's list of accounts
     let identityReads = 0;      // only the latest read of that list draws it
+    let identitiesNote = null;  // a refused removal's sentence, said once at the top of the Identities page
 
     const ICON_NAMES = { generic: 'Plain', microsoft: 'Microsoft', google: 'Google', okta: 'Okta', keycloak: 'Keycloak', authentik: 'Authentik' };
     const PAGES = [['connection', 'Connection'], ['access', 'Access'], ['factor', 'Second factor'], ['sessions', 'Sessions'],
@@ -528,6 +529,14 @@
     // a refusal or a hold. What a refusal and a hold are, and how each ends, is said on the page.
     function identitiesPage(provider) {
         const box = _el('div');
+        if (identitiesNote) {
+            // A removal refused for the accounts listed here: its sentence first, once.
+            const note = _el('p', 'alert alert-warning mb-sm', identitiesNote);
+            note.id = 'sso-identities-note';
+            note.setAttribute('role', 'alert');
+            box.appendChild(note);
+            identitiesNote = null;
+        }
         const about = _el('p', 'text-secondary text-sm mb-sm', 'The accounts linked to this provider. Refused or held: '
             + 'the provider refused the person when they last signed in there, or their days without a sign-in here had '
             + 'run out when the provider was turned off or was to be removed. The vault keeps the date of either, not '
@@ -735,18 +744,38 @@
         } catch (e) { showToast(e.message || 'The provider was not changed.', 'error'); }
     }
 
+    // The refusals whose sentence sends the administrator to the provider's Identities page: accounts held by it
+    // (some of them held by this very removal, after its step-up), or past its days.
+    const TO_IDENTITIES = ['refusals_in_force', 'days_ran_out'];
+
     async function remove() {
-        const ok = await showConfirm(`Remove ${open.name}? Its ${open.identities} link(s) to accounts are removed with it; the `
-            + 'accounts stay.', 'Remove the provider', null, 'Remove');
+        const ok = await showConfirm(`Remove ${open.name}? Its ${open.identities} link(s) to accounts are removed with it`
+            + (open.group_mappings ? `, and its ${open.group_mappings} group mapping(s)` : '') + '; the accounts stay.',
+            'Remove the provider', null, 'Remove');
         if (!ok) return;
+        const asked = open.id;
         try {
-            await apiRequest(`/admin/sso/providers/${encodeURIComponent(open.id)}`, { method: 'DELETE', silent: true });
+            await apiRequest(`/admin/sso/providers/${encodeURIComponent(asked)}`, { method: 'DELETE', silent: true });
             showToast('The provider was removed.', 'success');
             open = null;
             forgetDrafts();
             closeModal();
             load();
-        } catch (e) { showToast(e.message || 'The provider was not removed.', 'error'); }
+        } catch (e) {
+            // Whatever the refusal, the list is read again: one that came after the step-up may have held accounts.
+            load();
+            if (!TO_IDENTITIES.includes(e.reason)) {
+                showToast(e.message || 'The provider was not removed.', 'error');
+                return;
+            }
+            // The sentence names the Identities page: the provider is read again and shown on it, the sentence first.
+            identitiesNote = e.message || null;
+            await show(asked, 'identities');
+            if (identitiesNote) {                   // the page was not drawn: the sentence is said all the same
+                identitiesNote = null;
+                showToast(e.message || 'The provider was not removed.', 'error');
+            }
+        }
     }
 
     // The values of a page's fields, by field id (an address shown to be copied is no field).
@@ -986,6 +1015,7 @@
         loads += 1;
         identityReads += 1;
         identitiesFrom = 0;
+        identitiesNote = null;
         data = null;
         open = null;
         forgetDrafts();

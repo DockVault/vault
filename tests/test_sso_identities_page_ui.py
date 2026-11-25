@@ -453,3 +453,75 @@ await window.SsoSettings.load();
 out(document.querySelectorAll('.sso-provider-row button').map((b) => [b.textContent, b.getAttribute('aria-label')]));
 """)
     assert got == [["Open", "Open Contoso (contoso)"], ["Open", "Open okta-prod"], ["Open", "Open acme"]]
+
+
+REMOVE = r"""
+PROVIDER.state = 'disabled';
+PROVIDER.group_mappings = %s;
+const READ = answers['/admin/sso/providers/p-1'];
+let refusal = null;
+answers['/admin/sso/providers/p-1'] = () => {
+    if (asked[asked.length - 1].method === 'DELETE') throw refusal;
+    return READ;
+};
+answers[IDS] = LIST;
+await window.SsoSettings.load();
+document.querySelector('.sso-provider-row button').click();
+await tick(); await tick();
+const listed = () => asked.filter((a) => a.path === '/admin/sso/providers').length;
+const providerRead = () => asked.filter((a) => a.path === '/admin/sso/providers/p-1' && a.method === 'GET').length;
+const before = { listed: listed(), read: providerRead() };
+refusal = new Error(%s);
+refusal.status = 409; refusal.reason = %s;
+byId('sso-remove').click();
+await tick(); await tick(); await tick(); await tick();
+const note = byId('sso-identities-note');
+const landed = { page: document.querySelector('[role="tab"][aria-selected="true"]').id,
+                 note: note ? [note.textContent, note.className, note.getAttribute('role')] : null,
+                 noteFirst: note ? byId('sso-page-identities').children[0] === note : null,
+                 listedAgain: listed() - before.listed, readAgain: providerRead() - before.read,
+                 deletes: asked.filter((a) => a.method === 'DELETE').map((a) => a.path) };
+byId('sso-tab-connection').click();
+await tick();
+byId('sso-tab-identities').click();
+await tick(); await tick();
+out({ confirm: confirms[0], toasts, landed, noteAgain: byId('sso-identities-note') !== null });
+"""
+
+
+@pytest.mark.parametrize("reason", ["refusals_in_force", "days_ran_out"])
+def test_a_removal_refused_for_accounts_held_or_past_their_days_opens_the_identities_page_with_the_reason(reason):
+    """The removal is refused because accounts are held, or held a moment ago, or past their days: the sentence sends
+    the administrator to the provider's Identities page, so the dialog opens it, with the sentence first on it,
+    once; the provider and the list are read again (a refusal after the step-up may have just held accounts)."""
+    said = ("2 accounts have not signed in through this provider within its days. They are held now, so that removing "
+            "the provider does not give them their SSH keys, temporary credentials and devices back unseen. Lift each "
+            "on this provider's Identities page when they should have them back, then remove the provider again.")
+    got = _node(REMOVE % ("0", json.dumps(said), json.dumps(reason)))
+    landed = got["landed"]
+    assert landed["deletes"] == ["/admin/sso/providers/p-1"]
+    assert landed["page"] == "sso-tab-identities"
+    assert landed["note"] == [said, "alert alert-warning mb-sm", "alert"] and landed["noteFirst"] is True
+    assert landed["listedAgain"] == 1 and landed["readAgain"] == 1
+    assert got["toasts"] == []                               # said on the page, where it stays
+    assert got["noteAgain"] is False                         # once: the page shown again does not repeat it
+
+
+def test_a_removal_refused_for_another_reason_says_it_and_reads_the_list_again():
+    got = _node(REMOVE % ("0", json.dumps("Turn the provider off before removing it."), json.dumps("still_on")))
+    landed = got["landed"]
+    assert got["toasts"] == [["Turn the provider off before removing it.", "error"]]
+    assert landed["page"] == "sso-tab-connection" and landed["note"] is None
+    assert landed["listedAgain"] == 1 and landed["readAgain"] == 0
+
+
+@pytest.mark.parametrize("mappings, said", [
+    (3, "Remove contoso? Its 3 link(s) to accounts are removed with it, and its 3 group mapping(s); the accounts "
+        "stay."),
+    (0, "Remove contoso? Its 3 link(s) to accounts are removed with it; the accounts stay."),
+])
+def test_the_removal_confirmation_names_the_group_mappings_removed_with_the_provider(mappings, said):
+    got = _node(REMOVE % (json.dumps(mappings), json.dumps("Turn the provider off before removing it."),
+                          json.dumps("still_on")))
+    message, title, label = got["confirm"]
+    assert message == said and title == "Remove the provider" and label == "Remove"
