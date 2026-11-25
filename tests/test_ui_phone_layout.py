@@ -185,6 +185,29 @@ out({ classes: tabs.className.split(' '), tabs: tabs.children.map((t) => t.textC
     assert _declared(".flex-wrap", _skin_rules("utilities.css")).get("flex-wrap") == "wrap"
 
 
+@pytest.mark.unit
+def test_a_long_name_in_a_provider_row_or_a_linked_account_row_breaks_instead_of_widening_the_dialog():
+    """Settings, Sign-in draws each provider (static/js/settings-sso.js, drawRow) and each account linked to one
+    (identityRow) as a row whose first child, .flex-1, holds the name and its details. A name may have no space to
+    break at: an account made at a first sign-in can be named by the provider's subject for the person (43 letters of
+    base64url). That column may shrink below the name's width and breaks the name, in both skins, as an identity line
+    under Your account and a group mapping already do; otherwise the name sets the row's width and the dialog scrolls
+    sideways on a phone."""
+    got = sso_dialog_node(r"""
+answers[IDS] = LIST;
+await openIdentities();
+const text = (selector) => { const row = document.querySelector(selector);
+    return [row.children[0].className.split(' '), row.children[0].children[0].childNodes[0].textContent]; };
+out({ identity: text('.sso-identity-row'), provider: text('.sso-provider-row') });
+""")
+    assert got["identity"] == [["flex-1"], "carol"]
+    assert got["provider"] == [["flex-1"], "Contoso"]
+    rules = _skin_rules("components.css")
+    for row in (".sso-identity-row", ".sso-provider-row"):
+        declared = _declared(f"{row} > .flex-1", rules)
+        assert declared.get("min-width") == "0" and declared.get("overflow-wrap") == "anywhere", (row, declared)
+
+
 # --------------------------------------------------------------------------- ui lane
 
 @pytest.fixture

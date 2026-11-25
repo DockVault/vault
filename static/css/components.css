@@ -2306,3 +2306,6 @@ details summary:hover {
 /* A provider's group mappings: a long group name (a distinguished name holds no space) wraps instead of widening the
    dialog on a phone. */
 .sso-group-text { min-width: 0; overflow-wrap: anywhere; }
+/* The providers in Settings and the accounts linked to one: a name with no space in it (an account can be named by the
+   provider's subject for the person) breaks instead of widening the card or the dialog on a phone. */
+.sso-provider-row > .flex-1, .sso-identity-row > .flex-1 { min-width: 0; overflow-wrap: anywhere; }
