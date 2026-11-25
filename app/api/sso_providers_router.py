@@ -558,14 +558,19 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
         _record(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
                 details={"provider_id": str(row.id), "name": row.name, "changed": [], "identities": held,
                          "reason": "held_before_removal"})
-        people = [(u.id, u.username, u.email) for u in db.query(User).filter(User.id.in_(held_ids)).all()]
+        # The hold is written for every one of them. Told are the accounts that can sign in: one that is turned
+        # off signs in nowhere, and its stored address is often a former employee's own.
+        people = [(u.id, u.username, u.email) for u in db.query(User).filter(User.id.in_(held_ids)).all()
+                  if u.is_active]
+        turned_off = held - len(people)
         name, shown = row.name, row.label or row.name
         db.commit()
         _tell_administrators(current_user.username, "Accounts were held before a provider's removal", (
             f"{current_user.username} began to remove the single sign-on provider {name}. {held} account(s) had not "
             "signed in through it within its days and are held now, so that the removal does not give them their "
             "SSH keys, temporary credentials and devices back unseen. Lift each under Identities when it should "
-            "have them back; the provider can be removed then."))
+            "have them back; the provider can be removed then."
+            + (f" {turned_off} of them are turned off: held as the others are, and not told." if turned_off else "")))
         _tell_accounts(people, "Your keys stay paused on this vault", (
             f"You have not signed in through {shown} within the time your organisation allows, and {shown} is being "
             "removed from this vault. Your SSH keys, temporary credentials and devices stay paused until an "

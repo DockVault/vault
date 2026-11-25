@@ -325,7 +325,9 @@ def held_by_its_days(db, row, *, now=None) -> list:
     """The accounts linked to ``row`` (which is on) that its days hold to a provider's sign-in right now: their
     last sign-in through it is older than its days, and their password and passkeys sign them in to nothing until
     they have signed in through it again. Not the ones it refused: those are held by the refusal, whatever the
-    days are."""
+    days are. And not an account that is turned off: it signs in nowhere whatever the days are, so it is neither
+    counted among the accounts a save holds nor told that its password stopped (the address on such an account
+    is often a former employee's own)."""
     from datetime import datetime
     from app.core.models import ExternalIdentity, User
     from app.services import sso_freshness
@@ -336,7 +338,7 @@ def held_by_its_days(db, row, *, now=None) -> list:
         if standing is None or standing.refused or not sso_freshness.closes_now(standing, now):
             continue
         user = db.query(User).filter(User.id == identity.user_id).first()
-        if user is not None and sso_freshness.closes_the_other_ways_in(db, user, standing):
+        if user is not None and user.is_active and sso_freshness.closes_the_other_ways_in(db, user, standing):
             held.append(user)
     return held
 

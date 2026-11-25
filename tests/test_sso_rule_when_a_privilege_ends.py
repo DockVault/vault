@@ -81,6 +81,22 @@ def test_a_demotion_holds_an_account_made_at_a_first_sign_in_to_its_provider_aga
         "and its SFTP password sign-in no longer work."))]
 
 
+def test_a_demotion_of_a_turned_off_account_settles_it_and_tells_it_nothing(db, world, monkeypatch):
+    """The account is turned off when it is demoted. It is held to its provider again all the same; told that
+    "its password no longer works", by email to the address it holds, it was told of a password that signed it
+    in nowhere already."""
+    from app.core.models import RoleEnum, User
+    told = _told(monkeypatch)
+    provider, jay = _made_here(db, RoleEnum.ADMIN)
+    root = _user(db, "root", RoleEnum.ADMIN)
+    target = db.query(User).filter(User.id == jay.id).first()
+    target.is_active = False
+    api._set_role(db, target, RoleEnum.USER, actor=root)
+    db.commit()
+    assert _as_it_stands(db, jay.id) == ("user", True, True, False)      # settled as any account is
+    assert told == []
+
+
 def test_a_demotion_that_is_rolled_back_changes_nothing_and_tells_nobody(db, world, monkeypatch):
     from app.core.models import RoleEnum, User
     told = _told(monkeypatch)

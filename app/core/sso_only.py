@@ -374,7 +374,9 @@ def settle_when_a_privilege_ends(db, user, *, standing: str) -> Optional[str]:
     if not has_table(db, ExternalIdentity.__tablename__):
         return None                 # a database built without the identity tables links nobody to a provider
     outcome = settle(db, user)
-    if outcome == MADE and getattr(db, "info", None) is not None:
+    # Told only where the account can sign in: one that is turned off is settled all the same, and told nothing
+    # (it signs in nowhere, and its address is often a former employee's own).
+    if outcome == MADE and getattr(db, "info", None) is not None and getattr(user, "is_active", True):
         names, _buttons = _providers_to_name(db, user)
         through = " or ".join(names) or "your organisation's sign-in"
         after_commit.later(db, _HELD_AGAIN, (user.id, user.username, user.email, (

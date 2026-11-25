@@ -404,6 +404,37 @@ def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_
     assert status == 200 and out == {"removed": True}, out
 
 
+def test_a_removal_holds_a_turned_off_account_and_tells_it_nothing(monkeypatch):
+    """The organisation turns leavers' accounts off and leaves them linked. A removal held such an account and
+    told it, in the app and by email to the address it holds, that its keys stay paused and that "your password
+    signs you in as before": neither is true of an account that signs in nowhere. The hold is kept (the removal
+    still waits for each to be cleared); the account is told nothing, and the administrators how many such there
+    are."""
+    from datetime import datetime, timedelta
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
+    alice, leaver = _user("alice"), _user("leaver")
+    leaver.is_active = False
+    now = datetime.utcnow()
+    links = [_identity(who, row, subject=f"s-{who.username}", last_sign_in_at=now - timedelta(days=30),
+                       linked_at=now - timedelta(days=60), refused_at=None) for who in (alice, leaver)]
+    h = Admin(monkeypatch, [row], users=[alice, leaver], identities=links)
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and "2 accounts have not" in out["detail"]["message"]
+    assert all(link.refused_at is not None for link in links)             # both held: both must be cleared
+    assert [names for names, _title, _body in h.accounts_told] == [["alice"]]
+    assert h.told[0][2].endswith("the provider can be removed then. 1 of them are turned off: held as the others "
+                                 "are, and not told.")
+    assert h.audit("sso_provider_updated")[0][2]["identities"] == 2
+    # With nobody turned off among them, nothing more is said.
+    for link in links:
+        link.refused_at = None
+    leaver.is_active = True
+    del h.told[:]
+    assert h.call("DELETE", f"/admin/sso/providers/{row.id}")[0] == 409
+    assert h.told[0][2].endswith("the provider can be removed then.")
+
+
 def test_a_removal_goes_through_once_an_administrator_has_lifted_the_holds_it_made(monkeypatch):
     """The removal holds the people whose days ran out and says: clear each under Identities, then remove again.
     Clearing gave the identity no new deadline (nobody signs in through a provider that is off), so the next
@@ -1427,6 +1458,11 @@ def test_a_save_that_shortens_a_providers_days_says_whom_it_holds_and_tells_them
     path = f"/admin/sso/providers/{row.id}"
     from app.services import sso_providers as providers
     assert [u.username for u in providers.held_by_its_days(h.db, row)] == ["cy"]       # 40 days against 30
+    # A turned-off account past the days signs in nowhere: it is not among the accounts the days hold, so it is
+    # neither counted nor told that its password stopped.
+    cy.is_active = False
+    assert providers.held_by_its_days(h.db, row) == []
+    cy.is_active = True
     # An account the provider refused is held by the refusal, whatever the days are: it is not among these.
     from datetime import datetime, timedelta
     from app.core.models import ExternalIdentity, User
