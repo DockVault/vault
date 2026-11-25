@@ -266,3 +266,36 @@ await settle();
 out({ confirms });
 """.replace("LISTED", _list(_identity(restores_password=True, unlink_asks_provider=True))))
     assert got["confirms"][0]["message"].endswith("asks you to sign in there once more first." + MAY_HOLD_A_PASSWORD)
+
+
+def test_each_identity_says_who_it_is_at_the_provider_and_one_whose_unlink_is_refused_says_why_instead():
+    """Who stands on the account at the provider (the name and the address it gave when it was linked) is shown, so a
+    wrong one shows. Where the unlink would be refused whatever the provider says, its sentence is shown in place of
+    the button, so nobody is sent to the provider for an unlink refused on their return."""
+    got = _node(r"""
+answers['GET ' + LIST] = LISTED;
+await window.Sso.renderAccount();
+out({ page: page(), asked });
+""".replace("LISTED", _list(
+        _identity(display_name="Alice Corp", email="alice@corp.example"),
+        _identity(id="i-2", provider_id="p-2", provider="Fabrikam", unlink_asks_provider=True,
+                  unlink_refusal={"reason": "no_way_in_left", "message": "X"}))))
+    first, second = got["page"]["rows"]
+    assert "as Alice Corp, alice@corp.example · Linked " in first["text"]
+    assert first["unlink"] == ["Unlink"] and first["refused"] == []
+    assert second["unlink"] == [] and second["refused"] == [["X", "no_way_in_left"]]
+    assert "as " not in second["text"].split("Linked")[0]                 # no name, no address: nothing said
+    assert got["asked"] == ["GET /users/me/identities"]
+    assert not [a for a in got["asked"] if a.endswith("/reauth")]
+
+
+def test_an_identity_with_only_an_address_or_only_a_name_says_that_one():
+    got = _node(r"""
+answers['GET ' + LIST] = LISTED;
+await window.Sso.renderAccount();
+out(page());
+""".replace("LISTED", _list(_identity(email="alice@corp.example"),
+                            _identity(id="i-2", provider_id="p-2", provider="Fabrikam", display_name="Alice Corp"))))
+    first, second = got["rows"]
+    assert "as alice@corp.example · Linked " in first["text"]
+    assert "as Alice Corp · Linked " in second["text"]

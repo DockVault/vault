@@ -2293,8 +2293,10 @@ details summary:hover {
 @media (prefers-reduced-motion: reduce) { .is-flashed { animation: none; outline: 3px solid var(--primary, var(--brand-secondary, #2563eb)); } }
 
 /* Single sign-on: the provider buttons on the sign-in page (a long name wraps instead of being cut on a phone),
-   the status beside a provider and what a save said in Settings, the Link buttons in Your account. */
+   the status beside a provider and what a save said in Settings, the Link buttons in Your account, and an identity's
+   line there (a long address or name wraps instead of pushing the Unlink button off a phone's screen). */
 .sso-sign-in-btn { white-space: normal; overflow-wrap: anywhere; }
 .sso-provider-status, .sso-said { margin-left: var(--space-sm); }
 .sso-unsaved { font-weight: normal; }
 .identity-link { margin-right: var(--space-sm); }
+.identity-text, .identity-link-refused { min-width: 0; overflow-wrap: anywhere; }

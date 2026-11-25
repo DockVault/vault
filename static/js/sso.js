@@ -316,12 +316,25 @@
         identities.forEach((identity) => {
             const row = _el('div', 'identity-row flex items-center gap-sm mb-sm');
             row.dataset.identityId = identity.id;
-            const text = _el('div', 'flex-1');
+            const text = _el('div', 'flex-1 identity-text');
             text.appendChild(_el('div', 'text-sm font-bold', identity.provider || 'A provider'));
             const bits = ['Linked ' + (when(identity.linked_at) || 'earlier'),
                 identity.last_sign_in_at ? 'last signed in ' + when(identity.last_sign_in_at) : 'never signed in through it'];
+            // Who the identity is at the provider, as the provider said when it was linked: a wrong one shows.
+            const who = [identity.display_name, identity.email].filter((v) => typeof v === 'string' && v);
+            if (who.length) bits.unshift('as ' + who.join(', '));
             text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
             row.appendChild(text);
+            const refusal = identity.unlink_refusal;
+            if (refusal && typeof refusal.message === 'string' && refusal.message) {
+                // The unlink would be refused whatever the provider says: its reason, in the server's words, in place
+                // of the button, so that nobody is sent to the provider for an unlink refused on their return.
+                const said = _el('div', 'text-secondary text-xs identity-unlink-refused', refusal.message);
+                if (typeof refusal.reason === 'string') said.dataset.reason = refusal.reason;
+                text.appendChild(said);
+                body.appendChild(row);
+                return;
+            }
             const unlink = _el('button', 'btn btn-danger btn-sm', 'Unlink');
             unlink.type = 'button';
             unlink.setAttribute('aria-label', 'Unlink ' + (identity.provider || 'this provider'));
