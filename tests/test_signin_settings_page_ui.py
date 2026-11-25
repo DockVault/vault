@@ -154,3 +154,50 @@ out({ reads: asked.filter((a) => a.path === '/settings/sign-in' && a.method === 
     assert got["reads"] == 2
     assert got["verify"].startswith("4 passkeys in use never checked a PIN, fingerprint or face: turned on, ")
     assert got["grace"] == "30"
+
+
+ANCHORS = r"""
+const alert = byId('signin-passkey-anchors');
+const ready = byId('signin-passkey-readiness');
+out({ shown: !!alert && !alert.hidden, text: textOf(alert), role: alert ? alert.getAttribute('role') : null,
+      after: !!alert && ready.nextElementSibling === alert, readiness: textOf(ready), kind: ready.className });
+"""
+DIRECT_WITHOUT_ANCHORS = ("Direct attestation is on, but the server finds no trust anchors: every passkey anyone "
+                          "tries to add is refused, and the passkeys already added keep signing in. ")
+WAYS_OUT = ("Point WEBAUTHN_ATTESTATION_ROOTS in .env at a readable PEM bundle of root certificates and restart the "
+            "vault (python dockvault.py restart; a plain docker restart keeps the old .env), or set Attestation (an "
+            "advanced setting) to None to let passkeys be added again.")
+
+
+def test_direct_attestation_with_no_trust_anchors_is_said_with_the_reason_and_the_ways_out():
+    """Every registration is refused then (attestation_unverifiable), while the address works: the line above the
+    settings no longer says passkeys can be made there, and an alert under it says why none can be added."""
+    got = _loaded(_answer({"webauthn_attestation": "direct", "webauthn_mode": "required_for_roles",
+                           "webauthn_required_roles": ["admin"]}, trust_anchors=0, requirement_paused=False,
+                          trust_anchors_problem="the server finds no file where WEBAUTHN_ATTESTATION_ROOTS points"),
+                  ANCHORS)
+    assert got["shown"] and got["role"] == "alert" and got["after"]
+    assert got["text"] == (DIRECT_WITHOUT_ANCHORS + "The server finds no file where WEBAUTHN_ATTESTATION_ROOTS "
+                           "points. " + WAYS_OUT + " The passkey requirement keeps running meanwhile: people in the "
+                           "roles it names who hold no passkey are asked for one they cannot add.")
+    assert got["readiness"] == ("Passkeys work at https://vault.example.test: those already added sign in there. "
+                                "None can be added now (see below).")
+    assert "alert-warning" in got["kind"]
+    # No requirement on any role: nothing is said of one.
+    got = _loaded(_answer({"webauthn_attestation": "direct", "webauthn_mode": "optional"}, trust_anchors=0,
+                          trust_anchors_problem="WEBAUTHN_ATTESTATION_ROOTS is not set in .env"), ANCHORS)
+    assert got["text"] == (DIRECT_WITHOUT_ANCHORS + "WEBAUTHN_ATTESTATION_ROOTS is not set in .env. " + WAYS_OUT)
+    # Opened at another address than the vault's: passkeys are used there, and none can be added there either.
+    got = _loaded(_answer({"webauthn_attestation": "direct"}, trust_anchors=0), ANCHORS,
+                  location={"origin": "http://10.0.0.5:8200", "hostname": "10.0.0.5", "protocol": "http:"})
+    assert "can be made" not in got["readiness"] and "None can be added now (see below)." in got["readiness"]
+
+
+def test_the_anchors_alert_stays_away_while_there_are_anchors_or_attestation_is_not_direct():
+    """...and while passkeys are off: none is added or used then, and the passkeys already added sign in nowhere."""
+    for answer in (_answer({"webauthn_attestation": "direct"}, trust_anchors=1, trust_anchors_problem=None),
+                   _answer({"webauthn_attestation": "none"}, trust_anchors=0),
+                   _answer({"webauthn_attestation": "direct", "webauthn_mode": "off"}, trust_anchors=0)):
+        got = _loaded(answer, ANCHORS)
+        assert not got["shown"]
+        assert got["readiness"].startswith("Passkeys can be made at https://vault.example.test")

@@ -172,15 +172,30 @@
         return item;
     }
 
+    // Direct attestation with no trust anchors: every passkey anyone tries to add is refused (nothing can check the
+    // authenticator's statement), while the ones already added keep signing in. With passkeys off nothing is added or
+    // used, and there is nothing to say of it.
+    const noAnchors = (data) => valueOf(data, 'webauthn_attestation') === 'direct' && Number(data.trust_anchors) === 0
+        && valueOf(data, 'webauthn_mode') !== 'off';
+
     function drawReadiness(data) {
         const line = byId('signin-passkey-readiness');
         if (!line) return;
         const ready = data.readiness || {};
+        const blocked = noAnchors(data);
         line.hidden = false;
         if (ready.usable && ready.origin && ready.origin !== location.origin) {
             line.className = 'alert alert-warning mb-md';
-            line.textContent = `Passkeys can be made at ${ready.origin}, which is not the address this page was opened at `
-                + `(${location.origin}). Open the vault there to add or use one: here the browser refuses.`;
+            line.textContent = blocked
+                ? `Passkeys work at ${ready.origin}, which is not the address this page was opened at `
+                    + `(${location.origin}). Open the vault there to use one: here the browser refuses. None can be `
+                    + 'added now (see below).'
+                : `Passkeys can be made at ${ready.origin}, which is not the address this page was opened at `
+                    + `(${location.origin}). Open the vault there to add or use one: here the browser refuses.`;
+        } else if (ready.usable && blocked) {
+            line.className = 'alert alert-warning mb-md';
+            line.textContent = `Passkeys work at ${ready.origin}: those already added sign in there. None can be added `
+                + 'now (see below).';
         } else if (ready.usable) {
             line.className = 'alert alert-info mb-md';
             line.textContent = `Passkeys can be made at ${ready.origin}. A passkey works only at the address it was `
@@ -192,6 +207,38 @@
                 + (data.requirement_paused ? ' The passkey requirement below is paused until then: nobody is held at '
                     + 'the sign-in for a passkey that cannot be made, and the time to set one up starts over.' : '');
         }
+    }
+
+    // Under the line above the settings while direct attestation has no trust anchors: that no passkey can be added,
+    // why (the server's words, which never name the file's path), and the two ways out. Attestation set to None is
+    // a save the guards always let through: it asks for less than what is in force.
+    function drawAnchors(data) {
+        let line = byId('signin-passkey-anchors');
+        if (!noAnchors(data)) {
+            if (line) { line.textContent = ''; line.hidden = true; }
+            return;
+        }
+        if (!line) {
+            const ready = byId('signin-passkey-readiness');
+            if (!ready || !ready.parentNode) return;
+            line = el('div', 'alert alert-warning mb-md');
+            line.id = 'signin-passkey-anchors';
+            line.setAttribute('role', 'alert');
+            ready.parentNode.insertBefore(line, ready.nextElementSibling);
+        }
+        const problem = String(data.trust_anchors_problem || '');
+        const roles = valueOf(data, 'webauthn_required_roles');
+        const running = valueOf(data, 'webauthn_mode') === 'required_for_roles' && Array.isArray(roles)
+            && roles.length > 0 && !data.requirement_paused;
+        line.hidden = false;
+        line.textContent = 'Direct attestation is on, but the server finds no trust anchors: every passkey anyone '
+            + 'tries to add is refused, and the passkeys already added keep signing in. '
+            + (problem ? `${problem.charAt(0).toUpperCase()}${problem.slice(1)}. ` : '')
+            + 'Point WEBAUTHN_ATTESTATION_ROOTS in .env at a readable PEM bundle of root certificates and restart the '
+            + 'vault (python dockvault.py restart; a plain docker restart keeps the old .env), or set Attestation (an '
+            + 'advanced setting) to None to let passkeys be added again.'
+            + (running ? ' The passkey requirement keeps running meanwhile: people in the roles it names who hold no '
+                + 'passkey are asked for one they cannot add.' : '');
     }
 
     // Under direct attestation: the passkeys added before it, which keep signing in and prove no compliance step-up.
@@ -261,6 +308,7 @@
     // Everything said around the rows, from one read of the page.
     function drawAround(data) {
         drawReadiness(data);
+        drawAnchors(data);
         drawOlder(data);
         drawCounts(data);
     }
@@ -307,6 +355,8 @@
         if (line) { line.textContent = ''; line.hidden = true; }
         const older = byId('signin-passkey-older');
         if (older) { older.textContent = ''; older.hidden = true; }
+        const anchors = byId('signin-passkey-anchors');
+        if (anchors) { anchors.textContent = ''; anchors.hidden = true; }
     }
 
     document.addEventListener('click', (e) => {

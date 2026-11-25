@@ -226,3 +226,38 @@ def test_a_save_reads_the_page_again_and_draws_the_counts_it_changed(page: Page,
             page.locator("#stepup-modal-body .btn-primary").click()
             expect(page.locator(VERIFY + " input[type=checkbox]")).to_be_checked(timeout=10000)
         page.unroute_all(behavior="ignoreErrors")
+
+
+def test_the_page_says_when_direct_attestation_has_no_trust_anchors(page: Page, admin_creds, base_url):
+    from urllib.parse import urlsplit
+    here = {"usable": True, "rp_id": urlsplit(base_url).hostname, "origin": base_url, "reason": "ok"}
+
+    def without(body):
+        body["readiness"] = here
+        _value(body, "webauthn_attestation", "direct")
+        _value(body, "webauthn_mode", "required_for_roles")
+        _value(body, "webauthn_required_roles", ["admin"])
+        body["trust_anchors"] = 0
+        body["requirement_paused"] = False
+    _with_the_answer_changed(page, without)
+    _open(page, admin_creds)
+    alert = page.locator("#signin-passkey-anchors")
+    expect(alert).to_be_visible()
+    expect(alert).to_contain_text("finds no trust anchors")
+    expect(alert).to_contain_text("keeps running meanwhile")
+    expect(page.locator("#signin-passkey-readiness")).to_contain_text("None can be added now")
+    expect(page.locator("#signin-passkey-readiness")).not_to_contain_text("can be made")
+    page.unroute_all(behavior="ignoreErrors")
+
+    def one_anchor(body):
+        body["readiness"] = here
+        _value(body, "webauthn_attestation", "direct")
+        body["trust_anchors"] = 1
+    _with_the_answer_changed(page, one_anchor)
+    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    expect(alert).to_be_hidden(timeout=10000)
+    page.unroute_all(behavior="ignoreErrors")
+    # The server's own answer: attestation is not direct.
+    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    expect(page.locator(ATTESTATION + " select")).to_have_value("none", timeout=10000)
+    expect(alert).to_be_hidden()
