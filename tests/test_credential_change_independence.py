@@ -56,6 +56,13 @@ def db():
         engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _a_promotion_ends_no_sessions_here(monkeypatch):
+    """Making an administrator ends the account's sessions (test_sign_ins_under_way_end.py drives that). The
+    database here holds no sessions, and none of these tests is about them."""
+    monkeypatch.setattr(api, "_revoke_sessions", lambda db, **kw: 0)
+
+
 def _user(db, name, role=RoleEnum.ADMIN):
     u = User(username=name, email=None, password_hash="x", role=role, is_active=True, is_locked=False)
     db.add(u)
