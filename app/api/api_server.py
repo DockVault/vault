@@ -13053,33 +13053,64 @@ def _passkey_raw_id(credential) -> Optional[bytes]:
     return _passkey_b64url_decode(credential.get("rawId")) if isinstance(credential, dict) else None
 
 
+def _passkey_named_by(db, user, credential):
+    """The account's own key (not retired) that a browser's answer names, or None."""
+    raw_id = _passkey_raw_id(credential)
+    return next((k for k in _passkeys_of(db, user.id) if raw_id and k.credential_id == raw_id), None)
+
+
+def _passkey_of_a_refused_answer(db, user, credential):
+    """The key a refused answer named, read again so the warning of a copy can name it; None when it cannot be read
+    (a failed audit write before it can leave the session unusable). The refusal stands either way."""
+    try:
+        return _passkey_named_by(db, user, credential)
+    except Exception:      # noqa: BLE001
+        db.rollback()
+        return None
+
+
 SIGN_COUNT_REGRESSED = "sign_count_regressed"
 
 
-def _passkey_may_have_been_copied(db, user, request, what: str) -> None:
+def _passkey_may_have_been_copied(db, user, request, what: str, row=None) -> None:
     """A device-bound passkey was refused because its counter went backwards: a copy of the key was used in
     between, or this is the copy. Recorded as an event of its own and told to the owner, wherever the key was
     presented (``what``: "A sign-in", "A step-up"): by itself, as the second step after the password, or for a
     step-up. Said only for the first of these, the warning never reached an administrator, who always types the
-    password first: the owner whose key was copied saw "That passkey was not accepted" and nothing else."""
-    _passkey_audit(db, user, request, "passkey_sign_count_regressed", {"reason": SIGN_COUNT_REGRESSED},
-                   status="failure")
+    password first: the owner whose key was copied saw "That passkey was not accepted" and nothing else.
+
+    ``row`` is the key that was refused. The record names it, and so does the notice: a copy carries the name of
+    the key its owner knows, so the owner is told to remove that one, and to change the password where the account
+    has one somebody can type (the copy may have come with it). Told once a day for the key, however often it is
+    refused."""
+    details = {"reason": SIGN_COUNT_REGRESSED}
+    if row is not None:
+        details["passkey_id"] = str(row.id)
+    _passkey_audit(db, user, request, "passkey_sign_count_regressed", details, status="failure")
+    password = ", and change your password" if sign_in.has_a_password_it_can_type(user) else ""
+    if row is not None:
+        label = getattr(row, "label", None) or "Passkey"
+        said = (f"{what} with your passkey \"{label}\" was refused because its counter went backwards: someone may "
+                f"hold a copy of it. Remove \"{label}\" under Your account and add a new one{password}.")
+    else:       # the key was gone by the time it was looked up again
+        said = (f"{what} with one of your passkeys was refused because its counter went backwards: someone may hold "
+                f"a copy of it. Under Your account, remove the passkey you used and add a new one{password}.")
+    day = datetime.utcnow().date().isoformat()
     try:
         _notify_users([str(user.id)], "security", title="A passkey may have been copied",
-                      body=(f"{what} with one of your passkeys was refused because its counter went backwards, "
-                            "which can mean the key was copied. Review your passkeys and remove any you do not "
-                            "recognize."), target="#profile")
+                      body=f"{said} If you did not just try this, tell an administrator.", target="#profile",
+                      dedup_prefix=f"passkey_cloned:{row.id if row is not None else user.id}:{day}")
     except Exception as e:      # noqa: BLE001
         print(f"⚠ passkey notice skipped: {type(e).__name__}")
 
 
-async def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str, record: bool = True):
+async def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str, record: bool = True, row=None):
     """The generic refusal of a passkey sign-in: an audit row (naming the account only when a known key named
     it), the security monitor's counter, and, for a known key whose own proof failed (``record``), the lockouts'
     count against its account as a wrong password counts. A refusal that needed no proof (a challenge or a key
     that is not the account's) counts against the address only: a credential id is public, and must not be
-    enough to lock its owner out. A counter that went backwards on a device-bound key tells the owner: the key
-    may have been copied. 401, one message."""
+    enough to lock its owner out. A counter that went backwards on a device-bound key (``row``) tells the owner:
+    the key may have been copied. 401, one message."""
     audit_logger = AuditLogger(db)
     username = user.username if user is not None else ""
     try:
@@ -13093,7 +13124,7 @@ async def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str,
         except Exception:      # noqa: BLE001 -- the count is best-effort; the refusal stands
             db.rollback()
     if user is not None and reason.endswith("sign_count_regressed"):
-        _passkey_may_have_been_copied(db, user, request, "A sign-in")
+        _passkey_may_have_been_copied(db, user, request, "A sign-in", row=row)
     # Awaited in the offload pool, as the password door does: the brute-force counter must advance on every
     # refusal and is never shed under a spray.
     await run_offloaded(_record_failed_login_bg, username, client_ip, reason, record_id)
@@ -13200,7 +13231,8 @@ async def passkey_sign_in_verify(
         assertion = ws.verify_authentication(rp, _passkey_policy(db), challenge=challenge.challenge_bytes,
                                              credential=body.credential, key=known, allow_ids=allow_ids)
     except ws.Refused as refused:
-        raise await _passkey_sign_in_refused(db, request, client_ip, user=user, reason=f"passkey refused: {refused.code}")
+        raise await _passkey_sign_in_refused(db, request, client_ip, user=user, reason=f"passkey refused: {refused.code}",
+                                             row=row)
     if getattr(row, "rp_id", None) is None:
         row.rp_id = rp.rp_id                     # a row from before the address was recorded: it answered here
     # Before the sign-in is judged: a key that verified the person just now is one of the account's factors.
@@ -13264,8 +13296,7 @@ def _passkey_assert(db, user, *, purpose: str, challenge_id, credential, policy)
         raise HTTPException(status_code=400, detail={
             "reason": "challenge_unknown", "message": "That passkey request is unknown or has expired. Start again."})
     rp = _passkey_relying_party(db)
-    raw_id = _passkey_raw_id(credential)
-    row = next((k for k in _passkeys_of(db, user.id) if raw_id and k.credential_id == raw_id), None)
+    row = _passkey_named_by(db, user, credential)
     if row is None:
         raise ws.Refused("credential_not_offered", "not one of the account's keys")
     _passkey_algorithm_check(db, user, row)
@@ -13343,7 +13374,8 @@ def _passkey_step_up_factor(db, user, request, body) -> str:
                                          credential=body.credential, policy=policy)
     except ws.Refused as refused:
         if refused.code == SIGN_COUNT_REGRESSED:
-            _passkey_may_have_been_copied(db, user, request, "A step-up")
+            refused_key = _passkey_of_a_refused_answer(db, user, body.credential)
+            _passkey_may_have_been_copied(db, user, request, "A step-up", row=refused_key)
         raise _refuse(refused.code, "That passkey was not accepted.")
     if compliance:
         now = datetime.utcnow()
@@ -13448,7 +13480,8 @@ async def passkey_second_factor_verify(
         except Exception:  # noqa: BLE001
             pass
         if refused.code == SIGN_COUNT_REGRESSED:
-            _passkey_may_have_been_copied(db, user, request, "A sign-in")
+            refused_key = _passkey_of_a_refused_answer(db, user, body.credential)
+            _passkey_may_have_been_copied(db, user, request, "A sign-in", row=refused_key)
         raise HTTPException(status_code=401, detail="That passkey was not accepted.")
     method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
     outcome = sign_in.finish(db, sign_in.SignInResult(

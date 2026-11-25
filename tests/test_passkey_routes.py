@@ -746,6 +746,58 @@ def test_the_owner_of_a_reset_is_told_the_passkeys_it_retired(monkeypatch, held,
     assert title == "Your second factor was reset" and sentence == change
 
 
+def test_a_copied_passkey_is_told_once_a_day_by_its_name_with_advice_that_fits(monkeypatch):
+    """A device-bound key refused because its counter went backwards may have been copied. The owner is told which
+    key, once a day for it however often it is refused (each refusal added another notice), to remove that key
+    (a copy has the same name as the key they know, so "remove any you do not recognize" fit nothing) and, where
+    the account has a password somebody can type, to change it. The record of each refusal names the key."""
+    S = _api()
+    alice, sam = _user("alice"), _user("sam", sso_only=True)
+    audits, written = [], {}
+    monkeypatch.setattr(S.AuditLogger, "log_action", lambda _self, **kw: audits.append(kw) or None)
+
+    def notify(ids, ntype, title=None, body=None, target=None, dedup_prefix=None):
+        # As the notification table does: one row per account and key, a second one with the same key is skipped.
+        made = []
+        for uid in ids:
+            key = f"{dedup_prefix}:{uid}" if dedup_prefix else object()
+            if key not in written:
+                written[key] = (ntype, title, body, target)
+                made.append(uid)
+        return made
+    monkeypatch.setattr(S, "_notify_users", notify)
+    request = types.SimpleNamespace(headers={}, client=types.SimpleNamespace(host="192.0.2.7"))
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, label="yubikey")
+    days = {datetime.utcnow().date().isoformat()}
+    for _ in range(2):
+        S._passkey_may_have_been_copied(None, alice, request, "A sign-in", row=key)
+    days.add(datetime.utcnow().date().isoformat())
+    assert [a["action"] for a in audits] == ["passkey_sign_count_regressed"] * 2        # each refusal is recorded
+    assert all(a["details"] == {"reason": "sign_count_regressed", "passkey_id": str(key.id)} for a in audits)
+    ((dedup, (kind, title, body, target)),) = written.items()                            # and told once
+    assert dedup in {f"passkey_cloned:{key.id}:{day}:{alice.id}" for day in days}
+    assert (kind, title, target) == ("security", "A passkey may have been copied", "#profile")
+    assert body == ('A sign-in with your passkey "yubikey" was refused because its counter went backwards: someone '
+                    'may hold a copy of it. Remove "yubikey" under Your account and add a new one, and change your '
+                    'password. If you did not just try this, tell an administrator.')
+    # An account that signs in only through its provider has no password anybody types: nothing is said of one.
+    written.clear()
+    unnamed = types.SimpleNamespace(id=uuid.uuid4(), user_id=sam.id, label=None)
+    S._passkey_may_have_been_copied(None, sam, request, "A step-up", row=unnamed)
+    ((_dedup, (_kind, _title, body, _target)),) = written.items()
+    assert body == ('A step-up with your passkey "Passkey" was refused because its counter went backwards: someone '
+                    'may hold a copy of it. Remove "Passkey" under Your account and add a new one. If you did not '
+                    'just try this, tell an administrator.')
+    # Without the key in hand, the notice is kept once a day for the account.
+    written.clear()
+    del audits[:]
+    S._passkey_may_have_been_copied(None, alice, request, "A sign-in")
+    ((dedup, (_kind, _title, body, _target)),) = written.items()
+    assert dedup in {f"passkey_cloned:{alice.id}:{day}:{alice.id}" for day in days}
+    assert body.startswith("A sign-in with one of your passkeys was refused") and "the passkey you used" in body
+    assert audits[0]["details"] == {"reason": "sign_count_regressed"}
+
+
 def test_registration_has_a_budget_per_account_that_fails_closed(monkeypatch):
     """Asking for registration options is counted per account, on a budget of its own: refused with 429 when it is
     spent and with 503 while the limiter cannot count, and no challenge is made either time."""

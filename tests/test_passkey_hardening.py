@@ -91,12 +91,15 @@ def test_a_counter_that_went_backwards_tells_the_owner(monkeypatch):
     h = Harness(monkeypatch, [alice])
     notices = []
     monkeypatch.setattr(h.S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
-        notices.append((list(ids), title)) or list(ids)))
+        notices.append((list(ids), title, body, dedup_prefix)) or list(ids)))
     auth, row = h.enroll(alice, sign_count=9)
     status, body = h.sign_in(auth, username="alice", sign_count=3)
     assert status == 401 and h.counted == ["alice"]
     assert ("action", "passkey_sign_count_regressed") in h.audits
-    assert notices and notices[-1] == ([str(alice.id)], "A passkey may have been copied")
+    assert notices and notices[-1][:2] == ([str(alice.id)], "A passkey may have been copied")
+    # The key that was refused is named, and the warning is kept once a day for it.
+    assert notices[-1][2].startswith('A sign-in with your passkey "key" was refused')
+    assert notices[-1][3].startswith(f"passkey_cloned:{row.id}:")
     assert row.sign_count == 9 and row.last_used_at is None
 
 

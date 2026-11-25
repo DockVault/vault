@@ -395,7 +395,7 @@ def test_the_fixed_policies_know_a_passkey():
 def _told(monkeypatch, h):
     notices = []
     monkeypatch.setattr(h.S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
-        notices.append((list(ids), ntype, title, body)) or list(ids)))
+        notices.append((list(ids), ntype, title, body, dedup_prefix)) or list(ids)))
     return notices
 
 
@@ -420,9 +420,11 @@ def test_a_counter_that_went_backwards_at_the_second_step_tells_the_owner(monkey
                           {"challenge_id": body["challenge_id"], "credential": credential}, headers)
     assert status == 401 and out == {"detail": "That passkey was not accepted."} and pending.attempts == 1
     assert len(_regressions(h)) == 1
-    (ids, kind, title, said), = notices
+    (ids, kind, title, said, dedup), = notices
     assert ids == [str(alice.id)] and kind == "security" and title == "A passkey may have been copied"
-    assert said.startswith("A sign-in with one of your passkeys was refused because its counter went backwards")
+    # The key is named, and the warning is kept once a day for it.
+    assert said.startswith('A sign-in with your passkey "key" was refused because its counter went backwards')
+    assert dedup.startswith(f"passkey_cloned:{row.id}:")
     assert row.sign_count == 9                               # the stored counter is not lowered by the refusal
     # A signature that does not verify is a wrong answer, and no sign of a copy.
     del notices[:], h.audits[:]
@@ -441,9 +443,10 @@ def test_a_counter_that_went_backwards_at_a_step_up_tells_the_owner(monkeypatch)
     status, body = h.step_up_with_passkey(auth, "account.second_factor", sign_count=3)
     assert status == 403 and body == {"detail": "That passkey was not accepted."}, body
     assert len(_regressions(h)) == 1
-    (ids, kind, title, said), = notices
+    (ids, kind, title, said, dedup), = notices
     assert ids == [str(alice.id)] and title == "A passkey may have been copied"
-    assert said.startswith("A step-up with one of your passkeys was refused because its counter went backwards")
+    assert said.startswith('A step-up with your passkey "key" was refused because its counter went backwards')
+    assert dedup.startswith(f"passkey_cloned:{row.id}:")
     # Another refusal of a step-up (no user verification) warns of no copy.
     del notices[:], h.audits[:]
     status, body = h.step_up_with_passkey(auth, "account.second_factor", flags=FLAG.UP, sign_count=12)
@@ -456,8 +459,9 @@ def test_the_three_places_a_passkey_is_presented_warn_of_a_copy_through_one_help
     set_bare_api_env()
     import app.api.api_server as S
     source = inspect.getsource(S)
-    assert source.count('_passkey_may_have_been_copied(db, user, request, "A sign-in")') == 2      # alone, second step
-    assert source.count('_passkey_may_have_been_copied(db, user, request, "A step-up")') == 1
+    assert source.count('_passkey_may_have_been_copied(db, user, request, "A sign-in", row=') == 2      # alone, second step
+    assert source.count('_passkey_may_have_been_copied(db, user, request, "A step-up", row=') == 1
+    assert source.count("_passkey_may_have_been_copied(") == 4                       # the three, and the helper itself
     assert source.count('title="A passkey may have been copied"') == 1
     assert source.count('"passkey_sign_count_regressed"') == 1
     assert S.SIGN_COUNT_REGRESSED == "sign_count_regressed"
