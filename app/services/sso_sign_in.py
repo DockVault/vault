@@ -50,6 +50,7 @@ REAUTH_MAX_AGE_SECONDS = 60
 RESTRICTED = sso_policy.RESTRICTED
 RESTRICTION_CLAIM_MISSING = sso_policy.RESTRICTION_CLAIM_MISSING
 INVITATION_UNUSABLE = "invitation_unusable"
+INVITATION_ADDRESS = "invitation_address"      # the invitation names an address the provider did not confirm
 ADMINISTRATOR_INVITATION = "administrator_invitation"
 EMAIL_REQUIRED = "email_required"
 ACCOUNT_LIMIT = "account_limit"
@@ -94,6 +95,9 @@ REASON_TEXTS = {
     RESTRICTION_CLAIM_MISSING: ("Your organisation's sign-in did not say which tenant, domain or groups you belong to, "
                                 "so the vault could not check who it admits. Ask your administrator."),
     INVITATION_UNUSABLE: "This invitation can no longer be used. Ask your administrator for a new one.",
+    INVITATION_ADDRESS: ("This invitation was made for an email address that your organisation's sign-in did not "
+                         "confirm as yours. Open the invitation again and choose a password there; you can link "
+                         "your organisation's sign-in from Your account afterwards."),
     ADMINISTRATOR_INVITATION: ("An administrator's invitation is accepted with a password: an administrator types it at "
                                "every sign-in. Open the invitation again and choose a password there; you can link "
                                "your organisation's sign-in from Your account afterwards."),
@@ -358,6 +362,45 @@ def answer_record(answer: ProviderAnswer) -> dict:
             "email_verified": answer.email_verified, "display_name": answer.display_name}
 
 
+# How many of the provider's groups an invitation's acceptance keeps while it waits for its tab. More than this is
+# kept as "too many to say" (as the provider's own overage marker): the mappings are then not applied, and never
+# read as "member of nothing".
+GROUPS_KEPT = 1000
+
+
+def held_invitation(row, answer: ProviderAnswer, *, invitation_id, provider_id, client_ip, began_at, verifier_hash,
+                    code_challenge, purpose):
+    """What the one-time sign-in code holds for an invitation that is being accepted through ``row``, until the
+    tab that started the sign-in redeems it (app/core/sign_in_codes.Handover): the invitation, what the provider
+    said of the person (the identity's key and display data, the groups; never a token but the provider's logout
+    hint, encrypted, where the provider's logout wants it), and what the sign-in that follows the acceptance
+    carries. No account: there is none yet."""
+    from app.core import sign_in_codes
+    groups, overage = answer.groups, bool(answer.groups_overage)
+    if groups is not None and len(groups) > GROUPS_KEPT:
+        groups, overage = None, True
+    kept = {**answer_record(answer), "groups": None if groups is None else [str(g) for g in groups],
+            "groups_overage": overage}
+    return sign_in_codes.Handover(
+        user_id="", methods=[], client_ip=client_ip, provider_id=str(provider_id),
+        provider_mfa_trusted=bool(mfa_trusted(row, answer)), purpose=purpose, verifier_hash=verifier_hash,
+        code_challenge=code_challenge, provider_sid=answer.sid, provider_sub=answer.subject,
+        provider_logout_hint_enc=sign_in_codes._encrypted(answer.id_token if policy_of(row)["sso_idp_logout"] else None),
+        provider_auth_time=int(answer.auth_time.timestamp()) if answer.auth_time is not None else None,
+        provider_answered_at=began_at,
+        invitation={"invitation_id": str(invitation_id), "answer": kept})
+
+
+def answer_of_an_invitation(record: dict) -> ProviderAnswer:
+    """The provider's answer an invitation's acceptance kept (:func:`held_invitation`)."""
+    kept = record["answer"]
+    answer = answer_from_record(kept)
+    groups = kept.get("groups")
+    answer.groups = [str(g) for g in groups] if isinstance(groups, list) else None
+    answer.groups_overage = bool(kept.get("groups_overage"))
+    return answer
+
+
 def answer_from_record(record: dict) -> ProviderAnswer:
     return ProviderAnswer(claims={}, subject=record["subject"], issuer=record["issuer"], tenant_id=record.get("tenant_id"),
                           email=record.get("email"), email_verified=bool(record.get("email_verified")),
@@ -426,12 +469,18 @@ class Resolution:
     inviter_name: Optional[str] = None    # for an administrator's invitation: who made it
 
 
-def resolve_account(db, row, answer: ProviderAnswer, *, login=None) -> Resolution:
-    """Who the person is, for a sign-in, in the design's order: a known identity; the invitation the login state
-    carries (the invited account is made now); creation at the first sign-in when the provider makes accounts (its
-    item fills it in); an active account that is not an administrator with this verified email, when the provider
-    links by email and is restricted; otherwise ``NO_ACCOUNT``. The restriction was judged by the caller first.
-    What the invitation and email steps write stays in the caller's transaction; the caller commits."""
+def resolve_account(db, row, answer: ProviderAnswer) -> Resolution:
+    """Who the person is, for a sign-in, by the provider's answer alone, in the design's order: a known identity;
+    creation at the first sign-in when the provider makes accounts; an active account that is not an
+    administrator with this verified email, when the provider links by email and is restricted; otherwise
+    ``NO_ACCOUNT``. The restriction was judged by the caller first. What the creation and email steps write stays
+    in the caller's transaction; the caller commits.
+
+    Everything here is decided by what the provider said, never by whoever started the sign-in: the account that
+    is made or linked is the provider identity's own. So it may be written at the callback, whichever browser
+    reaches it (a start URL can be handed to anyone). An invitation is the starter's choice, and is not accepted
+    here: :func:`judge_invitation` at the callback, :func:`accept_invitation` where the tab that started the
+    sign-in has proved itself."""
     from app.core.models import User
     identity = known_identity(db, row, answer)
     if identity is not None:
@@ -443,10 +492,6 @@ def resolve_account(db, row, answer: ProviderAnswer, *, login=None) -> Resolutio
         if identity.tenant_id is None and answer.tenant_id:
             identity.tenant_id = answer.tenant_id      # linked before the provider named a tenant: pinned from now on
         return Resolution(user, identity)
-    extras = getattr(login, "extras", None) if login is not None else None
-    invitation_id = extras.get("invitation_id") if isinstance(extras, dict) else None
-    if invitation_id:
-        return _accept_invitation(db, row, answer, invitation_id)
     policy = policy_of(row)
     if policy["sso_account_creation"] == "jit":
         made = _create_account(db, row, answer, policy)
@@ -691,20 +736,22 @@ def _link_by_email(db, row, answer: ProviderAnswer, policy: dict):
                       password_stopped=had_password and bool(getattr(user, "sso_only", False)))
 
 
-def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolution:
-    """The login state carried an invitation: the invited account is made now, with the invitation's username
-    and role, a real password hash nobody knows (the person signs in through the provider; a password is set
-    through a reset), and this identity; the invitation is claimed once. The checks are the password acceptance's
-    (app/api/api_server.py, accept_invite), in its order; each refusal is a reason here, its detail the audit's
-    reason word. The person can type nothing in this flow, so a required address the provider did not verify is
-    a refusal rather than a prompt."""
-    import secrets
+def judge_invitation(db, row, answer: ProviderAnswer, invitation_id, *, lock: bool = False):
+    """Whether the invitation ``invitation_id`` may be accepted with this answer of the provider's, and with what:
+    (the invitation, the account's address, its role, the provider's policy, now). Nothing is written. The checks
+    are the password acceptance's (app/api/api_server.py, accept_invite), in its order; each refusal is a reason
+    here, its detail the audit's reason word. The person can type nothing in this flow, so a required address the
+    provider did not verify is a refusal rather than a prompt.
+
+    An invitation that names an address names a person: it is accepted only where the provider says, verified,
+    that the person at the provider holds that address. Anyone at the provider could otherwise finish the
+    acceptance as the invited person; an invitation without an address rests on the tab that started it alone.
+
+    ``lock``: hold the inviter's row until the transaction ends (the acceptance does; a look at the callback
+    does not)."""
     import uuid as _uuid
-    from sqlalchemy.exc import IntegrityError
     from app.core.email_identity import email_in_use
-    from app.core.endpoint_permissions import grant_default_permissions_for_role
-    from app.core.models import AccountInvitation, RoleEnum, User
-    from app.core.security import hash_password
+    from app.core.models import AccountInvitation, RoleEnum
     api = _api()
     try:
         inv_id = _uuid.UUID(str(invitation_id))
@@ -717,7 +764,7 @@ def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolu
     account_policy = api._account_policy(db)
     if not account_policy.get("invite_enabled"):
         raise Refusal(INVITATION_UNUSABLE, "invitations_off")
-    if not api._invitation_inviter_can_act(db, inv, lock=True):
+    if not api._invitation_inviter_can_act(db, inv, lock=lock):
         raise Refusal(INVITATION_UNUSABLE, "inviter_not_admin")
     if api._username_kept(inv.username):
         raise Refusal(INVITATION_UNUSABLE, "username_reserved")
@@ -727,6 +774,9 @@ def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolu
     if inv.email:
         if email_in_use(db, inv.email):
             raise Refusal(INVITATION_UNUSABLE, "email_in_use")
+        said = usable_email(answer.email) if answer.email_verified else None
+        if said is None or said != usable_email(inv.email):
+            raise Refusal(INVITATION_ADDRESS, "address_not_confirmed" if said is None else "another_address")
         email = inv.email
     else:
         email = _admitted_address(db, answer, policy, account_policy)
@@ -748,6 +798,26 @@ def _accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolu
         # accepted with the form, where the person chooses the password; the provider is linked afterwards. (This
         # also keeps every administrator off a provider whose people hold no password.)
         raise Refusal(ADMINISTRATOR_INVITATION, "administrator_invitation")
+    return inv, email, role, policy, now
+
+
+def accept_invitation(db, row, answer: ProviderAnswer, invitation_id) -> Resolution:
+    """Accept the invitation with this answer of the provider's: the invited account is made now, with the
+    invitation's username and role, a real password hash nobody knows (the person signs in through the provider;
+    a password is set through a reset), and this identity; the invitation is claimed once. Judged first, again
+    (:func:`judge_invitation`), in the caller's transaction, which the caller commits.
+
+    Called only where the tab that started the sign-in has proved itself, by redeeming the one-time code with
+    its verifier (app/api/sso_router.py, finish_invitation). The invitation is the starter's; the browser that
+    reaches the provider's callback may be anybody's, so nothing of this is written there."""
+    import secrets
+    import uuid as _uuid
+    from sqlalchemy.exc import IntegrityError
+    from app.core.endpoint_permissions import grant_default_permissions_for_role
+    from app.core.models import AccountInvitation, RoleEnum, User
+    from app.core.security import hash_password
+    api = _api()
+    inv, email, role, policy, now = judge_invitation(db, row, answer, invitation_id, lock=True)
     sso_only = policy["sso_password_login"] == "disabled"
     user = User(id=_uuid.uuid4(), username=inv.username, email=email,
                 password_hash=hash_password(secrets.token_urlsafe(32)),

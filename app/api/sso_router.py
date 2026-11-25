@@ -298,6 +298,61 @@ def _invitation_for_start(db, token: str, client_ip: str):
     return inv
 
 
+def _sign_in_fragment(handover_code: str, login) -> str:
+    """What a sign-in's callback sends the browser back with: the one-time code, and where the page goes after."""
+    fragment = f"sso={handover_code}"
+    if login.return_to and login.return_to != sso_state.DEFAULT_RETURN_TO:
+        fragment += "&return_to=" + login.return_to.lstrip("#")
+    return fragment
+
+
+def finish_invitation(db, handover, *, client_ip) -> None:
+    """Accept the invitation a one-time sign-in code holds, now that the tab that started the sign-in has
+    redeemed the code with its verifier (POST /auth/finish): the account made, its identity linked, the
+    provider's groups applied and the invitation claimed, in one transaction; then what was done is recorded and
+    told. ``handover`` then names the account, and is finished as any provider's sign-in.
+
+    Nothing of this is written at the provider's callback: whoever reaches the callback may be anybody the
+    starter sent the address to. The provider's row is read again as it stands and held, as at the callback: a
+    provider turned off in the minute between makes no account. A refusal is raised as the route's answer, with
+    the reason's sentence, and leaves nothing behind."""
+    from sqlalchemy.exc import IntegrityError
+    from app.core import sign_in_lockout
+    from app.services import sign_in
+    api = _api()
+    invitation_id = handover.invitation["invitation_id"]
+    purpose = sso_state.APP if handover.purpose == "app" else sso_state.SIGN_IN
+    details = {"provider_id": handover.provider_id, "purpose": purpose}
+
+    def refused(code: str, detail: str = "") -> HTTPException:
+        db.rollback()
+        _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure",
+               details={**details, "reason": code, **({"refused_because": detail} if detail else {})})
+        api._audit_accept_failure(db, _invitation_prefix(db, invitation_id), client_ip, reason=detail or code)
+        return HTTPException(status_code=409, detail={"reason": code, "message": sso.reason_text(code)})
+    try:
+        row = _provider_as_it_stands(db, handover.provider_id)
+    except ProviderRowBusy:
+        raise HTTPException(status_code=503, headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}, detail={
+            "reason": oc.TEMPORARILY_UNAVAILABLE,
+            "message": "This provider's settings are being saved. Open the invitation again in a moment."})
+    why = sso.usable_for(row, purpose) if row is not None else sso.PROVIDER_DISABLED
+    if why is not None:
+        raise refused(why)
+    answer = sso.answer_of_an_invitation(handover.invitation)
+    try:
+        found = sso.accept_invitation(db, row, answer, invitation_id)
+        applied = sso_groups.apply(db, row, found.user, answer)
+        db.commit()
+    except sso.Refusal as exc:
+        raise refused(exc.code, exc.detail)
+    except IntegrityError:
+        raise refused(sso.INVITATION_UNUSABLE, "commit_conflict")
+    _record_resolution(db, row, found, client_ip=client_ip, details=details)
+    sso_groups.tell(db, row, found.user, applied, client_ip=client_ip)
+    handover.user_id, handover.ended, handover.invitation = str(found.user.id), sign_in.as_read(found.user), None
+
+
 def _invitation_prefix(db, invitation_id) -> str:
     from app.core.models import AccountInvitation
     try:
@@ -463,8 +518,19 @@ async def sign_in_callback(
 
     if login.purpose in (sso_state.SIGN_IN, sso_state.APP):
         invitation_id = login.extras.get("invitation_id") if isinstance(login.extras, dict) else None
+        # An invitation is the choice of whoever started this sign-in, and the browser that reaches this callback
+        # proves nothing about who that was (a start URL can be handed to anyone). So for an invitation nothing
+        # is written here: it is judged, and what the provider said waits under the one-time code until the tab
+        # that started the sign-in redeems it with its verifier. Written here, the account an invited person
+        # named was bound to whoever at the provider opened that person's start address, with that colleague's
+        # departments. A person the vault already knows signs in as themselves, the invitation untouched.
+        holds_invitation = bool(invitation_id) and sso.known_identity(db, row, answer) is None
         try:
-            found = sso.resolve_account(db, row, answer, login=login)
+            if holds_invitation:
+                sso.judge_invitation(db, row, answer, invitation_id)
+                found = None
+            else:
+                found = sso.resolve_account(db, row, answer)
         except sso.Refusal as exc:
             db.rollback()          # nothing of a refused resolution may ride on the audit row's commit
             _audit(db, "sso_sign_in_refused", ip=client_ip, status_="failure",
@@ -475,6 +541,18 @@ async def sign_in_callback(
                                           reason=exc.detail or exc.code)
             _tell_of_a_sign_in_kept_out(db, row, exc)
             return _redirect("sso-error=" + exc.code)
+        from app.core import sign_in_codes
+        if holds_invitation:
+            try:
+                handover_code = sign_in_codes.store(sso.held_invitation(
+                    row, answer, invitation_id=invitation_id, provider_id=login.provider_id, client_ip=client_ip,
+                    began_at=sso_state.began_at(login), verifier_hash=login.verifier_hash,
+                    code_challenge=login.code_challenge,
+                    purpose="app" if login.purpose == sso_state.APP else "sign_in"))
+            except sign_in_codes.Unavailable:
+                return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)
+            db.rollback()          # nothing was written, and nothing is until the code is redeemed
+            return _redirect(_sign_in_fragment(handover_code, login))
         user = found.user
         # The provider's groups into departments and roles, for this token (a held request for the administrator
         # role, never the role itself).
@@ -496,7 +574,6 @@ async def sign_in_callback(
             if found.created or found.linked_now:
                 _record_resolution(db, row, found, client_ip=client_ip, details=details)
         sso_groups.tell(db, row, user, applied, client_ip=client_ip)
-        from app.core import sign_in_codes
         result = sso.pipeline_result(db, row, user, answer, provider_id=login.provider_id, client_ip=client_ip,
                                      identity=found.identity, began_at=sso_state.began_at(login))
         try:
@@ -506,10 +583,7 @@ async def sign_in_callback(
         except sign_in_codes.Unavailable:
             return _redirect("sso-error=" + oc.TEMPORARILY_UNAVAILABLE)
         db.commit()        # a tenant learnt at this sign-in; the identity's last sign-in is stamped by the finish
-        fragment = f"sso={handover_code}"
-        if login.return_to and login.return_to != sso_state.DEFAULT_RETURN_TO:
-            fragment += "&return_to=" + login.return_to.lstrip("#")
-        return _redirect(fragment)
+        return _redirect(_sign_in_fragment(handover_code, login))
 
     # A link and a test belong to the signed-in account and tab that started them. The browser that reaches this
     # callback proves nothing about that (a start URL can be handed to anyone), so nothing is linked or written

@@ -116,6 +116,10 @@ class Handover:
     # How many times the account's sessions had been ended when the proof read the account
     # (app/services/sign_in.py, in_the_accounts_turn). A record without it matches no account.
     ended: Optional[int] = None
+    # An invitation that is being accepted through an identity provider: its id and what the provider said of the
+    # person. There is no account yet (``user_id`` is empty): it is made when the tab that started the sign-in
+    # redeems the code, and by nothing before (app/api/sso_router.py, finish_invitation).
+    invitation: Optional[dict] = None
 
     @classmethod
     def from_payload(cls, data) -> Optional["Handover"]:
@@ -127,8 +131,13 @@ class Handover:
             handover = cls(**{k: v for k, v in data.items() if k in known})
         except TypeError:
             return None
-        if not isinstance(handover.user_id, str) or not handover.user_id:
+        if not isinstance(handover.user_id, str):
             return None
+        if handover.invitation is None:
+            if not handover.user_id:
+                return None
+        elif handover.user_id or not _is_an_invitation(handover.invitation) or not handover.provider_id:
+            return None                # an account is named only once the invitation is accepted
         if not isinstance(handover.methods, list) or not all(isinstance(m, str) for m in handover.methods):
             return None
         if handover.purpose not in PURPOSES:
@@ -154,6 +163,16 @@ class Handover:
         return handover
 
 
+def _is_an_invitation(record) -> bool:
+    """The shape of ``Handover.invitation``: the invitation's id, and the provider's answer with at least the
+    identity's key (who issued it, and its subject there)."""
+    if not isinstance(record, dict) or not isinstance(record.get("invitation_id"), str) or not record["invitation_id"]:
+        return False
+    answer = record.get("answer")
+    return (isinstance(answer, dict) and all(isinstance(answer.get(name), str) and answer[name]
+                                             for name in ("subject", "issuer")))
+
+
 def store(handover: Handover, *, redis=None, ttl_seconds: int = CODE_TTL_SECONDS) -> str:
     """Write the record under a fresh code and return the code. The record must name exactly one proof the
     finisher will give: a tab verifier's hash, or a PKCE challenge."""
@@ -163,6 +182,8 @@ def store(handover: Handover, *, redis=None, ttl_seconds: int = CODE_TTL_SECONDS
         raise ValueError(f"not a sign-in code purpose: {handover.purpose!r}")
     if not handover.methods and not handover.provider_id:
         raise ValueError("a sign-in code needs a first proof: a method, or an identity provider")
+    if not handover.user_id and not _is_an_invitation(handover.invitation):
+        raise ValueError("a sign-in code names an account, or the invitation an account is to be made from")
     code = make_secret()
     payload = json.dumps(asdict(handover), separators=(",", ":"))
     try:

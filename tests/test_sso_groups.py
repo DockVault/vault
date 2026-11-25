@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from test_sso_resolution import Resolving, _sign_in
+from test_sso_resolution import Resolving, _accept, _sign_in
 from test_sso_sign_in import _call, _h, _identity, _provider, _user
 
 pytestmark = pytest.mark.unit
@@ -99,6 +99,74 @@ class Grouping(Resolving):
 
 def _names(groups):
     return sorted(g.name for g in groups)
+
+
+# --------------------------------------------------------------------------- an invitation and somebody else's browser
+
+def _an_invitation_opened_by_a_colleague(monkeypatch, **policy):
+    """Mallory was invited. She starts the acceptance from her own tab and hands the provider's address to a
+    colleague, who is signed in at the provider and not linked here yet: the colleague's browser comes back."""
+    root = _user("root", role="admin")
+    p = _provider(policy=policy or None)
+    h = Grouping(monkeypatch, [root], [p])
+    finance = h.department("Finance")
+    h.mapping(p, "fin", finance)
+    h.mapping(p, "vault-admins", role="admin")
+    token, inv = h.invite(username="mallory", created_by=root.id)
+    status, out = h.start(p, verifier="mallory-tab", invitation=token)
+    assert status == 200, out
+    state, _ = h.state_of(out["authorization_url"])
+    h.claims_override = {"sub": "victim-subject", "email": "victim@example.test", "groups": ["fin", "vault-admins"]}
+    status, location, _ = h.callback(p, state)
+    assert status == 302 and location.startswith("/#sso="), location
+    return h, p, inv, token, finance, location
+
+
+def test_an_invitation_finished_by_another_browser_makes_no_account(monkeypatch):
+    """The browser that comes back from the provider proves nothing about who started the sign-in (a start address
+    can be handed to anyone). Written at the callback, the account the invited person named was bound to the
+    colleague's identity at the provider, with the colleague's departments and a request for their role, and
+    every later sign-in of the colleague landed in it."""
+    h, p, inv, token, finance, location = _an_invitation_opened_by_a_colleague(monkeypatch, sso_admin_mapping=True)
+    from app.core.models import user_groups
+
+    def nothing_was_written():
+        assert h.users_named("mallory") == [] and h.identities() == []
+        assert h.db.rows_of(user_groups) == [] and h.requests() == []
+        assert inv.accepted_at is None and inv.accepted_user_id is None and inv.revoked_at is None
+        assert ("commit",) not in h.db.log and h.membership_audits() == [] and h.emails == []
+    nothing_was_written()
+    # The colleague's tab holds no verifier for this code: refused, and the code is spent.
+    assert h.finish(location, verifier="victim-tab")[0] == 401
+    nothing_was_written()
+    # Mallory cannot redeem it afterwards either: one guess.
+    assert h.finish(location, verifier="mallory-tab")[0] == 401
+    nothing_was_written()
+    # The colleague signs in from their own tab: no account of Mallory's takes them in.
+    h.claims_override = None
+    location, _ = _sign_in(h, p, sub="victim-subject", email="victim@example.test", groups=["fin"])
+    assert location == "/#sso-error=no_account", location
+    nothing_was_written()
+    # And the invitation is still Mallory's to accept, from her own tab, as herself.
+    _accept(h, p, token, sub="mallory-subject", email="mallory@example.test", groups=[])
+    (mallory,) = h.users_named("mallory")
+    assert [i.subject for i in h.identities()] == ["mallory-subject"] and mallory.groups == [] and h.requests() == []
+
+
+def test_an_invitation_redeemed_by_its_own_tab_is_written_whole_in_one_commit(monkeypatch):
+    """The acceptance by the tab that started it: the account, its identity, the departments the provider's
+    groups map to and the claimed invitation, together."""
+    h, p, inv, token, finance, location = _an_invitation_opened_by_a_colleague(monkeypatch)
+    commits = h.db.log.count(("commit",))
+    status, body = h.finish(location, verifier="mallory-tab")
+    assert status == 200, body
+    (mallory,) = h.users_named("mallory")
+    (identity,) = h.identities()
+    assert identity.user_id == mallory.id and identity.linked_by == "invitation"
+    assert _names(mallory.groups) == ["Finance"] and inv.accepted_user_id == mallory.id
+    assert h.db.log.count(("commit",)) > commits
+    first = h.db.log.index(("commit",))
+    assert ("execute", "insert user_groups", mallory.id, finance.id) in h.db.log[:first]      # before the one commit
 
 
 # --------------------------------------------------------------------------- departments

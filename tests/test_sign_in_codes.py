@@ -305,3 +305,28 @@ def test_a_record_round_trips_through_the_pipelines_result():
     pending.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     assert c.to_result(db, record) is None
     assert c.to_result(db, c.Handover(user_id="not-a-uuid", methods=[]), client_ip=None) is None
+
+
+def test_a_code_may_hold_an_invitation_instead_of_an_account():
+    """An invitation accepted through a provider has no account until its code is redeemed: the record names the
+    invitation and what the provider said, and no account. Anything between the two shapes is no record."""
+    from app.core import sign_in_codes as codes
+    redis = _Redis()
+    invitation = {"invitation_id": "i-1", "answer": {"subject": "s-1", "issuer": "https://idp.example/"}}
+    held = codes.Handover(user_id="", methods=[], provider_id="p-1", verifier_hash=codes.digest("tab"),
+                          invitation=invitation)
+    code = codes.store(held, redis=redis)
+    back = codes.take(code, verifier="tab", redis=redis)
+    assert back is not None and back.user_id == "" and back.invitation == invitation
+    assert codes.to_result(None, back) is None                     # no account: nothing signs in on it as it is
+    # No account and no invitation, or both, or an invitation without the identity's key or a provider: no record.
+    with pytest.raises(ValueError):
+        codes.store(codes.Handover(user_id="", methods=[], provider_id="p-1", verifier_hash="h"), redis=redis)
+    whole = {"user_id": "", "methods": [], "provider_id": "p-1", "verifier_hash": "h", "invitation": invitation}
+    assert codes.Handover.from_payload(whole) is not None
+    for broken in ({**whole, "user_id": "u-1"}, {**whole, "invitation": None}, {**whole, "provider_id": None},
+                   {**whole, "invitation": {"invitation_id": "i-1"}},
+                   {**whole, "invitation": {"invitation_id": "", "answer": invitation["answer"]}},
+                   {**whole, "invitation": {"invitation_id": "i-1", "answer": {"subject": "s-1"}}},
+                   {**whole, "invitation": "i-1"}):
+        assert codes.Handover.from_payload(broken) is None, broken

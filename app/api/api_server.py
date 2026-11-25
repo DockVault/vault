@@ -8929,6 +8929,11 @@ async def finish_sign_in(
     except sign_in_codes.Unavailable:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="Sign-in is temporarily unavailable; try again in a moment.")
+    if handover is not None and handover.invitation is not None:
+        # An invitation accepted through an identity provider. The tab that started it has just proved itself:
+        # the account is made now, and by nothing before (the provider's callback wrote nothing).
+        from app.api import sso_router
+        sso_router.finish_invitation(db, handover, client_ip=client_ip)
     result = sign_in_codes.to_result(db, handover, client_ip=client_ip) if handover is not None else None
     if result is None:
         raise HTTPException(status_code=401, detail="This sign-in code is not valid; start again.")

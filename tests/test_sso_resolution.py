@@ -82,6 +82,16 @@ def _sign_in(h, p, token=None, **claims):
     return location, record
 
 
+def _accept(h, p, token, **claims):
+    """An invitation accepted through the provider by the tab that started it: the start with the invitation, the
+    callback (which writes nothing), and the code redeemed. (location, the state's record, the finish's answer)."""
+    location, record = _sign_in(h, p, token, **claims)
+    assert location.startswith("/#sso="), location
+    status, body = h.finish(location)
+    assert status == 200, body
+    return location, record, body
+
+
 # --------------------------------------------------------------------------- an invitation accepted through the provider
 
 def test_an_invitation_is_accepted_through_the_provider(monkeypatch):
@@ -91,6 +101,13 @@ def test_an_invitation_is_accepted_through_the_provider(monkeypatch):
     location, record = _sign_in(h, p, token)
     assert record["extras"] == {"invitation_id": str(inv.id)} and "invite_accept_prefix" in h.limiter
     assert location.startswith("/#sso="), location
+    # The callback wrote nothing: whoever reached it may be anybody the start address was handed to. The account
+    # is made when the tab that started the sign-in redeems the code with its verifier.
+    assert h.users_named("newbie") == [] and h.identities() == [] and inv.accepted_at is None
+    assert ("commit",) not in h.db.log and h.emails == [] and h.grants == []
+    assert not any(a[0] == "account_invitation_accepted" for a in h.audits)
+    status, body = h.finish(location)
+    assert status == 200, body
     (user,) = h.users_named("newbie")
     from app.core.models import RoleEnum
     assert user.role == RoleEnum.USER and user.email == "alice@example.test" and user.created_by == root.id
@@ -105,14 +122,113 @@ def test_an_invitation_is_accepted_through_the_provider(monkeypatch):
     assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "invitation"}) in h.audits
     assert ("account_welcome", "alice@example.test", None) in h.emails
     assert h.notices == []                                        # an invitation is the owner's own doing: no notice
-    # The account stood before the code was handed out, and the code signs it in.
+    # Made, linked and claimed in one commit, and the same call signs the account in.
     assert ("commit",) in h.db.log
-    status, body = h.finish(location)
-    assert status == 200, body
     assert _claims(body["access_token"])["sub"] == str(user.id) and ("login_success", "newbie", []) in h.audits
+    # The code is spent with the acceptance: it makes nothing twice.
+    assert h.finish(location)[0] == 401 and len(h.users_named("newbie")) == 1
     # The invitation is spent: the token starts nothing now.
     status, out = h.start(p, invitation=token)
     assert status == 404 and out["detail"]["reason"] == "invitation_unusable"
+
+
+def test_the_callback_looks_at_an_invitation_and_the_acceptance_holds_what_it_decides_on(monkeypatch):
+    """The look at the callback reads and holds nothing. The acceptance holds the inviter's row until it commits:
+    an inviter demoted in between does not leave an account their invitation made."""
+    root, p = _user("root", role="admin"), _provider()
+    h = Resolving(monkeypatch, [root], [p])
+    token, inv = h.invite(created_by=root.id)
+    held = []
+    can_act = h.S._invitation_inviter_can_act
+    monkeypatch.setattr(h.S, "_invitation_inviter_can_act",
+                        lambda db, inv, lock=False: (held.append(lock), can_act(db, inv, lock=lock))[1])
+    location, _ = _sign_in(h, p, token)
+    assert held == [False, False]                        # the start's look and the callback's: neither holds
+    assert h.finish(location)[0] == 200 and held == [False, False, True]
+
+
+def test_an_acceptance_that_cannot_be_committed_leaves_nothing_and_says_so(monkeypatch):
+    """A name or an address taken in the same moment surfaces at the commit: the whole acceptance is undone, the
+    invitation stays pending, and the refusal is recorded."""
+    from sqlalchemy.exc import IntegrityError
+    root, p = _user("root", role="admin"), _provider()
+    h = Resolving(monkeypatch, [root], [p])
+    token, inv = h.invite(created_by=root.id)
+    location, _ = _sign_in(h, p, token)
+    commit = h.db.commit
+
+    def taken_meanwhile():
+        monkeypatch.setattr(h.db, "commit", commit)
+        raise IntegrityError("insert", {}, Exception("duplicate key"))
+    monkeypatch.setattr(h.db, "commit", taken_meanwhile)
+    status, body = h.finish(location)
+    assert status == 409 and body["detail"]["reason"] == "invitation_unusable", body
+    assert h.users_named("newbie") == [] and h.identities() == []
+    assert any(a[0] == "account_invitation_accept_failed" and a[2]["reason"] == "commit_conflict" for a in h.audits)
+    assert not any(a[0] == "account_invitation_accepted" for a in h.audits) and h.emails == []
+
+
+def test_a_first_sign_in_reached_by_another_browser_makes_only_the_providers_own_account(monkeypatch):
+    """What is written at the callback without an invitation is decided by the provider's answer alone. Mallory
+    starts a sign-in and hands the address to a colleague: the account that is made is the colleague's own (their
+    subject, their name and address from the token), nothing of Mallory's is on it, and the code that comes back
+    signs nobody in without the verifier of the tab that started it."""
+    root = _user("root", role="admin")
+    p = _provider(policy={"sso_account_creation": "jit", "sso_allowed_domains": ["example.test"]})
+    h = Resolving(monkeypatch, [root], [p])
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
+    status, out = h.start(p, verifier="mallory-tab")
+    state, _ = h.state_of(out["authorization_url"])
+    h.claims_override = {"sub": "victim-subject", "email": "victim@example.test", "preferred_username": "victim"}
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso="), location
+    (victim,) = h.users_named("victim")
+    (identity,) = h.identities()
+    assert identity.user_id == victim.id and identity.subject == "victim-subject" and identity.linked_by == "jit"
+    assert victim.email == "victim@example.test" and h.users_named("mallory") == []
+    assert h.finish(location, verifier="victim-tab")[0] == 401 and h.finish(location, verifier="mallory-tab")[0] == 401
+
+
+def test_what_an_invitations_code_keeps_of_the_providers_answer():
+    """The identity's key and display data, the groups, and what the sign-in that follows carries; never a token
+    but the provider's logout hint, encrypted, where the provider's logout wants it. More groups than are kept
+    are kept as "too many to say", never as "member of nothing"."""
+    from app.core import sign_in_codes
+    from app.services import sso_sign_in as sso
+    p = _provider(policy={"sso_idp_logout": False})
+    answer = sso.ProviderAnswer(claims={"secret": "claim"}, subject="s-1", issuer="https://idp.example/", tenant_id="t1",
+                                email="a@example.test", email_verified=True, display_name="A", auth_time=None,
+                                sid="sid-1", id_token="the-id-token", groups=["fin", 7])
+    held = sso.held_invitation(p, answer, invitation_id="i-1", provider_id=p.id, client_ip="203.0.113.9",
+                               began_at=1000.5, verifier_hash="h", code_challenge=None, purpose="sign_in")
+    assert held.user_id == "" and held.methods == [] and held.provider_id == str(p.id)
+    assert held.provider_sid == "sid-1" and held.provider_sub == "s-1" and held.provider_answered_at == 1000.5
+    assert held.provider_logout_hint_enc is None and held.verifier_hash == "h"
+    assert held.invitation == {"invitation_id": "i-1", "answer": {
+        "subject": "s-1", "issuer": "https://idp.example/", "tenant_id": "t1", "email": "a@example.test",
+        "email_verified": True, "display_name": "A", "groups": ["fin", "7"], "groups_overage": False}}
+    assert "the-id-token" not in str(held) and "claim" not in str(held)
+    assert sign_in_codes.Handover.from_payload(held.__dict__) is not None
+    back = sso.answer_of_an_invitation(held.invitation)
+    assert (back.subject, back.issuer, back.tenant_id, back.email, back.email_verified, back.display_name) == (
+        "s-1", "https://idp.example/", "t1", "a@example.test", True, "A")
+    assert back.groups == ["fin", "7"] and back.groups_overage is False
+    # No groups claim stays "no claim"; the provider's own overage marker stays one; too many become one.
+    answer.groups = None
+    none = sso.answer_of_an_invitation(sso.held_invitation(
+        p, answer, invitation_id="i-1", provider_id=p.id, client_ip=None, began_at=1.0, verifier_hash="h",
+        code_challenge=None, purpose="sign_in").invitation)
+    assert none.groups is None and none.groups_overage is False
+    answer.groups = [f"g{n}" for n in range(sso.GROUPS_KEPT + 1)]
+    many = sso.answer_of_an_invitation(sso.held_invitation(
+        p, answer, invitation_id="i-1", provider_id=p.id, client_ip=None, began_at=1.0, verifier_hash="h",
+        code_challenge=None, purpose="sign_in").invitation)
+    assert many.groups is None and many.groups_overage is True
+    answer.groups = [f"g{n}" for n in range(sso.GROUPS_KEPT)]
+    kept = sso.answer_of_an_invitation(sso.held_invitation(
+        p, answer, invitation_id="i-1", provider_id=p.id, client_ip=None, began_at=1.0, verifier_hash="h",
+        code_challenge=None, purpose="sign_in").invitation)
+    assert len(kept.groups) == sso.GROUPS_KEPT and kept.groups_overage is False
 
 
 @pytest.mark.parametrize("arrange", ["unknown", "expired", "revoked", "accepted", "invitations_off", "inviter_demoted", "app",
@@ -164,6 +280,10 @@ def test_an_invitation_start_is_refused_for_a_token_that_cannot_be_accepted(monk
     ("subject_pinned_elsewhere", "already_linked", "subject_linked_elsewhere"),
     ("claim_lost", "invitation_unusable", "claim_lost"),
     ("resent", "invitation_unusable", "not_pending"),
+    ("another_address", "invitation_address", "another_address"),
+    ("address_not_confirmed", "invitation_address", "address_not_confirmed"),
+    ("turned_off_before_the_finish", "provider_disabled", None),
+    ("revoked_before_the_finish", "invitation_unusable", "not_pending"),
 ])
 def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account(monkeypatch, arrange, reason, detail):
     root = _user("root", role="admin")
@@ -176,8 +296,9 @@ def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account
     identities = [_identity(_user("other"), p, tenant_id="t1")] if arrange == "subject_pinned_elsewhere" else []
     h = Resolving(monkeypatch, users, [p], identities=identities)
     admin_role = arrange in ("inviter_demoted", "administrator")
-    token, inv = h.invite(created_by=root.id, role="admin" if admin_role else "user",
-                          email="taken@example.test" if arrange == "invitation_address_in_use" else None)
+    named = {"invitation_address_in_use": "taken@example.test", "another_address": "invited@example.test",
+             "address_not_confirmed": "invited@example.test"}
+    token, inv = h.invite(created_by=root.id, role="admin" if admin_role else "user", email=named.get(arrange))
     if admin_role:
         # The start refuses an administrator's invitation outright; the callback is held to the same, for a state
         # that names one all the same.
@@ -216,17 +337,47 @@ def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account
     elif arrange == "subject_pinned_elsewhere":
         h.claims_override = {"tid": "t2"}
     elif arrange == "claim_lost":
-        # Revoked after the invitation was read as pending and before the atomic claim: the claim finds no
-        # pending row. (Staged at a check that sits between the two.)
-        monkeypatch.setattr(h.S, "_username_kept", lambda name: setattr(inv, "revoked_at", datetime.utcnow()) or False)
+        # Revoked after the acceptance read the invitation as pending and before its atomic claim: the claim finds
+        # no pending row. (Staged at a check that sits between the two, the second time it is asked: the first
+        # is the callback's look.)
+        asked = []
+
+        def kept(name):
+            asked.append(name)
+            if len(asked) > 1:
+                inv.revoked_at = datetime.utcnow()
+            return False
+        monkeypatch.setattr(h.S, "_username_kept", kept)
+    elif arrange == "another_address":
+        pass                                # the provider confirms alice@example.test; the invitation names another
+    elif arrange == "address_not_confirmed":
+        h.claims_override = {"email": "invited@example.test", "email_verified": False}
     status, location, _ = h.callback(p, state)
-    assert location == f"/#sso-error={reason}", location
+    if arrange in ("claim_lost", "turned_off_before_the_finish", "revoked_before_the_finish"):
+        # The callback's look passed. The acceptance is the finish's, and judges again in its own transaction.
+        assert location.startswith("/#sso="), location
+        assert h.users_named("newbie") == [] and inv.accepted_at is None
+        if arrange == "turned_off_before_the_finish":
+            p.state = "disabled"
+        elif arrange == "revoked_before_the_finish":
+            inv.revoked_at = now
+        from app.services import sso_sign_in as texts
+        status, body = h.finish(location)
+        assert status == 409 and body["detail"] == {"reason": reason, "message": texts.reason_text(reason)}, body
+        assert h.finish(location)[0] == 401                            # the code was spent by the refusal
+    else:
+        assert location == f"/#sso-error={reason}", location
     assert h.users_named("newbie") == [] and len(h.identities()) == len(identities) and h.codes() == []
     assert ("commit",) not in h.db.log                                 # nothing of the attempt was committed
     assert inv.accepted_user_id is None or arrange == "accepted_meanwhile"
     assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == reason for a in h.audits), h.audits
-    assert any(a[0] == "account_invitation_accept_failed" and a[2] == {"token_prefix": inv.token_prefix, "reason": detail}
-               for a in h.audits), h.audits
+    assert any(a[0] == "account_invitation_accept_failed"
+               and a[2] == {"token_prefix": inv.token_prefix, "reason": detail or reason} for a in h.audits), h.audits
+    if arrange in ("another_address", "address_not_confirmed"):
+        # Still pending, to be accepted with the form: the sentence says so.
+        assert inv.accepted_at is None and inv.revoked_at is None
+        from app.services import sso_sign_in as texts
+        assert "choose a password there" in texts.reason_text("invitation_address")
     if arrange == "subject_pinned_elsewhere":
         assert inv.accepted_at is None                                 # still pending: the person may be invited again
     if resent is not None:
@@ -234,7 +385,7 @@ def test_an_invitation_that_cannot_be_completed_at_the_callback_makes_no_account
 
 
 @pytest.mark.parametrize("arrange, expected", [
-    ("invitation_address", "invited@example.test"),      # the invitation's address, whatever the provider says
+    ("invitation_address", "invited@example.test"),      # the invitation's address, which the provider confirms
     ("claim_verified", "alice@example.test"),
     ("claim_unverified_optional", None),
     ("claim_domain_denied_optional", None),
@@ -268,8 +419,9 @@ def test_the_new_accounts_address_is_the_invitations_else_the_providers_verified
         claims = {"email": "a@evil.test@example.test"}
     elif arrange == "claim_outside_the_domain_list_optional":
         claims = {"hd": "example.test", "email": "alice@victim.test"}
-    location, _ = _sign_in(h, p, token, **claims)
-    assert location.startswith("/#sso="), location
+    if arrange == "invitation_address":
+        claims = {"email": "Invited@Example.test"}        # the same address, as the provider happens to write it
+    _accept(h, p, token, **claims)
     (user,) = h.users_named("newbie")
     assert user.email == expected
 
@@ -311,7 +463,7 @@ def test_an_account_made_through_a_provider_holds_a_password_that_is_not_its_own
     h = Resolving(monkeypatch, [root, bob], [p, q])
     monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
     token, _inv = h.invite(username="invited", created_by=root.id)
-    assert _sign_in(h, p, token, sub="s-invited", email="invited@example.test")[0].startswith("/#sso=")
+    _accept(h, p, token, sub="s-invited", email="invited@example.test")
     assert _sign_in(h, p, sub="s-first", email="first@example.test", preferred_username="first")[0].startswith("/#sso=")
     assert _sign_in(h, q, sub="s-bob", email="bob@example.test")[0].startswith("/#sso=")
     (invited,), (first,) = h.users_named("invited"), h.users_named("first")
@@ -328,17 +480,22 @@ def test_every_new_account_gets_a_password_hash_of_its_own_that_nobody_knows(mon
     h = Resolving(monkeypatch, [root], [p])
     token1, _ = h.invite(username="first", created_by=root.id)
     token2, _ = h.invite(username="second", created_by=root.id)
-    _sign_in(h, p, token1)
-    _sign_in(h, p, token2, sub="subject-2", email="second@example.test")
+    _accept(h, p, token1)
+    _accept(h, p, token2, sub="subject-2", email="second@example.test")
     (first,), (second,) = h.users_named("first"), h.users_named("second")
     assert first.password_hash != second.password_hash
     assert first.password_hash.startswith("argon2:") and first.password_hash != "argon2:" + _h("")
     assert len(first.password_hash) == len("argon2:") + 64          # a hash of a random secret, no plain text
 
 
-def test_the_account_stands_when_the_code_store_fails_afterwards(monkeypatch):
-    root, p = _user("root", role="admin"), _provider()
+def test_a_code_store_that_fails_costs_one_more_sign_in_and_never_half_an_account(monkeypatch):
+    """An invitation: nothing is written before its code is redeemed, so a store that fails at the callback leaves
+    the invitation pending and the person starts again. An account made at a first sign-in is the provider
+    identity's own and stands before any code is handed out: the next sign-in finds it."""
+    root = _user("root", role="admin")
+    p = _provider(policy={"sso_account_creation": "jit", "sso_allowed_domains": ["example.test"]})
     h = Resolving(monkeypatch, [root], [p])
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
     token, inv = h.invite(created_by=root.id)
     from app.core import sign_in_codes
 
@@ -348,12 +505,18 @@ def test_the_account_stands_when_the_code_store_fails_afterwards(monkeypatch):
     monkeypatch.setattr(sign_in_codes, "store", unavailable)
     location, _ = _sign_in(h, p, token)
     assert location == "/#sso-error=temporarily_unavailable", location
-    (user,) = h.users_named("newbie")
-    assert inv.accepted_user_id == user.id and ("commit",) in h.db.log and len(h.identities()) == 1
-    # The next sign-in finds the identity: one account, one sign-in more.
+    assert h.users_named("newbie") == [] and h.identities() == [] and inv.accepted_at is None
+    assert ("commit",) not in h.db.log
+    location, _ = _sign_in(h, p, sub="s-first", email="first@example.test", preferred_username="first")
+    assert location == "/#sso-error=temporarily_unavailable", location
+    (first,) = h.users_named("first")
+    assert ("commit",) in h.db.log and [i.user_id for i in h.identities()] == [first.id]
     monkeypatch.setattr(sign_in_codes, "store", real_store)
-    location, _ = _sign_in(h, p)
-    assert location.startswith("/#sso=") and len(h.users_named("newbie")) == 1 and h.finish(location)[0] == 200
+    # The invitation is accepted at the next try; the first sign-in's account is found by the next sign-in.
+    _accept(h, p, token)
+    assert inv.accepted_at is not None and len(h.users_named("newbie")) == 1
+    location, _ = _sign_in(h, p, sub="s-first", email="first@example.test", preferred_username="first")
+    assert location.startswith("/#sso=") and len(h.users_named("first")) == 1 and h.finish(location)[0] == 200
 
 
 @pytest.mark.parametrize("password_login, sso_only", [("allowed", False), ("disabled", True)])
@@ -361,7 +524,7 @@ def test_a_user_made_by_an_invitation_is_sso_only_when_the_provider_says_so(monk
     root, p = _user("root", role="admin"), _provider(policy={"sso_password_login": password_login})
     h = Resolving(monkeypatch, [root], [p])
     token, _ = h.invite(created_by=root.id)
-    _sign_in(h, p, token)
+    _accept(h, p, token)
     (user,) = h.users_named("newbie")
     assert user.sso_only is sso_only and user.sftp_password_auth is (not sso_only)
 
@@ -1363,11 +1526,9 @@ def test_an_invitation_confirms_the_address_it_carried_and_a_providers_word_conf
     monkeypatch.setattr(h.S, "_username_kept", lambda name: False)
     monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
     token, inv = h.invite(username="invited", email="invited@example.test")
-    location, _ = _sign_in(h, p, token, sub="s1", email="invited@example.test")
-    assert location.startswith("/#sso="), location
+    _accept(h, p, token, sub="s1", email="invited@example.test")
     token, inv = h.invite(username="typed")
-    location, _ = _sign_in(h, p, token, sub="s2", email="typed@example.test")
-    assert location.startswith("/#sso="), location
+    _accept(h, p, token, sub="s2", email="typed@example.test")
     location, _ = _sign_in(h, p, sub="s3", email="first@example.test", preferred_username="first")
     assert location.startswith("/#sso="), location
     confirmed = {u.username: u.email_confirmed_at is not None for u in h.db.rows_of(type(h.users_named("invited")[0]))}

@@ -330,6 +330,9 @@ OWN_UNLESS_ADMINISTRATOR = {
 LINK_USE = {
     ("POST", "/reset/{token}"): "sets the password of the account a reset link was made for",
     ("POST", "/invites/{token}/accept"): "makes the account an invitation was made for",
+    ("POST", "/auth/finish"): ("makes the account an invitation was made for, where it is accepted through an "
+                               "identity provider: for the tab that redeems the sign-in's one-time code with its "
+                               "verifier"),
     ("POST", "/auth/forgot-password"): "emails a reset link to the account's own address",
     ("POST", "/auth/sso/{provider_id}/backchannel-logout"): "ends the sessions a provider's signed logout token names",
 }
