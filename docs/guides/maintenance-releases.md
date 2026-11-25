@@ -3,7 +3,7 @@
 Which release lines are supported, and until when, is set by [SECURITY.md](../../.github/SECURITY.md):
 from 0.36.0 on, the newest line, and for 30 days after a minor release ships, the line before it.
 This guide says what that means for an install, and how the maintainers release a fix on a line that
-is no longer the newest, as they did for the 0.33 and 0.34 lines.
+is no longer the newest, where SECURITY.md promises one, as they did for the 0.33 and 0.34 lines.
 
 ## Release lines
 
@@ -11,9 +11,10 @@ A release line is every release that shares a major and minor version: 0.33.0, 0
 the 0.33 line.
 
 - The newest line is released from `main`.
-- Once a newer minor release exists (0.34.0, say), fixes for the older line come from a branch named
-  `release/0.33`. It is cut from the newest 0.33 release tag and holds only that line's fixes. Before
-  0.34.0 exists, a 0.33 patch release comes from `main` like any other release.
+- Once a newer minor release exists (0.34.0, say), a fix that SECURITY.md promises to the older line
+  comes from a branch named `release/0.33`. It is cut from the newest 0.33 release tag and holds only
+  that line's fixes. Before 0.34.0 exists, a 0.33 patch release comes from `main` like any other
+  release.
 - A release candidate is pushed as `candidate/X.Y.Z`. Candidates get the full test run on demand;
   pushes to `main` and to `release/X.Y` branches run the merge checks automatically.
 - While a line is supported, its `release/X.Y` branch gets the full test run and the setup scenarios
@@ -87,9 +88,9 @@ release before it until the newer one publishes.
 
 ### A fix on several lines
 
-1. Prepare a candidate for each supported line the fix affects: the newest line from `main`, each
-   older line as `candidate/X.Y.N` from its `release/X.Y` branch. Run the full test run on every
-   candidate.
+1. Prepare a candidate for each line the fix affects that receives security fixes (SECURITY.md):
+   the newest line from `main`, any older line as `candidate/X.Y.N` from its `release/X.Y` branch.
+   Run the full test run on every candidate.
 2. Tag the older lines first. Their matrix is `main`'s plus their own new entry, the edge into it
    and an edge from it up to the newest release, without the advisory, and their notes say that a
    security fix is included and that its details are published with the newest line's release the

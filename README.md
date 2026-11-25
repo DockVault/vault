@@ -617,9 +617,10 @@ newest line, whose end is not known until the next minor release ships. The vali
 date against that promise, and requires a mitigation on an advisory that leaves the newest release
 of a line affected while the line is supported. A release of a line from 0.33 on whose period has
 ended is not marked end-of-life by that alone, so a move within its line, or back to it, still
-works; it is marked not secure as soon as an advisory affects it. How a fix is released on a line
-that is no longer the newest is described in
-[`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md).
+works; it is marked not secure as soon as an advisory affects it. Where `.github/SECURITY.md`
+promises a fix to a line that is no longer the newest,
+[`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md) describes how it is
+released.
 
 When a version is not secure, the matrix says why. Each vulnerability is recorded once, in the
 top-level `advisories`: a title and description, its **impact** (what it let someone do), its

@@ -252,6 +252,18 @@ def test_the_readme_and_the_maintenance_guide_state_the_support_rule_once():
     assert "six months" not in readme and "six months" not in guide
     assert "security fixes" not in guide.split("## Release lines", 1)[0]
     assert "is set by [SECURITY.md](../../.github/SECURITY.md)" in guide
+    # A fix on a line that is no longer the newest is released where the policy promises one, and nowhere else:
+    # neither text says it is made for every supported line, so the rule's sentence alone decides which lines.
+    flat_guide, flat_readme = " ".join(guide.split()), " ".join(readme.split())
+    for promise in ("each supported line", "fixes for the older line come from", "each older line as"):
+        assert promise not in flat_guide, promise
+    assert "a fix that SECURITY.md promises to the older line comes from a branch named `release/0.33`" in flat_guide
+    assert "Prepare a candidate for each line the fix affects that receives security fixes (SECURITY.md)" in flat_guide
+    assert "where SECURITY.md promises one, as they did for the 0.33 and 0.34 lines" in flat_guide
+    assert ("Where `.github/SECURITY.md` promises a fix to a line that is no longer the newest, "
+            "[`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md) describes how it is "
+            "released.") in flat_readme
+    assert "How a fix is released on a line that is no longer the newest" not in flat_readme
 
 
 def test_the_security_policy_and_readme_publish_the_accepted_approval_residuals():
