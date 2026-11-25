@@ -1271,3 +1271,109 @@ def test_a_change_that_turns_a_provider_off_says_which_sessions_still_stand(monk
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"label": "Staff"})
     assert status == 200 and out["turned_off"] is False and out["sessions_not_ended"] == 0
     assert "could not be ended" not in h.told[-1][2]
+
+
+def _linked_since(monkeypatch, days_ago, *, policy=None):
+    """A provider that is on and three accounts linked to it, signed in through it ``days_ago`` each."""
+    from datetime import datetime, timedelta
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None, policy=policy))
+    people = [_user(name) for name in ("ann", "ben", "cy")]
+    links = [_identity(person, row, subject=f"s-{person.username}",
+                       last_sign_in_at=datetime.utcnow() - timedelta(days=ago))
+             for person, ago in zip(people, days_ago)]
+    h = Admin(monkeypatch, [row], users=people, identities=links)
+    return h, row, people
+
+
+def test_a_save_that_shortens_a_providers_days_says_whom_it_holds_and_tells_them(monkeypatch):
+    """An administrator saves a provider with 7 days where it had 30. Every linked account whose last sign-in
+    through it is older than 7 days is held from that moment: its password and passkeys sign it in to nothing.
+    They had no warning (the warning counts down to the days as they were), and the administrators' notice did
+    not say how many stopped. The answer, the record and the notice say it, and each of those people is told."""
+    h, row, (ann, ben, cy) = _linked_since(monkeypatch, [1, 10, 40])
+    path = f"/admin/sso/providers/{row.id}"
+    from app.services import sso_providers as providers
+    assert [u.username for u in providers.held_by_its_days(h.db, row)] == ["cy"]       # 40 days against 30
+    # An account the provider refused is held by the refusal, whatever the days are: it is not among these.
+    from datetime import datetime, timedelta
+    from app.core.models import ExternalIdentity, User
+    dee = _user("dee")
+    h.db.rows_of(User).append(dee)
+    h.db.rows_of(ExternalIdentity).append(_identity(dee, row, subject="s-dee", refused_at=datetime.utcnow(),
+                                                    last_sign_in_at=datetime.utcnow() - timedelta(days=40)))
+    assert [u.username for u in providers.held_by_its_days(h.db, row)] == ["cy"]
+    status, out = h.call("PATCH", path, {"policy": {"sso_freshness_days": 7}})
+    assert status == 200 and out["changed"] == ["policy.sso_freshness_days"], out
+    assert out["held_by_its_days"] == 2 and out["newly_held"] == 1                      # ben, since this save
+    (told,) = h.accounts_told
+    assert told[0] == ["ben"] and told[1].startswith("Sign in through ")
+    assert "your password and passkeys do not sign you in to this vault until you have signed in through" in told[2]
+    said = h.told[-1][2]
+    assert ("1 more linked account(s) have not signed in through it within its days as they are now: their password "
+            "and passkeys do not sign them in until they have. They were told. 2 account(s) are held so in all.") in said
+    # Recorded after the change's own record, which was written with the change before this could be counted.
+    change, count = h.audit("sso_provider_updated")
+    assert change[2]["changed"] == ["policy.sso_freshness_days"] and "newly_held" not in change[2]
+    assert count[2] == {"provider_id": str(row.id), "name": row.name, "changed": [], "reason": "held_by_its_days",
+                        "held_by_its_days": 2, "newly_held": 1}
+    # A change of something else, while two accounts are held: nobody is counted, nobody told again.
+    del h.accounts_told[:], h.audits[:]
+    status, out = h.call("PATCH", path, {"label": "Staff sign-in"})
+    assert status == 200 and out["held_by_its_days"] == 0 and out["newly_held"] == 0 and h.accounts_told == []
+    assert "have not signed in through it within its days" not in h.told[-1][2]
+    # Longer days hold fewer: nobody new, nobody told, and the notice says nothing of it.
+    del h.accounts_told[:], h.audits[:]
+    status, out = h.call("PATCH", path, {"policy": {"sso_freshness_days": 60}})
+    assert status == 200 and out["held_by_its_days"] == 0 and out["newly_held"] == 0
+    assert h.accounts_told == [] and "have not signed in through it within its days" not in h.told[-1][2]
+    # A change that is not of the days counts nobody.
+    status, out = h.call("PATCH", path, {"label": "Staff"})
+    assert status == 200 and out["held_by_its_days"] == 0 and out["newly_held"] == 0 and h.accounts_told == []
+    # Nothing new held, nothing recorded of it: one record for each of the two changes since.
+    assert [a[2]["changed"] for a in h.audit("sso_provider_updated")] == [["policy.sso_freshness_days"], ["label"]]
+
+
+def test_a_save_that_turns_on_that_the_days_end_sign_in_says_whom_it_holds(monkeypatch):
+    h, row, (ann, ben, cy) = _linked_since(monkeypatch, [1, 40, 50], policy={"sso_lapse_ends_sign_in": False})
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": True}})
+    assert status == 200 and out["changed"] == ["policy.sso_lapse_ends_sign_in"], out
+    assert out["held_by_its_days"] == 2 and out["newly_held"] == 2
+    (told,) = h.accounts_told
+    assert sorted(told[0]) == ["ben", "cy"]
+    assert "2 more linked account(s) have not signed in through it within its days" in h.told[-1][2]
+    # Turned off again: the days hold nobody, and nobody is told that they are held.
+    del h.accounts_told[:]
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": False}})
+    assert status == 200 and out["held_by_its_days"] == 0 and out["newly_held"] == 0 and h.accounts_told == []
+
+
+def test_a_provider_that_is_off_holds_nobody_by_its_days_at_a_save(monkeypatch):
+    """Turned off, a provider's days hold nobody: nothing is counted and nobody told at a save, and the count is
+    given when it is turned on. The same for a save that turns the provider off by changing its connection."""
+    h, row, people = _linked_since(monkeypatch, [40, 40, 40])
+    row.state = "disabled"
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 7}})
+    assert status == 200 and out["held_by_its_days"] == 0 and out["newly_held"] == 0 and h.accounts_told == []
+    row.state = "enabled"
+    _tested(row)
+    _watch_turn_off(monkeypatch, h, ended=0, held=0)
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}",
+                         {"client_id": "another-client", "policy": {"sso_freshness_days": 3}})
+    assert status == 200 and out["turned_off"] is True and out["held_by_its_days"] == 0 and out["newly_held"] == 0
+    assert not [t for t in h.accounts_told if t[1].startswith("Sign in through ")]
+
+
+def test_the_accounts_a_providers_days_hold_are_never_counted_while_its_row_is_held():
+    """The count reads every account linked to the provider. Sign-ins through the provider wait for its row a
+    short time and are refused as busy after it: so the count before the change is taken before the row is, and
+    the count after it once the change is committed."""
+    import inspect
+    from app.api import sso_providers_router as R
+    source = inspect.getsource(R.update_provider)
+    steps = ('held_before = {u.id for u in providers.held_by_its_days(db, row)} if "policy" in changes else set()',
+             "row = _row_or_404(db, provider_id, lock=True)",
+             "        db.commit()",
+             "held_now = _held_by_its_days_after(db, row, by=current_user, ip=api.get_client_ip(request),")
+    order = [source.index(step) for step in steps]
+    assert order == sorted(order), order
+    assert source.count("held_by_its_days(db, row)") == 1 and source.count("_held_by_its_days_after(") == 1

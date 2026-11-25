@@ -281,6 +281,9 @@ DETAIL_KEYS.update({
     "recipients": COUNT, "attempted": COUNT, "sent": COUNT, "failed": COUNT, "errors": COUNT,
     # how many vault sessions a provider's back-channel logout ended
     "sessions": COUNT,
+    # how many linked accounts a provider's days hold to a sign-in through it after a change of them, and how
+    # many of those since that change
+    "held_by_its_days": COUNT, "newly_held": COUNT,
     # what changed on a settings save or an account: the setting's or field's name, then its old and new
     # value; an account's email address is an email address
     "changes": NESTED,

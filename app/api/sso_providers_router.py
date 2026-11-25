@@ -196,6 +196,26 @@ def _said_of_sessions_standing(standing: Optional[int]) -> str:
             "to end them, or sign those accounts out.")
 
 
+def _held_by_its_days_after(db, row, *, by, ip, held_before) -> list:
+    """The accounts ``row``'s days hold after a change of them was committed, and the record of it, in a
+    transaction of its own (the change's own record was written with the change, before this could be counted):
+    how many are held, and how many of them since this change. A count that cannot be made holds up nothing: the
+    change stands, nobody is said to be held, and the failure is logged."""
+    try:
+        held = providers.held_by_its_days(db, row)
+        newly = sum(1 for user in held if user.id not in held_before)
+        if newly:
+            _record(db, "sso_provider_updated", user=by, ip=ip, row_id=row.id,
+                    details={"provider_id": str(row.id), "name": row.name, "changed": [],
+                             "reason": "held_by_its_days", "held_by_its_days": len(held), "newly_held": newly})
+            db.commit()
+        return held
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.warning("the accounts a provider's days hold were not counted: %s", type(exc).__name__)
+        return []
+
+
 def _accounts_named(db, usernames) -> list:
     """(id, username, email) of the accounts ``usernames`` names, for a notice sent after the commit."""
     names = list(usernames or [])
@@ -307,6 +327,10 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     # here, before the row is taken: sign-ins through the provider wait for that row, and hashing is slow.
     from app.core import sso_only
     unknown_hash = sso_only.a_password_nobody_knows() if "policy" in changes else None
+    # Whom the provider's days hold to a sign-in through it, before the change: a save that shortens the days, or
+    # turns on that they end sign-in, holds more accounts from the moment it is committed. Counted here and
+    # after the commit, never while the provider's row is held: it reads every linked account.
+    held_before = {u.id for u in providers.held_by_its_days(db, row)} if "policy" in changes else set()
     row = _row_or_404(db, provider_id, lock=True)
     try:
         changes = providers.clean(body, row=row)
@@ -342,9 +366,23 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     ended = (_end_sessions_of(db, row.id, by=current_user, ip=api.get_client_ip(request), name=row.name)
              if turned_off else 0)
     standing = _sessions_standing(db, row.id) if turned_off else 0
+    # Whom its days hold now that the change is committed, where one of the two settings changed. A provider that
+    # is off holds nobody by its days (one this change turned off among them): the count is given when it is
+    # turned on again.
+    days_changed = any(field in outcome["changed"] for field in providers.WHAT_ITS_DAYS_HOLD)
+    held_now = _held_by_its_days_after(db, row, by=current_user, ip=api.get_client_ip(request),
+                                       held_before=held_before) if days_changed else []
+    newly_held = [(u.id, u.username, u.email) for u in held_now if u.id not in held_before]
     outcome = {**outcome, "turned_off": bool(turned_off), "sessions_ended": ended, "sessions_not_ended": standing,
-               "held": held, "owners_told": len(owners)}
+               "held": held, "owners_told": len(owners), "held_by_its_days": len(held_now),
+               "newly_held": len(newly_held)}
     label = row.label or row.name
+    # The people the change holds from this moment had no warning of it (the warning counts five days down to the
+    # days as they were): each is told now, in the app and by email, what stopped and what brings it back.
+    _tell_accounts(newly_held, f"Sign in through {label} to keep signing in here", (
+        f"An administrator changed how often {label} must have seen you. Your last sign-in through {label} is older "
+        f"than that: your password and passkeys do not sign you in to this vault until you have signed in through "
+        f"{label} again."))
     _tell_accounts(owners, f"{label} was pointed somewhere else", (
         f"An administrator changed where this vault finds {label}, a sign-in your account is linked to. Nobody signs "
         f"in through {label} until an administrator has tested it again and turned it on. If the sign-in you meet "
@@ -380,6 +418,10 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
                 else ".")
             if owners:
                 said += f" The {len(owners)} account(s) linked to it were told."
+        if newly_held:
+            said += (f" {len(newly_held)} more linked account(s) have not signed in through it within its days as "
+                     "they are now: their password and passkeys do not sign them in until they have. They were "
+                     f"told. {len(held_now)} account(s) are held so in all.")
         if turned_off:
             said += (" Its connection changed, so it was turned off until a test sign-in passes again"
                      + (f", and {ended} session(s) that came through it were ended." if ended else "."))

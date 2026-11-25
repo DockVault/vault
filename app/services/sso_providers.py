@@ -313,22 +313,34 @@ def days_ran_out(db, row, *, now=None) -> int:
     return count
 
 
-def due_at_turn_on(db, row, *, now=None) -> int:
-    """How many accounts linked to ``row`` (which is on) its days hold to a provider's sign-in right now: what an
-    administrator is told when a provider is turned on after a time in which nobody could sign in through it."""
+# The settings of a provider that say when its days hold an account to a sign-in through it.
+WHAT_ITS_DAYS_HOLD = ("policy.sso_freshness_days", "policy.sso_lapse_ends_sign_in")
+
+
+def held_by_its_days(db, row, *, now=None) -> list:
+    """The accounts linked to ``row`` (which is on) that its days hold to a provider's sign-in right now: their
+    last sign-in through it is older than its days, and their password and passkeys sign them in to nothing until
+    they have signed in through it again. Not the ones it refused: those are held by the refusal, whatever the
+    days are."""
     from datetime import datetime
     from app.core.models import ExternalIdentity, User
     from app.services import sso_freshness
     now = now or datetime.utcnow()
-    due = 0
+    held = []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
         standing = sso_freshness.deadline_of(identity, row)
         if standing is None or standing.refused or not sso_freshness.closes_now(standing, now):
             continue
         user = db.query(User).filter(User.id == identity.user_id).first()
         if user is not None and sso_freshness.closes_the_other_ways_in(db, user, standing):
-            due += 1
-    return due
+            held.append(user)
+    return held
+
+
+def due_at_turn_on(db, row, *, now=None) -> int:
+    """How many accounts linked to ``row`` (which is on) its days hold to a provider's sign-in right now: what an
+    administrator is told when a provider is turned on after a time in which nobody could sign in through it."""
+    return len(held_by_its_days(db, row, now=now))
 
 
 def fingerprint(row) -> str:
