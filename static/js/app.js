@@ -8420,13 +8420,23 @@ async function renderAccountPasskeys() {
             text.appendChild(_el('div', 'text-secondary text-xs', 'Added before this vault checked authenticator makes: '
                 + 'it signs you in, and does not prove a compliance action. Add it again to change that.'));
         }
-        if (key.provisional) {
+        // Confirmed only with something older on the account (the server says whether there is any): where there is
+        // nothing, as after a reset of the second factor, the key becomes ordinary on its day and no button is offered.
+        const confirmable = key.provisional && key.confirmable !== false;
+        if (confirmable) {
             text.appendChild(_el('div', 'text-warning text-xs', 'Waiting for your confirmation until '
                 + (_passkeyWhen(key.provisional_until) || 'its provisional period ends')
                 + ': an administrator changed your sign-in details recently.'));
+        } else if (key.provisional) {
+            const until = _passkeyWhen(key.provisional_until);
+            text.appendChild(_el('div', 'text-warning text-xs', (until
+                ? 'Provisional until ' + until + ': an administrator changed your sign-in details recently, and '
+                  + 'nothing older on your account can confirm it. It becomes ordinary on its own then.'
+                : 'Provisional: an administrator changed your sign-in details recently, and nothing older on your '
+                  + 'account can confirm it. It becomes ordinary on its own when its provisional period ends.')));
         }
         row.appendChild(text);
-        if (key.provisional) {
+        if (confirmable) {
             const confirm = _el('button', 'btn btn-secondary btn-sm', 'Confirm');
             confirm.setAttribute('aria-label', 'Confirm ' + (key.label || 'this passkey'));
             confirm.addEventListener('click', async () => {
@@ -8555,11 +8565,16 @@ async function _addPasskey({ confirmed = false } = {}) {
         const label = await showPrompt('A name for this passkey, so you can tell it apart (for example, this laptop).',
             'Name your passkey', { defaultValue: '' });
         try {
-            await apiRequest('/users/me/passkeys/register/verify', {
+            const r = await apiRequest('/users/me/passkeys/register/verify', {
                 method: 'POST', body: JSON.stringify({ challenge_id: start.challenge_id, credential, label: label || null })
             });
             _markPasskeyUsedHere();
-            showSuccess(start.provisional ? 'Passkey added. Confirm it with a factor you already had.' : 'Passkey added.');
+            // The key as the server stored it: provisional or not, and whether anything older can confirm it.
+            const added = (r && r.passkey) || r || {};
+            const until = _passkeyWhen(added.provisional_until);
+            showSuccess(!added.provisional ? 'Passkey added.'
+                : added.confirmable ? 'Passkey added. Confirm it with your authenticator app, a recovery code or an older passkey.'
+                : 'Passkey added. It is provisional ' + (until ? 'until ' + until : 'for now') + ', then becomes ordinary on its own.');
         } catch (e) { showError(e.message || 'The passkey was not added.'); }
         return;
     }

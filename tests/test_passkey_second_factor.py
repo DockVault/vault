@@ -334,10 +334,15 @@ def test_a_provisional_passkey_cannot_confirm_itself(monkeypatch):
     assert status == 200
     status, out = _call_h(h.S, "POST", f"/users/me/passkeys/{row.id}/confirm", None, {"X-Second-Factor": body["receipt"]})
     assert status == 200 and out["provisional"] is False and row.provisional_until is None
-    # Without a receipt: the step-up is asked, with the passkey among the methods.
+    # Without a receipt: the step-up is asked, with the passkey among the methods, where something older can vouch.
     other = _user("carol")
     h2 = Harness(monkeypatch, [other])
     _, prow = h2.enroll(other, provisional=True)
+    # With nothing older, no step-up could change the answer: refused at once, nothing asked.
+    status, out = _call_h(h2.S, "POST", f"/users/me/passkeys/{prow.id}/confirm")
+    assert status == 409 and "Nothing older can vouch for this passkey" in out["detail"], out
+    _, older2 = h2.enroll(other, label="old")
+    older2.created_at = prow.created_at - timedelta(days=30)
     status, out = _call_h(h2.S, "POST", f"/users/me/passkeys/{prow.id}/confirm")
     assert status == 403 and out["detail"]["reason"] == "step_up_required" and out["detail"]["methods"] == ["passkey"]
 

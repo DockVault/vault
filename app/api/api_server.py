@@ -12664,14 +12664,20 @@ async def passkey_register_verify(
     webauthn_settings.end_lifting(user)
     db.commit()
     shown = _passkey_public(db, row, now)
+    # Whether anything older on the account can confirm it: the page offers Confirm, and words its toast, by this.
+    shown["confirmable"] = bool(shown["provisional"]) and _passkey_vouchers(db, user.id, row, now)
     _passkey_audit(db, user, request, "passkey_registered",
                    {"passkey_id": str(row.id), "provisional": shown["provisional"]})
     named = f"the passkey \"{shown['label']}\"" if shown["label"] else "a passkey"
     change = f"You added {named} to your account."
     if shown["provisional"]:
+        # A confirmation is promised only where something older can give it: after a second-factor reset there is
+        # nothing, and the key becomes ordinary on its own on its day.
+        until = row.provisional_until.date().isoformat()
         change += (" It was added within 14 days after an administrator changed your sign-in details, so it is "
                    "provisional: it signs you in, but does not count for the actions that need your own factor "
-                   f"until you confirm it with an older factor or until {row.provisional_until.date().isoformat()}.")
+                   + (f"until you confirm it with an older factor or until {until}." if shown["confirmable"]
+                      else f"until {until}."))
     _passkey_notice(db, user, "A passkey was added to your account", change)
     if pending is not None:
         # Forced enrollment: the pipeline spends the pending login and finishes the sign-in with the new key as
@@ -12696,13 +12702,19 @@ async def list_my_passkeys(
     """The caller's own passkeys (never a retired one), oldest first, with the account's limit, whether passkeys are
     on here, the role's requirement with its grace (the profile shows the date), how the account proves adding
     one (``first_proof``, with the providers that can confirm it when that is the way), and, for an account that
-    signs in only through its provider, the sentence saying a passkey does not replace that."""
+    signs in only through its provider, the sentence saying a passkey does not replace that. Each key says whether
+    anything older on the account can confirm it (``confirmable``; false for a key that is not provisional)."""
     from app.core import sso_only, webauthn_settings
     _passkey_refuse_temp(current_user)
     now = datetime.utcnow()
     from app.core import public_url
     kind, providers = _passkey_first_proof_kind(db, current_user)
-    return {"passkeys": [_passkey_public(db, r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT,
+    shown = []
+    for r in _passkeys_of(db, current_user.id):
+        key = _passkey_public(db, r, now)
+        key["confirmable"] = bool(key["provisional"]) and _passkey_vouchers(db, current_user.id, r, now)
+        shown.append(key)
+    return {"passkeys": shown, "limit": PASSKEY_LIMIT,
             "require_user_verification": webauthn_settings.require_uv(),
             "attestation": webauthn_settings.attestation(), "origin": public_url.expected_origin() or None,
             "enabled": _passkeys_enabled(db),
@@ -12774,6 +12786,26 @@ def _authenticator_app_older_than(db, user_id, moment) -> bool:
     return since.replace(tzinfo=None) < moment.replace(tzinfo=None)
 
 
+def _passkey_vouchers(db, user_id, row, now) -> bool:
+    """Whether anything on the account can confirm the provisional passkey ``row``: the authenticator app in use,
+    set up before it (its recovery codes vouch as it does), or an ordinary passkey added before it that is a factor
+    now. The confirmation's own rule (confirm_my_passkey); a key that is no factor now (made at another address, of
+    an algorithm no longer accepted, or never having checked the person while the vault asks for that) proves no
+    step-up while it is none, so it confirms nothing until it is one again. Read by the list and the registration's
+    answer, so that the page offers Confirm only where it can work, and by the confirmation before it spends a
+    step-up."""
+    from app.core import webauthn_settings
+    if _authenticator_app_older_than(db, user_id, row.created_at):
+        return True
+    if row.created_at is None:
+        return False
+    here = webauthn_settings.address_now()
+    return any(k.id != row.id and k.created_at and k.created_at < row.created_at
+               and not (k.provisional_until and k.provisional_until > now)
+               and webauthn_settings.why_a_key_is_no_factor(db, k, now=now, here=here) is None
+               for k in _passkeys_of(db, user_id))
+
+
 @app.post("/users/me/passkeys/{passkey_id}/confirm")
 async def confirm_my_passkey(
     passkey_id: uuid.UUID,
@@ -12784,13 +12816,19 @@ async def confirm_my_passkey(
     """The owner confirms a provisional passkey, in a session that proved the account.second_factor step-up with
     a factor older than it (an authenticator app, a recovery code, or an older passkey): it becomes ordinary.
     The receipt says which factor vouched; the provisional key itself never does. Refused (409) when the
-    account holds nothing older to confirm it with."""
+    account holds nothing older to confirm it with: before the step-up is asked for or spent, since no proof can
+    change that answer."""
     from app.core import second_factor as sf
     _passkey_refuse_temp(current_user)
     row = _passkey_of(db, current_user.id, passkey_id)
     now = datetime.utcnow()
     if not (row.provisional_until and row.provisional_until > now):
         return _passkey_public(db, row, now)
+    if not _passkey_vouchers(db, current_user.id, row, now):
+        raise HTTPException(status_code=409, detail=(
+            "Nothing older can vouch for this passkey: your account has no authenticator app set up before it and "
+            "no earlier passkey that can be used here. It becomes ordinary on its own when its provisional period "
+            "ends."))
     req, has_active = _sf_requirement_for(db, current_user, "account.second_factor")
     if req["must_enroll"]:
         raise HTTPException(status_code=403, detail={
@@ -12806,10 +12844,6 @@ async def confirm_my_passkey(
              if k.id != row.id and k.created_at and k.created_at < row.created_at
              and not (k.provisional_until and k.provisional_until > now)]
     app_is_older = _authenticator_app_older_than(db, current_user.id, row.created_at)
-    if not app_is_older and not older:
-        raise HTTPException(status_code=409, detail=(
-            "Nothing older can vouch for this passkey: your account has no authenticator app set up before it and "
-            "no earlier passkey. It becomes ordinary on its own when its provisional period ends."))
     # Only a factor older than this key vouches: the authenticator app set up before it (or one of that app's
     # recovery codes), or an ordinary passkey registered before it. The key itself, another provisional key, an
     # authenticator app set up after the key, or an email code never does.
