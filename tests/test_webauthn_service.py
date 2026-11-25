@@ -308,3 +308,101 @@ def test_the_relying_party_comes_from_the_public_address(monkeypatch):
     for no_address in ("https://10.0.0.5", "http://vault.lan:8200", "*.example.com", ""):
         monkeypatch.setattr(config.settings, "allowed_hosts", no_address, raising=False)
         assert ws.relying_party("Acme Vault") is None, no_address
+
+
+def _made_certificates():
+    """Makes certificates for the path tests: (make(subject, issuer_key, issuer_name, **what), key())."""
+    import datetime as dt
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def name(text):
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, text)])
+
+    def make(subject, key, issuer=None, issuer_key=None, *, ca=None, path_length=None, usage=None,
+             since=-1, until=365):
+        builder = (x509.CertificateBuilder().subject_name(name(subject)).issuer_name(name(issuer or subject))
+                   .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                   .not_valid_before(now + dt.timedelta(days=since)).not_valid_after(now + dt.timedelta(days=until)))
+        if ca is not None:
+            builder = builder.add_extension(x509.BasicConstraints(ca=ca, path_length=path_length if ca else None),
+                                            critical=True)
+        if usage is not None:
+            builder = builder.add_extension(x509.KeyUsage(
+                digital_signature=True, content_commitment=False, key_encipherment=False, data_encipherment=False,
+                key_agreement=False, key_cert_sign=usage, crl_sign=False, encipher_only=False, decipher_only=False),
+                critical=True)
+        return builder.sign(issuer_key or key, hashes.SHA256()).public_bytes(serialization.Encoding.DER)
+    return make, lambda: ec.generate_private_key(ec.SECP256R1())
+
+
+def test_an_attestations_certificates_are_judged_as_a_path_to_an_anchor():
+    """Matched by the issuer's name alone, with only the signatures checked, any certificate under an anchor could
+    vouch for an attestation certificate its holder made up."""
+    ws = _svc()
+    make, key = _made_certificates()
+    root_key, mid_key, leaf_key, other_key = key(), key(), key(), key()
+    root = make("Vendor Root", root_key, ca=True)
+    mid = make("Vendor Issuing", mid_key, "Vendor Root", root_key, ca=True, path_length=0, usage=True)
+    leaf = make("Authenticator Attestation", leaf_key, "Vendor Issuing", mid_key, ca=False)
+    direct = make("Authenticator Attestation", leaf_key, "Vendor Root", root_key, ca=False)
+    assert ws.anchor_of([direct], [root]) == root
+    assert ws.anchor_of([leaf, mid], [root]) == root
+    # An ordinary certificate under the anchor, used to sign a made-up attestation certificate: no authority.
+    ordinary_key = key()
+    ordinary = make("attacker.example", ordinary_key, "Vendor Root", root_key, ca=False)
+    forged = make("Authenticator Attestation", key(), "attacker.example", ordinary_key, ca=False)
+    assert ws.anchor_of([forged, ordinary], [root]) is None
+    unmarked = make("attacker.example", ordinary_key, "Vendor Root", root_key)            # says nothing of itself
+    assert ws.anchor_of([forged, unmarked], [root]) is None
+    # An authority of the right name that did not sign the certificate below it.
+    stand_in = make("Vendor Issuing", other_key, "Vendor Root", root_key, ca=True, usage=True)
+    assert ws.anchor_of([leaf, stand_in], [root]) is None
+    # An authority that may not sign certificates, and one with more authorities below it than it allows.
+    no_signing = make("Vendor Issuing", mid_key, "Vendor Root", root_key, ca=True, usage=False)
+    assert ws.anchor_of([leaf, no_signing], [root]) is None
+    lower_key = key()
+    lower = make("Vendor Lower", lower_key, "Vendor Issuing", mid_key, ca=True)
+    deep = make("Authenticator Attestation", leaf_key, "Vendor Lower", lower_key, ca=False)
+    assert ws.anchor_of([deep, lower, mid], [root]) is None                              # mid allows none below it
+    roomy = make("Vendor Issuing", mid_key, "Vendor Root", root_key, ca=True, path_length=1, usage=True)
+    assert ws.anchor_of([deep, lower, roomy], [root]) == root
+    # Out of its validity period: the attestation certificate, an authority, the anchor.
+    assert ws.anchor_of([make("Authenticator Attestation", leaf_key, "Vendor Root", root_key, ca=False,
+                              since=-3700, until=-3620)], [root]) is None
+    assert ws.anchor_of([make("Authenticator Attestation", leaf_key, "Vendor Root", root_key, ca=False, since=1)],
+                        [root]) is None
+    old_mid = make("Vendor Issuing", mid_key, "Vendor Root", root_key, ca=True, since=-400, until=-1)
+    assert ws.anchor_of([leaf, old_mid], [root]) is None
+    old_root = make("Vendor Root", root_key, ca=True, since=-4000, until=-1)
+    assert ws.anchor_of([direct], [old_root]) is None
+    # An anchor of the same name and another key vouches for nothing; the right one after it is still found.
+    namesake = make("Vendor Root", other_key, ca=True)
+    assert ws.anchor_of([direct], [namesake]) is None
+    assert ws.anchor_of([direct], [namesake, b"not a certificate", root]) == root
+    # An anchor is the operator's word: an old root that carries no constraints is taken, one that says it is
+    # no authority is not.
+    bare_root = make("Vendor Root", root_key)
+    assert ws.anchor_of([direct], [bare_root]) == bare_root
+    assert ws.anchor_of([direct], [make("Vendor Root", root_key, ca=False)]) is None
+    # Nothing to anchor, and bytes that are no certificate.
+    assert ws.anchor_of([], [root]) is None and ws.anchor_of(None, [root]) is None
+    assert ws.anchor_of([b"junk"], [root]) is None and ws.anchor_of([direct], []) is None
+    # The verifier asks exactly this.
+    verifier = ws._AnchoredVerifier([root])
+    import types
+    assert verifier.ca_lookup(types.SimpleNamespace(trust_path=[leaf, mid]), None) == root
+    assert verifier.ca_lookup(types.SimpleNamespace(trust_path=[forged, ordinary]), None) is None
+    assert verifier.ca_lookup(types.SimpleNamespace(trust_path=[]), None) is None
+
+
+def test_the_roots_file_is_said_to_hold_only_vendors_attestation_roots():
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+    help_text = text[text.index("# Passkeys: the file of root certificates"):text.index("# WEBAUTHN_ATTESTATION_ROOTS=")]
+    assert "ONLY authenticator vendors' attestation roots" in help_text
+    assert "never" in help_text and "general-purpose certificate authority" in help_text
+    assert "within its validity period" in help_text

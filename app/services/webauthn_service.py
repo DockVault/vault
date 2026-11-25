@@ -131,15 +131,79 @@ class _AnchoredVerifier(AttestationVerifier):
         self._anchors = list(anchors)
 
     def ca_lookup(self, result, auth_data):
-        if not result.trust_path:
-            return None
-        from cryptography import x509
-        leaf = x509.load_der_x509_certificate(result.trust_path[-1])
-        for anchor_der in self._anchors:
-            anchor = x509.load_der_x509_certificate(anchor_der)
-            if leaf.issuer == anchor.subject:
-                return anchor_der
+        return anchor_of(result.trust_path, self._anchors)
+
+
+def anchor_of(trust_path: Sequence[bytes], anchors: Sequence[bytes], *, now=None) -> Optional[bytes]:
+    """The trust anchor the statement's certificates lead to as a valid path, or None.
+
+    ``trust_path`` is the statement's own list: the attestation certificate first, then whatever stands above
+    it. The path is judged as a path, and not only by a name that matches an anchor's:
+
+    * every certificate, the anchor too, is within its validity period;
+    * every certificate above the attestation certificate is a certificate authority (basic constraints with
+      ``cA`` set; where it states a key usage, signing certificates is among it), and so many authorities may
+      stand below it as its path length allows;
+    * each certificate is signed by the one above it, the topmost by the anchor;
+    * every anchor whose name matches is tried, not only the first.
+
+    Matched by name alone, and with only the signatures checked, any certificate under an anchor could vouch for
+    an attestation certificate its holder made up: an ordinary end-entity certificate from a general-purpose
+    authority in the bundle was enough to register any software key as any make of authenticator, attested and
+    device-bound.
+
+    An anchor is trusted because the operator put it in the bundle: one that carries no basic constraints (an
+    old root) is taken as it is, one that carries them must say it is an authority. Which makes of authenticator
+    an anchor may vouch for is not bound here: the bundle is to hold authenticator vendors' attestation roots
+    and nothing else."""
+    from datetime import datetime, timezone
+    from cryptography import x509
+    now = now or datetime.now(timezone.utc)
+    try:
+        path = [x509.load_der_x509_certificate(der) for der in trust_path or ()]
+    except Exception:  # noqa: BLE001 -- not a certificate: no path
         return None
+    if not path:
+        return None
+
+    def in_time(cert) -> bool:
+        return cert.not_valid_before_utc <= now <= cert.not_valid_after_utc
+
+    def an_authority(cert, below: int, *, required: bool) -> bool:
+        """``below``: how many authorities stand between it and the attestation certificate."""
+        try:
+            basic = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        except x509.ExtensionNotFound:
+            return not required
+        except Exception:  # noqa: BLE001 -- extensions that cannot be read
+            return False
+        if not basic.ca or (basic.path_length is not None and basic.path_length < below):
+            return False
+        try:
+            return bool(cert.extensions.get_extension_for_class(x509.KeyUsage).value.key_cert_sign)
+        except x509.ExtensionNotFound:
+            return True
+
+    def signed_by(cert, issuer) -> bool:
+        try:
+            cert.verify_directly_issued_by(issuer)
+        except Exception:  # noqa: BLE001 -- another name, another key, a signature that does not verify
+            return False
+        return True
+
+    if not all(in_time(cert) for cert in path):
+        return None
+    for i in range(1, len(path)):
+        if not an_authority(path[i], i - 1, required=True) or not signed_by(path[i - 1], path[i]):
+            return None
+    for anchor_der in anchors:
+        try:
+            anchor = x509.load_der_x509_certificate(anchor_der)
+        except Exception:  # noqa: BLE001
+            continue
+        if in_time(anchor) and an_authority(anchor, len(path) - 1, required=False) and signed_by(path[-1], anchor):
+            return anchor_der
+    return None
 
 
 def _server(rp: RelyingParty, policy: PasskeyPolicy) -> Fido2Server:
