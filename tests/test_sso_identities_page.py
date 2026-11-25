@@ -25,8 +25,8 @@ def _t(value):
     return value.isoformat() + "Z"
 
 
-def _world(monkeypatch, *, state="enabled"):
-    p = _provider(state=state, policy=dict(POLICY), created_at=None, updated_at=None)
+def _world(monkeypatch, *, state="enabled", policy=None):
+    p = _provider(state=state, policy=dict(policy or POLICY), created_at=None, updated_at=None)
     q = _provider(name="fabrikam", label="Fabrikam", policy=dict(POLICY), created_at=None, updated_at=None)
     alice, bob, carol, dave = _user("alice"), _user("Bob"), _user("carol"), _user("dave")
     erin = _user("erin", role="admin")
@@ -164,6 +164,47 @@ def test_a_hold_written_when_the_provider_was_turned_off_is_listed_with_its_date
     # Lifted: the days still count as they stand, but while the provider is off they close no password.
     assert rows["Bob"]["state"] == "lapsed" and rows["Bob"]["refused_at"] is None
     assert rows["Bob"]["holds_sign_in"] is False
+
+
+@pytest.mark.parametrize("ends_sign_in", [True, False], ids=["days end sign-in", "days pause keys only"])
+@pytest.mark.parametrize("how", ["on", "off from the start", "turned off"])
+def test_where_each_account_stands_is_what_the_sign_in_and_the_keys_hold_it_to(monkeypatch, ends_sign_in, how):
+    """The page says what the vault enforces: an account is shown refused or lapsed exactly when its keys are paused
+    for this provider (sso_freshness.lapsed), and its password and passkeys are said not to sign it in exactly when
+    the sign-in holds it to this provider (sso_freshness.held_to_a_provider). The provider's own switch decides the
+    second: with "missed days end sign-in" off, a refused or lapsed account still signs in with its password."""
+    from app.services import sso_freshness
+    w = _world(monkeypatch, state="disabled" if how == "off from the start" else "enabled",
+               policy={"sso_freshness_days": 30, "sso_lapse_ends_sign_in": ends_sign_in})
+    if how == "turned off":
+        status, out = w.h.call("POST", f"/admin/sso/providers/{w.p.id}/state", {"state": "disabled"})
+        assert status == 200 and out["held"] == 2, out
+    rows = _list(w.h, w.p.id)[1]["identities"]
+    users = {str(u.id): u for u in (w.alice, w.bob, w.carol, w.dave, w.erin)}
+    for row in rows:
+        user = users[row["user_id"]]
+        missed = sso_freshness.lapsed(w.h.db, user.id)
+        held = sso_freshness.held_to_a_provider(w.h.db, user)
+        assert (row["state"] != "linked") == (missed is not None and missed.provider_id == str(w.p.id)), row
+        assert row["holds_sign_in"] == (held is not None and held.provider_id == str(w.p.id)), row
+    by_name = {r["username"]: r for r in rows}
+    assert by_name["carol"]["state"] == "refused" and by_name["Bob"]["state"] != "linked"
+    assert by_name["carol"]["holds_sign_in"] is ends_sign_in
+    assert by_name["Bob"]["holds_sign_in"] is (ends_sign_in and how != "off from the start")
+    assert by_name["erin"]["holds_sign_in"] is False                # an administrator keeps the password
+
+
+def test_a_refusal_on_a_provider_that_counts_no_days_has_no_date_for_its_days(monkeypatch):
+    """With the days at 0 only a refusal holds anybody, and its deadline is the refusal itself: the page gives the
+    refusal's date, and no date for days that are not counted."""
+    w = _world(monkeypatch, policy={"sso_freshness_days": 0, "sso_lapse_ends_sign_in": True})
+    status, out = _list(w.h, w.p.id)
+    assert status == 200 and out["counts"] == {"linked": 4, "refused": 1, "lapsed": 0}
+    rows = {r["username"]: r for r in out["identities"]}
+    carol = rows["carol"]
+    assert carol["state"] == "refused" and carol["refused_at"] == _t(w.refused.refused_at)
+    assert carol["due_at"] is None and carol["holds_sign_in"] is True
+    assert all(r["due_at"] is None and r["state"] == "linked" for name, r in rows.items() if name != "carol")
 
 
 def _refused_for(monkeypatch, w, user):
