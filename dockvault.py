@@ -3530,7 +3530,29 @@ def env_upgrade_notes(env, current, target):
                 "Other accounts' automatic locks still last until cleared, and so does a lock with no end "
                 "that a release before 0.33.0 armed, which is recorded like one an administrator set. "
                 "From the host, python dockvault.py accounts --action unlock clears any account's locks.")
+    if crosses((0, 36, 0)):
+        said = sign_in_address_note(env.get("ALLOWED_HOSTS"))
+        if said is not None:
+            notes.append("ALLOWED_HOSTS in .env: from 0.36.0, " + said)
+        locked = settings_locked_tokens(env.get("SETTINGS_LOCKED_KEYS"))
+        if "*" in locked or "webauthn" in locked:
+            notes.append(
+                "SETTINGS_LOCKED_KEYS in .env locks the passkey settings 0.36.0 adds (the group webauthn): they "
+                "take the WEBAUTHN_* values in .env, the defaults where none is set (passkeys an option, a passkey "
+                "alone signing users and external accounts in), and no administrator can change them until the "
+                "lock stops naming them.")
+        if "*" in locked or "sso" in locked:
+            notes.append(
+                "SETTINGS_LOCKED_KEYS in .env locks the single sign-on providers 0.36.0 adds (the group sso): no "
+                "provider can be added in Settings until the lock stops naming them.")
     return notes
+
+
+def settings_locked_tokens(raw):
+    """SETTINGS_LOCKED_KEYS as the server reads it (app/core/settings_registry.locked_tokens): the keys and groups
+    it names, in lower case, split at commas, semicolons and spaces (``*`` for all). Pure."""
+    text = str(raw or "").strip().strip("'\"")
+    return frozenset(t.strip().lower() for t in text.replace(";", ",").replace(" ", ",").split(",") if t.strip())
 
 
 # Where Docker puts compose networks by default (its default address pools), for when the deployment's
@@ -5518,17 +5540,27 @@ class DockVault:
             print(pal.paint("  (containers not listed while .env is locked - unlock first)", "yellow"))
             return
         env = self._load_env()
-        passkey_note = sign_in_address_note(env.get("ALLOWED_HOSTS")) if env else None
-        if passkey_note:
-            print(pal.paint("  Passkeys: hidden - %s" % passkey_note, "yellow"))
-        if env:
-            elsewhere = passkeys_elsewhere_note(self._passkey_addresses(), passkey_host(env.get("ALLOWED_HOSTS")))
-            if elsewhere:
-                print(pal.paint("  Passkeys: %s" % elsewhere, "yellow"))
+        self._print_sign_in_lines(env)
         try:
             self._run_dc("ps", capture=False, timeout=30)
         except (OSError, subprocess.SubprocessError):
             print(pal.paint("  (could not list containers)", "yellow"))
+
+    def _print_sign_in_lines(self, env):
+        """What `status` says about signing in at this deployment, and a healthy update says after it: only the lines
+        that say something needs doing (an address no passkey can be made at, passkeys made at another address).
+        ``env`` is the parsed .env; with none, nothing is said. The running deployment is asked for a warning only,
+        so nothing here fails the command that prints it."""
+        if not env:
+            return
+        pal = self.pal
+        allowed = env.get("ALLOWED_HOSTS")
+        passkey_note = sign_in_address_note(allowed)
+        if passkey_note:
+            print(pal.paint("  Passkeys: hidden - %s" % passkey_note, "yellow"))
+        elsewhere = passkeys_elsewhere_note(self._passkey_addresses(), passkey_host(allowed))
+        if elsewhere:
+            print(pal.paint("  Passkeys: %s" % elsewhere, "yellow"))
 
     def setup(self, args=None):
         """Configure + start the standalone HTTPS vault: author (or reuse) .env, provision a TLS
@@ -8837,6 +8869,8 @@ class DockVault:
         healthy = self._wait_secure_healthy(self._load_env().get("COMPOSE_PROFILES", "combined"))
         print(pal.paint("\n  Update to %s: %s.\n" % (tag, "healthy" if healthy else "NOT healthy - check the logs"),
                         "green" if healthy else "red"))
+        if healthy:
+            self._print_sign_in_lines(self._load_env())
 
     def _offer_chain_key(self, args, interactive, target):
         """Before a release with the audit log's integrity chain first starts: a chain key of its own. Without
