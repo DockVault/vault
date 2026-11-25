@@ -831,7 +831,9 @@ all live at the root.
   server-side per request, and a vault password only controls who may open one. **Zero-knowledge** vaults keep
   the key in the browser, so the server never sees plaintext.
 - **Transport:** run it behind TLS — a reverse proxy, or the included HTTPS deployment
-  script. SFTP uses SSH host keys.
+  script. SFTP uses SSH host keys, and agrees its session keys with the hybrid post-quantum exchange
+  `mlkem768x25519-sha256` (ML-KEM-768 with X25519) whenever the client offers it;
+  `SFTP_KEX_POLICY=pq-required` refuses clients that do not (see `.env.example`).
 - **Container hardening:** runs as a non-root user on a read-only root filesystem with no
   new privileges; login throttling and account lockout are built in.
 - **Secrets:** all keys and passwords come from `.env`. Use fresh encryption/JWT keys per deployment.

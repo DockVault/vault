@@ -79,3 +79,18 @@ def test_the_checklist_says_a_passkey_can_meet_a_compliance_step_up():
     assert ("an authenticator code, a recovery code or a passkey that verified the person (for an auditor who is not "
             "an administrator, only a passkey their auditor right was approved or last reconfirmed with)") in checklist
     assert "an authenticator or recovery code" not in checklist
+
+
+def test_the_guide_and_the_readme_say_how_sftp_agrees_its_keys():
+    """SFTP agrees the keys of a connection with the hybrid post-quantum exchange where the client offers it, and
+    SFTP_KEX_POLICY=pq-required refuses the clients that do not; the container log names each connection that
+    agreed a classical one (app/sftp/sftp_server.py), which is how an operator finds who would be refused."""
+    from app.sftp import kex_policy
+    guide = _flat(_guide())
+    readme = _flat((ROOT / "README.md").read_text(encoding="utf-8"))
+    for text in (guide, readme):
+        assert "SFTP_KEX_POLICY" in text
+    assert kex_policy.HYBRID in readme and "`SFTP_KEX_POLICY=pq-required` refuses clients that do not" in readme
+    assert kex_policy.PREFERRED == "pq-preferred" and "`SFTP_KEX_POLICY=pq-preferred`, the default" in guide
+    assert "kex.agreed.classical" in guide
+    assert "in the one-container shape the whole vault stops with it" in guide
