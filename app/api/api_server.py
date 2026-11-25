@@ -12066,6 +12066,7 @@ _PASSKEY_REFUSALS = {
     "attestation_unverifiable": "The authenticator's attestation could not be verified.",
     "authenticator_not_allowed": "This make of authenticator is not allowed here.",
     "malformed": "The browser's answer could not be read. Try again.",
+    "key_too_short": "This authenticator made a key too short for this vault to accept. Use another authenticator.",
     "cross_origin": "The vault was opened inside another site's page. Open it at its own address and try again.",
 }
 

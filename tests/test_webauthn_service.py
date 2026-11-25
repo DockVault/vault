@@ -585,3 +585,44 @@ def test_the_person_is_told_what_to_do_about_a_framed_registration():
     import app.api.api_server as S
     assert S._PASSKEY_REFUSALS["cross_origin"] == (
         "The vault was opened inside another site's page. Open it at its own address and try again.")
+
+
+@pytest.mark.parametrize("bits, taken", [(1024, False), (2047, False), (2048, True), (3072, True)])
+def test_a_passkey_with_an_rsa_key_too_short_to_trust_is_refused(bits, taken):
+    """A badly built authenticator makes an RS256 key of 1024 bits. Its algorithm is allowed, and nothing asked
+    its size: it registered and signed in, for a role whose passkey is the whole sign-in, while a provider's key
+    of that size verifies nothing. It is refused when it is registered, and a stored one at every use."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from fido2 import cbor
+    from fido2.cose import CoseKey
+    ws = _svc()
+    auth = SoftAuthenticator(RS256)
+    auth._priv = rsa.generate_private_key(public_exponent=65537, key_size=bits)
+    auth.cose_public_key = CoseKey.for_alg(RS256).from_cryptography_key(auth._priv.public_key())
+    assert ws.rsa_key_bits(auth.cose_public_key) == bits and ws.RSA_KEY_MIN_BITS == 2048
+    if taken:
+        registered, _, _ = _register(ws, auth)
+        assert _assert(ws, auth, _key(ws, registered)) is not None
+        return
+    with pytest.raises(ws.Refused) as refused:
+        _register(ws, auth)
+    assert refused.value.code == "key_too_short" and str(bits) in str(refused.value)
+    # One that is stored (from before the size was asked) is refused when it is used.
+    long_enough = SoftAuthenticator(RS256)
+    registered, _, _ = _register(ws, long_enough)
+    stored = ws.KnownKey(credential_id=auth.credential_id, public_key_cose=cbor.encode(dict(auth.cose_public_key)),
+                         cose_alg=RS256, sign_count=0, backup_eligible=registered.backup_eligible,
+                         user_id=USER_ID.bytes, transports=registered.transports)
+    with pytest.raises(ws.Refused) as refused:
+        _assert(ws, auth, stored)
+    assert refused.value.code == "key_too_short"
+
+
+def test_only_an_rsa_key_has_its_size_asked():
+    ws = _svc()
+    assert ws.rsa_key_bits(SoftAuthenticator(ES256).cose_public_key) is None
+    assert ws.rsa_key_bits(SoftAuthenticator(EDDSA).cose_public_key) is None
+    assert ws.rsa_key_bits({1: 3}) == 0 and ws.rsa_key_bits({1: 3, -1: "no bytes"}) == 0
+    ws._refuse_a_short_rsa_key(SoftAuthenticator(ES256).cose_public_key)
+    with pytest.raises(ws.Refused):
+        ws._refuse_a_short_rsa_key({1: 3})

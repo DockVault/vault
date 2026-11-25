@@ -295,6 +295,7 @@ def verify_registration(rp: RelyingParty, policy: PasskeyPolicy, *, challenge: b
     alg = cred.public_key.ALGORITHM
     if alg not in policy.allowed_algs:
         raise Refused("algorithm_not_allowed", ALG_NAMES.get(alg, str(alg)))
+    _refuse_a_short_rsa_key(cred.public_key)
     if any(cred.credential_id == known for known in existing_ids):
         raise Refused("already_registered")
     aaguid = _aaguid(cred.aaguid)
@@ -360,9 +361,11 @@ def verify_authentication(rp: RelyingParty, policy: PasskeyPolicy, *, challenge:
     if asserted_id != key.credential_id:
         raise Refused("credential_mismatch")
     try:
-        stored = AttestedCredentialData.create(b"\x00" * 16, key.credential_id, _cose(key.public_key_cose))
+        stored_key = _cose(key.public_key_cose)
+        stored = AttestedCredentialData.create(b"\x00" * 16, key.credential_id, stored_key)
     except Exception as exc:  # noqa: BLE001 -- a stored key the library cannot read is a refusal, not a 500
         raise Refused("stored_key_unreadable", type(exc).__name__) from exc
+    _refuse_a_short_rsa_key(stored_key)
     server = _server(rp, policy)
     try:
         server.authenticate_complete(_state(challenge, policy), [stored], credential)
@@ -424,6 +427,31 @@ def _refuse_a_ceremony_in_a_frame(rp: RelyingParty, credential: dict) -> None:
     top = data.get("topOrigin")
     if top is not None and top != rp.origin:
         raise Refused("cross_origin", "another site's page on top")
+
+
+RSA_KEY_MIN_BITS = 2048             # an RSA passkey under this is refused, as a provider's signing key is
+
+
+def rsa_key_bits(cose_key) -> Optional[int]:
+    """The size in bits of the RSA public key ``cose_key`` holds (its modulus: member -1 of a key of type 3), or
+    None for a key that is no RSA key. A key of that type whose modulus cannot be read has no bits."""
+    try:
+        if cose_key.get(1) != 3:
+            return None
+        return int.from_bytes(bytes(cose_key.get(-1)), "big").bit_length()
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _refuse_a_short_rsa_key(cose_key) -> None:
+    """An RS256 passkey whose RSA key is shorter than :data:`RSA_KEY_MIN_BITS` is refused, when it is registered
+    and at every use of one that is stored. The checks asked only whether the algorithm is allowed, and the
+    library's RS256 has no floor: a badly built authenticator's 512-bit key registered and signed in, while a
+    provider's key of that size verifies nothing. For a role that signs in with a passkey alone that key is the
+    whole sign-in, and whoever reads a copy of the table can factor it."""
+    bits = rsa_key_bits(cose_key)
+    if bits is not None and bits < RSA_KEY_MIN_BITS:
+        raise Refused("key_too_short", f"an RSA key of {bits} bits")
 
 
 def _refuse_backed_up_but_not_eligible(flags) -> None:
