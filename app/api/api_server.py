@@ -255,6 +255,30 @@ async def _http_exception_handler(request: StarletteRequest, exc: StarletteHTTPE
     return await fastapi_http_exception_handler(request, exc)
 
 
+LOCK_WAIT_RAN_OUT = "55P03"          # PostgreSQL's lock_not_available
+BUSY_TRY_AGAIN = "The vault is busy with this right now. Try again in a moment."
+
+
+async def _lock_wait_ran_out_handler(request: StarletteRequest, exc: Exception):
+    """A statement that waited for a lock longer than a request waits (the connection's lock_timeout, or a
+    shorter wait a path set for itself) and was caught by nothing was answered 500: "Stay signed in", an
+    administrator's change of an account's sign-in details, whatever takes an account's turn at its sessions
+    while a change that settles many accounts holds it. The statement failed and wrote nothing, and the request's
+    transaction ends with the request, so the answer is the busy one: 503 with the wait, which a client tries
+    again. The log has the route, never the statement. Any other database error is not this handler's: raised
+    again, it is the 500 it was."""
+    if getattr(getattr(exc, "orig", None), "pgcode", None) != LOCK_WAIT_RAN_OUT:
+        raise exc
+    from app.core import sign_in_lockout
+    print(f"⚠ busy: a lock was held for longer than a request waits ({request.method} {request.url.path})")
+    return JSONResponse(status_code=503, content={"detail": BUSY_TRY_AGAIN},
+                        headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)})
+
+
+from sqlalchemy.exc import OperationalError as _OperationalError  # noqa: E402
+app.add_exception_handler(_OperationalError, _lock_wait_ran_out_handler)
+
+
 # A refusal on a key-proof path renders as {"detail": <sentence>, "reason": <slug>}, never a 401 and never
 # with a word the web app acts on (see app/services/zk_key_proof.py).
 from app.services.zk_key_proof import KeyProofRefusal as _KeyProofRefusal, refusal_handler as _key_proof_refusal_handler  # noqa: E402
