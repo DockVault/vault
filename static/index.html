@@ -134,8 +134,9 @@
                         <!-- Shown by app.js when the vault offers passkeys (/auth/policy) and this browser can use them. -->
                         <button type="button" id="passkey-sign-in-btn" class="btn btn-secondary btn-block mt-sm" style="display: none;">Sign in with a passkey</button>
                         <p id="login-origin-note" class="text-secondary text-sm mt-sm" role="note" hidden></p>
-                        <!-- One button for each single sign-on provider the vault offers (/auth/policy), added by sso.js. -->
-                        <div id="sso-sign-in" style="display: none;"></div>
+                        <!-- One button for each single sign-on provider the vault offers (/auth/policy), added by sso.js
+                             under a heading that names the group. -->
+                        <div id="sso-sign-in" role="group" aria-labelledby="sso-sign-in-heading" style="display: none;"></div>
                     </form>
                     
                     <div id="login-error" class="alert alert-error mt-md" style="display: none;"></div>

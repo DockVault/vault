@@ -175,3 +175,41 @@ await _ssoOnSignInScreen(arrive('#sso-error=no_account'));
 out(note());
 """, reasons)
     assert got == {"text": said, "shown": True}
+
+
+TWO = [{"id": "11111111-1111-4111-8111-111111111111", "label": "Company sign-in", "kind": "oidc", "icon": "microsoft",
+        "order": 1},
+       {"id": "22222222-2222-4222-8222-222222222222", "label": "Contractors", "kind": "oidc", "icon": "generic",
+        "order": 2}]
+
+
+def test_the_provider_buttons_stand_under_a_heading_that_names_the_group():
+    """The buttons carry the administrator's name for each provider and no verb: a heading before them says what they
+    do, and names the group they form for a screen reader (index.html's role and aria-labelledby). With no provider
+    the box, and its heading, are not shown."""
+    got = _node(r"""
+_initSsoSignIn({ methods: { providers: PROVIDERS } });
+const kids = ssoBox.children.map((c) => [c.localName, c.id, c.textContent, c.className]);
+const heading = document.getElementById('sso-sign-in-heading');
+const buttons = ssoBox.querySelectorAll('button').map((b) => b.textContent);
+const shown = ssoBox.style.display !== 'none';
+_initSsoSignIn({ methods: { providers: [] } });
+out({ kids, heading: heading && heading.textContent, buttons, shown,
+      after: { shown: ssoBox.style.display !== 'none', heading: document.getElementById('sso-sign-in-heading') === null,
+               children: ssoBox.children.length } });
+""".replace("PROVIDERS", json.dumps(TWO)))
+    assert got["shown"] is True and got["heading"] == "Sign in with your organisation"
+    assert got["kids"][0][:3] == ["p", "sso-sign-in-heading", "Sign in with your organisation"]
+    assert "sso-sign-in-heading" in got["kids"][0][3].split()
+    assert got["buttons"] == ["Company sign-in", "Contractors"]
+    assert [k[0] for k in got["kids"]] == ["p", "button", "button"]          # the heading first, then the buttons
+    assert got["after"] == {"shown": False, "heading": True, "children": 0}
+    html = INDEX.read_text(encoding="utf-8")
+    box = re.search(r'<div id="sso-sign-in"[^>]*>', html).group(0)
+    assert 'role="group"' in box and 'aria-labelledby="sso-sign-in-heading"' in box, box
+    # The divider beside the heading is drawn in the colour every skin gives its hairlines.
+    css = (ROOT / "static" / "css" / "components.css").read_text(encoding="utf-8")
+    rule = re.search(r"\.sso-sign-in-heading::before, \.sso-sign-in-heading::after \{([^}]*)\}", css)
+    assert rule and "border-top: 1px solid var(--surface-3)" in rule.group(1), rule
+    for skin in ("theme.css", "ui-v2.css"):
+        assert "--surface-3:" in (ROOT / "static" / "css" / skin).read_text(encoding="utf-8"), skin

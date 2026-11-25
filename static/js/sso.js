@@ -157,13 +157,19 @@
     }
 
     // The provider buttons, from /auth/policy's methods.providers: [{id, label, kind, icon, order}], in the order
-    // given. `onError(message)` shows what a start that failed said.
+    // given, under a heading that says what they do (a button carries the provider's name alone) and names the
+    // group for a screen reader (the box's aria-labelledby). `onError(message)` shows what a start that failed said.
     function renderButtons(providers, onError) {
         const box = document.getElementById('sso-sign-in');
         if (!box) return;
         const list = Array.isArray(providers) ? providers.filter((p) => p && typeof p.id === 'string' && p.id) : [];
         box.replaceChildren();
         box.style.display = list.length ? '' : 'none';
+        if (list.length) {
+            const heading = _el('p', 'sso-sign-in-heading text-secondary text-sm mt-md', 'Sign in with your organisation');
+            heading.id = 'sso-sign-in-heading';
+            box.appendChild(heading);
+        }
         list.forEach((provider) => {
             const button = _el('button', 'btn btn-secondary btn-block mt-sm sso-sign-in-btn',
                 typeof provider.label === 'string' && provider.label ? provider.label : 'Single sign-on');
