@@ -296,7 +296,13 @@ def test_the_readme_names_the_line_tags_and_separates_end_of_life_from_support()
     readme = _public("README.md")
     assert "The newest release of each\nrelease line is also `:vX.Y`" in readme
     assert "(plus `:latest`)" not in readme
-    assert "End-of-life is not the end of security support." in readme
+    # The policy calls a line end-of-life once its support ends; the matrix's mark of that name is another thing,
+    # which such a line's releases do not get by that alone.
+    flat = " ".join(readme.split())
+    assert "The matrix's end-of-life mark is not the end of security support." in flat
+    assert "[`.github/SECURITY.md`](.github/SECURITY.md); it calls a line end-of-life once its support ends." in flat
+    assert "whose period has ended keeps `eol: false` all the same" in flat
+    assert "End-of-life is not the end of security support." not in flat
     assert "](.github/SECURITY.md)" in readme
     assert "](docs/guides/maintenance-releases.md)" in readme
 

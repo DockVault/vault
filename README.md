@@ -607,16 +607,17 @@ one, and warns before moving to a version with known unpatched vulnerabilities. 
 called supported only while its line is supported, as `.github/SECURITY.md` defines support; one on a
 line that is not says so.
 
-End-of-life is not the end of security support. It marks the releases an install can no longer move
-to in place; an install on one can still upgrade to a supported release (see below). Which release
-lines are supported, and until when, is stated in [`.github/SECURITY.md`](.github/SECURITY.md). From
+The matrix's end-of-life mark is not the end of security support. It marks the releases an install
+can no longer move to in place; an install on one can still upgrade to a supported release (see
+below). Which release lines are supported, and until when, is stated in
+[`.github/SECURITY.md`](.github/SECURITY.md); it calls a line end-of-life once its support ends. From
 0.36.0 on, only the newest line receives security fixes, and when the next minor release ships, the
 line before it has 30 more days to upgrade. The matrix states the same in its top-level `lines` map:
 each line from 0.33 on with the last day it is supported (`security_fixes_until`), null for the
 newest line, whose end is not known until the next minor release ships. The validator checks each
 date against that promise, and requires a mitigation on an advisory that leaves the newest release
 of a line affected while the line is supported. A release of a line from 0.33 on whose period has
-ended is not marked end-of-life by that alone, so a move within its line, or back to it, still
+ended keeps `eol: false` all the same, so a move within its line, or back to it, still
 works; it is marked not secure as soon as an advisory affects it. Where `.github/SECURITY.md`
 promises a fix to a line that is no longer the newest,
 [`docs/guides/maintenance-releases.md`](docs/guides/maintenance-releases.md) describes how it is
