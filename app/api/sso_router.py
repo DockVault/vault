@@ -1592,13 +1592,19 @@ def _tell_owner(db, user, row, title: str, change: str, *, advice: Optional[str]
     try:
         if advice is None:
             advice = owners_advice(user, removed=removed)
-        api._notify_users([str(user.id)], "account_changed", title=title, body=f"{change} {advice}", target="#profile")
+    except Exception as exc:  # noqa: BLE001 -- told without the advice rather than not at all
+        log.info("sso owner advice skipped: %s", type(exc).__name__)
+        advice = ""
+    # The email says what the notice says: the change, and what to do about it.
+    said = f"{change} {advice}".strip()
+    try:
+        api._notify_users([str(user.id)], "account_changed", title=title, body=said, target="#profile")
     except Exception as exc:  # noqa: BLE001
         log.info("sso owner notice skipped: %s", type(exc).__name__)
     try:
         if (user.email or "").strip():
             api._fire_action_email(db, "sign_in_method_changed", email=user.email, username=user.username,
-                                   action_context={"change": change, "when": api._change_time_text()})
+                                   action_context={"change": said, "when": api._change_time_text()})
     except Exception as exc:  # noqa: BLE001
         log.info("sso owner email skipped: %s", type(exc).__name__)
 

@@ -564,10 +564,11 @@ def test_the_owner_is_advised_by_who_made_the_change(monkeypatch):
     by an account that has one anybody can type. One an administrator made ends with the advice for that: the
     owner did not do it, and has nothing to remove."""
     from app.api import sso_router
-    said = []
+    said, mailed = [], []
     api = types.SimpleNamespace(
         _notify_users=lambda ids, kind, title, body, target: said.append(body),
-        _fire_action_email=lambda *a, **k: None, _change_time_text=lambda: "now")
+        _fire_action_email=lambda db, key, **k: mailed.append(k["action_context"]["change"]),
+        _change_time_text=lambda: "now")
     monkeypatch.setattr(sso_router, "_api", lambda: api)
     alice = _user()
     sso_router._tell_owner(None, alice, None, "t", "You unlinked your account from Contoso.", removed=True)
@@ -583,6 +584,7 @@ def test_the_owner_is_advised_by_who_made_the_change(monkeypatch):
                     "root unlinked your account from Contoso. If you did not expect this, ask an administrator.",
                     "You linked Contoso. If you did not do this, tell an administrator at once.",
                     "You unlinked your account from Contoso. If you did not do this, tell an administrator at once."]
+    assert mailed == said                       # the email carries the same advice as the notice
 
 
 def test_the_owners_unlink_waits_a_short_time_for_the_accounts_turn_and_is_answered_as_busy(monkeypatch):

@@ -486,6 +486,7 @@ def test_the_owner_is_advised_by_what_was_done_and_by_whether_the_account_has_a_
     removed = h.notices[-1]["body"]
     assert removed.endswith("If you did not do this, change your password and tell an administrator at once.")
     assert "remove what you do not recognize" not in removed
+    assert h.emails[-1]["context"]["change"] == removed            # the email carries the same advice
     provider_only = _user("bob", sso_only=True)
     h.S._passkey_notice(h.db, provider_only, "A passkey was added to your account",
                         "You added a passkey to your account.")

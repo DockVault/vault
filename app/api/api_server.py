@@ -12453,14 +12453,19 @@ def _passkey_notice(db, user, title: str, change: str, *, removed: bool = False,
     whether the account has a password anybody can type (sso_router.owners_advice). Best-effort, after the commit."""
     try:
         from app.api import sso_router as sso_routes
-        advice = sso_routes.owners_advice(user, removed=removed, undo=undo)
-        _notify_users([str(user.id)], "account_changed", title=title, body=f"{change} {advice}", target="#profile")
+        said = f"{change} {sso_routes.owners_advice(user, removed=removed, undo=undo)}"
+    except Exception as e:      # noqa: BLE001 -- told without the advice rather than not at all
+        print(f"⚠ passkey notice advice skipped: {type(e).__name__}")
+        said = change
+    try:
+        _notify_users([str(user.id)], "account_changed", title=title, body=said, target="#profile")
     except Exception as e:      # noqa: BLE001
         print(f"⚠ passkey notice skipped: {type(e).__name__}")
     try:
         if (user.email or "").strip():
+            # The email says what the notice says: the change, and what to do about it.
             _fire_action_email(db, "sign_in_method_changed", email=user.email, username=user.username,
-                               action_context={"change": change, "when": _change_time_text()})
+                               action_context={"change": said, "when": _change_time_text()})
     except Exception as e:      # noqa: BLE001
         print(f"⚠ passkey email skipped: {type(e).__name__}")
 
@@ -30119,12 +30124,13 @@ def _settle_privileged_provider_only_accounts():
             if not restored:
                 return
             from app.api import sso_providers_router as providers_router
-            # Told how to set one in the words that hold on this vault, read from its settings here.
+            # Told how to set one in the words that hold on this vault, read from its settings here. The vault made
+            # this change itself at its start, so the notice carries no advice to ask whoever made it.
             providers_router._tell_how_to_set_a_password(
                 db, [(user_id, username, email) for user_id, username, email, _what in restored],
                 "Your account may hold a password again",
                 lambda set_one: "Your account signed in only through your organisation's sign-in, and it is one "
-                                "that always keeps a password of its own. " + set_one)
+                                "that always keeps a password of its own. " + set_one, advice="")
         names = ", ".join(sorted(username for _id, username, _email, _what in restored))
         providers_router._tell_administrators(
             "the vault", "Accounts were given their password sign-in back",

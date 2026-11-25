@@ -354,8 +354,18 @@ def test_the_sign_in_method_email_is_described_by_everything_it_is_sent_for():
     provider. A description that names only the first hides the others from the one who edits its template."""
     described = ea.SPEC_BY_KEY["sign_in_method_changed"]["description"]
     for sent_for in ("a passkey is added to or removed from", "an authenticator app is set up",
-                     "single sign-on provider", "an identity linked or unlinked"):
+                     "single sign-on provider", "an identity linked or unlinked",
+                     "an administrator changes a single sign-on provider", "at start-up"):
         assert sent_for in described, sent_for
+
+
+def test_the_sign_in_method_email_carries_the_advice_of_each_change_and_none_of_its_own():
+    """What to do about the change differs: the owner who did not make it, an administrator's change, the vault's
+    own, an account with no password anybody can type. The advice comes with the change ({{action.change}}); a
+    fixed paragraph told every one of them to change a password."""
+    body = ea.DEFAULT_TEMPLATES["sign_in_method_changed"]["body_html"]
+    assert "{{action.change}}" in body
+    assert "change your password" not in body.lower() and "if this was you" not in body.lower()
 
 
 def test_the_freshness_warning_links_to_the_vault():

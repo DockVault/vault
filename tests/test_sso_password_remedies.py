@@ -135,3 +135,28 @@ def test_an_administrators_unlink_says_who_can_set_the_password_it_gives_back(mo
         assert told[-1].endswith("It has none anybody can type until you make a reset link for it (Users, Copy reset "
                                  "link).")
         assert owners[-1].endswith(" " + FROM_AN_ADMINISTRATOR)
+
+
+def test_a_removal_is_told_with_the_advice_for_an_administrators_change_in_the_app_and_by_email(monkeypatch):
+    """The person did not remove the provider: an administrator did. The email says what the notice says, the
+    change with the advice for it, and nothing about a password to change."""
+    import contextlib
+    from app.api import sso_providers_router as R
+    from app.core import database
+    tell_accounts = R._tell_accounts
+    row = _provider(created_at=None, updated_at=None, state="disabled")
+    alice = _user("alice")
+    h = Admin(monkeypatch, [row], users=[alice], identities=[_identity(alice, row)])
+    monkeypatch.setattr(R, "_tell_accounts", tell_accounts)
+    monkeypatch.setattr(database, "get_db_context", lambda: contextlib.nullcontext(h.db))
+    notices, emails = [], []
+    monkeypatch.setattr(h.S, "_notify_users", lambda ids, kind, title=None, body=None, target=None, **more: (
+        notices.append((kind, title, body))))
+    monkeypatch.setattr(h.S, "_fire_action_email", lambda db, key, *, email, username=None, action_context=None: (
+        emails.append((key, email, action_context))))
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 200 and out == {"removed": True}, out
+    ((key, email, context),) = emails
+    assert (key, email) == ("sign_in_method_changed", "alice@example.test")
+    assert context["change"].endswith(" If you did not expect this, ask an administrator.")
+    assert notices == [("account_changed", "A sign-in method was removed from your account", context["change"])]

@@ -121,29 +121,36 @@ def _row_or_404(db, provider_id, *, lock: bool = False) -> SsoProvider:
     return row
 
 
-def _tell_accounts(users, title: str, change: str, *, once_for: Optional[str] = None) -> None:
+def _tell_accounts(users, title: str, change: str, *, once_for: Optional[str] = None,
+                   advice: Optional[str] = None) -> None:
     """Tell each of ``users`` of a change an administrator made to how their account signs in: in the app, and by
-    email when the account has an address and email is configured. After the commit; never raises.
+    email when the account has an address and email is configured, both with ``advice``, what to do about it (by
+    default, as for any change an administrator made: the person did not make it; "" for a change the vault made
+    itself). After the commit; never raises.
 
     ``once_for``: what this telling is about, when it must reach an account once however often it is asked for
     (a key for the notice's ledger). An account already told of it is told nothing more, in the app or by
     email."""
     api = _api()
+    if advice is None:
+        from app.api import sso_router
+        advice = sso_router.BY_AN_ADMINISTRATOR
+    said = f"{change} {advice}".strip()
     try:
         from app.core.database import get_db_context
         with get_db_context() as db:
             for user_id, username, email in users:
                 try:
                     if once_for:
-                        if not api._notify_users([str(user_id)], "account_changed", title=title, body=change,
+                        if not api._notify_users([str(user_id)], "account_changed", title=title, body=said,
                                                  target="#profile", dedup_prefix=once_for, once=True):
                             continue
                     else:
-                        api._notify_users([str(user_id)], "account_changed", title=title, body=change,
+                        api._notify_users([str(user_id)], "account_changed", title=title, body=said,
                                           target="#profile")
                     if (email or "").strip():
                         api._fire_action_email(db, "sign_in_method_changed", email=email, username=username,
-                                               action_context={"change": change, "when": api._change_time_text()})
+                                               action_context={"change": said, "when": api._change_time_text()})
                 except Exception as exc:  # noqa: BLE001 -- one notice that fails does not stop the others
                     log.info("sso account notice skipped: %s", type(exc).__name__)
     except Exception as exc:  # noqa: BLE001

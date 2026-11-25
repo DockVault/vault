@@ -473,7 +473,8 @@ def test_the_privileged_accounts_are_settled_at_start_recorded_and_told(monkeypa
 
     monkeypatch.setattr(database, "get_db_context", lambda: contextlib.nullcontext(_Db()))
     monkeypatch.setattr(api.AuditLogger, "build_row", lambda self, **kw: kw)
-    monkeypatch.setattr(providers_router, "_tell_accounts", lambda users, title, change: told.append(("owners", users, title, change)))
+    monkeypatch.setattr(providers_router, "_tell_accounts", lambda users, title, change, advice=None: told.append(
+        ("owners", users, title, change, advice)))
     monkeypatch.setattr(providers_router, "_tell_administrators", lambda by, title, body: told.append(("administrators", by, title, body)))
     one, two = uuid.uuid4(), uuid.uuid4()
     # "Forgot your password?" sends a link here: switched on, email configured, the public address set.
@@ -490,6 +491,8 @@ def test_the_privileged_accounts_are_settled_at_start_recorded_and_told(monkeypa
     assert committed == [2]
     with_address, without, administrators = told
     assert with_address[1] == [(one, "zoe", "zoe@example.test")] and without[1] == [(two, "amy", None)]
+    # The vault did this, not a person: nobody is told to ask who did it.
+    assert with_address[4] == without[4] == ""
     assert "may hold a password again" in with_address[2] and "\"Forgot your password?\"" in with_address[3]
     # The sign-in page sends a link only to an address: an account without one asks an administrator.
     assert without[3].endswith("Your account has no password yet: ask an administrator for a reset link.")
