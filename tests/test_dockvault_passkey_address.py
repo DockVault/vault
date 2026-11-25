@@ -321,6 +321,24 @@ def test_the_example_environment_says_it_beside_the_address():
     tail = before[-2500:]
     assert "Passkeys need https and a HOST NAME" in tail and "reached by IP" in tail and "plain http" in tail
     assert "xn-- form" in tail and "waits meanwhile" in tail and "dockvault.py setup and status say so" in tail
+    # Single sign-on is built on the same entry: an operator who reads only the passkey rule learns nothing of it.
+    assert "Single sign-on needs the same first entry" in tail and "an address reached by IP serves it" in tail
+    assert "/auth/sso/<provider id>/callback" in tail
+
+
+@pytest.mark.parametrize("allowed_hosts, refused", [
+    ("https://203.0.113.5", False),          # an address reached by IP serves single sign-on, not passkeys
+    ("http://vault.example.com", True),      # plain http away from localhost serves neither
+    ("vault.example.com", False),            # a bare name is read as https
+])
+def test_single_sign_on_takes_the_address_as_the_example_file_says(allowed_hosts, refused, monkeypatch):
+    """What the example file says beside ALLOWED_HOSTS of single sign-on is what the vault does with the entry."""
+    from app.core import config, public_url
+    from app.services import sso_sign_in
+    monkeypatch.setattr(config.settings, "allowed_hosts", allowed_hosts, raising=False)
+    assert (sso_sign_in.address_refusal() is not None) is refused
+    if allowed_hosts == "https://203.0.113.5":
+        assert public_url.readiness()["reason"] == "ip_address"
 
 
 def test_the_note_about_passkeys_made_at_another_address_counts_those_and_no_others():
