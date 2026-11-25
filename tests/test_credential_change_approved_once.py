@@ -116,3 +116,37 @@ def test_a_change_refused_while_applying_leaves_the_request_held(factory, monkey
         assert s.get(CredentialChange, change_id).status == cc.HELD
     finally:
         s.close()
+
+
+def test_an_approved_passkey_removal_names_the_passkey_in_its_record(factory, applied):
+    # A removal held under the two-person rule and approved later writes no passkey_admin_removed row: its
+    # approval's record is the one an administrator finds, so it names the passkey that was removed.
+    s = factory()
+    try:
+        alice, bob = (User(username=n, password_hash="x", role=RoleEnum.ADMIN, is_active=True, is_locked=False)
+                      for n in ("alice", "bob"))
+        carol = User(username="carol", password_hash="x", role=RoleEnum.USER, is_active=True, is_locked=False)
+        s.add_all([alice, bob, carol])
+        s.commit()
+        key = "5b0c3a4e-7d0f-4e0a-9a51-3c2f0b8d6e11"
+        held = cc.hold(s, kind=cc.PASSKEY, target_id=carol.id, requester_id=alice.id, requester_name="alice",
+                       summary="s", payload={"passkey_id": key})
+        s.commit()
+        api._approve_credential_change(s, held, carol, approver=bob)
+        assert applied == [(cc.PASSKEY, {"passkey_id": key})]
+        (row,) = s.query(AuditLog).filter(AuditLog.action == "credential_change_approved").all()
+        assert row.details["kind"] == cc.PASSKEY and row.details["passkey_id"] == key, row.details
+    finally:
+        s.close()
+
+
+def test_an_approval_of_another_kind_names_no_passkey(factory, applied):
+    change_id, carol_id, bob_id, _dave = _setup(factory)
+    s = factory()
+    try:
+        api._approve_credential_change(s, s.get(CredentialChange, change_id), s.get(User, carol_id),
+                                       approver=s.get(User, bob_id))
+        (row,) = s.query(AuditLog).filter(AuditLog.action == "credential_change_approved").all()
+        assert row.details["kind"] == cc.RESET_LINK and "passkey_id" not in row.details, row.details
+    finally:
+        s.close()

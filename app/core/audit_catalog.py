@@ -69,7 +69,8 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("passkey_sign_count_regressed", "sign_in", "Passkey counter went backwards (a copy?)", "warning"),
     AuditAction("passkey_requirement_cleared", "sign_in", "Passkey requirement cleared for an account", "warning"),
     AuditAction("passkey_requirement_restored", "sign_in", "Passkey requirement put back for an account", "info"),
-    # By an administrator (through the two-person rule) or by an approved request.
+    # Only for a removal made at once. One held under the two-person rule and approved later is recorded as
+    # credential_change_approved (kind passkey), with the passkey's id.
     AuditAction("passkey_admin_removed", "sign_in", "Passkey removed for another user", "warning"),
     # A sign-in through a provider, refused: counted as a failed sign-in. A link, a test or a confirmation refused
     # at the provider is asked for by somebody already signed in, and is recorded apart (app/api/sso_router.py).

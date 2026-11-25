@@ -14460,7 +14460,9 @@ def _approve_credential_change(db, change, target, *, approver, request=None) ->
         username=None if approver is not None else cc.HOST_OPERATOR,
         resource_type="user", resource_id=str(target.id),
         details={"kind": kind, "change_id": str(change.id), "target_username": target.username,
-                 "requested_by": requested_by, "approved_by": approver_name}))
+                 "requested_by": requested_by, "approved_by": approver_name,
+                 # A passkey removed on approval writes no passkey_admin_removed row: this one names the key.
+                 **({"passkey_id": payload.get("passkey_id")} if kind == cc.PASSKEY else {})}))
     db.commit()
     _announce_decided_change(db, change, target, cc.APPROVED, result)
     return {k: result[k] for k in ("reset_link", "expires_in_minutes", "email_sent") if k in result}
