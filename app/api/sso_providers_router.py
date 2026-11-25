@@ -265,6 +265,41 @@ def _held_after(db, row, *, by, ip, held_before) -> tuple:
         return [], set()
 
 
+def _tell_those_a_turn_off_held(db, held_ids, held_before, label: str) -> None:
+    """Tell the accounts a save has just held because it turned their provider off with their days run out, in
+    the app and by email. Not an account that is turned off, and not one the provider held before the save (it
+    was told when that began). Each is told what holds for it: where the hold also closes its password, that;
+    where it pauses the keys alone, that its password signs it in as before, when it has one it can type.
+
+    A save that changed a provider's connection and its days at once judged the hold by the new days, turned
+    the provider off, and counted the accounts its days hold only while it is on: nobody was told."""
+    from app.services import sign_in, sso_freshness
+    try:
+        if not held_ids:
+            return
+        told = {}
+        for user in db.query(User).filter(User.id.in_(list(held_ids))).all():
+            if not user.is_active or user.id in held_before:
+                continue
+            if sso_freshness.held_to_a_provider(db, user) is not None:
+                ends = (", and your password and passkeys do not sign you in, until an administrator lifts that or "
+                        f"{label} is turned on again and admits you.")
+            else:
+                ends = (" until an administrator lifts that."
+                        + (" Your password signs you in as before." if sign_in.has_a_password_it_can_type(user) else ""))
+            told.setdefault(ends, []).append((user.id, user.username, user.email))
+        db.rollback()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.info("sso turn-off hold notices skipped: %s", type(exc).__name__)
+        return
+    for ends, people in told.items():
+        _tell_accounts(people, "Your keys are paused on this vault", (
+            f"An administrator changed {label}, which is turned off until it has been tested again. You have not "
+            f"signed in through {label} within the time your organisation allows: your SSH keys, temporary "
+            "credentials and devices stay paused" + ends))
+
+
 def _accounts_named(db, usernames) -> list:
     """(id, username, email) of the accounts ``usernames`` names, for a notice sent after the commit."""
     names = list(usernames or [])
@@ -393,7 +428,8 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         # (turning it off first hides nothing), beside the other administrators.
         pointed_elsewhere = any(field in outcome["changed"] for field in providers.WHERE_IT_IS)
         owners = _accounts_linked(db, row, but=current_user.id) if pointed_elsewhere else []
-        held = providers.hold_lapsed(db, row) if turned_off else 0
+        held_ids = []
+        held = providers.hold_lapsed(db, row, into=held_ids) if turned_off else 0
         if turned_off:
             row.state = providers.DISABLED
         if outcome["changed"]:
@@ -448,6 +484,7 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
         f"sign-in through {label}: its password and passkeys do not sign it in to this vault until {label} has "
         "admitted it again. If it does not, ask your administrator."), once_for=today)
+    _tell_those_a_turn_off_held(db, held_ids, held_before, label)
     _tell_accounts(owners, f"{label} was pointed somewhere else", (
         f"An administrator changed where this vault finds {label}, a sign-in your account is linked to. Nobody signs "
         f"in through {label} until an administrator has tested it again and turned it on. If the sign-in you meet "
@@ -496,6 +533,9 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         if turned_off:
             said += (" Its connection changed, so it was turned off until a test sign-in passes again"
                      + (f", and {ended} session(s) that came through it were ended." if ended else "."))
+            if held:
+                said += (f" {held} account(s) whose sign-in there had lapsed stay held: lift each under Identities "
+                         "when it should have its keys back.")
             said += _said_of_sessions_standing(standing)
         _tell_administrators(current_user.username, "A single sign-on provider was changed", said)
     return {"provider": providers.public(db, row), **outcome}
