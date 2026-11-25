@@ -98,14 +98,25 @@
         return credentialJSON(cred);
     }
 
+    // A browser that refuses passkeys on a page whose certificate it does not trust (Chrome and Edge, on a self-signed
+    // certificate that was clicked through) says so as a NotAllowedError that names the certificate.
+    function certificateRefused(error) {
+        return !!error && error.name === 'NotAllowedError' && /certificate/i.test(error.message || '');
+    }
+
     // Whether an error is the person cancelling (or the browser's own timeout, which it reports the same way) or a
-    // ceremony aborted by the page: nothing to show.
+    // ceremony aborted by the page: nothing to show. A refusal for the certificate is not one: it says why.
     function cancelled(error) {
+        if (certificateRefused(error)) return false;
         return !!error && (error.name === 'NotAllowedError' || error.name === 'AbortError');
     }
 
     // The sentence for a ceremony that failed for another reason.
     function failureText(error) {
+        if (certificateRefused(error)) {
+            return 'Passkeys need this vault\'s certificate to be trusted by this browser. Ask whoever runs the vault '
+                + 'for a certificate your browser trusts.';
+        }
         if (error && error.name === 'InvalidStateError') return 'This device already holds a passkey for your account.';
         if (error && error.name === 'SecurityError') return 'Passkeys need this vault opened at its own address over https.';
         if (error && error.name === 'NotSupportedError') return 'This device cannot make a passkey the vault accepts.';
