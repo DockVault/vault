@@ -315,6 +315,28 @@ def test_the_administrators_are_told_of_a_first_sign_in_that_met_an_unconfirmed_
     assert "correct it on the Users page" in admins[2]
 
 
+@pytest.mark.parametrize("over_the_limit_by, fresh", [(2, False), (-5, True)])
+def test_a_links_sign_in_is_fresh_for_as_long_as_a_confirmation_is_and_no_longer(monkeypatch, over_the_limit_by, fresh):
+    """The provider says when it signed the person in. A link takes that sign-in while it is no older than a
+    confirmation may be (a minute), and refuses one older: with a wider window, a link answered from somebody
+    else's provider session of some minutes ago was taken as theirs."""
+    from app.services import sso_sign_in as sso_rules
+    alice = _user()
+    p = _provider(last_test={"outcome": "ok", "auth_time_present": True})
+    h = Resolving(monkeypatch, [alice], [p])
+    h.current_user = alice
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    age = sso_rules.REAUTH_MAX_AGE_SECONDS + over_the_limit_by
+    h.claims_override = {"sub": "alice-at-corp", "email": "alice@corp.example", "auth_time": int(time.time()) - age}
+    location = h.callback(p, state)[1]
+    if fresh:
+        assert not location.startswith("/#sso-error="), location
+    else:
+        assert location == "/#sso-error=reauth_stale" and h.identities() == []
+    assert sso_rules.REAUTH_MAX_AGE_SECONDS == 60
+
+
 def test_a_link_asks_the_provider_for_a_fresh_sign_in_and_says_who_was_linked(monkeypatch):
     """What is linked is the identity of whoever is at the provider in that browser. So a link asks the provider
     to sign the person in again, refuses an answer the provider gave from a session it already had (where the
