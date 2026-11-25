@@ -8488,6 +8488,7 @@ async function renderAccountPasskeys() {
                 if (keys.length === 1) { try { storage.removeItem(PASSKEY_USED_HERE); } catch (_) {} }
             } catch (e) { showError(e.message || 'The passkey was not removed.'); }
             renderAccountPasskeys();
+            renderAccount2FA();          // the two-factor section counts the passkeys too
         });
         row.appendChild(rename);
         row.appendChild(remove);
@@ -8533,6 +8534,7 @@ async function renderAccountPasskeys() {
         _passkeyAddConfirmed = false;                      // one try: the next one confirms again
         try { await _addPasskey({ confirmed: goOn }); } finally { add.disabled = false; }
         renderAccountPasskeys();
+        renderAccount2FA();              // the two-factor section counts the passkeys too
     });
     body.appendChild(add);
     if (confirmed) {
@@ -8613,10 +8615,13 @@ async function renderAccount2FA() {
     catch (_) { body.replaceChildren(_el('p', 'text-secondary text-sm', 'Could not load two-factor status.')); return; }
     body.replaceChildren();
     const enabled = !!(st && (st.enrolled === true || st.status === 'active'));
+    const passkeys = _account2FAPasskeys(st);
     if (enabled) {
         const remaining = (st.recovery_codes_remaining != null) ? st.recovery_codes_remaining : 0;
+        const kinds = passkeys > 0 ? 'authenticator app and ' + passkeys + (passkeys === 1 ? ' passkey' : ' passkeys')
+            : 'authenticator app';
         body.appendChild(_el('p', 'text-sm mb-sm',
-            'Two-factor authentication is on (authenticator app). ' + remaining +
+            'Two-factor authentication is on (' + kinds + '). ' + remaining +
             ' recovery code' + (remaining === 1 ? '' : 's') + ' remaining.'));
         const row = _el('div', 'flex gap-sm');
         const regen = _el('button', 'btn btn-secondary btn-sm', 'Regenerate recovery codes');
@@ -8624,7 +8629,21 @@ async function renderAccount2FA() {
         row.appendChild(regen); row.appendChild(off); body.appendChild(row);
         const msg = _el('div', 'mt-sm'); body.appendChild(msg);
         regen.addEventListener('click', () => account2FARegenerate(msg));
-        off.addEventListener('click', () => account2FADisable(msg));
+        off.addEventListener('click', () => account2FADisable(msg, st));
+    } else if (passkeys > 0) {
+        // A passkey is the account's second factor: the sign-in asks for it. An authenticator app is added beside it
+        // where the account has a password to confirm the set-up with; under Your account the server refuses it
+        // to one that has none, so such an account is offered nothing here.
+        const canAdd = st.password_to_type !== false;
+        const on = _el('p', 'text-sm mb-sm', 'Two-factor authentication is on (passkey).'
+            + (canAdd ? ' You can add an authenticator app as well.' : ''));
+        on.id = 'us-2fa-passkey';
+        body.appendChild(on);
+        if (canAdd) {
+            const add = _el('button', 'btn btn-secondary btn-sm', 'Add an authenticator app');
+            body.appendChild(add);
+            add.addEventListener('click', () => account2FASetup(body));
+        }
     } else if (st && st.password_to_type === false) {
         // The set-up here asks for the account's password, and this account has none anybody can type.
         const none = _el('p', 'text-secondary text-sm mb-sm',
@@ -8664,8 +8683,22 @@ function account2FASetup(body) {
     pw.focus();
 }
 
-async function account2FADisable(msg) {
-    if (!window.confirm('Turn off two-factor authentication? You will sign in with your password only.')) return;
+// How many usable passkeys the account holds, from GET /users/me/second-factor (0 while passkeys are turned off, and
+// from a server that does not say).
+function _account2FAPasskeys(st) {
+    const n = st && st.passkeys;
+    return (typeof n === 'number' && Number.isFinite(n) && n > 0) ? n : 0;
+}
+
+// The removal takes the authenticator app and its recovery codes, nothing else: the question says what is left.
+async function account2FADisable(msg, st) {
+    const question = _account2FAPasskeys(st) > 0
+        ? 'Turn off the authenticator app? Your passkeys stay, and still confirm it is you.'
+        : (st && st.password_to_type === false)
+            ? 'Turn off two-factor authentication? You will sign in through your organisation\'s sign-in without a '
+              + 'second factor from this vault.'
+            : 'Turn off two-factor authentication? You will sign in with your password only.';
+    if (!window.confirm(question)) return;
     msg.replaceChildren();
     try {
         await apiRequest('/users/me/second-factor', { method: 'DELETE' });

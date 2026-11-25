@@ -11859,7 +11859,9 @@ async def get_my_second_factor(
     db: Session = Depends(get_db),
 ):
     """The caller's own second-factor state: the enrolled method (if any), whether it is active or
-    mid-enrollment, and how many recovery codes remain."""
+    mid-enrollment, how many recovery codes remain, and how many usable passkeys the account holds (a passkey is a
+    second factor too: the sign-in asks for it)."""
+    from app.core.active_factors import active_factors
     enr = _sf_enrollment(db, current_user.id)
     return {
         "enrolled": bool(enr and enr.status == "active"),
@@ -11869,6 +11871,8 @@ async def get_my_second_factor(
         "recovery_codes_remaining": _sf_recovery_remaining(db, current_user.id),
         # Whether the account has a password somebody can type: the authenticator's set-up here asks for it.
         "password_to_type": sign_in.has_a_password_it_can_type(current_user),
+        # The passkeys that confirm it is the person: the usable ones only, and none while passkeys are turned off.
+        "passkeys": active_factors(db, current_user.id).passkeys,
     }
 
 

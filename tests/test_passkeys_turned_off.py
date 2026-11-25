@@ -182,3 +182,40 @@ def test_an_account_with_no_password_to_type_is_not_told_after_your_password(mon
     monkeypatch.setattr(R.ws_settings, "only_a_passkey", lambda db: {"owners": []})
     R._tell_the_accounts_with_only_a_passkey(object())
     assert told == []
+
+
+def test_your_accounts_two_factor_section_counts_the_usable_passkeys_and_none_while_passkeys_are_off(monkeypatch):
+    """GET /users/me/second-factor says how many of the account's passkeys confirm it is the person, beside the
+    authenticator app: the usable ones only (a key made at another address, one that never checked the person while
+    the vault asks for that, and a retired one are no factor), and none while passkeys are turned off, when the keys
+    are kept and count again once passkeys are back on."""
+    from _async_run import run_coroutine
+    registry, wss = _mod()
+    from app.core.models import SecondFactorEnrollment, WebAuthnCredential
+    alice = _user("alice")
+    h = SignInHarness(monkeypatch, [alice])
+    S = h.S
+    _resolving(monkeypatch, registry, {wss.MODE: "optional", wss.REQUIRE_UV: True})
+    h.db.rows_of(WebAuthnCredential).extend([
+        _key(alice, verified=True),
+        _key(alice, verified=False),
+        _key(alice, verified=True, rp_id="elsewhere.example.test"),
+        _key(alice, verified=True, retired_at=datetime(2026, 11, 1)),
+    ])
+
+    def state():
+        return run_coroutine(S.get_my_second_factor(current_user=alice, db=h.db), timeout=30)
+
+    got = state()
+    assert got["passkeys"] == 1 and type(got["passkeys"]) is int, got
+    assert got["enrolled"] is False and got["status"] == "not_setup" and got["password_to_type"] is True, got
+    h.db.rows_of(WebAuthnCredential).append(_key(alice, verified=True))
+    h.db.rows_of(SecondFactorEnrollment).append(
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, method="totp", status="active", confirmed_at=None))
+    got = state()
+    assert got["passkeys"] == 2 and got["enrolled"] is True, got
+    # Turned off: no passkey is a factor, and the section says so by the number.
+    _resolving(monkeypatch, registry, {wss.MODE: "off", wss.REQUIRE_UV: True})
+    assert state()["passkeys"] == 0
+    _resolving(monkeypatch, registry, {wss.MODE: "optional", wss.REQUIRE_UV: True})
+    assert state()["passkeys"] == 2

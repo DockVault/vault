@@ -25,7 +25,7 @@ APP_JS = ROOT / "static" / "js" / "app.js"
 # Your account's passkeys, as shipped; a name that is not in app.js is left out (and its test fails on what the page
 # does, not on a missing name).
 _SHIPPED = ("_el", "parseServerTime", "_passkeyWhen", "_passkeyStateText", "_addressFixable", "renderAccountPasskeys",
-            "_addPasskey")
+            "_addPasskey", "_account2FAPasskeys", "renderAccount2FA")
 
 
 def _function(js, name):
@@ -214,3 +214,44 @@ out({ said: body.children.filter((c) => c.localName === 'p').map((p) => p.textCo
                        .replace("PAGE_PROTOCOL", json.dumps(parts.scheme + ":"))
                        .replace("ACCOUNT_ROLE", json.dumps(role)).replace("VAULT_AT", json.dumps(THERE)))
     assert got == {"said": [BASE + more], "add": 0}, got
+
+
+def test_the_two_factor_section_is_drawn_again_after_a_passkey_is_added_or_removed():
+    """A passkey is a second factor, and the two-factor section above the passkeys counts them: an account that adds
+    its first one reads at once that two-factor authentication is on, and one that removes its last reads that it is
+    off, not what the section said when Your account opened."""
+    got = account_node(r"""
+const twoFactor = document.createElement('div'); twoFactor.id = 'us-2fa-body'; document.body.appendChild(twoFactor);
+const STATE = (passkeys) => ({ enrolled: false, method: null, status: 'not_setup', awaiting_acknowledge: false,
+    recovery_codes_remaining: 0, password_to_type: true, passkeys });
+const settle = async () => { for (let i = 0; i < 20; i++) await tick(); };
+const seen = {};
+// Adding the first one.
+answers['GET /users/me/passkeys'] = LIST([]);
+answers['POST /users/me/passkeys/register/options'] = { challenge_id: 'c-1', options: { publicKey: {} } };
+answers['POST /users/me/passkeys/register/verify'] = { passkey: { id: 'new', provisional: false } };
+await renderAccountPasskeys();
+answers['GET /users/me/passkeys'] = LIST([KEY('new')]);
+answers['GET /users/me/second-factor'] = STATE(1);
+asked.length = 0;
+body.querySelector('#us-passkey-add').click();
+await settle();
+seen.added = { asked: asked.map((a) => a.method + ' ' + a.path), said: twoFactor.textContent };
+// Removing the last one.
+answers['DELETE /users/me/passkeys/new'] = {};
+answers['GET /users/me/passkeys'] = LIST([]);
+answers['GET /users/me/second-factor'] = STATE(0);
+asked.length = 0;
+body.querySelectorAll('button').find((b) => b.textContent === 'Remove').click();
+await settle();
+seen.removed = { asked: asked.map((a) => a.method + ' ' + a.path), said: twoFactor.textContent };
+out(seen);
+""")
+    assert "GET /users/me/second-factor" in got["added"]["asked"], got["added"]
+    assert got["added"]["asked"].index("POST /users/me/passkeys/register/verify") < got["added"]["asked"].index(
+        "GET /users/me/second-factor")
+    assert got["added"]["said"].startswith("Two-factor authentication is on (passkey)."), got["added"]
+    assert "GET /users/me/second-factor" in got["removed"]["asked"], got["removed"]
+    assert got["removed"]["asked"].index("DELETE /users/me/passkeys/new") < got["removed"]["asked"].index(
+        "GET /users/me/second-factor")
+    assert got["removed"]["said"].startswith("Two-factor authentication is off."), got["removed"]
