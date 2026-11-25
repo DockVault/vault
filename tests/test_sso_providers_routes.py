@@ -152,8 +152,17 @@ def test_a_change_is_judged_then_stepped_up_then_written_and_recorded_by_field_n
     assert "s3cret" not in str(out) and "enc(" not in str(out)
     (audit,) = h.audit("sso_provider_updated")
     assert audit[2] == {"provider_id": str(row.id), "name": row.name, "made_sso_only": 0, "restored": 0,
-                        "changed": ["label", "issuer", "client_id", "client_secret", "policy.sso_freshness_days"]}
-    assert "s3cret" not in str(h.audits) and ISSUER_2 not in str(h.audits)     # names of fields, never a value
+                        "secret_cleared": False, "owners_told": 0,
+                        "changed": ["label", "issuer", "client_id", "client_secret", "policy.sso_freshness_days"],
+                        # What each was and is: none of them is a secret, and an auditor reads who changed what.
+                        "changes": {"label": {"old": None, "new": "Company sign-in"},
+                                    "issuer": {"old": None, "new": ISSUER_2},
+                                    "client_id": {"old": None, "new": "client-1"},
+                                    "client_secret": {"old": None, "new": "(set)"},      # only that one was set
+                                    "sso_freshness_days": {"old": 30, "new": 7}}}
+    assert "s3cret" not in str(h.audits) and "enc(" not in str(h.audits)       # never the secret, in any form
+    # Recorded in the transaction that made the change: added before its commit.
+    assert [step[0] for step in h.db.log if step[0] in ("add", "commit")][-2:] == ["add", "commit"]
     assert len(h.told) == 1 and "s3cret" not in str(h.told) and "client_secret" in h.told[0][2]
     # The same values again: the step-up is asked (a change was sent), nothing is recorded or told.
     status, out = h.call("PATCH", path, {"label": "Company sign-in"})
@@ -260,7 +269,9 @@ def test_a_provider_is_turned_on_only_tested_and_off_at_once(monkeypatch):
     status, out = h.call("POST", path, {"state": "enabled"})
     assert status == 200 and out["changed"] is True and row.state == "enabled" and h.order == ["step_up"]
     assert h.audit("sso_provider_updated")[0][2] == {"provider_id": str(row.id), "name": row.name,
-                                                     "changed": ["state"], "state": "enabled"}
+                                                     "changed": ["state"], "state": "enabled",
+                                                     "changes": {"state": {"old": "draft", "new": "enabled"}}}
+    assert [step[0] for step in h.db.log if step[0] in ("add", "commit")][-2:] == ["add", "commit"]
     assert h.told[0][1] == "A single sign-on provider was turned on"
     # Already so: nothing asked, nothing recorded.
     status, out = h.call("POST", path, {"state": "enabled"})
@@ -660,7 +671,8 @@ def _watch_turn_off(monkeypatch, h, ended=3, held=2):
     from app.services import sso_providers
     seen = []
     monkeypatch.setattr(sso_providers, "hold_lapsed", lambda db, row, now=None: seen.append(("held", row.state)) or held)
-    monkeypatch.setattr(h.R, "_end_sessions_of", lambda db, provider_id: seen.append(("ended", str(provider_id))) or ended)
+    monkeypatch.setattr(h.R, "_end_sessions_of", lambda db, provider_id, **record: (
+        seen.append(("ended", str(provider_id))) or ended))
     return seen
 
 
@@ -757,7 +769,9 @@ def test_turning_a_provider_off_ends_its_sessions_and_holds_the_lapsed_accounts(
     assert status == 200 and out["changed"] is True and out["sessions_ended"] == 4 and out["held"] == 1, out
     assert row.state == "disabled" and seen == [("held", "enabled"), ("ended", str(row.id))]
     audit = h.audit("sso_provider_updated")[-1][2]
-    assert audit["state"] == "disabled" and audit["sessions"] == 4 and audit["identities"] == 1
+    # The sessions are ended after this commit and recorded where they are ended (the test of that ending).
+    assert audit["state"] == "disabled" and audit["identities"] == 1 and "sessions" not in audit
+    assert audit["changes"] == {"state": {"old": "enabled", "new": "disabled"}}
     said = h.told[-1][2]
     assert "4 session(s) that came through it were ended" in said and "1 account(s) whose sign-in there had lapsed stay held" in said
     # Turning it on ends nothing and holds nobody, and its answer says nothing of either.
@@ -789,6 +803,15 @@ def test_the_sessions_of_a_provider_are_ended_under_each_owners_turn(monkeypatch
     wanted = sorted(str(s.session_id) for s in mine)
     assert h.R._end_sessions_of(h.db, row.id) == 2
     assert order == [("owners", wanted), ("turn", "u1"), ("turn", "u2"), ("revoke", wanted, "provider turned off", True)]
+    assert h.audits == []                                    # nobody named to record it for: nothing is written
+    order.clear()
+    # Ended for an administrator's change: how many is recorded with the ending, in its transaction.
+    del h.db.log[:]
+    assert h.R._end_sessions_of(h.db, row.id, by=h.root, ip="203.0.113.9", name=row.name) == 2
+    assert h.audit("sso_provider_updated") == [("sso_provider_updated", "success", {
+        "provider_id": str(row.id), "name": row.name, "changed": [], "sessions": 2, "reason": "sessions_ended"})]
+    assert [step[0] for step in h.db.log if step[0] in ("add", "commit")] == ["add", "commit"]
+    del h.audits[:]
     order.clear()
     assert h.R._end_sessions_of(h.db, uuid.uuid4()) == 0 and order == []        # a provider with none
 
@@ -1054,3 +1077,78 @@ def test_an_unknown_password_made_beforehand_is_what_is_written_and_one_is_made_
     before = bob.password_hash
     sso_only.allow_password_sign_in(None, bob, keep_password=True, unknown_hash=ready)
     assert bob.password_hash == before
+
+
+def test_a_change_that_turns_a_provider_off_records_what_it_did(monkeypatch):
+    """One save points a provider that is on somewhere else. Its record says more than the fields: the provider
+    went off, how many lapsed accounts were held, that the stored secret was dropped, and how many linked people
+    were told."""
+    alice = _user("alice")
+    row = _tested(_provider(state="enabled", created_at=None, updated_at=None))
+    h = Admin(monkeypatch, [row], users=[alice], identities=[_identity(alice, row)])
+    _watch_turn_off(monkeypatch, h, ended=3, held=2)
+    was = row.issuer
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"issuer": ISSUER_2})
+    assert status == 200 and out["turned_off"] is True, out
+    (audit,) = h.audit("sso_provider_updated")
+    assert audit[2] == {"provider_id": str(row.id), "name": row.name, "changed": ["issuer"],
+                        "changes": {"issuer": {"old": was, "new": ISSUER_2},
+                                    "client_secret": {"old": "(set)", "new": None}},
+                        "made_sso_only": 0, "restored": 0, "secret_cleared": True, "owners_told": 1,
+                        "state": "disabled", "identities": 2}
+
+
+def test_no_change_of_a_provider_without_its_record(monkeypatch):
+    """The record is written with the change or the change is not made: a provider added, changed, turned on or
+    removed with nothing in the audit log saying who did it is the one thing an investigator cannot work with."""
+    import app.services.audit_logger as al
+    row = _tested(_provider(state="disabled", created_at=None, updated_at=None))
+    h = Admin(monkeypatch, [row])
+
+    class Broken:
+        def __init__(self, db):
+            pass
+
+        def build_row(self, **kw):
+            raise RuntimeError("the audit log cannot be written")
+    monkeypatch.setattr(al, "AuditLogger", Broken)
+    path = f"/admin/sso/providers/{row.id}"
+    for method, where, body in (("POST", "/admin/sso/providers", {"name": "another"}),
+                                ("PATCH", path, {"label": "Another button"}),
+                                ("POST", path + "/state", {"state": "enabled"}), ("DELETE", path, None)):
+        del h.db.log[:]
+        row.state = "disabled"          # (the stand-in database rolls no field back; a real one does)
+        status, out = h.call(method, where, body)
+        assert status == 503 and "its audit record could not be written. Nothing was changed" in out["detail"], out
+        assert ("commit",) not in h.db.log and ("rollback",) in h.db.log, (method, where)
+    assert h.told == [] and h.rows()[0] is row
+
+
+def test_what_a_providers_record_keeps_of_its_settings():
+    from app.services import sso_providers
+    row = _provider(created_at=None, updated_at=None, policy={"sso_freshness_days": 7})
+    before = sso_providers.recorded_values(row)
+    assert before["client_secret"] == "(set)" and before["issuer"] == row.issuer and before["sso_freshness_days"] == 7
+    assert before["sso_trust_idp_mfa"] is False                 # a setting never saved is recorded as what applies
+    assert "client_secret_enc" not in before and row.client_secret_enc not in str(before)
+    row.label, row.policy, row.client_secret_enc = "Staff", {"sso_freshness_days": 7, "sso_trust_idp_mfa": True}, "enc(new)"
+    changes = sso_providers.recorded_changes(before, row, ["label", "client_secret", "policy.sso_trust_idp_mfa"])
+    assert changes == {"label": {"old": before["label"], "new": "Staff"},
+                       "client_secret": {"old": "(set)", "new": "(replaced)"},
+                       "sso_trust_idp_mfa": {"old": False, "new": True}}
+    # A secret dropped by the change, with no new one entered: said, though no field of that name was sent.
+    row.client_secret_enc = None
+    assert sso_providers.recorded_changes(before, row, ["issuer"])["client_secret"] == {"old": "(set)", "new": None}
+    # A long value is kept as the caller shortens it.
+    long = sso_providers.recorded_changes(before, row, ["label"], shorten=lambda field, value: f"{field}:{len(str(value))}")
+    assert long["label"] == {"old": f"label:{len(str(before['label']))}", "new": "label:5"}
+
+
+def test_a_providers_records_are_kept_with_the_other_settings_records():
+    """Who may sign in through whom is an administrator's setting. Its records are in the category the size cap
+    never deletes and the administrators' minimum protects."""
+    from app.core import audit_catalog, audit_retention
+    by_name = {a.name: a for a in audit_catalog.ACTIONS} if hasattr(audit_catalog, "ACTIONS") else None
+    for name in ("sso_provider_created", "sso_provider_updated", "sso_provider_deleted", "sso_provider_tested"):
+        category = by_name[name].category if by_name else audit_catalog.category_of(name)
+        assert category == "administration" and category in audit_retention.PROTECTED_CATEGORIES, name

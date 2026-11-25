@@ -220,6 +220,40 @@ def clean(body: dict, *, row=None) -> dict:
 # kept only for it: pointing the provider somewhere else drops the secret, to be entered again by whoever knows it.
 WHERE_IT_IS = ("issuer", "discovery_url", "private_network")
 
+# What the audit log keeps of a provider's settings: every field but the client secret.
+_RECORDED = ("name", "label", "icon", "sort_order", "show_on_sign_in", "issuer", "discovery_url", "private_network",
+             "client_id", "token_auth", "scopes", "claims")
+SECRET_STORED = "(set)"
+SECRET_REPLACED = "(replaced)"
+
+
+def recorded_values(row) -> dict:
+    """A provider's settings as the audit log keeps them, by the field's name (a policy setting by its own): each
+    as it is. None of them is a secret. Of the client secret only whether one is stored is kept."""
+    out = {field: getattr(row, field, None) for field in _RECORDED}
+    out.update(sso_policy.effective(getattr(row, "policy", None)))
+    out["client_secret"] = SECRET_STORED if getattr(row, "client_secret_enc", None) else None
+    return out
+
+
+def recorded_changes(before: dict, row, changed, *, shorten=None) -> dict:
+    """``{field: {"old": ..., "new": ...}}`` for the fields a save changed (``changed``, as :func:`apply` names
+    them), from the values before it (``before``, :func:`recorded_values`) and the row as it is now. A new client
+    secret is said as set or replaced, a dropped one as gone; ``shorten(field, value)`` may stand a long value in
+    by its digest."""
+    after = recorded_values(row)
+    keep = shorten or (lambda field, value: value)
+    out = {}
+    for name in changed:
+        field = name[len("policy."):] if name.startswith("policy.") else name
+        if field == "client_secret":
+            out[field] = {"old": before.get(field), "new": SECRET_REPLACED if before.get(field) else SECRET_STORED}
+        else:
+            out[field] = {"old": keep(field, before.get(field)), "new": keep(field, after.get(field))}
+    if "client_secret" not in out and before.get("client_secret") != after.get("client_secret"):
+        out["client_secret"] = {"old": before.get("client_secret"), "new": after.get("client_secret")}
+    return out
+
 
 def hold_lapsed(db, row, *, now=None, into=None) -> int:
     """Before ``row`` is turned off, and again before it is removed, in the caller's transaction: every identity

@@ -42,7 +42,7 @@ PASS_THROUGH = {
     ("app/api/api_server.py", "_passkey_audit"),
     ("app/api/sso_router.py", "_audit"),
     ("app/api/sso_admin_router.py", "_audit"),
-    ("app/api/sso_providers_router.py", "_audit"),
+    ("app/api/sso_providers_router.py", "_record"),
     ("app/services/sso_groups.py", "_audit"),
     ("app/sftp/sftp_server.py", "_audit"),
     ("app/services/auth_service.py", "_lock_audit_row"),

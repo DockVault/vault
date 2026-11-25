@@ -177,9 +177,11 @@ _IDENTIFIER_KEYS = (
     "passkey_id", "provisional",
     # single sign-on: the provider and identity rows, what the sign-in was for, how an identity was linked
     "provider_id", "identity_id", "purpose", "linked_by", "ends_sign_in", "confirmed_at_provider",
-    # a provider an administrator changed: the preset it was made from, the names of the fields that changed (never
-    # a value), its state, and how many linked accounts and links the change touched
-    "preset", "changed", "state", "made_sso_only", "restored", "identities",
+    # a provider an administrator changed: the preset it was made from, the names of the fields that changed (what
+    # each was and is goes under "changes"; of the client secret only whether one is stored), its state, how many
+    # linked accounts and links the change touched, whether the stored secret was dropped, and how many linked
+    # people were told
+    "preset", "changed", "state", "made_sso_only", "restored", "identities", "secret_cleared", "owners_told",
     # legal holds: the case's number, a hold's dates, and what it kept and why (never a name)
     "case_number", "confirm_by", "hold_only", "purge_after", "by_release", "kept_reason", "kept_at", "held_by_case",
     # an owner's notice of compliance access: whether its email waits or there is no address, whether a copy goes

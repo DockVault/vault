@@ -7,9 +7,10 @@ app/services/sso_providers.py. A test sign-in starts and finishes in app/api/sso
 
 Every write is refused while the deployment has locked single sign-on (app/core/sso_settings.py), is judged before
 anything is asked of the administrator, then asks the fixed step-up every sign-in setting is written under, then
-judges again on the row as it stands, writes, and records what changed (the names of the fields, never a value: an
-issuer is not a secret, but a row that never holds a secret cannot leak one). The other administrators are told.
-The client secret is taken, encrypted and never answered.
+judges again on the row as it stands, writes, and records what changed in the transaction that changes it: the
+names of the fields and what each was and is, as a save of any other setting is recorded (no change without its
+record). Of the client secret the record says only that one was set, replaced or dropped. The other administrators
+are told. The client secret is taken, encrypted and never answered.
 """
 from __future__ import annotations
 
@@ -49,13 +50,25 @@ def _api():
     return api_server
 
 
-def _audit(db, action: str, *, user, ip, row_id, details: dict) -> None:
+def _record(db, action: str, *, user, ip, row_id, details: dict) -> None:
+    """Add the record of a change to the transaction that makes it, before its commit: the two are written
+    together or not at all. Written after the commit, a record that failed left a provider added, changed or
+    removed with nothing in the audit log to say who did it. A record that cannot be built refuses the change."""
+    from app.core.safe_log import log_failure
     try:
         from app.services.audit_logger import AuditLogger
-        AuditLogger(db).log_action(action=action, status="success", user=user, ip_address=ip, details=details,
-                                   resource_type="sso_provider", resource_id=str(row_id))
-    except Exception as exc:      # noqa: BLE001 -- the change stands; the missing row is said
-        log.warning("sso provider audit row not written: %s", type(exc).__name__)
+        db.add(AuditLogger(db).build_row(action=action, status="success", user=user, ip_address=ip, details=details,
+                                         resource_type="sso_provider", resource_id=str(row_id)))
+    except Exception as exc:      # noqa: BLE001 -- no change without its record
+        db.rollback()
+        error_id = log_failure("a change of a single sign-on provider was not saved", exc)
+        raise HTTPException(status_code=503, detail="The change was not saved: its audit record could not be "
+                                                    f"written. Nothing was changed (error {error_id}).")
+
+
+def _recorded_changes(before: dict, row, changed) -> dict:
+    """What a save changed, as the audit log keeps it: a long value by its digest, as any setting's is."""
+    return providers.recorded_changes(before, row, changed, shorten=_api()._settings_value_for_audit)
 
 
 def _tell_administrators(by: str, title: str, body: str) -> None:
@@ -119,10 +132,12 @@ def _tell_accounts(users, title: str, change: str) -> None:
         log.info("sso account notices skipped: %s", type(exc).__name__)
 
 
-def _end_sessions_of(db, provider_id) -> int:
+def _end_sessions_of(db, provider_id, *, by=None, ip=None, name=None) -> int:
     """End every session that came through the provider, once it is off (no new sign-in and no renewal goes through
     it any more): each account's turn at its sessions first, as a provider's own logout ends them. Returns how
-    many ended; a failure ends none and is logged, and the provider stays off."""
+    many ended; a failure ends none and is logged, and the provider stays off. How many ended is recorded with
+    their ending, in its transaction, as the administrator's (``by``): the change that turned the provider off
+    was committed before, and could not know the number."""
     from app.api import sso_router
     from app.core.models import SsoSession
     api = _api()
@@ -134,10 +149,14 @@ def _end_sessions_of(db, provider_id) -> int:
         for owner in sso_router._owners_of(db, named):
             api._sessions_turn(db, owner)
         session_ids = [s.session_id for s in query.all()]
-        ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider turned off",
-                                     durable=True) if session_ids else 0
+        ended = int(api._revoke_sessions(db, session_ids=session_ids, actor_username="provider turned off",
+                                         durable=True) or 0) if session_ids else 0
+        if ended and by is not None:
+            _record(db, "sso_provider_updated", user=by, ip=ip, row_id=provider_id,
+                    details={"provider_id": str(provider_id), "name": name, "changed": [], "sessions": ended,
+                             "reason": "sessions_ended"})
         db.commit()
-        return int(ended or 0)
+        return ended
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         log.warning("sso sessions of a provider turned off were not ended: %s", type(exc).__name__)
@@ -213,12 +232,13 @@ def create_provider(body: ProviderCreate, request: Request, current_user: User =
     _step_up(db, current_user, request)        # may commit (a receipt is used once)
     try:
         row = providers.create(db, name=body.name, preset_id=body.preset, by=current_user)
+        db.flush()                                 # the row has its id: the record names it
+        _record(db, "sso_provider_created", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
+                details={"provider_id": str(row.id), "name": row.name, "preset": body.preset or ""})
         db.commit()
     except (providers.Invalid, providers.Conflict) as exc:
         db.rollback()
         raise _refused(exc)
-    _audit(db, "sso_provider_created", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
-           details={"provider_id": str(row.id), "name": row.name, "preset": body.preset or ""})
     _tell_administrators(current_user.username, "A single sign-on provider was added",
                          f"{current_user.username} added the single sign-on provider {row.name}. It is off until it "
                          "is tested and turned on.")
@@ -258,6 +278,7 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     try:
         changes = providers.clean(body, row=row)
         stored_policy = providers.check(db, row, changes, account_policy=api._account_policy(db))
+        before = providers.recorded_values(row)
         outcome = providers.apply(db, row, changes, stored_policy, unknown_hash=unknown_hash)
         made, restored = _accounts_named(db, outcome["made_sso_only"]), _accounts_named(db, outcome["restored"])
         turned_off = outcome["connection_changed"] and row.state == providers.ENABLED
@@ -269,11 +290,24 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
         held = providers.hold_lapsed(db, row) if turned_off else 0
         if turned_off:
             row.state = providers.DISABLED
+        if outcome["changed"]:
+            # With the change, in its transaction: the fields, what each was and is, and what the change did to
+            # the provider and to the accounts linked to it. (The sessions it ends are ended after the commit,
+            # and recorded there.)
+            details = {"provider_id": str(row.id), "name": row.name, "changed": outcome["changed"],
+                       "changes": _recorded_changes(before, row, outcome["changed"]),
+                       "made_sso_only": len(outcome["made_sso_only"]), "restored": len(outcome["restored"]),
+                       "secret_cleared": bool(outcome["secret_cleared"]), "owners_told": len(owners)}
+            if turned_off:
+                details.update(state=providers.DISABLED, identities=held)
+            _record(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
+                    details=details)
         db.commit()
     except (providers.Invalid, providers.Conflict) as exc:
         db.rollback()
         raise _refused(exc)
-    ended = _end_sessions_of(db, row.id) if turned_off else 0
+    ended = (_end_sessions_of(db, row.id, by=current_user, ip=api.get_client_ip(request), name=row.name)
+             if turned_off else 0)
     outcome = {**outcome, "turned_off": bool(turned_off), "sessions_ended": ended, "held": held,
                "owners_told": len(owners)}
     label = row.label or row.name
@@ -301,9 +335,6 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
             f"An administrator now lets accounts made at their first sign-in through {label} set a password. "
             f"{SET_A_PASSWORD}" + (f" You can still sign in through {label}." if is_on else while_off)))
     if outcome["changed"]:
-        _audit(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
-               details={"provider_id": str(row.id), "name": row.name, "changed": outcome["changed"],
-                        "made_sso_only": len(outcome["made_sso_only"]), "restored": len(outcome["restored"])})
         said = f"{current_user.username} changed the single sign-on provider {row.name} ({', '.join(outcome['changed'])})."
         if outcome["made_sso_only"]:
             said += f" {len(outcome['made_sso_only'])} linked account(s) now sign in only through it."
@@ -352,12 +383,14 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
             raise _refused(refusal)
     off = body.state == providers.DISABLED
     held = providers.hold_lapsed(db, row) if off else 0        # while the row still reads as on
+    state_change = dict(old=row.state, new=body.state)
     row.state = body.state
+    _record(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
+            details={"provider_id": str(row.id), "name": row.name, "changed": ["state"], "state": row.state,
+                     "changes": {"state": state_change}, **({"identities": held} if off else {})})
     db.commit()
-    ended = _end_sessions_of(db, row.id) if off else 0
-    _audit(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
-           details={"provider_id": str(row.id), "name": row.name, "changed": ["state"], "state": row.state,
-                    **({"sessions": ended, "identities": held} if off else {})})
+    ended = (_end_sessions_of(db, row.id, by=current_user, ip=api.get_client_ip(request), name=row.name)
+             if off else 0)
     turned = "on" if row.state == providers.ENABLED else "off"
     said = f"{current_user.username} turned the single sign-on provider {row.name} {turned}."
     if off and ended:
@@ -414,12 +447,9 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     held_ids = []
     if row.state != providers.ENABLED and providers.hold_lapsed(db, row, into=held_ids):
         held = len(held_ids)
-        from app.services.audit_logger import AuditLogger
-        db.add(AuditLogger(db).build_row(
-            action="sso_provider_updated", status="success", user=current_user, ip_address=api.get_client_ip(request),
-            resource_type="sso_provider", resource_id=str(row.id),
-            details={"provider_id": str(row.id), "name": row.name, "changed": [], "identities": held,
-                     "reason": "held_before_removal"}))
+        _record(db, "sso_provider_updated", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
+                details={"provider_id": str(row.id), "name": row.name, "changed": [], "identities": held,
+                         "reason": "held_before_removal"})
         people = [(u.id, u.username, u.email) for u in db.query(User).filter(User.id.in_(held_ids)).all()]
         name, shown = row.name, row.label or row.name
         db.commit()
@@ -459,14 +489,14 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
             to_ask.append(told)
         else:
             kept.append(told)
+    _record(db, "sso_provider_deleted", user=current_user, ip=api.get_client_ip(request), row_id=gone["provider_id"],
+            details={"provider_id": gone["provider_id"], "name": gone["name"], "identities": gone["identities"]})
     db.delete(row)
     db.commit()
     removed = f"An administrator removed {label} from this vault: your account can no longer sign in through it."
     _tell_accounts(kept, "A sign-in method was removed from your account", removed)
     _tell_accounts(may_set, "A sign-in method was removed from your account", f"{removed} {SET_A_PASSWORD}")
     _tell_accounts(to_ask, "A sign-in method was removed from your account", f"{removed} {sso_only.NO_PROVIDER_ON}")
-    _audit(db, "sso_provider_deleted", user=current_user, ip=api.get_client_ip(request), row_id=gone["provider_id"],
-           details={"provider_id": gone["provider_id"], "name": gone["name"], "identities": gone["identities"]})
     _tell_administrators(current_user.username, "A single sign-on provider was removed",
                          f"{current_user.username} removed the single sign-on provider {gone['name']}"
                          + (f", with the links of {gone['identities']} account(s) to it." if gone["identities"] else "."))

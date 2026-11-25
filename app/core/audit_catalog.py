@@ -74,10 +74,12 @@ ACTIONS: Tuple[AuditAction, ...] = (
     AuditAction("sso_sign_in_refused", "sign_in", "Single sign-on refused", "warning"),
     AuditAction("sso_identity_linked", "sign_in", "Organisation identity linked", "notice"),
     AuditAction("sso_identity_unlinked", "sign_in", "Organisation identity unlinked", "notice"),
-    AuditAction("sso_provider_tested", "sign_in", "Single sign-on provider tested", "notice"),
-    AuditAction("sso_provider_created", "sign_in", "Single sign-on provider added", "warning"),
-    AuditAction("sso_provider_updated", "sign_in", "Single sign-on provider changed", "warning"),
-    AuditAction("sso_provider_deleted", "sign_in", "Single sign-on provider removed", "warning"),
+    # Who may sign in through whom is an administrator's setting: kept with the other settings' records, which
+    # the size cap never deletes and the administrators' minimum protects (app/core/audit_retention.py).
+    AuditAction("sso_provider_tested", "administration", "Single sign-on provider tested", "notice"),
+    AuditAction("sso_provider_created", "administration", "Single sign-on provider added", "warning"),
+    AuditAction("sso_provider_updated", "administration", "Single sign-on provider changed", "warning"),
+    AuditAction("sso_provider_deleted", "administration", "Single sign-on provider removed", "warning"),
     AuditAction("sso_groups_missing", "sign_in", "Single sign-on token without group information", "warning"),
     AuditAction("sso_backchannel_logout", "sign_in", "Provider signed the person out", "notice"),
     AuditAction("sso_freshness_warned", "sign_in", "Told to sign in through the provider before keys pause", "info",
