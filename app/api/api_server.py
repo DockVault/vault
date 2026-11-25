@@ -11597,6 +11597,22 @@ def _passkey_algorithm_check(db, user, row) -> None:
             print(f"⚠ passkey notice skipped: {type(e).__name__}")
 
 
+def _passkey_verified_the_person(row, assertion) -> None:
+    """A key added without verifying the person (the rule was off, or the key had no PIN yet) counts as one that
+    can from its first accepted proof that did (app/core/webauthn_settings.py, verified_the_person). Never the
+    other way: a later proof without it takes nothing from the key."""
+    if assertion.uv and not getattr(row, "uv_initialized", False):
+        row.uv_initialized = True
+
+
+def _passkey_proved(row, assertion) -> None:
+    """What an accepted proof leaves on the key: its counter, whether it is backed up now, and that it verified
+    the person when it did."""
+    row.sign_count = assertion.sign_count
+    row.backup_state = assertion.bs
+    _passkey_verified_the_person(row, assertion)
+
+
 def _passkey_relying_party(db):
     """The vault as a relying party, or 409: passkeys are bound to the vault's public address, and an address
     with no host name (or an IP address) cannot carry them."""
@@ -11626,6 +11642,7 @@ def _passkey_public(row, now=None) -> dict:
             "last_used_at": _passkey_time(row.last_used_at), "synced": bool(row.backup_eligible),
             "transports": list(row.transports or []), "algorithm": _PASSKEY_ALG_NAMES.get(row.cose_alg, str(row.cose_alg)),
             "attested": bool(getattr(row, "attested", False)),
+            "user_verified": bool(getattr(row, "uv_initialized", False)),
             "provisional": provisional, "provisional_until": _passkey_time(row.provisional_until) if provisional else None}
 
 
@@ -11815,9 +11832,14 @@ async def passkey_register_options(
         raise HTTPException(status_code=503, detail="Passkeys are temporarily unavailable. Try again in a moment.")
     now = datetime.utcnow()
     try:
+        # A key that never verified the person, while the vault asks for that, may be added again: its owner
+        # sets a PIN on it and registers it anew. Named among the keys not to repeat, the authenticator would
+        # answer that it is already registered, and the account would be left with a key it cannot use.
+        from app.core import webauthn_settings
         options = ws.registration_options(rp, policy, challenge=challenge.challenge_bytes, user_id=ws.user_handle_for(user.id),
                                           username=user.username, display_name=None,
-                                          existing=[(c.credential_id, tuple(c.transports or ())) for c in existing])
+                                          existing=[(c.credential_id, tuple(c.transports or ())) for c in existing
+                                                    if webauthn_settings.verified_the_person(c)])
     except ws.Refused as refused:
         raise HTTPException(status_code=400, detail={
             "reason": refused.code,
@@ -11940,6 +11962,7 @@ async def list_my_passkeys(
     now = datetime.utcnow()
     from app.core import public_url
     return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, current_user.id)], "limit": PASSKEY_LIMIT,
+            "require_user_verification": webauthn_settings.require_uv(),
             "attestation": webauthn_settings.attestation(), "origin": public_url.expected_origin() or None,
             "enabled": _passkeys_enabled(db),
             "requirement": webauthn_settings.requirement_public(webauthn_settings.requirement(db, current_user))}
@@ -12056,7 +12079,9 @@ async def admin_list_passkeys(
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     now = datetime.utcnow()
-    return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, target.id)], "limit": PASSKEY_LIMIT}
+    from app.core import webauthn_settings
+    return {"passkeys": [_passkey_public(r, now) for r in _passkeys_of(db, target.id)], "limit": PASSKEY_LIMIT,
+            "require_user_verification": webauthn_settings.require_uv()}
 
 
 @app.delete("/users/{user_id}/passkeys/{passkey_id}")
@@ -12306,6 +12331,8 @@ async def passkey_sign_in_verify(
         raise await _passkey_sign_in_refused(db, request, client_ip, user=user, reason=f"passkey refused: {refused.code}")
     if getattr(row, "rp_id", None) is None:
         row.rp_id = rp.rp_id                     # a row from before the address was recorded: it answered here
+    # Before the sign-in is judged: a key that verified the person just now is one of the account's factors.
+    _passkey_verified_the_person(row, assertion)
     method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
     result = sign_in.SignInResult(user, [method], client_ip, user_verified=assertion.uv,
                                   passwordless_allowed=_passkey_passwordless_allowed(db, user),
@@ -12318,15 +12345,13 @@ async def passkey_sign_in_verify(
         # The account signs in only through its provider: the proof was good, so the key keeps its counter and
         # flags (a copied key is still told apart) and the throttle gives the attempt back; the refusal, its message
         # and its audit row are the pipeline's.
-        row.sign_count = assertion.sign_count
-        row.backup_state = assertion.bs
+        _passkey_proved(row, assertion)
         db.commit()
         AuthService._give_back(throttle)
         raise
     # The proof was accepted and the sign-in is whole or held for its next step: the key records it, and the
     # throttle gives the attempt back.
-    row.sign_count = assertion.sign_count
-    row.backup_state = assertion.bs
+    _passkey_proved(row, assertion)
     row.last_used_at = datetime.utcnow()
     db.commit()
     AuthService._give_back(throttle)
@@ -12378,8 +12403,7 @@ def _passkey_assert(db, user, *, purpose: str, challenge_id, credential, policy)
     allow_ids = [decoded for decoded in (_passkey_b64url_decode(e) for e in challenge.allow_ids) if decoded]
     assertion = ws.verify_authentication(rp, policy, challenge=challenge.challenge_bytes, credential=credential,
                                          key=known, allow_ids=allow_ids)
-    row.sign_count = assertion.sign_count
-    row.backup_state = assertion.bs
+    _passkey_proved(row, assertion)
     row.last_used_at = datetime.utcnow()
     if getattr(row, "rp_id", None) is None:
         row.rp_id = rp.rp_id                     # a row from before the address was recorded: it answered here

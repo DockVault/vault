@@ -45,11 +45,16 @@ def get_sign_in_settings(current_user: User = Depends(require_interactive_admin)
     """The passkey settings as the page shows them: each with its value in force, where it comes from and whether
     the deployment locked it; the public address's readiness (passkeys need one) and, when no passkey can be made at
     it, what to change, in words, and whether a requirement on some role waits because of it; whether trust anchors
-    exist, and under direct attestation how many passkeys in use were added without it."""
+    exist, and under direct attestation how many passkeys in use were added without it; how many passkeys in use
+    never verified the person, and how many accounts hold no other (with the rule on, the ones that no longer
+    count; with it off, the ones that would stop counting if it were turned on)."""
     from app.core.public_url import readiness, why_no_passkeys
+    never = ws_settings.never_verified(db)
     return {"settings": registry.describe(ws_settings.KEYS), "readiness": readiness(), "why_not": why_no_passkeys(),
             "requirement_paused": ws_settings.requirement_paused(),
             "unattested_passkeys": ws_settings.unattested_count(db),
+            "passkeys_without_verification": never["passkeys"],
+            "accounts_with_only_such_passkeys": never["accounts_with_no_other"],
             "trust_anchors": len(ws_settings.trust_anchors()), "step_up": ws_settings.STEP_UP_ACTION}
 
 
@@ -72,6 +77,7 @@ def put_sign_in_setting(setting: str, body: SignInValue, request: Request,
     _step_up(db, current_user, request)       # may commit (a receipt is used once): bound the rest again
     limit_statements(db)
     old_algs = ws_settings.allowed_alg_names() if key == ws_settings.ALLOWED_ALGS else None
+    verified_before = ws_settings.require_uv()
     try:
         outcome = setting_changes.request(db, key, body.value, actor=current_user)
         if key == ws_settings.ALLOWED_ALGS and outcome.status == "applied":
@@ -90,5 +96,28 @@ def put_sign_in_setting(setting: str, body: SignInValue, request: Request,
                                                     f"written. Nothing was changed (error {error_id}).")
     if outcome.status == "applied":
         registry.refresh()
+        if key == ws_settings.REQUIRE_UV and ws_settings.require_uv() and not verified_before:
+            _tell_the_owners_of_keys_that_never_verified(db)
     setting_changes.announce_outcome(outcome, current_user.username)
     return {"status": outcome.status, "setting": registry.describe([key])[0]}
+
+
+def _tell_the_owners_of_keys_that_never_verified(db) -> None:
+    """The rule that the authenticator verify the person was just turned on: whoever holds a passkey that never
+    did is told that it no longer counts, and what to do. Best effort: the change is saved, and the sign-in page
+    says the same to an account left with only such keys."""
+    try:
+        from datetime import datetime
+        from app.api import api_server as api
+        owners = [str(owner) for owner in ws_settings.never_verified(db)["owners"]]
+        if owners:
+            api._notify_users(owners, "security", title="One of your passkeys no longer counts here",
+                              body=("This vault now asks every passkey to check a PIN, a fingerprint or a face. A "
+                                    "passkey of yours has never done so, and is refused until it does: set a PIN "
+                                    "on it and sign in with it, or add another passkey or an authenticator app. "
+                                    "If it was your only second factor, you set one up again at your next "
+                                    "sign-in."),
+                              target="#profile",
+                              dedup_prefix=f"passkey_never_verified:{datetime.utcnow().date().isoformat()}")
+    except Exception as exc:  # noqa: BLE001 -- the change is saved; nothing here may undo it
+        log_failure("owners of passkeys that never verified the person were not told", exc)

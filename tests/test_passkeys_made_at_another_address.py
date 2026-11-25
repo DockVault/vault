@@ -34,7 +34,7 @@ def _address(monkeypatch, host):
 
 
 def _key(user, made_at, **extra):
-    fields = dict(id=uuid.uuid4(), user_id=user.id, retired_at=None, cose_alg=-7, rp_id=made_at, label="key")
+    fields = dict(id=uuid.uuid4(), user_id=user.id, uv_initialized=True, retired_at=None, cose_alg=-7, rp_id=made_at, label="key")
     fields.update(extra)
     return types.SimpleNamespace(**fields)
 
@@ -273,7 +273,7 @@ def test_the_deployment_says_where_its_passkeys_were_made():
                         (people[1], ELSEWHERE, None), (people[1], ELSEWHERE, datetime(2026, 11, 1)),
                         (people[2], None, None))):
                     db.add(WebAuthnCredential(user_id=owner.id, credential_id=bytes([index + 1]) * 8,
-                                              public_key_cose=b"k", cose_alg=-7, rp_id=address, retired_at=retired))
+                                              public_key_cose=b"k", cose_alg=-7, rp_id=address, uv_initialized=True, retired_at=retired))
                 db.commit()
                 said = host_operator.passkey_addresses(db)
     finally:

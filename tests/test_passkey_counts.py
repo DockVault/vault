@@ -56,7 +56,7 @@ def _user(db, name):
 def _passkey(db, user, *, retired=False):
     from app.core.models import WebAuthnCredential
     row = WebAuthnCredential(user_id=user.id, credential_id=uuid.uuid4().bytes, public_key_cose=b"key", cose_alg=-7,
-                             retired_at=datetime(2026, 11, 1) if retired else None)
+                             uv_initialized=True, retired_at=datetime(2026, 11, 1) if retired else None)
     db.add(row)
     db.commit()
     return row

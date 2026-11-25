@@ -125,7 +125,7 @@ def test_the_requirement_follows_the_role_the_keys_and_the_clearance(monkeypatch
     assert wss.requirement(db, alice, now=now + timedelta(days=14, seconds=1)).overdue is True
     assert wss.requirement_public(req)["due"].startswith("2026-11-23")
     # A passkey ends it; a retired one does not count; another role is not asked; the clearance ends it.
-    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, retired_at=None, cose_alg=-7)
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, uv_initialized=True, retired_at=None, cose_alg=-7)
     db.rows_of(WebAuthnCredential).append(key)
     assert wss.requirement(db, alice, now=now).required is False
     assert wss.usable_passkeys(db, alice.id) == 1 and wss.usable_passkeys(db, alice.id, without=key.id) == 0
@@ -183,7 +183,7 @@ def test_the_guards_at_save(monkeypatch):
     _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"]})
     assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 7)
     assert wss.save_refusal(db, wss.GRACE_DAYS, 60) is None                      # a longer grace covers root again
-    db.rows_of(WebAuthnCredential).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=root.id, retired_at=None, cose_alg=-7))
+    db.rows_of(WebAuthnCredential).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=root.id, uv_initialized=True, retired_at=None, cose_alg=-7))
     assert wss.save_refusal(db, wss.GRACE_DAYS, 7) is None                       # an administrator holds a key
     # ...one whose algorithm still signs in: a key of an algorithm removed for good protects nobody.
     _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"], wss.ALLOWED_ALGS: ["RS256"]})
@@ -193,7 +193,7 @@ def test_the_guards_at_save(monkeypatch):
     # ...and made at the address the vault has now: a key made at another address is never offered by the browser
     # here, and protects nobody. The same key counts again once the vault is back at its address.
     from app.services import webauthn_service as ws
-    elsewhere = types.SimpleNamespace(id=uuid.uuid4(), user_id=root.id, retired_at=None, cose_alg=-7,
+    elsewhere = types.SimpleNamespace(id=uuid.uuid4(), user_id=root.id, uv_initialized=True, retired_at=None, cose_alg=-7,
                                       rp_id="old.example.test")
     db.rows_of(WebAuthnCredential).append(elsewhere)
     _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"],

@@ -93,7 +93,9 @@ _spec(SIGN_IN_ROLES, "list", ["user", "external"], "Roles a passkey signs in alo
            "password.")
 _spec(REQUIRE_UV, "bool", True, "The authenticator must verify the person",
       help="Off, a passkey that did not check a PIN, fingerprint or face is one possession factor: the "
-           "password always follows it, and it never counts for a compliance step-up.")
+           "password always follows it, and it never counts for a compliance step-up. Turned on again, a passkey "
+           "that was added while it was off and has never checked one is refused at every use and no longer "
+           "counts: an account left with only such passkeys sets a second factor up again at its next sign-in.")
 _spec(ALLOWED_ALGS, "list", ["ES256", "RS256", "EdDSA"], "Signature algorithms", choices=tuple(ALG_CODES),
       level=registry.ADVANCED,
       validate=lambda v: f"{ALLOWED_ALGS} needs at least one algorithm" if not v else None,
@@ -291,16 +293,47 @@ def fill_the_addresses_not_recorded(db) -> int:
         {WebAuthnCredential.rp_id: here}, synchronize_session=False) or 0)
 
 
+def verified_the_person(key, required: Optional[bool] = None) -> bool:
+    """Whether ``key`` can meet the rule that the authenticator verify the person (a PIN, a fingerprint, a face):
+    the rule is off, or the key has verified the person, when it was added or at a use since. While the rule is
+    on, every use of a key asks for the verification, and a key that never gave it (one that cannot, or one whose
+    owner never set its PIN) is refused each time: it is no factor the account can give, as a key of a removed
+    algorithm is none. It counts again by itself when it verifies the person at a use (its owner set a PIN and
+    signed in with it), or when the rule is turned off. ``required`` reads the rule as it would be after a
+    save."""
+    required = require_uv() if required is None else bool(required)
+    return not required or bool(getattr(key, "uv_initialized", False))
+
+
+def never_verified(db) -> dict:
+    """The passkeys in use that never verified the person, for the Sign-in page and for telling their owners:
+    ``{"passkeys": how many, "owners": [account ids], "accounts_with_no_other": how many of those accounts hold
+    no passkey that did}``. With the rule on these are the keys that no longer count; with it off, the ones that
+    would stop counting if it were turned on."""
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not has_table(db, WebAuthnCredential.__tablename__):
+        return {"passkeys": 0, "owners": [], "accounts_with_no_other": 0}
+    in_use = db.query(WebAuthnCredential).filter(WebAuthnCredential.retired_at.is_(None)).all()
+    never = [key.user_id for key in in_use if not getattr(key, "uv_initialized", False)]
+    did = {key.user_id for key in in_use if getattr(key, "uv_initialized", False)}
+    owners = list(dict.fromkeys(never))
+    return {"passkeys": len(never), "owners": owners,
+            "accounts_with_no_other": sum(1 for owner in owners if owner not in did)}
+
+
 def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None,
-                    whatever_the_switch: bool = False) -> int:
+                    whatever_the_switch: bool = False, verification: Optional[bool] = None) -> int:
     """How many passkeys of the account can still be used: not retired, made at the address the vault has now
-    (:func:`at_this_address`), and of an algorithm that is allowed now or was removed less than 30 days ago
-    (:func:`algorithm_usable`). A key of an algorithm an administrator removed is refused at every use once its 30
-    days are over, and a key made at another address is never offered by the browser: each is on the account in
-    name only, is no second factor, and does not meet a role's requirement. ``without`` leaves one key out (the
-    one about to be removed). With passkeys turned off none is a factor; ``whatever_the_switch`` counts them all
-    the same, for the one who asks what a removal leaves (the switch is the deployment's and may be turned back
-    on)."""
+    (:func:`at_this_address`), of an algorithm that is allowed now or was removed less than 30 days ago
+    (:func:`algorithm_usable`), and able to meet the rule that the authenticator verify the person
+    (:func:`verified_the_person`). A key of an algorithm an administrator removed is refused at every use once its
+    30 days are over, a key made at another address is never offered by the browser, and a key that never
+    verified the person is refused at every use while the vault asks for that: each is on the account in name
+    only, is no second factor, and does not meet a role's requirement. ``without`` leaves one key out (the one
+    about to be removed). With passkeys turned off none is a factor; ``whatever_the_switch`` counts them all the
+    same, for the one who asks what a removal leaves (the switch is the deployment's and may be turned back on).
+    ``verification`` reads the rule as it would be after a save."""
     from app.core.models import WebAuthnCredential
     from app.core.table_presence import has_table
     if (not whatever_the_switch and not enabled()) or not has_table(db, WebAuthnCredential.__tablename__):
@@ -311,13 +344,20 @@ def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None
     here = address_now()
     return sum(1 for key in keys
                if getattr(key, "id", None) != without and at_this_address(key, here)
-               and algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0])
+               and algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0]
+               and verified_the_person(key, verification))
+
+
+PASSKEYS_AT_ANOTHER_ADDRESS = "passkeys_at_another_address"
+PASSKEYS_NO_LONGER_ACCEPTED = "passkeys_no_longer_accepted"
+PASSKEYS_WITHOUT_VERIFICATION = "passkeys_without_verification"
 
 
 def why_none_can_be_used(db, user_id, *, now: Optional[datetime] = None) -> Optional[str]:
     """For an account that holds passkeys of which none can be used: why. ``passkeys_at_another_address`` when
     none was made at the address the vault has now (the vault moved, or its address can carry no passkey);
-    ``passkeys_no_longer_accepted`` when the ones made here are of an algorithm that was removed and has run out.
+    ``passkeys_no_longer_accepted`` when the ones made here are of an algorithm that was removed and has run out;
+    ``passkeys_without_verification`` when the ones left never verified the person and the vault asks for that.
     None for an account that holds none, or one it can use, and with passkeys turned off."""
     from app.core.models import WebAuthnCredential
     from app.core.table_presence import has_table
@@ -328,17 +368,21 @@ def why_none_can_be_used(db, user_id, *, now: Optional[datetime] = None) -> Opti
                                                WebAuthnCredential.retired_at.is_(None)).all()
     here = address_now()
     made_here = [key for key in keys if at_this_address(key, here)]
-    if not keys or any(algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0] for key in made_here):
+    accepted = [key for key in made_here if algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0]]
+    if not keys or any(verified_the_person(key) for key in accepted):
         return None
-    return "passkeys_no_longer_accepted" if made_here else "passkeys_at_another_address"
+    if accepted:
+        return PASSKEYS_WITHOUT_VERIFICATION
+    return PASSKEYS_NO_LONGER_ACCEPTED if made_here else PASSKEYS_AT_ANOTHER_ADDRESS
 
 
 def only_lapsed_passkeys(db, user_id, *, now: Optional[datetime] = None) -> bool:
     """Whether the account holds passkeys and none of them can be used any more: each is of an algorithm an
-    administrator removed more than 30 days ago, or was made at another address than the vault has now. Its
-    factor went away under it, by nobody's act on the account: it sets one up again at its next sign-in, as after
-    a reset, and the keys count again by themselves if the algorithm, or the address, comes back. False with
-    passkeys turned off (none is a factor then, by the deployment's choice), and for an account that holds none."""
+    administrator removed more than 30 days ago, was made at another address than the vault has now, or never
+    verified the person while the vault asks for that. Its factor went away under it, by nobody's act on the
+    account: it sets one up again at its next sign-in, as after a reset, and the keys count again by themselves
+    if the algorithm, the address or the rule comes back. False with passkeys turned off (none is a factor then,
+    by the deployment's choice), and for an account that holds none."""
     from app.core.models import WebAuthnCredential
     from app.core.table_presence import has_table
     if not enabled() or not has_table(db, WebAuthnCredential.__tablename__):
@@ -495,21 +539,23 @@ def save_refusal(db, key: str, value, *, settings_now: Optional[dict] = None) ->
                 "(/app/certs/<file name>), restart, and try again.")
     if proposed[ALLOWED_AAGUIDS] and proposed[ATTESTATION] != DIRECT:
         return "A list of allowed authenticator makes proves nothing without direct attestation: turn that on first."
-    if key in (MODE, REQUIRED_ROLES, GRACE_DAYS) and proposed[MODE] == REQUIRED_FOR_ROLES \
+    if key in (MODE, REQUIRED_ROLES, GRACE_DAYS, REQUIRE_UV) and proposed[MODE] == REQUIRED_FOR_ROLES \
             and "admin" in (proposed[REQUIRED_ROLES] or ()):
-        why = _last_administrator_refusal(db, int(proposed[GRACE_DAYS]))
+        why = _last_administrator_refusal(db, int(proposed[GRACE_DAYS]), verification=bool(proposed[REQUIRE_UV]))
         if why:
             return why
     return None
 
 
-def _last_administrator_refusal(db, grace: int) -> Optional[str]:
+def _last_administrator_refusal(db, grace: int, *, verification: Optional[bool] = None) -> Optional[str]:
     """Refuse a requirement on administrators that would leave none able to sign in: every administrator who can
     act (active, not locked) holds no passkey that can be used (:func:`usable_passkeys`: made at the address the
-    vault has now, of an algorithm that still signs in), has no clearance, and has a grace that has already run
-    out (or would, with the new grace). An administrator whose grace has not started yet is protected by the
-    window; one who cannot sign in anyway protects nobody. A key made at another address is one the browser never
-    offers here: it protects nobody either, as the requirement itself reads it."""
+    vault has now, of an algorithm that still signs in, able to verify the person where the vault asks for it),
+    has no clearance, and has a grace that has already run out (or would, with the new grace). An administrator
+    whose grace has not started yet is protected by the window; one who cannot sign in anyway protects nobody. A
+    key made at another address is one the browser never offers here: it protects nobody either, as the
+    requirement itself reads it. ``verification`` is the rule on verifying the person as it would be after the
+    save: turning it on takes the keys that never did out of the count, so it is asked the same question."""
     from app.core import last_admin
     from app.core.models import RoleEnum, User
     now = datetime.utcnow()
@@ -520,7 +566,7 @@ def _last_administrator_refusal(db, grace: int) -> Optional[str]:
     for admin in admins:
         if getattr(admin, "passkey_requirement_cleared_at", None) is not None:
             return None
-        if usable_passkeys(db, admin.id, now=now, whatever_the_switch=True) > 0:
+        if usable_passkeys(db, admin.id, now=now, whatever_the_switch=True, verification=verification) > 0:
             return None
         since = getattr(admin, "passkey_required_since", None)
         if since is None or now <= since + timedelta(days=grace):

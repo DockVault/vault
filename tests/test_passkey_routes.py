@@ -315,12 +315,12 @@ def test_the_same_authenticator_credential_registers_once_and_the_account_holds_
     assert status == 400 and out["detail"]["reason"] == "already_registered"
     # The same credential on ANOTHER account: refused too (one key, one account).
     other = _user("bob")
-    h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, credential_id=b"other-cred", retired_at=None,
+    h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, credential_id=b"other-cred", uv_initialized=True, retired_at=None,
                                           provisional_until=None, created_at=datetime.utcnow(), transports=None))
     # Twenty keys fill the account; the twenty-first is refused at options and at verify.
     now = datetime.utcnow()
     for i in range(19):
-        h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=h.user.id, credential_id=bytes([i]) * 8, retired_at=None,
+        h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=h.user.id, credential_id=bytes([i]) * 8, uv_initialized=True, retired_at=None,
                                               provisional_until=None, created_at=now, transports=None, label=f"k{i}",
                                               backup_eligible=False, cose_alg=-7, last_used_at=None))
     assert len([r for r in h.rows() if r.user_id == h.user.id]) == 20
@@ -332,7 +332,7 @@ def test_the_same_authenticator_credential_registers_once_and_the_account_holds_
     assert status == 200
     # ...but its credential id stays taken while the row exists.
     h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=h.user.id, credential_id=SoftAuthenticator().credential_id,
-                                          retired_at=now, provisional_until=None, created_at=now, transports=None))
+                                          uv_initialized=True, retired_at=now, provisional_until=None, created_at=now, transports=None))
     assert isinstance(h.db.rows_of(WebAuthnCredential), list)
 
 
@@ -376,7 +376,7 @@ def test_nothing_older_cannot_vouch_for_a_provisional_passkey(monkeypatch):
     status, out = _call(h.S, "POST", f"/users/me/passkeys/{row.id}/confirm", None, {"X-Second-Factor": "ok"})
     assert status == 409 and "Nothing older" in out["detail"]
     # An older, ordinary passkey can.
-    older = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, credential_id=b"older", retired_at=None, provisional_until=None,
+    older = types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, credential_id=b"older", uv_initialized=True, retired_at=None, provisional_until=None,
                                   created_at=row.created_at - timedelta(days=30), transports=None, label="old",
                                   backup_eligible=False, cose_alg=-7, last_used_at=None)
     h.rows().append(older)
@@ -425,7 +425,7 @@ def test_the_last_factor_of_a_required_or_sso_only_account_stays(monkeypatch):
     status, out = _call(h.S, "DELETE", f"/users/me/passkeys/{row.id}", None, {"X-Second-Factor": "ok"})
     assert status == 409 and "last one" in out["detail"] and h.rows() == [row]
     # With another passkey, the removal goes through.
-    other = types.SimpleNamespace(id=uuid.uuid4(), user_id=h.user.id, credential_id=b"two", retired_at=None, provisional_until=None,
+    other = types.SimpleNamespace(id=uuid.uuid4(), user_id=h.user.id, credential_id=b"two", uv_initialized=True, retired_at=None, provisional_until=None,
                                   created_at=datetime.utcnow(), transports=None, label="two", backup_eligible=False, cose_alg=-7,
                                   last_used_at=None)
     h.rows().append(other)
@@ -451,7 +451,7 @@ def test_an_administrator_removes_a_passkey_as_a_credential_change_and_never_the
     from app.core.models import User
     h.db.rows_of(User).append(target)
     now = datetime.utcnow()
-    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, credential_id=b"c", retired_at=None, provisional_until=None,
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, credential_id=b"c", uv_initialized=True, retired_at=None, provisional_until=None,
                                 created_at=now, transports=["usb"], label="yubikey", backup_eligible=False, cose_alg=-7, last_used_at=None)
     h.rows().append(key)
     monkeypatch.setattr(h.S, "require_endpoint_permission", lambda *a, **k: (lambda f: f), raising=False)
@@ -483,7 +483,7 @@ def test_an_administrator_removes_a_passkey_as_a_credential_change_and_never_the
     # Removing it again: 404. An administrator's own passkey: not through this route.
     status, out = _call(h.S, "DELETE", f"/users/{target.id}/passkeys/{key.id}")
     assert status == 404
-    own = types.SimpleNamespace(id=uuid.uuid4(), user_id=admin.id, credential_id=b"a", retired_at=None, provisional_until=None,
+    own = types.SimpleNamespace(id=uuid.uuid4(), user_id=admin.id, credential_id=b"a", uv_initialized=True, retired_at=None, provisional_until=None,
                                 created_at=now, transports=None, label="mine", backup_eligible=False, cose_alg=-7, last_used_at=None)
     h.rows().append(own)
     status, out = _call(h.S, "DELETE", f"/users/{admin.id}/passkeys/{own.id}")
@@ -507,15 +507,15 @@ def test_an_administrators_removal_of_the_last_factor_an_account_set_up_counts_a
     from app.core.models import SecondFactorEnrollment, WebAuthnCredential, User
     S = _api()
     admin, target, other = _user("root", role="admin"), _user("carol"), _user("dave")
-    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, retired_at=None, label="yubikey", cose_alg=-7)
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, uv_initialized=True, retired_at=None, label="yubikey", cose_alg=-7)
     keys, enrollments = [key], []
     if left.startswith("another passkey"):
-        keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, retired_at=None, label="phone",
+        keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, uv_initialized=True, retired_at=None, label="phone",
                                           cose_alg=-257 if "removed algorithm" in left else -7))
     elif left == "another account's passkey":
-        keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, retired_at=None, label="his", cose_alg=-7))
+        keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, uv_initialized=True, retired_at=None, label="his", cose_alg=-7))
     elif left == "a passkey retired earlier":
-        keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, retired_at=datetime(2026, 11, 1),
+        keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, uv_initialized=True, retired_at=datetime(2026, 11, 1),
                                           label="old", cose_alg=-7))
     elif left.startswith("an authenticator"):
         enrollments.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, method="totp",
@@ -554,7 +554,7 @@ def test_an_administrators_removal_of_the_last_factor_an_account_set_up_counts_a
     assert "Your account was signed out everywhere." in sentence
     # The same change made as the account's own act (an administrator on their own account, through a route of
     # theirs) is no reset by somebody else.
-    again = types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, retired_at=None, label="own", cose_alg=-7)
+    again = types.SimpleNamespace(id=uuid.uuid4(), user_id=other.id, uv_initialized=True, retired_at=None, label="own", cose_alg=-7)
     db.rows_of(WebAuthnCredential).append(again)
     for mine in [k for k in keys if k.user_id == other.id]:
         mine.retired_at = datetime(2026, 11, 1)
@@ -571,8 +571,8 @@ def test_a_second_factor_reset_retires_every_passkey_and_a_gone_key_is_reported(
     S = _api()
     admin, target = _user("root", role="admin"), _user("carol")
     now = datetime.utcnow()
-    keys = [types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, retired_at=None) for _ in range(2)]
-    keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=_user("dave").id, retired_at=None))
+    keys = [types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, uv_initialized=True, retired_at=None) for _ in range(2)]
+    keys.append(types.SimpleNamespace(id=uuid.uuid4(), user_id=_user("dave").id, uv_initialized=True, retired_at=None))
     db = MemoryDB({User: [admin, target], WebAuthnCredential: keys, SecondFactorEnrollment: [], SecondFactorRecoveryCode: []})
     monkeypatch.setattr(S, "_revoke_sessions", lambda db, **kw: None)
     from app.core import auditor_rights, legal_holds
@@ -660,10 +660,10 @@ def test_the_auditor_grant_remembers_the_passkeys_it_was_approved_with():
     uid = uuid.uuid4()
     a, b = uuid.uuid4(), uuid.uuid4()
     db = MemoryDB({WebAuthnCredential: [
-        types.SimpleNamespace(id=a, user_id=uid, retired_at=None),
-        types.SimpleNamespace(id=b, user_id=uid, retired_at=None),
-        types.SimpleNamespace(id=uuid.uuid4(), user_id=uid, retired_at=datetime.utcnow()),
-        types.SimpleNamespace(id=uuid.uuid4(), user_id=uuid.uuid4(), retired_at=None)]})
+        types.SimpleNamespace(id=a, user_id=uid, uv_initialized=True, retired_at=None),
+        types.SimpleNamespace(id=b, user_id=uid, uv_initialized=True, retired_at=None),
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=uid, uv_initialized=True, retired_at=datetime.utcnow()),
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=uuid.uuid4(), uv_initialized=True, retired_at=None)]})
     assert auditor_rights.passkey_ids(db, uid) == sorted([str(a), str(b)])
     assert "approved_credential_ids" in AuditorGrant.__table__.columns.keys()
     assert AuditorGrant.__table__.c.approved_credential_ids.nullable
@@ -717,7 +717,7 @@ def test_what_a_removal_leaves_is_counted_whatever_the_passkey_switch_says(monke
     h = Harness(monkeypatch, admin)
     h.db.rows_of(User).append(target)
     now = datetime.utcnow()
-    keys = [types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, credential_id=bytes([i]), retired_at=None,
+    keys = [types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, credential_id=bytes([i]), uv_initialized=True, retired_at=None,
                                   provisional_until=None, created_at=now, transports=["usb"], label=f"key-{i}",
                                   backup_eligible=False, cose_alg=-7, last_used_at=None) for i in (1, 2)]
     h.rows().extend(keys)

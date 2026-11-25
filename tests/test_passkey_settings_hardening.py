@@ -291,7 +291,7 @@ def test_an_account_left_with_a_dead_key_signs_in_and_sets_a_new_passkey_up(monk
     h = SignInHarness(monkeypatch, [erin])
     _required(monkeypatch, registry, wss, ["user"])
     h.db.rows_of(WebAuthnCredential).append(
-        types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, retired_at=None, cose_alg=-257))
+        types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, uv_initialized=True, retired_at=None, cose_alg=-257))
     _only_this_algorithm_left(monkeypatch, wss)
     for methods, kw in ((["pwd"], {}), (["pwd"], {"provider_id": "p"}), (["pwd"], {"provider_id": "p", "provider_mfa_trusted": True})):
         outcome = sign_in.finish(h.db, sign_in.SignInResult(erin, methods, "203.0.113.9", **kw))
@@ -321,7 +321,7 @@ def test_an_account_whose_only_factor_can_no_longer_be_used_sets_one_up_again_at
     monkeypatch.setattr(S, "_login_second_factor_in_effect", in_effect)
     monkeypatch.setattr(S, "_second_factor_effective", effective)
     _resolving(monkeypatch, registry, {wss.MODE: "optional"})
-    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, retired_at=None, cose_alg=-257)
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, uv_initialized=True, retired_at=None, cose_alg=-257)
     h.db.rows_of(WebAuthnCredential).append(key)
 
     def after_the_password(user):
@@ -364,7 +364,7 @@ def test_an_account_whose_only_factor_can_no_longer_be_used_sets_one_up_again_at
     body = after_the_password(erin)
     assert body["enrollment_required"] is False and body["methods"] == ["totp", "recovery"], body
     h.db.rows_of(SecondFactorEnrollment).remove(enrollment)
-    good = types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, retired_at=None, cose_alg=-7)
+    good = types.SimpleNamespace(id=uuid.uuid4(), user_id=erin.id, uv_initialized=True, retired_at=None, cose_alg=-7)
     h.db.rows_of(WebAuthnCredential).append(good)
     assert wss.only_lapsed_passkeys(h.db, erin.id) is False and S._second_factor_to_set_up_again(h.db, erin) is False
     # The usable key beside it is the account's factor: under a rule that asks for one it does not go, the dead one does.
@@ -492,7 +492,7 @@ def test_an_administrator_does_not_reset_away_the_last_passkey_their_own_role_mu
     assert status == 409 and "Your role must hold a passkey, and a reset would retire yours" in body["detail"], body
     assert len(h.rows()) == 1 and h.rows()[0].retired_at is None
     # Another administrator's account is theirs to reset, passkey or not.
-    h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=sam.id, retired_at=None, cose_alg=-7))
+    h.rows().append(types.SimpleNamespace(id=uuid.uuid4(), user_id=sam.id, uv_initialized=True, retired_at=None, cose_alg=-7))
     assert wss.usable_passkeys(h.db, sam.id) == 1 and wss.must_hold(sam) is True
     assert _rcall(h.S, "POST", others, None, receipt)[0] == 418
     # The rule waits with the requirement.
@@ -588,7 +588,7 @@ def test_a_sign_in_under_way_ends_with_the_accounts_sessions(monkeypatch, what):
     elif what == "an administrator resets the second factor":
         h.S._apply_credential_change(h.db, cc.SECOND_FACTOR, alice, {}, actor_id=root.id, actor_name="root")
     elif what == "an administrator removes its last passkey":
-        key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, retired_at=None, label="k", cose_alg=-7)
+        key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, uv_initialized=True, retired_at=None, label="k", cose_alg=-7)
         h.db.rows_of(WebAuthnCredential).append(key)
         h.S._apply_credential_change(h.db, cc.PASSKEY, alice, {"passkey_id": str(key.id)}, actor_id=root.id,
                                      actor_name="root")
@@ -671,7 +671,7 @@ def test_a_change_to_how_an_account_signs_in_takes_its_turn_before_it_reads_anyt
     monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
     monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
     monkeypatch.setattr(h.S, "_revoke_sessions", lambda db, **kw: 0)
-    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, retired_at=None, label="k", cose_alg=-7)
+    key = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, uv_initialized=True, retired_at=None, label="k", cose_alg=-7)
     h.db.rows_of(WebAuthnCredential).append(key)
     _authenticator(h, alice)
     was = alice.password_hash
