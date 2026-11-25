@@ -1507,9 +1507,14 @@ async def list_my_identities(
 
 
 def _a_factor_can_be_set_up_here(user) -> bool:
+    """Whether the account can set a second factor up under Your account, which the page's hint goes by: an
+    authenticator app asks for the password again, and a passkey needs passkeys turned on and an address one can
+    be made at. Turned off, a passkey's registration is refused whatever the address is: the hint must not send
+    an account with no password it can type to a set-up that will refuse it."""
     from app.core import webauthn_settings
     from app.services import sign_in
-    return sign_in.has_a_password_it_can_type(user) or webauthn_settings.passkeys_can_be_made()
+    return sign_in.has_a_password_it_can_type(user) or (
+        webauthn_settings.enabled() and webauthn_settings.passkeys_can_be_made())
 
 
 @router.post("/users/me/identities/{provider_id}/start")

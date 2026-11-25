@@ -1286,8 +1286,13 @@ def test_the_pages_offer_a_confirmation_only_where_it_would_let_a_provider_find_
         assert _call(h.S, "GET", "/users/me/identities")[1]["email"]["factor_here"] is False
         m.setattr(webauthn_settings, "passkeys_can_be_made", lambda: True)
         assert _call(h.S, "GET", "/users/me/identities")[1]["email"]["factor_here"] is True
-        m.setattr(webauthn_settings, "passkeys_can_be_made", lambda: False)
+        # Nor where passkeys are turned off, whatever the address could carry: the registration would refuse.
+        m.setattr(webauthn_settings, "enabled", lambda: False)
+        assert _call(h.S, "GET", "/users/me/identities")[1]["email"]["factor_here"] is False
         m.setattr(sign_in, "has_a_password_it_can_type", lambda user: True)
+        assert _call(h.S, "GET", "/users/me/identities")[1]["email"]["factor_here"] is True      # the authenticator
+        m.setattr(webauthn_settings, "enabled", lambda: True)
+        m.setattr(webauthn_settings, "passkeys_can_be_made", lambda: False)
         assert _call(h.S, "GET", "/users/me/identities")[1]["email"]["factor_here"] is True
     h.current_user = done
     assert _call(h.S, "GET", "/users/me/identities")[1]["email"] is None
