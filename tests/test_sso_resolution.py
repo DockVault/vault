@@ -189,6 +189,95 @@ def test_a_first_sign_in_reached_by_another_browser_makes_only_the_providers_own
     assert h.finish(location, verifier="victim-tab")[0] == 401 and h.finish(location, verifier="mallory-tab")[0] == 401
 
 
+JIT = {"sso_account_creation": "jit", "sso_allowed_domains": ["example.test"]}
+
+
+@pytest.mark.parametrize("links, holder, outcome", [
+    (True, "an account that may be linked", "linked"),
+    (False, "an account that may be linked", "its owner links it"),
+    (True, "an administrator", "its owner links it"),
+    (False, "an administrator", "its owner links it"),
+    (True, "an account that set up its own factor", "link_from_profile"),
+    (False, "an account that set up its own factor", "its owner links it"),
+    (False, "an account that is turned off", "its owner links it"),
+    (True, "an account that never confirmed the address", "no_account"),
+    (False, "an account that never confirmed the address", "its owner links it"),
+    (True, "nobody", "made"),
+    (False, "nobody", "made"),
+])
+def test_a_first_sign_in_makes_no_second_account_for_an_address_that_has_one(monkeypatch, links, holder, outcome):
+    """A provider that makes an account at a first sign-in, with and without the link by address. The account that
+    holds the provider's verified address is linked where it may be, and refused for its own reason where it may
+    not; in no case is another account made beside it. Made all the same, it carried no address or was refused
+    for want of one the provider had sent, and the identity could no longer be linked to the real account."""
+    root = _user("root", role="admin")
+    fields = {"an administrator": {"role": "admin"}, "an account that is turned off": {"is_active": False},
+              "an account that never confirmed the address": {"email_confirmed_at": None}}.get(holder, {})
+    bob = _user("bob", **fields)
+    p = _provider(policy={**JIT, "sso_link_by_email": links})
+    h = Resolving(monkeypatch, [root] + ([bob] if holder != "nobody" else []), [p],
+                  account_policy={"email_requirement": "optional"})
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
+    if holder == "an account that set up its own factor":
+        _factor(h, bob, "authenticator")
+    location, _ = _sign_in(h, p, sub="s-bob", email="bob@example.test", preferred_username="bob")
+    accounts = sorted(u.username for u in h.users_named("bob") + h.users_named("bob-2"))
+    if outcome == "made":
+        assert location.startswith("/#sso="), location
+        assert accounts == ["bob"] and [i.linked_by for i in h.identities()] == ["jit"]
+        return
+    assert accounts == ["bob"] and h.users_named("bob") == [bob]          # never a second account
+    if outcome == "linked":
+        assert location.startswith("/#sso="), location
+        (identity,) = h.identities()
+        assert identity.user_id == bob.id and identity.linked_by == "email"
+        return
+    assert h.identities() == [] and h.codes() == []
+    if outcome == "its owner links it":
+        assert location == "/#sso-error=link_from_your_account", location
+        because = {"an administrator": "privileged_account:administrator",
+                   "an account that never confirmed the address": "address_on_an_unconfirmed_account"}
+        expected = because.get(holder, "address_has_an_account")
+        if holder == "an administrator" and not links:
+            expected = "address_has_an_account"          # the creation's own refusal: the link was not asked
+        assert any(a[0] == "sso_sign_in_refused" and a[2].get("refused_because") == expected for a in h.audits), h.audits
+        assert ([str(bob.id)], "A sign-in through Sign in with Contoso with your address was kept out") in h.notices
+    else:
+        assert location == f"/#sso-error={outcome}", location
+
+
+def test_an_address_the_provider_did_not_verify_says_nothing_about_whose_it_is(monkeypatch):
+    """Anybody can write any address at a provider that does not verify it. It is no reason to refuse a first
+    sign-in, and no reason to speak of the account that holds it: the account is made without an address."""
+    root, bob = _user("root", role="admin"), _user("bob")
+    p = _provider(policy=JIT)
+    h = Resolving(monkeypatch, [root, bob], [p], account_policy={"email_requirement": "optional"})
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
+    # (The organisation's hosted-domain claim admits the sign-in; the address itself is not verified.)
+    location, _ = _sign_in(h, p, sub="s-carol", email="bob@example.test", email_verified=False, hd="example.test",
+                           preferred_username="carol")
+    assert location.startswith("/#sso="), location
+    (carol,) = h.users_named("carol")
+    assert carol.email is None and not any(n[0] == [str(bob.id)] for n in h.notices)
+
+
+def test_the_administrators_are_told_of_a_first_sign_in_that_met_an_unconfirmed_address(monkeypatch):
+    """The address on that account may be the person's own, or somebody typed a colleague's on theirs. Nobody is
+    given a second account either way, and nobody is left to find out alone: the administrators can correct it."""
+    root, bob = _user("root", role="admin"), _user("bob", email_confirmed_at=None)
+    p = _provider(policy=JIT)
+    h = Resolving(monkeypatch, [root, bob], [p], account_policy={"email_requirement": "optional"})
+    told = []
+    monkeypatch.setattr(h.S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None,
+                        once=False: told.append((list(ids), title, body, target, once)) or list(ids))
+    location, _ = _sign_in(h, p, sub="s-bob", email="bob@example.test", preferred_username="bob")
+    assert location == "/#sso-error=link_from_your_account", location
+    (admins,) = [t for t in told if t[0] == [str(root.id)]]
+    assert admins[1] == "A first sign-in through Sign in with Contoso made no account" and admins[3] == "#users"
+    assert "written on bob's account, which never confirmed it" in admins[2] and admins[4] is True
+    assert "correct it on the Users page" in admins[2]
+
+
 def test_what_an_invitations_code_keeps_of_the_providers_answer():
     """The identity's key and display data, the groups, and what the sign-in that follows carries; never a token
     but the provider's logout hint, encrypted, where the provider's logout wants it. More groups than are kept
@@ -610,11 +699,16 @@ def test_a_privileged_account_is_never_linked_by_its_verified_email(monkeypatch,
         from app.core.models import AuditorGrant
         h.db.rows_of(AuditorGrant).append(types.SimpleNamespace(id=uuid.uuid4(), user_id=bob.id, status=arrange))
     location, _ = _sign_in(h, p, email="bob@example.test")
-    assert location == "/#sso-error=restricted", location
+    # Told what is so: not that the vault is closed to their tenant (it is not), but that the sign-in is not linked
+    # and where its owner links it.
+    assert location == "/#sso-error=link_from_your_account", location
+    from app.services import sso_sign_in as sso
+    assert "not open to your tenant" not in sso.reason_text("link_from_your_account")
+    assert "link your organisation's sign-in under Your account" in sso.reason_text("link_from_your_account")
     assert h.identities() == [] and h.codes() == [] and h.emails == []
     # The owner is told that it was tried (and nobody else here: there is no other administrator).
     assert h.notices == [([str(bob.id)], "A sign-in through Sign in with Contoso with your address was kept out")]
-    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "restricted"
+    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "link_from_your_account"
                and a[2].get("refused_because") == f"privileged_account:{kind}" for a in h.audits), h.audits
     # An ended grant is no standing: the account links.
     if arrange != "role":
@@ -956,7 +1050,7 @@ def test_the_owner_is_told_when_a_sign_in_with_their_address_was_kept_out(monkey
     # A privileged account: its owner, and the other administrators who are active.
     del told[:]
     location, _ = _sign_in(h, p, sub="s-2", email="root@example.test")
-    assert location == "/#sso-error=restricted"
+    assert location == "/#sso-error=link_from_your_account"
     owner, others = told
     assert owner[0] == [str(root.id)] and owner[5] == key and owner[6] is True
     assert others[0] == [str(second.id)] and others[4] == "#users" and others[5] == f"{key}:{root.id}" and others[6] is True
@@ -1400,6 +1494,22 @@ def test_a_test_sign_in_reports_the_restriction_and_what_the_vault_would_do(monk
     h.db.rows_of(SecondFactorEnrollment).remove(factor)
     summary = run(email="nobody@example.test")
     assert summary["would"].startswith("refuse: no account is linked")
+    # Where the provider makes accounts: the link comes first, and an address that has an account gets no second.
+    from app.services import sso_sign_in as sso
+    made = _provider(name="makes", policy={"sso_account_creation": "jit", "sso_link_by_email": True,
+                                           "sso_allowed_domains": ["example.test"]})
+
+    def would(email, **more):
+        answer = sso.ProviderAnswer(claims={"preferred_username": email.split("@")[0]}, subject="s-new",
+                                    issuer="https://login.example.org", tenant_id=None, email=email,
+                                    email_verified=True, display_name=None, auth_time=None)
+        return sso.would_do(h.db, made, answer, None)["would"]
+    assert would("bob@example.test") == "link the account bob by its verified email address and sign it in"
+    made.policy = {"sso_account_creation": "jit", "sso_allowed_domains": ["example.test"]}
+    assert would("bob@example.test") == (
+        "refuse: an account here already holds this verified address, and no second one is made; its owner signs in "
+        "to it and links this provider under Your account")
+    assert would("nobody@example.test").startswith("create the account nobody at the first sign-in")
     h.db.rows_of(type(h.identities()[0]) if h.identities() else __import__("app.core.models", fromlist=["ExternalIdentity"]).ExternalIdentity).append(_identity(root, p))
     summary = run()
     assert summary["would"] == "sign in the linked account"
@@ -1421,6 +1531,24 @@ def test_every_reason_has_words_the_sign_in_page_can_fetch(monkeypatch):
                  oc.TOKEN_INVALID, oc.NONCE_MISMATCH, oc.ENDPOINT_REFUSED, oc.TEMPORARILY_UNAVAILABLE, oc.DISCOVERY_INVALID):
         assert isinstance(reasons.get(code), str) and reasons[code].strip(), code
     assert sso.reason_text("something-new") == reasons[oc.PROVIDER_ERROR]
+    # Every reason a sign-in is refused with in the code has its own words there: one that had none would be shown
+    # as "did not complete", whatever it meant. Read from the source, so a new one is found.
+    import ast
+    import inspect
+    from app.api import sso_router
+    named = set()
+    for module in (sso, sso_router):
+        for node in ast.walk(ast.parse(inspect.getsource(module))):
+            if (isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", None)) == "Refusal"
+                    and node.args):
+                first = node.args[0]                    # a constant's name; a variable is a reason passed on
+                if isinstance(first, ast.Name) and first.id.isupper():
+                    named.add(getattr(sso, first.id))
+                elif (isinstance(first, ast.Attribute) and first.attr.isupper()
+                      and getattr(first.value, "id", None) in ("oc", "sso")):
+                    named.add(getattr({"oc": oc, "sso": sso}[first.value.id], first.attr))
+    assert {"invitation_address", "link_from_your_account", "held_to_a_provider"} <= named
+    assert not [code for code in sorted(named) if not (reasons.get(code) or "").strip()]
 
 
 # --------------------------------------------------------------------------- whose word an address is

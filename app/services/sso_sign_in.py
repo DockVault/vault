@@ -38,6 +38,7 @@ NO_ACCOUNT = "no_account"
 ACCOUNT_DISABLED = "account_disabled"
 ALREADY_LINKED = "already_linked"
 LINK_FROM_PROFILE = "link_from_profile"
+LINK_FROM_YOUR_ACCOUNT = "link_from_your_account"    # not linked on the provider's word; the owner links it
 HELD_TO_A_PROVIDER = "held_to_a_provider"        # the account signs in through another provider only, for now
 NOT_THIS_ACCOUNT = "not_this_account"
 PURPOSE_NOT_READY = "purpose_not_ready"
@@ -77,6 +78,9 @@ REASON_TEXTS = {
     LINK_FROM_PROFILE: ("An account with your address is protected by its own second factor, so it is not linked on "
                         "your organisation's word alone. Sign in with your password, then link your organisation's "
                         "sign-in under Your account."),
+    LINK_FROM_YOUR_ACCOUNT: ("This sign-in is not linked to an account here. If you have an account, sign in to it "
+                             "the way you usually do, then link your organisation's sign-in under Your account. If "
+                             "you have none, ask your administrator."),
     HELD_TO_A_PROVIDER: ("An account with your address signs in only through the sign-in it already uses, until "
                          "it has signed in there again, so no other sign-in is linked to it now. Use that sign-in, "
                          "or ask your administrator."),
@@ -493,14 +497,18 @@ def resolve_account(db, row, answer: ProviderAnswer) -> Resolution:
             identity.tenant_id = answer.tenant_id      # linked before the provider named a tenant: pinned from now on
         return Resolution(user, identity)
     policy = policy_of(row)
-    if policy["sso_account_creation"] == "jit":
-        made = _create_account(db, row, answer, policy)
-        if made is not None:
-            return made
+    # An account the person already has comes before one made for them: where the provider links by address, the
+    # account that holds the verified address is linked, or the sign-in is refused for the reason that account
+    # gives. Tried after the creation, the link never ran where both were on: every existing person was given a
+    # second account at their first sign-in.
     if policy["sso_link_by_email"]:
         linked = _link_by_email(db, row, answer, policy)
         if linked is not None:
             return linked
+    if policy["sso_account_creation"] == "jit":
+        made = _create_account(db, row, answer, policy)
+        if made is not None:
+            return made
     raise Refusal(NO_ACCOUNT)
 
 
@@ -524,6 +532,16 @@ def _create_account(db, row, answer: ProviderAnswer, policy: dict):
         return None
     if subject_owner(db, row, answer) is not None:
         raise Refusal(ALREADY_LINKED, "subject_linked_elsewhere")     # the same subject, pinned to another tenant
+    holder = address_holder(db, answer)
+    if holder is not None:
+        # The verified address is written on an account already. No second account is made for it: the person
+        # signs in to the account they have and links the provider there. (Made all the same, the new account
+        # carried no address, or was refused for want of one the provider had in fact sent, and the provider's
+        # identity could no longer be linked to the real account.) Where that account never confirmed the address
+        # it may not be this person's at all: the administrators are told, who can correct it.
+        from app.core import email_confirmation
+        raise Refusal(LINK_FROM_YOUR_ACCOUNT, (ADDRESS_HAS_AN_ACCOUNT if email_confirmation.confirmed(holder)
+                                               else ADDRESS_ON_AN_UNCONFIRMED_ACCOUNT), about=holder)
     email = _admitted_address(db, answer, policy, account_policy)
     if email is None and account_policy.get("email_requirement") == "required":
         raise Refusal(EMAIL_REQUIRED, "email_required")
@@ -552,6 +570,19 @@ def _create_account(db, row, answer: ProviderAnswer, policy: dict):
     grant_default_permissions_for_role(str(user.id), user.role, db, commit=False)
     identity = link_identity(db, row, user, answer, linked_by="jit")
     return Resolution(user, identity, created=True, linked_now=True, linked_by="jit")
+
+
+# The audit's words for a first sign-in refused because the provider's verified address is written on an account.
+ADDRESS_HAS_AN_ACCOUNT = "address_has_an_account"
+ADDRESS_ON_AN_UNCONFIRMED_ACCOUNT = "address_on_an_unconfirmed_account"
+
+
+def address_holder(db, answer: ProviderAnswer):
+    """The account the provider's verified address is written on, whatever its state, or None (no verified
+    address, or nobody's)."""
+    from app.core.email_identity import find_user_by_email
+    email = usable_email(answer.email) if answer.email_verified else None
+    return find_user_by_email(db, email) if email is not None else None
 
 
 def _password_is_nobodys(user, now) -> None:
@@ -666,7 +697,9 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
     if kind is not None:
         # An administrator, or an account with the auditor right (open), reaches other people's vaults: a takeover of
         # its address at the provider must not reach it silently. It links only from its own profile, under step-up.
-        raise Refusal(RESTRICTED, f"privileged_account:{kind}", about=user)
+        # The reason says that, in words that fit anyone the vault does not link: the restriction's own sentence
+        # told an administrator in the admitted tenant that the vault was not open to their tenant.
+        raise Refusal(LINK_FROM_YOUR_ACCOUNT, f"{PRIVILEGED_ACCOUNT}:{kind}", about=user)
     if not email_confirmation.confirmed(user):
         raise Refusal(NO_ACCOUNT, ADDRESS_NOT_CONFIRMED)
     if set_up_its_own_factor(db, user):
@@ -689,6 +722,9 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
         return None          # the account's identity on this provider is another one: an administrator sorts it out
     return user
 
+
+# The audit's word for a link by email refused because the account reaches other people's vaults by its standing.
+PRIVILEGED_ACCOUNT = "privileged_account"
 
 # The audit's word for a link by email refused because the vault never confirmed the account's address.
 ADDRESS_NOT_CONFIRMED = "address_not_confirmed"
@@ -878,8 +914,16 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
                 "would": ("sign in the linked account" if tester is not None and identity.user_id == tester.id
                           else "sign in another account this identity is linked to")}
     policy = policy_of(row)
+    if policy["sso_link_by_email"]:
+        said = _would_link_by_email(db, row, answer, policy)
+        if said is not None:
+            return said
     if policy["sso_account_creation"] == "jit":
         if sso_policy.is_restricted(policy, _api()._account_policy(db)):
+            if address_holder(db, answer) is not None:
+                return {"restriction": "passes", "would": (
+                    "refuse: an account here already holds this verified address, and no second one is made; its "
+                    "owner signs in to it and links this provider under Your account")}
             name = username_for(db, row, answer)
             return {"restriction": "passes",
                     "would": (f"create the account {name} at the first sign-in and sign it in"
@@ -887,6 +931,12 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
                                  else "") if name
                               else "refuse: no usable username could be made from the provider's answer")}
         return {"restriction": "passes", "would": "refuse: account creation at the first sign-in needs a restricted provider"}
+    return {"restriction": "passes", "would": "refuse: no account is linked to this identity, and none would be made or linked"}
+
+
+def _would_link_by_email(db, row, answer: ProviderAnswer, policy: dict) -> Optional[dict]:
+    """For a test sign-in: what the link by address would do with this answer, or None when it would do nothing
+    (the sign-in then goes on to the next step, as :func:`resolve_account` does)."""
     try:
         match = _email_match(db, row, answer, policy)
     except Refusal as refused:
@@ -908,7 +958,7 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
     if match is not None:
         return {"restriction": "passes",
                 "would": f"link the account {match.username} by its verified email address and sign it in"}
-    return {"restriction": "passes", "would": "refuse: no account is linked to this identity, and none would be made or linked"}
+    return None
 
 
 def link_refusal(db, row, user, answer: ProviderAnswer) -> None:

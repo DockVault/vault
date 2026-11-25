@@ -1193,7 +1193,25 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
                                 f"Your account. If that was you, link it there. If it was not, your address at {label} "
                                 "may be in someone else's hands: tell an administrator."),
                           target="#profile", dedup_prefix=key, once=True)
-        if refusal.code == sso.RESTRICTED:
+        detail = getattr(refusal, "detail", "") or ""
+        if detail == sso.ADDRESS_ON_AN_UNCONFIRMED_ACCOUNT:
+            # A first sign-in that made no account: its verified address is written on an account that never
+            # confirmed it. Either that account is this person's, and they link the provider there; or the
+            # address on it is wrong, and until an administrator corrects it this person gets no account.
+            from app.core import setting_changes
+            from app.core.models import RoleEnum
+            admins = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN).all() if a.is_active]
+            if admins:
+                api._notify_users(admins, setting_changes.NOTICE_TYPE,
+                                  title=f"A first sign-in through {label} made no account",
+                                  body=(f"Someone signed in through {label} for the first time with an email address "
+                                        f"that is written on {user.username}'s account, which never confirmed it. No "
+                                        f"second account was made. If the person is {user.username}, they sign in to "
+                                        f"that account and link {label} under Your account. If not, the address on "
+                                        f"{user.username}'s account is wrong: correct it on the Users page, and the "
+                                        "person can sign in again."),
+                                  target="#users", dedup_prefix=f"{key}:{user.id}:unconfirmed", once=True)
+        if detail.startswith(sso.PRIVILEGED_ACCOUNT):
             from app.core import setting_changes
             from app.core.models import RoleEnum
             others = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN).all()
