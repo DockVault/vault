@@ -504,11 +504,17 @@ def another_way_in(db, user, *, without) -> bool:
     return False
 
 
-def _providers_to_name(db, user) -> tuple:
+def _providers_to_name(db, user, *, at_this_address: bool = True) -> tuple:
     """(the names to tell the person, the button labels on the sign-in page) of the enabled providers ``user`` is
     linked to, each once, in the order found. A provider is named to the person as its button names it (its label,
-    else its name): the person knows it by that, and the name is the administrators'."""
+    else its name): the person knows it by that, and the name is the administrators'. None while the vault's address
+    cannot carry single sign-on: the sign-in page shows no provider's button then, and no sign-in through one
+    starts, so naming one would send the person where nothing answers. ``at_this_address`` False asks only
+    whether an enabled provider vouches for the account, whatever the address."""
     from app.core.models import ExternalIdentity, SsoProvider
+    from app.services import sso_sign_in
+    if at_this_address and sso_sign_in.address_refusal():
+        return [], []
     names, buttons = [], []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
         row = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
@@ -533,7 +539,7 @@ def passkey_after_the_provider_message(db, user) -> str:
     sign-in (an administrator, a holder of the auditor right): through its provider it would be asked for that
     password, and its passkey never signs in by itself."""
     from app.core import privileged_accounts
-    if privileged_accounts.kind(db, user) is not None or not _providers_to_name(db, user)[0]:
+    if privileged_accounts.kind(db, user) is not None or not _providers_to_name(db, user, at_this_address=False)[0]:
         return ("Your account has no password of its own yet, and your passkey signs you in by itself only once it "
                 "has one. Use the password reset link you were given, or ask an administrator for one.")
     return (provider_only_message(db, user) + " Your passkey confirms it is you after that sign-in. It signs you "

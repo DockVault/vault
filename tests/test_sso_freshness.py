@@ -248,6 +248,37 @@ def test_the_person_reads_the_providers_button_text_and_the_administrators_its_n
     assert F.deadlines(db, alice.id)[0].provider_label == "entra-prod"
 
 
+def test_a_vault_address_single_sign_on_cannot_use_sends_nobody_to_a_button(monkeypatch):
+    """The vault's address cannot carry single sign-on (plain http on a public name, say): the sign-in page shows
+    no provider's button and no sign-in through a provider starts. A person held to a provider is told it is not
+    available on this vault right now, never to use a button that is not there, nor another provider of theirs,
+    which cannot start either."""
+    from app.services import sso_sign_in
+    alice = _user()
+    p, q = _provider(30, name="entra-prod", label="Contoso"), _provider(30, name="fabrikam")
+    held = _identity(alice, p, signed_in=NOW - 31 * DAY)               # its days ran out a day ago
+    other = _identity(alice, q, signed_in=NOW - DAY)
+    db = _db([alice], [p, q], [held, other])
+    lapsed = F.lapsed(db, alice.id, now=NOW)
+    held.refused_at = NOW - DAY + timedelta(hours=1)
+    refused = F.lapsed(db, alice.id, now=NOW)
+    assert not lapsed.refused and refused.refused and lapsed.provider_id == refused.provider_id == str(p.id)
+    # An address single sign-on can use: the button, and for a refusal the person's other provider.
+    monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: None)
+    assert F.way_in_text(db, lapsed).endswith("Use the “Contoso” button on the sign-in page.")
+    assert F.way_in_text(db, refused).endswith("You can sign in through fabrikam instead: Use the “fabrikam” button "
+                                               "on the sign-in page.")
+    # One it cannot use.
+    monkeypatch.setattr(sso_sign_in, "address_refusal",
+                        lambda: "Single sign-on needs the vault's public address. It is not set.")
+    for found in (lapsed, refused):
+        said = F.way_in_text(db, found)
+        assert said == ("Your account signs in only through Contoso until it has signed in there again, and Contoso "
+                        "is not available on this vault right now. Ask your administrator."), said
+        assert "button" not in said
+    assert F.another_way_in(db, refused) is None
+
+
 def test_the_sweep_sends_no_email_to_an_account_without_an_address(told):
     alice, p = _user(email=None), _provider(30)
     db = _db([alice], [p], [_identity(alice, p, signed_in=NOW - 26 * DAY)])

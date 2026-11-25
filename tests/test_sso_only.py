@@ -636,6 +636,26 @@ def test_the_message_names_the_provider_and_its_button(monkeypatch):
     assert "Ask your administrator" in sso_only.provider_only_message(h.db, alice)
 
 
+def test_a_vault_address_single_sign_on_cannot_use_names_no_button(monkeypatch):
+    """The vault's address cannot carry single sign-on: the sign-in page shows no provider's button and no sign-in
+    through a provider starts. The person is told their organisation's sign-in is not available here now, not to
+    use a button that is not there."""
+    privileged_accounts, sso_only = _mod()
+    from app.services import sso_sign_in
+    alice, p = _user(sso_only=True), _provider(label="Contoso")
+    h = Resolving(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: None)
+    assert sso_only.provider_only_message(h.db, alice).endswith("Use the “Contoso” button on the sign-in page.")
+    monkeypatch.setattr(sso_sign_in, "address_refusal",
+                        lambda: "Single sign-on needs the vault's public address. It is not set.")
+    assert sso_only.provider_only_message(h.db, alice) == sso_only.NO_PROVIDER_ON
+    assert "not available on this vault right now" in sso_only.NO_PROVIDER_ON
+    # A passkey alone: the same, and not a reset link, which is not made for an account that signs in only
+    # through its provider.
+    said = sso_only.passkey_after_the_provider_message(h.db, alice)
+    assert said.startswith(sso_only.NO_PROVIDER_ON) and "button" not in said
+
+
 def test_the_refusal_names_the_door_in_its_audit_row(monkeypatch):
     from app.services import sign_in as s
     alice, p = _user(sso_only=True), _provider()

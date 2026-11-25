@@ -38,6 +38,15 @@ from app.services import auth_service, sign_in, sso_freshness, sso_sign_in  # no
 
 pytestmark = pytest.mark.unit
 
+
+@pytest.fixture(autouse=True)
+def _an_address_single_sign_on_can_use(monkeypatch):
+    """The vault's address can carry single sign-on, so the sign-in page shows the providers' buttons, and the
+    sentences here name them. Without such an address no provider is available, and none is named
+    (tests/test_sso_freshness.py, tests/test_sso_only.py)."""
+    from app.services import sso_sign_in
+    monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: None)
+
 TABLES = (User.__table__, Group.__table__, user_groups, SystemSetting.__table__, AuditLog.__table__,
           SecondFactorAction.__table__, SecondFactorEnrollment.__table__, TemporaryCredential.__table__,
           ActiveSession.__table__, SsoProvider.__table__, ExternalIdentity.__table__, SsoSession.__table__)

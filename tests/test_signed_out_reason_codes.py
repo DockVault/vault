@@ -50,6 +50,8 @@ def _without_the_provider(old: dict) -> dict:
 
 
 def _what_the_server_says(db, monkeypatch) -> dict:
+    from app.services import sso_sign_in
+    monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: None)     # an address single sign-on can use
     contoso = _provider(db, name="Contoso")
     said = {}
     user, _, old = _through(db, contoso, name="ada", mfa_at=1)

@@ -28,6 +28,15 @@ from test_sso_sign_in import DB, _identity, _provider, _user  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
+
+@pytest.fixture(autouse=True)
+def _an_address_single_sign_on_can_use(monkeypatch):
+    """The vault's address can carry single sign-on, so the sign-in page shows the providers' buttons, and the
+    sentences here name them. Without such an address no provider is available, and none is named
+    (tests/test_sso_freshness.py, tests/test_sso_only.py)."""
+    from app.services import sso_sign_in
+    monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: None)
+
 LONG_AGO = timedelta(days=40)          # past the thirty days a provider asks for unless it says otherwise
 # Said of the provider as its button names it ({0}).
 NOT_AVAILABLE = ("Your account signs in only through {0} until it has signed in there again, and {0} is not "

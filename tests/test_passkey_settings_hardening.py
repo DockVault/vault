@@ -845,6 +845,8 @@ def test_a_held_enrollment_registers_no_passkey_once_its_provider_no_longer_stan
     no key, and the held sign-in is not used up. The same holds for a sign-in that did not come through a provider
     at all, on an account that meanwhile signs in only through one."""
     registry, wss = _mod()
+    from app.services import sso_sign_in
+    monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: None)     # an address single sign-on can use
     from app.core.models import ExternalIdentity, SsoProvider, WebAuthnCredential
     overdue = datetime.utcnow() - timedelta(days=20)
     alice = _user(passkey_required_since=overdue, passkey_requirement_cleared_at=None)

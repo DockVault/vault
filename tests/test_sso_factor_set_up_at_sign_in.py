@@ -447,7 +447,8 @@ def test_a_key_set_up_on_the_providers_word_signs_in_after_the_provider_and_neve
     not: by itself it is refused, with a message that says where to sign in, and it is her second factor after
     the provider. Once she has a password of her own (a reset link), the mark is gone and the key signs in as
     anybody's. An account with a password is not touched by any of this."""
-    from app.services import sign_in
+    from app.services import sign_in, sso_sign_in
+    monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: None)     # an address single sign-on can use
     dana, alice = _without_a_password("its password is one nobody knows"), _user("alice")
     w = World(monkeypatch, [dana, alice], mfa_mode="optional")
     auth, row = w.h.enroll(dana)

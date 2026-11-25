@@ -247,13 +247,17 @@ def another_way_in(db, found: Deadline) -> Optional[str]:
     another provider the account is linked to that is on and holds no refusal of it, as "You can sign in through
     X instead: ...", or None when there is none. A sign-in through any provider the account is linked to is let in
     (:func:`held_to_a_provider`), so the person is not sent to an administrator while such a way stands. Named as
-    its button names it; the first by that, so the sentence is the same each time.
+    its button names it; the first by that, so the sentence is the same each time. None while the vault's
+    address cannot carry single sign-on: no sign-in through any provider starts then.
 
     A refusal the person has answered since (the provider admitted a later sign-in, which leaves the stamp where
     it is) holds nobody, and does not keep its provider from being named: skipped for the stamp alone, a provider
     that refused the person once was never named again, and the door said "ask your administrator" beside a
     button that would have let them in."""
     from app.core.models import ExternalIdentity, SsoProvider
+    from app.services import sso_sign_in
+    if sso_sign_in.address_refusal():
+        return None
     try:
         owner = uuid.UUID(str(found.user_id))
     except ValueError:
@@ -278,8 +282,11 @@ def way_in_text(db, found: Deadline) -> str:
     """What a person is told at a door that goes through no provider while :func:`held_to_a_provider` holds their
     account: the provider as its button names it, and how to reach it; where it cannot be reached or has refused
     them, another provider of theirs that lets them in (:func:`another_way_in`), or to ask an administrator when
-    there is none. Said only after the proof at that door was good."""
+    there is none. Said only after the proof at that door was good. While the vault's address cannot carry single
+    sign-on the sign-in page shows no provider's button, and no sign-in through one starts: the provider is not
+    available then, as when it is off."""
     from app.core.models import SsoProvider
+    from app.services import sso_sign_in
     name = found.provider_label
     row = None
     try:
@@ -288,7 +295,7 @@ def way_in_text(db, found: Deadline) -> str:
         row = None
     if row is not None:
         name = _button_name(row) or name              # as the button says it now
-    if row is None or getattr(row, "state", None) != "enabled":
+    if row is None or getattr(row, "state", None) != "enabled" or sso_sign_in.address_refusal():
         other = another_way_in(db, found)
         return (f"Your account signs in only through {name} until it has signed in there again, and {name} is not "
                 "available on this vault right now. " + (other or "Ask your administrator."))
