@@ -173,12 +173,22 @@ def test_the_note_about_passkeys_made_at_another_address_counts_those_and_no_oth
 def test_the_host_passkeys_are_made_for_is_the_one_the_vault_gives_out():
     assert dv.passkey_host("https://vault.example.com") == "vault.example.com"
     assert dv.passkey_host("https://vault.example.com:8443") == "vault.example.com"
-    # As the vault records it on a key (app/core/public_url.py): lower case, and no trailing dot.
-    for written in ("vault.example.com.", "https://vault.example.com.:8443", "https://VAULT.Example.COM", "Vault.Example.Com."):
+    # As the vault records it on a key (app/core/public_url.py): lower case.
+    for written in ("https://VAULT.Example.COM", "Vault.Example.Com"):
         assert dv.passkey_host(written) == "vault.example.com", written
+    # A name written with a dot at its end is no address a passkey is made at, for the tool as for the vault.
+    for written in ("vault.example.com.", "https://vault.example.com.:8443", "Vault.Example.Com.", "https://vault.example.com./"):
+        assert dv.sign_in_address_reason(written) == "dot" and dv.passkey_host(written) == "", written
+        assert "without that dot" in dv.sign_in_address_note(written), written
     from app.core import allowed_hosts, public_url
-    for written in ("vault.example.com", "vault.example.com.", "https://VAULT.Example.COM:8443",
-                    "*.example.com,vault.example.com", "https://xn--bcher-kva.example", "https://vault.example.com./"):
+    for written in ("vault.example.com.", "https://vault.example.com./"):
+        try:
+            public_url.link_base, kept = (lambda w=written: allowed_hosts.link_base(w)), public_url.link_base
+            assert public_url.rp_id() == "" == dv.passkey_host(written), written
+        finally:
+            public_url.link_base = kept
+    for written in ("vault.example.com", "https://VAULT.Example.COM:8443",
+                    "*.example.com,vault.example.com", "https://xn--bcher-kva.example"):
         try:
             public_url.link_base, kept = (lambda w=written: allowed_hosts.link_base(w)), public_url.link_base
             assert dv.passkey_host(written) == public_url.rp_id() != "", written

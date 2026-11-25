@@ -779,14 +779,16 @@ SIGN_IN_PLAIN_HTTP_HOSTS = ("localhost", "127.0.0.1", "::1")
 def sign_in_address_reason(allowed_hosts):
     """Why no passkey can be made at the address the vault gives out (ALLOWED_HOSTS's first entry that is not a
     wildcard), judged as the application judges it (app/core/public_url.py), or None when one can: ``none`` (no
-    such entry), ``script`` (a host name not written in its xn-- form), ``http`` (plain http anywhere but this
-    computer) or ``ip`` (an address reached by IP)."""
+    such entry), ``script`` (a host name not written in its xn-- form), ``dot`` (a host name written with a dot
+    at its end), ``http`` (plain http anywhere but this computer) or ``ip`` (an address reached by IP)."""
     import ipaddress
     scheme, name = _allowed_hosts_first(allowed_hosts)
     if not name:
         return "none"
     if not name.isascii():
         return "script"
+    if name.endswith("."):
+        return "dot"
     if scheme == "http" and name not in SIGN_IN_PLAIN_HTTP_HOSTS:
         return "http"
     try:
@@ -801,7 +803,7 @@ def passkey_host(allowed_hosts):
     there (see sign_in_address_reason)."""
     if sign_in_address_reason(allowed_hosts) is not None:
         return ""
-    return _allowed_hosts_first(allowed_hosts)[1].rstrip(".")        # as the vault records it: no trailing dot
+    return _allowed_hosts_first(allowed_hosts)[1]
 
 
 def passkeys_elsewhere_note(answer, host):
@@ -851,6 +853,10 @@ def sign_in_address_note(allowed_hosts):
     elif reason == "script":
         said = ("passkeys stay hidden at this address: its host name is written in another script. Write it first "
                 "in ALLOWED_HOSTS in its xn-- form, as the browser's address bar shows it.")
+    elif reason == "dot":
+        said = ("passkeys and single sign-on stay off at this address: its host name is written with a dot at its "
+                "end. Write it first in ALLOWED_HOSTS without that dot; passkeys made at the name without the dot "
+                "work again then.")
     else:
         said = ("passkeys stay hidden: the vault has no address (ALLOWED_HOSTS has no entry that names one). Set "
                 "it to the address people open the vault at; until then no reset or invitation link is sent either.")

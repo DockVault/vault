@@ -72,6 +72,21 @@ def test_a_key_is_one_of_the_address_it_was_made_at(monkeypatch):
     _resolving(monkeypatch, registry, {wss.MODE: "off"})
     assert wss.only_lapsed_passkeys(h.db, alice.id) is False and wss.why_none_can_be_used(h.db, alice.id) is None
 
+def test_an_address_written_with_a_dot_at_its_end_is_one_no_passkey_is_made_or_counted_at(monkeypatch):
+    """The vault's address written with the dot: no passkey can be made there, and one made at the name without
+    it counts as made elsewhere (its account sets a factor up again), not as one a browser there could give."""
+    registry, wss = _mod()
+    import app.core.config as config
+    from app.core import public_url
+    alice = _user()
+    made_without_the_dot = _key(alice, "vault.example.test")
+    monkeypatch.setattr(config.settings, "allowed_hosts", "vault.example.test", raising=False)
+    assert wss.address_now() == "vault.example.test" and wss.at_this_address(made_without_the_dot) is True
+    monkeypatch.setattr(config.settings, "allowed_hosts", "vault.example.test.", raising=False)
+    assert public_url.readiness()["reason"] == public_url.ADDRESS_NOT_USABLE
+    assert wss.address_now() == "" and wss.at_this_address(made_without_the_dot) is False
+    assert wss.passkeys_can_be_made() is False
+
 
 @pytest.mark.parametrize("role", ["user", "admin"])
 @pytest.mark.parametrize("address", ["another host name", "one that can carry no passkey"])
