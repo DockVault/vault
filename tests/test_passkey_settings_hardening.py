@@ -605,11 +605,11 @@ def test_a_sign_in_under_way_ends_with_the_accounts_sessions(monkeypatch, what):
     assert status == 401 and body["detail"] == "This login attempt has expired; start again.", body
     assert _call_h(h.S, "POST", options_path, {}, others["headers"])[0] == 200
     # Every place that ends an account's sessions for such a reason does the same (a password set with a reset
-    # link, the account's own change of it, a password taken back at a promotion, a lock or a deactivation).
+    # link, the account's own change of it, a promotion, a password taken back at one, a lock or a deactivation).
     # Each of those is driven in test_sign_ins_under_way_end.py; none is to be added without a case there.
     import inspect
     from app.api import user_management_api
-    assert inspect.getsource(h.S).count("sign_in.spend_sign_ins_under_way(") == 8
+    assert inspect.getsource(h.S).count("sign_in.spend_sign_ins_under_way(") == 9
     assert inspect.getsource(user_management_api).count("sign_in.spend_sign_ins_under_way(") == 3
 
 

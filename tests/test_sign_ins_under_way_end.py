@@ -2,7 +2,7 @@
 
 A sign-in held for a further step (the second factor, the password, the set-up of a factor) lives five minutes
 and was proved by what the account had when it began. Where the account's sessions are ended because how it
-signs in changed, or because it is locked, turned off or taken back at a promotion, that held sign-in is spent
+signs in changed, or because it is locked, turned off or made an administrator, that held sign-in is spent
 with them, and so is an authenticator app the account had begun to set up and not finished: whoever began it
 knows its secret. Another account's held sign-in and set-up are left alone. The routes an administrator's
 password, second-factor reset, sign-out everywhere and removal of a last passkey go through are driven in
@@ -89,6 +89,15 @@ def _promoted(route):
     return promote
 
 
+def _promoted_with_a_password_of_its_own(route):
+    def promote(db, ada, alice, monkeypatch):
+        # Nothing is taken back: the password is the account's own. The promotion itself ends what was begun
+        # with what a user owes. (The take-back's own ending is stood in for, so only the promotion's counts.)
+        monkeypatch.setattr(api, "_take_back_password_at_promotion", lambda *a, **k: None)
+        PROMOTE[route](db, ada, alice)
+    return promote
+
+
 def _patched(**change):
     def patch(db, ada, alice, monkeypatch):
         run_coroutine(api.update_user(user_id=alice.id, user_update=api.UserUpdate(**change), current_user=ada,
@@ -117,6 +126,8 @@ ENDS = {
     "a deactivation, the user-management switch": _toggled("toggle_user_active"),
     "a lock, the user-management switch": _toggled("toggle_user_locked"),
     **{f"a password taken back at a promotion, {route}": _promoted(route) for route in sorted(PROMOTE)},
+    **{f"a promotion, the password the account's own, {route}": _promoted_with_a_password_of_its_own(route)
+       for route in sorted(PROMOTE)},
 }
 
 
