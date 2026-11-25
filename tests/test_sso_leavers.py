@@ -401,6 +401,35 @@ def test_what_the_administrators_are_told_about_the_password_when_a_provider_ref
     assert "an administrator or an auditor keeps a password of their own" in F.password_after_a_refusal(db2, root)
 
 
+def test_a_held_account_is_not_linked_by_its_verified_email_at_another_provider(monkeypatch):
+    """A second provider that links by a verified address would give a held account a way back in: the sign-in
+    that made the link would finish as a provider's own. Refused where the link is decided, as the link from Your
+    account is, with the reason in the record; an account that is not held is linked as before."""
+    from app.services import sso_sign_in as sso
+    bob, root = _user("bob"), _user("root", role="admin")
+    holding = _provider(name="contoso")
+    other = _provider(name="fabrikam", label="Sign in with Fabrikam",
+                      policy={"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]})
+    held_by = _identity(bob, holding, subject="bob-at-contoso", last_sign_in_at=datetime.utcnow() - LONG_AGO)
+    h = Resolving(monkeypatch, [bob, root], [holding, other], identities=[held_by])
+    assert F.held_to_a_provider(h.db, bob) is not None
+    location, _ = _sign_in(h, other, sub="bob-at-fabrikam", email="bob@example.test")
+    assert location == "/#sso-error=held_to_a_provider", location
+    assert len(h.identities()) == 1
+    assert [a for a in h.audits if a[0] == "sso_sign_in_refused"][-1][2]["reason"] == sso.HELD_TO_A_PROVIDER
+    assert "signs in only through the sign-in it already uses" in sso.REASON_TEXTS[sso.HELD_TO_A_PROVIDER]
+    # What a test sign-in at that provider says of the same person.
+    told = sso.would_do(h.db, other, types.SimpleNamespace(
+        issuer=other.issuer, subject="bob-at-fabrikam", tenant_id=None, email="bob@example.test", email_verified=True,
+        hosted_domain=None, groups=None, groups_overage=False, display_name=None, preferred_username=None))
+    assert "signs in only through a provider it is already linked to" in told["would"], told
+    # Inside its days at the first provider, the account is linked by its address as any other.
+    held_by.last_sign_in_at = datetime.utcnow()
+    location, _ = _sign_in(h, other, sub="bob-at-fabrikam", email="bob@example.test")
+    assert location.startswith("/#sso="), location
+    assert sorted(i.linked_by for i in h.identities()) == ["email", "self"]
+
+
 # --------------------------------------------------------------------------- an account made at a first sign-in
 
 @pytest.mark.parametrize("policy, provider_only", [

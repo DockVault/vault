@@ -38,6 +38,7 @@ NO_ACCOUNT = "no_account"
 ACCOUNT_DISABLED = "account_disabled"
 ALREADY_LINKED = "already_linked"
 LINK_FROM_PROFILE = "link_from_profile"
+HELD_TO_A_PROVIDER = "held_to_a_provider"        # the account signs in through another provider only, for now
 NOT_THIS_ACCOUNT = "not_this_account"
 PURPOSE_NOT_READY = "purpose_not_ready"
 REAUTH_STALE = "reauth_stale"
@@ -75,6 +76,9 @@ REASON_TEXTS = {
     LINK_FROM_PROFILE: ("An account with your address is protected by its own second factor, so it is not linked on "
                         "your organisation's word alone. Sign in with your password, then link your organisation's "
                         "sign-in under Your account."),
+    HELD_TO_A_PROVIDER: ("An account with your address signs in only through the sign-in it already uses, until "
+                         "it has signed in there again, so no other sign-in is linked to it now. Use that sign-in, "
+                         "or ask your administrator."),
     NOT_THIS_ACCOUNT: "That organisation identity belongs to another account here.",
     PURPOSE_NOT_READY: "This step is not available yet.",
     REAUTH_STALE: "Your organisation's sign-in did not ask you to sign in again just now. Start again.",
@@ -628,6 +632,13 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
         # be asked for nothing of the account's. Such an account links the provider from its own profile, where
         # its own sign-in and its own factor stand behind the link.
         raise Refusal(LINK_FROM_PROFILE, HOLDS_A_FACTOR, about=user)
+    from app.services import sso_freshness
+    if sso_freshness.held_to_a_provider(db, user) is not None:
+        # The account's sign-in through a provider it is linked to has lapsed, or that provider refused the
+        # person, and it closes the other ways in until the person has signed in there again
+        # (app/services/sso_freshness.py). A link made here would be another way in: the sign-in that made it
+        # would finish as a provider's own, which is let in. Refused as the link from Your account is.
+        raise Refusal(HELD_TO_A_PROVIDER, HELD_ACCOUNT, about=user)
     if db.query(ExternalIdentity.id).filter(ExternalIdentity.provider_id == row.id,
                                             ExternalIdentity.user_id == user.id).first() is not None:
         return None          # the account's identity on this provider is another one: an administrator sorts it out
@@ -639,6 +650,8 @@ ADDRESS_NOT_CONFIRMED = "address_not_confirmed"
 # The audit's word for a link by email refused because the account holds a second factor of its own (the reason
 # shown is LINK_FROM_PROFILE: it is linked from its own profile only).
 HOLDS_A_FACTOR = "account_holds_a_factor"
+# The audit's word for a link by email refused because the account is held to another provider's sign-in.
+HELD_ACCOUNT = "account_held_to_its_provider"
 # How an identity linked by its verified email address is recorded (external_identities.linked_by): nobody at the
 # vault asked for such a link, the provider's word put it on the account.
 LINKED_BY_EMAIL = "email"
@@ -813,6 +826,10 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
             return {"restriction": "passes", "would": (
                 "refuse: the account that owns this address set up its own second factor; its owner links this "
                 "provider under Your account")}
+        if refused.detail == HELD_ACCOUNT:
+            return {"restriction": "passes", "would": (
+                "refuse: the account that owns this address signs in only through a provider it is already linked "
+                "to, until it has signed in there again")}
         return {"restriction": "passes", "would": "refuse: the account that owns this address is " + (
             "an administrator" if refused.detail.endswith("administrator") else "holding the auditor right") +
             "; it links only from its own signed-in profile"}
