@@ -122,6 +122,25 @@ def test_nothing_changes_unless_the_username_is_typed_again(admin, temp_user):
     assert psql(f"SELECT count(*) FROM credential_changes WHERE target_user_id='{uid}'") == "0"
 
 
+def test_a_reset_for_an_account_that_signs_in_only_through_its_provider_is_refused_in_words(admin, temp_user):
+    """Such an account holds no password: a reset link made for it would be refused when it is used. The tool
+    says so before anything is written, and shows that the account is provider-only where it is looked up."""
+    uid, name = temp_user["id"], temp_user["_username"]
+    psql(f"UPDATE users SET sso_only = true WHERE id='{uid}'")
+    try:
+        shown = tool("lookup", "--username", name)["account"]
+        assert shown["sso_only"] is True and shown["providers"] == []
+        for extra in ([], ["--temporary-password"]):
+            answer = tool("reset-password", "--username", name, "--confirm-username", name, *extra)
+            assert not answer["ok"] and "holds no password" in answer["error"], answer
+        assert psql(f"SELECT count(*) FROM credential_changes WHERE target_user_id='{uid}'") == "0"
+        assert psql(f"SELECT count(*) FROM password_reset_tokens WHERE user_id='{uid}'") == "0"
+        answer = tool("reset-second-factor", "--username", name, "--confirm-username", name)
+        assert answer["ok"] and answer["sso_only"] is True, answer
+    finally:
+        psql(f"UPDATE users SET sso_only = false WHERE id='{uid}'")
+
+
 def test_an_unknown_account_is_refused(admin):
     answer = tool("lookup", "--username", "no-such-account-anywhere")
     assert not answer["ok"] and "no account" in answer["error"].lower()

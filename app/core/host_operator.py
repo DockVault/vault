@@ -125,7 +125,39 @@ def _describe(db, user):
         "passkey_requirement_cleared": getattr(user, "passkey_requirement_cleared_at", None) is not None,
         "passkey_requirement_cleared_at": (user.passkey_requirement_cleared_at.isoformat() + "Z"
                                            if getattr(user, "passkey_requirement_cleared_at", None) else None),
+        # Whether the account signs in only through its organisation's provider (it holds no password then), and
+        # the providers it is linked to with whether each is on: what a reset would meet.
+        "sso_only": bool(getattr(user, "sso_only", False)),
+        "providers": linked_providers(db, user),
     }
+
+
+PROVIDER_ONLY = ("{name} signs in only through its organisation's provider and holds no password: a reset link "
+                 "would be refused when it is used, and no temporary password is set for it. An administrator "
+                 "allows password sign-in on the provider first (Settings, Sign-in), or turns the provider on.")
+
+
+def linked_providers(db, user) -> list:
+    """The identity providers ``user`` is linked to: ``[{"name", "on"}]``, by name. None where this database
+    holds no providers."""
+    from app.core.models import ExternalIdentity, SsoProvider
+    from app.core.table_presence import has_table
+    if not has_table(db, ExternalIdentity.__tablename__) or not has_table(db, SsoProvider.__tablename__):
+        return []
+    out = []
+    for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
+        row = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
+        if row is not None:
+            out.append({"name": row.name, "on": getattr(row, "state", None) == "enabled"})
+    return sorted(out, key=lambda p: (p["name"] or "").lower())
+
+
+def _refusal_text(exc) -> str:
+    """The sentence of a refusal the web app's own code raised, for the operator."""
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        detail = detail.get("message") or detail.get("reason")
+    return str(detail or "The change was refused. Nothing was changed.")
 
 
 def passkey_addresses(db) -> dict:
@@ -431,13 +463,24 @@ def _run(args, api) -> int:
             return _refuse(problem)
 
         if args.action == "reset-password":
+            from fastapi import HTTPException
             from app.core.password_reset import pepper_ok
+            # An account that signs in only through its provider holds no password. A reset link made for it
+            # would be refused when the person uses it ("invalid or expired"), after the change was recorded and
+            # the person told; a temporary password is refused where it is set. Said here, before anything is
+            # written, in the words the web app uses for the same request.
+            if getattr(user, "sso_only", False):
+                return _refuse(PROVIDER_ONLY.format(name=user.username))
             if args.temporary_password or not pepper_ok(api._reset_pepper()):
                 from app.core.security import hash_password
                 secret = temporary_password()
-                outcome = api._credential_change(db, None, user, cc.PASSWORD,
-                                                 summary="Temporary password set by the host operator",
-                                                 payload={"password_hash": hash_password(secret)})
+                try:
+                    outcome = api._credential_change(db, None, user, cc.PASSWORD,
+                                                     summary="Temporary password set by the host operator",
+                                                     payload={"password_hash": hash_password(secret)})
+                except HTTPException as exc:
+                    db.rollback()
+                    return _refuse(_refusal_text(exc))
                 db.commit()
                 api._notify_credential_change(db, cc.PASSWORD, user, outcome.result, by_name=cc.HOST_OPERATOR)
                 AuditLogger(db).log_action(
@@ -447,9 +490,13 @@ def _run(args, api) -> int:
                              "by": "host operator"})
                 return _answer({"ok": True, "account": user.username, "secret": secret,
                                 "secret_kind": "temporary_password"})
-            outcome = api._credential_change(db, None, user, cc.RESET_LINK,
-                                             summary="Password reset link created by the host operator",
-                                             payload={"delivery": "copy"})
+            try:
+                outcome = api._credential_change(db, None, user, cc.RESET_LINK,
+                                                 summary="Password reset link created by the host operator",
+                                                 payload={"delivery": "copy"})
+            except HTTPException as exc:
+                db.rollback()
+                return _refuse(_refusal_text(exc))
             db.commit()
             api._notify_credential_change(db, cc.RESET_LINK, user, outcome.result, by_name=cc.HOST_OPERATOR)
             AuditLogger(db).log_action(
@@ -524,8 +571,13 @@ def _run(args, api) -> int:
                 webauthn_settings.tell_of_a_lifting(db, user, webauthn_settings.PUT_BACK, by="The server's operator")
             return _answer({"ok": True, "account": user.username, "was_lifted": was_lifted})
         if args.action == "reset-second-factor":
-            outcome = api._credential_change(db, None, user, cc.SECOND_FACTOR,
-                                             summary="Second factor reset by the host operator", payload={})
+            from fastapi import HTTPException
+            try:
+                outcome = api._credential_change(db, None, user, cc.SECOND_FACTOR,
+                                                 summary="Second factor reset by the host operator", payload={})
+            except HTTPException as exc:
+                db.rollback()
+                return _refuse(_refusal_text(exc))
             db.commit()
             api._notify_credential_change(db, cc.SECOND_FACTOR, user, outcome.result, by_name=cc.HOST_OPERATOR)
             AuditLogger(db).log_action(
@@ -533,7 +585,8 @@ def _run(args, api) -> int:
                 resource_type="user", resource_id=str(user.id),
                 details={"target_username": user.username, "by": "host operator"})
             return _answer({"ok": True, "account": user.username,
-                            "had_second_factor": outcome.result.get("had_second_factor")})
+                            "had_second_factor": outcome.result.get("had_second_factor"),
+                            "sso_only": bool(getattr(user, "sso_only", False))})
     return _refuse("Nothing to do.")
 
 

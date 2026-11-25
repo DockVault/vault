@@ -351,3 +351,41 @@ def test_the_passkey_requirement_lifted_is_shown_said_and_put_back(app, monkeypa
         app.accounts(_args("--action", "clear-passkey-requirement", *NAMED, "--non-interactive"))
     said = capsys.readouterr()
     assert "there is nothing to lift" in said.err + said.out
+
+
+def test_an_account_that_signs_in_only_through_its_provider_is_shown_so_and_its_reset_is_refused_in_words(
+        app, monkeypatch, capsys):
+    """The operator reads, before the username is typed again, that the account holds no password and which
+    providers it is linked to. The reset the tool in the container refuses is said in its words, and a second
+    factor reset says where the person sets the next one up."""
+    account = dict(ACCOUNT["account"], sso_only=True, providers=[{"name": "contoso", "on": False},
+                                                                 {"name": "fabrikam", "on": True}])
+    refusal = ("alice signs in only through its organisation's provider and holds no password: a reset link would "
+               "be refused when it is used, and no temporary password is set for it.")
+    answers = dict(ANSWERS, lookup={"ok": True, "account": account})
+    answers["reset-password"] = {"ok": False, "error": refusal}
+    monkeypatch.setattr(app, "_run_account_tool", _Tool(answers))
+    with pytest.raises(SystemExit):
+        app.accounts(_args("--action", "reset-password", *NAMED, "--non-interactive"))
+    said = capsys.readouterr()
+    assert ("signs in:      only through its organisation's provider (no password): contoso (off), fabrikam (on)"
+            in said.out)
+    assert "holds no password" in said.err + said.out and "PASSWORD RESET LINK" not in said.out
+    answers["reset-second-factor"] = {"ok": True, "account": "alice", "had_second_factor": True, "sso_only": True}
+    monkeypatch.setattr(app, "_run_account_tool", _Tool(answers))
+    app.accounts(_args("--action", "reset-second-factor", *NAMED, "--non-interactive"))
+    out = capsys.readouterr().out
+    assert "they set up a new factor, at their next sign-in through their organisation's provider." in out
+    assert "with their own password" not in out
+    # An account with a password of its own, linked to a provider: the providers are shown, nothing else changes.
+    plain = dict(ACCOUNT["account"], sso_only=False, providers=[{"name": "contoso", "on": True}])
+    monkeypatch.setattr(app, "_run_account_tool", _Tool(dict(ANSWERS, lookup={"ok": True, "account": plain})))
+    app.accounts(_args("--action", "reset-second-factor", *NAMED, "--non-interactive"))
+    out = capsys.readouterr().out
+    assert "providers:     contoso (on)" in out and "signs in:" not in out
+    assert "with their own password, at the next sign-in." in out
+    # An answer from a tool that knows no providers prints neither line.
+    monkeypatch.setattr(app, "_run_account_tool", _Tool(ANSWERS))
+    app.accounts(_args("--action", "unlock", *NAMED, "--non-interactive"))
+    out = capsys.readouterr().out
+    assert "providers:" not in out and "signs in:" not in out

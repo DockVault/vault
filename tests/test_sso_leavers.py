@@ -718,3 +718,45 @@ def test_the_provider_page_sends_both_settings():
     assert "sso_jit_password: madeHere.box.checked" in page and "tick('sso-jit-password'" in page
     assert "sso_lapse_ends_sign_in: lapse.box.checked" in page and "tick('sso-lapse'" in page
     assert "policy.sso_jit_password" in page and "policy.sso_lapse_ends_sign_in" in page
+
+
+def test_the_host_tool_refuses_a_reset_for_a_provider_only_account_before_anything_is_written():
+    """The account tool in the container, as it is written: an account that signs in only through its provider is
+    refused a password reset in words, before the change is recorded or a link made; a refusal the web app's own
+    code raises is answered as a refusal, not as a tool that stopped; and the account's view names its providers."""
+    import inspect
+    from fastapi import HTTPException
+    from app.core import host_operator
+    source = inspect.getsource(host_operator)
+    reset = source[source.index('if args.action == "reset-password":'):source.index('if args.action == "unlock":')]
+    assert reset.index('if getattr(user, "sso_only", False):') < reset.index("return _refuse(PROVIDER_ONLY.format(name=user.username))") \
+        < reset.index("api._credential_change(db, None, user, cc.PASSWORD") < reset.index("api._credential_change(db, None, user, cc.RESET_LINK")
+    assert reset.count("except HTTPException as exc:\n                    db.rollback()\n                    return _refuse(_refusal_text(exc))") == 1
+    assert reset.count("except HTTPException as exc:\n                db.rollback()\n                return _refuse(_refusal_text(exc))") == 1
+    factor = source[source.index('if args.action == "reset-second-factor":'):source.index('return _refuse("Nothing to do.")')]
+    assert "except HTTPException as exc:" in factor and '"sso_only": bool(getattr(user, "sso_only", False))' in factor
+    said = host_operator.PROVIDER_ONLY.format(name="bob")
+    assert said.startswith("bob signs in only through its organisation's provider and holds no password")
+    assert "allows password sign-in on the provider first" in said
+    # A refusal's words, whatever shape the web app's code gave it.
+    text = host_operator._refusal_text
+    assert text(HTTPException(status_code=409, detail="No password to change.")) == "No password to change."
+    assert text(HTTPException(status_code=409, detail={"reason": "x", "message": "Said in words."})) == "Said in words."
+    assert text(HTTPException(status_code=409, detail={"reason": "only_a_reason"})) == "only_a_reason"
+    import types
+    assert text(types.SimpleNamespace(detail=None)) == "The change was refused. Nothing was changed."
+    # What the tool shows of an account.
+    from app.core.models import ExternalIdentity, SsoProvider
+    from _memory_db import MemoryDB
+    import uuid
+    bob = types.SimpleNamespace(id=uuid.uuid4())
+    on = types.SimpleNamespace(id=uuid.uuid4(), name="fabrikam", state="enabled")
+    off = types.SimpleNamespace(id=uuid.uuid4(), name="Contoso", state="disabled")
+    gone = uuid.uuid4()
+    db = MemoryDB({SsoProvider: [on, off], ExternalIdentity: [
+        types.SimpleNamespace(user_id=bob.id, provider_id=on.id), types.SimpleNamespace(user_id=bob.id, provider_id=off.id),
+        types.SimpleNamespace(user_id=bob.id, provider_id=gone), types.SimpleNamespace(user_id=uuid.uuid4(), provider_id=on.id)]})
+    assert host_operator.linked_providers(db, bob) == [{"name": "Contoso", "on": False}, {"name": "fabrikam", "on": True}]
+    assert host_operator.linked_providers(MemoryDB({}), bob) == []
+    described = inspect.getsource(host_operator._describe)
+    assert '"sso_only": bool(getattr(user, "sso_only", False))' in described and '"providers": linked_providers(db, user)' in described

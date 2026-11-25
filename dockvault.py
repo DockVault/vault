@@ -9174,6 +9174,13 @@ class DockVault:
         print("  role:          %s%s" % (server_text(account.get("role")), "" if account.get("active") else "  (deactivated)"))
         print("  last sign-in:  %s" % (server_text(account.get("last_login")) or "never"))
         print("  second factor: %s" % ("set up" if account.get("second_factor") else "not set up"))
+        linked = ", ".join("%s (%s)" % (server_text(p.get("name")), "on" if p.get("on") else "off")
+                           for p in (account.get("providers") or []) if isinstance(p, dict))
+        if account.get("sso_only"):
+            print("  signs in:      only through its organisation's provider (no password)%s" % (
+                ": " + linked if linked else ""))
+        elif linked:
+            print("  providers:     %s" % linked)
         if account.get("passkeys") is not None:
             lifted = account.get("passkey_requirement_cleared_at") or (
                 "yes" if account.get("passkey_requirement_cleared") else "")
@@ -9881,8 +9888,10 @@ class DockVault:
                 print(pal.paint("  %s's encryption key is not held: nothing to release." % username, "yellow"))
             return
         if action == "reset-second-factor":
-            print(pal.paint("  Second factor reset for %s. Their sessions ended; they set up a new factor, "
-                            "with their own password, at the next sign-in." % username, "green"))
+            how = ("at their next sign-in through their organisation's provider" if answer.get("sso_only")
+                   else "with their own password, at the next sign-in")
+            print(pal.paint("  Second factor reset for %s. Their sessions ended; they set up a new factor, %s."
+                            % (username, how), "green"))
             return
         if action == "clear-passkey-requirement":
             print(pal.paint("  Passkey requirement lifted for %s: the role's requirement no longer applies to this "
