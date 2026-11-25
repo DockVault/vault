@@ -698,3 +698,20 @@ out({ more, none });
                            "now: their password and passkeys do not sign them in until they have. They were told. 3 "
                            "account(s) are held so in all.", "success"]
     assert got["none"] == ["Saved. 3 linked account(s) are held to a sign-in through it by its days.", "success"]
+
+
+def test_a_save_that_lets_accounts_hold_a_password_again_says_how_they_get_one_on_this_vault():
+    """Password sign-in allowed again for a provider: the accounts it held to none may hold one again, and have none
+    yet. "Forgot your password?" on the sign-in page sends a link only where the vault offers it (the server says so
+    in self_service_reset) and to an account with an email address; otherwise an administrator makes the link."""
+    got = _node(SAVE + r"""
+const offered = await save('sso-name', 'contoso-2', { restored: ['a', 'b'], self_service_reset: true });
+const not = await save('sso-name', 'contoso-3', { restored: ['a'] });
+out({ offered, not });
+""")
+    assert got["offered"] == ["Saved. 2 linked account(s) may hold a password again and have none yet: each that has "
+                              "an email address can set one with \"Forgot your password?\" on the sign-in page, and "
+                              "you can make a reset link for any of them on the Users page.", "success"]
+    assert got["not"] == ["Saved. 1 linked account(s) may hold a password again and have none yet: make each a reset "
+                          "link on the Users page.", "success"]
+    assert "sign-in page" not in got["not"][0]

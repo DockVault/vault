@@ -268,8 +268,13 @@
                 if (out.secret_cleared) told += ' Enter the client secret again: it is kept only for the address it was entered for.';
                 if ((out.made_sso_only || []).length) told += ` ${out.made_sso_only.length} linked account(s) now sign in only through it.`;
                 if ((out.restored || []).length) {
-                    told += ` ${out.restored.length} linked account(s) may hold a password again: each asks for a reset `
-                        + 'link on the sign-in page, or you make one for them on the Users page.';
+                    // "Forgot your password?" sends a link only where the vault offers it (off by default; the server
+                    // says so in self_service_reset), and only to an account with an email address.
+                    told += ` ${out.restored.length} linked account(s) may hold a password again and have none yet: `
+                        + (out.self_service_reset
+                            ? 'each that has an email address can set one with "Forgot your password?" on the sign-in '
+                              + 'page, and you can make a reset link for any of them on the Users page.'
+                            : 'make each a reset link on the Users page.');
                 }
                 if (out.owners_told) {
                     told += ` The ${out.owners_told} account(s) linked to it were told it was pointed somewhere else.`;
