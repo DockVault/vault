@@ -139,6 +139,11 @@ class Harness:
             def log_action(_self, **kw):
                 self.audits.append(("action", kw.get("action")))
 
+            def build_row(_self, **kw):
+                # A record written in the caller's own transaction (an authenticator set up at a held sign-in).
+                self.audits.append(("action", kw.get("action")))
+                return types.SimpleNamespace(**kw)
+
             def log_second_factor_failure(_self, user, ip_address=None, details=None):
                 self.audits.append(("action", "second_factor_failed"))
         monkeypatch.setattr(S, "AuditLogger", _Audit)

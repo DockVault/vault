@@ -274,6 +274,10 @@ def test_an_authenticator_set_up_at_a_held_sign_in_is_recorded_whatever_the_sign
     enrollment.status = "unconfirmed"
     monkeypatch.setattr(S, "_revoke_sessions", lambda *a, **kw: 0)
     monkeypatch.setattr(S, "_current_session_token", lambda request: "the-session")
+    # (The session is read again in the account's turn before the factor is made active: it stands.)
+    from app.core.models import ActiveSession
+    db.tables[ActiveSession] = [types.SimpleNamespace(id=uuid.uuid4(), user_id=user.id, is_active=True, revoked=False,
+                                                      session_token=S.hash_session_token("the-session"))]
     out = run_coroutine(S.acknowledge_recovery_codes(request=None, principal=(user, None), db=db), timeout=30)
     assert out == {"enrolled": True, "method": "totp"} and built == []
     (row,) = logged
