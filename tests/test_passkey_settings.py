@@ -190,6 +190,31 @@ def test_the_guards_at_save(monkeypatch):
     assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 7)
     _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"]})
     db.rows_of(WebAuthnCredential).clear()
+    # ...and made at the address the vault has now: a key made at another address is never offered by the browser
+    # here, and protects nobody. The same key counts again once the vault is back at its address.
+    from app.services import webauthn_service as ws
+    elsewhere = types.SimpleNamespace(id=uuid.uuid4(), user_id=root.id, retired_at=None, cose_alg=-7,
+                                      rp_id="old.example.test")
+    db.rows_of(WebAuthnCredential).append(elsewhere)
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"],
+                                       wss.ALLOWED_ALGS: ["ES256"]})
+    assert wss.algorithm_usable(db, -7)[0] is True                              # the key's algorithm signs in
+    monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(
+        rp_id="new.example.test", origin="https://new.example.test", name="DockVault"))
+    assert wss.usable_passkeys(db, root.id, whatever_the_switch=True) == 0
+    assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 7)
+    monkeypatch.setattr(ws, "relying_party", lambda name: ws.RelyingParty(
+        rp_id="old.example.test", origin="https://old.example.test", name="DockVault"))
+    assert wss.usable_passkeys(db, root.id, whatever_the_switch=True) == 1
+    assert wss.save_refusal(db, wss.GRACE_DAYS, 7) is None
+    # Asked while passkeys are switched off, about turning the requirement on: the key an administrator holds
+    # counts, as it will the moment they are on.
+    _resolving(monkeypatch, registry, {wss.MODE: "off", wss.REQUIRED_ROLES: ["admin"], wss.ALLOWED_ALGS: ["ES256"],
+                                       wss.GRACE_DAYS: 7})
+    assert wss.usable_passkeys(db, root.id) == 0
+    assert wss.save_refusal(db, wss.MODE, "required_for_roles") is None
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"]})
+    db.rows_of(WebAuthnCredential).clear()
     # An administrator who cannot sign in (locked by an administrator) protects nobody either.
     bob = _user("bob", role="admin", passkey_required_since=None, passkey_requirement_cleared_at=None, is_locked=True,
                 locked_until=None)

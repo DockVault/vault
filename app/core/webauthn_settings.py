@@ -505,11 +505,13 @@ def save_refusal(db, key: str, value, *, settings_now: Optional[dict] = None) ->
 
 def _last_administrator_refusal(db, grace: int) -> Optional[str]:
     """Refuse a requirement on administrators that would leave none able to sign in: every administrator who can
-    act (active, not locked) holds no passkey whose algorithm still signs in, has no clearance, and has a grace
-    that has already run out (or would, with the new grace). An administrator whose grace has not started yet is
-    protected by the window; one who cannot sign in anyway protects nobody."""
+    act (active, not locked) holds no passkey that can be used (:func:`usable_passkeys`: made at the address the
+    vault has now, of an algorithm that still signs in), has no clearance, and has a grace that has already run
+    out (or would, with the new grace). An administrator whose grace has not started yet is protected by the
+    window; one who cannot sign in anyway protects nobody. A key made at another address is one the browser never
+    offers here: it protects nobody either, as the requirement itself reads it."""
     from app.core import last_admin
-    from app.core.models import RoleEnum, User, WebAuthnCredential
+    from app.core.models import RoleEnum, User
     now = datetime.utcnow()
     admins = [a for a in db.query(User).filter(User.role == RoleEnum.ADMIN, User.is_active.is_(True)).all()
               if last_admin.can_administer(a)]
@@ -518,9 +520,7 @@ def _last_administrator_refusal(db, grace: int) -> Optional[str]:
     for admin in admins:
         if getattr(admin, "passkey_requirement_cleared_at", None) is not None:
             return None
-        keys = db.query(WebAuthnCredential).filter(WebAuthnCredential.user_id == admin.id,
-                                                   WebAuthnCredential.retired_at.is_(None)).all()
-        if any(algorithm_usable(db, getattr(k, "cose_alg", None), now=now)[0] for k in keys):
+        if usable_passkeys(db, admin.id, now=now, whatever_the_switch=True) > 0:
             return None
         since = getattr(admin, "passkey_required_since", None)
         if since is None or now <= since + timedelta(days=grace):
