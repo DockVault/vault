@@ -1359,14 +1359,25 @@ def _tell_of_a_held_account_kept_out(db, row, user, label: str, key: str) -> Non
 
 
 def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
-    """A sign-in at the provider carried the verified address of an account that is never linked by its address
-    (it set up a second factor of its own, or it is privileged). Whoever holds that address at the provider
-    learns little from the answer; the account's owner would learn nothing at all, and an address taken over at
-    the provider shows here first. So the owner is told, in the app, at most once a day for a provider; for a
-    privileged account the other administrators are told as well. No email: the notice is not something a
-    stranger at the provider may send at will. Never raises."""
+    """A sign-in at the provider met an account of the vault and was kept out of it. Whoever holds that address at
+    the provider learns little from the answer; the account's owner would learn nothing at all, and an address
+    taken over at the provider shows here first. So the owner is told, in the app, at most once a day for a
+    provider, in words that fit why:
+
+    - the account is held to another provider's sign-in: the owner is told what works (that provider first), and
+      the administrators are told as well (:func:`_tell_of_a_held_account_kept_out`);
+    - the account is privileged (an administrator, or the auditor right): it is linked only from Your account, and
+      not at all to a provider whose people hold no password; the other administrators are told as well;
+    - the account set up a second factor of its own: it is linked only from Your account;
+    - a first sign-in that would have made an account met an address written on an account already: no second
+      account is made, the owner links the provider from Your account, and where that account never confirmed the
+      address the administrators are told as well;
+    - the identity is linked, and its account is turned off or locked by an administrator: nobody is told (the
+      audit row names the account), as telling its owner to link a provider it is linked to would be false.
+
+    No email: the notice is not something a stranger at the provider may send at will. Never raises."""
     user = getattr(refusal, "about", None)
-    if user is None:
+    if user is None or getattr(refusal, "code", None) == sso.ACCOUNT_DISABLED:
         return
     api = _api()
     label = (getattr(row, "label", None) or getattr(row, "name", None) or "a provider").strip()
@@ -1380,12 +1391,26 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
             # does.
             _tell_of_a_held_account_kept_out(db, row, user, label, key)
             return
+        if detail.startswith(sso.PRIVILEGED_ACCOUNT):
+            # Linked only from Your account under step-up; and never to a provider whose people hold no password,
+            # since such an account keeps one (the link is refused, sso_sign_in.PRIVILEGED_ON_PASSWORD_LESS).
+            from app.core import privileged_accounts
+            whom = ("another administrator" if detail.endswith(":" + privileged_accounts.ADMINISTRATOR)
+                    else "an administrator")
+            body = (f"Someone signed in through {label} with your email address. Nobody was signed in to your account "
+                    "and nothing was linked: an administrator's or auditor's account is linked to a provider only "
+                    "from Your account, after its password and, where it has one, its second factor."
+                    + (f" {label} signs its people in without a local password, and an administrator's or auditor's "
+                       f"account keeps one, so your account cannot be linked to {label}." if sso_only.password_less(row) else
+                       f" If that was you, link {label} there.")
+                    + f" If it was not, your address at {label} may be in someone else's hands: tell {whom}.")
+        else:
+            body = (f"Someone signed in through {label} with your email address. Nobody was signed in to your "
+                    f"account and nothing was linked: your account is linked to {label} only by you, under Your "
+                    f"account. If that was you, link it there. If it was not, your address at {label} may be in "
+                    "someone else's hands: tell an administrator.")
         api._notify_users([str(user.id)], "account_changed", title=f"A sign-in through {label} with your address was kept out",
-                          body=(f"Someone signed in through {label} with your email address. Nobody was signed in to your "
-                                f"account and nothing was linked: your account is linked to {label} only by you, under "
-                                f"Your account. If that was you, link it there. If it was not, your address at {label} "
-                                "may be in someone else's hands: tell an administrator."),
-                          target="#profile", dedup_prefix=key, once=True)
+                          body=body, target="#profile", dedup_prefix=key, once=True)
         if detail == sso.ADDRESS_ON_AN_UNCONFIRMED_ACCOUNT:
             # A first sign-in that made no account: its verified address is written on an account that never
             # confirmed it. Either that account is this person's, and they link the provider there; or the

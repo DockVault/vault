@@ -1197,6 +1197,50 @@ def test_the_owner_is_told_when_a_sign_in_with_their_address_was_kept_out(monkey
     assert told == [] and h.emails == []
 
 
+@pytest.mark.parametrize("passwords", ["kept", "none"])
+def test_an_administrator_kept_out_is_told_how_its_account_is_linked_or_that_it_is_not(monkeypatch, passwords):
+    """An administrator's or auditor's account is linked to a provider only from Your account, after its password
+    and, where it has one, its second factor. Where the provider's people hold no password, it cannot be linked
+    there at all (the link is refused: such an account keeps a password), so its owner is not told to link it."""
+    root, second = _user("root", role="admin"), _user("second", role="admin")
+    policy = {"sso_link_by_email": True, "sso_allowed_domains": ["example.test"]}
+    if passwords == "none":
+        policy["sso_password_login"] = "disabled"
+    p = _provider(policy=policy)
+    h = Resolving(monkeypatch, [root, second], [p])
+    told = []
+    monkeypatch.setattr(h.S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None,
+                        once=False: told.append((list(ids), ntype, title, body, target)) or list(ids))
+    location, _ = _sign_in(h, p, sub="s-root", email="root@example.test")
+    assert location == "/#sso-error=link_from_your_account", location
+    (body,) = [t[3] for t in told if t[0] == [str(root.id)]]
+    assert body.startswith("Someone signed in through Sign in with Contoso with your email address. Nobody was "
+                           "signed in to your account and nothing was linked: an administrator's or auditor's account "
+                           "is linked to a provider only from Your account")
+    assert body.endswith("your address at Sign in with Contoso may be in someone else's hands: tell another "
+                         "administrator.")
+    if passwords == "kept":
+        assert "If that was you, link Sign in with Contoso there." in body
+    else:
+        assert "link it there" not in body and "link Sign in with Contoso there" not in body
+        assert "so your account cannot be linked to Sign in with Contoso" in body
+
+
+def test_a_turned_off_account_whose_identity_is_linked_is_not_told_to_link_it(monkeypatch):
+    """A sign-in through an identity linked to an account that is turned off is refused, and recorded under that
+    account. Telling its owner to link the provider would be false: it is linked already. Nobody is told."""
+    bob, root = _user("bob", is_active=False), _user("root", role="admin")
+    p = _provider()
+    h = Resolving(monkeypatch, [bob, root], [p], identities=[_identity(bob, p, subject="s-bob")])
+    told = []
+    monkeypatch.setattr(h.S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None,
+                        once=False: told.append((list(ids), ntype, title, body, target)) or list(ids))
+    location, _ = _sign_in(h, p, sub="s-bob", email="bob@example.test")
+    assert location == "/#sso-error=account_disabled", location
+    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "account_disabled" for a in h.audits), h.audits
+    assert told == [] and h.emails == []
+
+
 @pytest.mark.parametrize("row", ["names a hosted-domain claim", "judged on the address"])
 def test_under_the_sign_up_list_a_link_by_email_needs_the_address_itself_on_the_list(monkeypatch, row):
     """The vault's sign-up list restricts the provider. With a hosted-domain claim the sign-in is admitted on the
