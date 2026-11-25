@@ -38,8 +38,15 @@ global.location = { origin: 'https://vault.example.test' };
 var currentUser = { id: 'root-id', username: 'root', role: 'admin' };
 const asked = [], toasts = [];
 let answers = {};
+// The policy as the server shows it: every setting, at its default (app/core/sso_policy.py, DEFAULTS).
+const POLICY = { sso_account_creation: 'invite_only', sso_default_role: 'user', sso_password_login: 'allowed',
+                 sso_link_by_email: false, sso_admin_mapping: false, sso_use_signup_domains: false,
+                 sso_backchannel_logout: true, sso_idp_logout: false, sso_trust_idp_mfa: false, sso_accepted_amr: [],
+                 sso_accepted_acr: [], sso_requested_acr: '', sso_allowed_tenants: [], sso_allowed_domains: [],
+                 sso_required_groups: [], sso_freshness_days: 30, sso_refusal_ends_access: true,
+                 sso_jit_password: false, sso_lapse_ends_sign_in: true };
 const PROVIDER = { id: 'p-1', name: 'contoso', label: 'Contoso', state: 'disabled', configured: true, tested: true,
-                   identities: 0, issuer: 'https://login.example.test', policy: {}, claims: {}, addresses: null,
+                   identities: 0, issuer: 'https://login.example.test', policy: POLICY, claims: {}, addresses: null,
                    last_test: null, sso_only_accounts: 0, only_way_in_accounts: 0, icon: 'generic', sort_order: 0,
                    show_on_sign_in: true, scopes: 'openid', token_auth: 'client_secret_basic', group_mappings: 0 };
 answers['/admin/sso/providers'] = { providers: [PROVIDER], presets: [], icons: ['generic'], limit: 20,
@@ -117,3 +124,49 @@ def test_the_page_names_the_accounts_and_access_page_as_the_settings_show_it():
     """The Settings tab is "Accounts & Access": no help on these pages sends anyone to an "Accounts page"."""
     source = PAGE.read_text(encoding="utf-8")
     assert "the Accounts page" not in source and "Accounts & Access" in source
+
+
+SAVE_ECHOES = r"""
+// The server keeps what a save sends and answers with the provider as it now stands.
+answers['/admin/sso/providers/p-1'] = () => {
+    const last = asked[asked.length - 1];
+    if (last.method === 'PATCH') {
+        const sent = JSON.parse(last.body);
+        PROVIDER.policy = Object.assign({}, PROVIDER.policy, sent.policy || {});
+        return { provider: PROVIDER };
+    }
+    return { provider: PROVIDER };
+};
+const patches = () => asked.filter((a) => a.method === 'PATCH').map((a) => JSON.parse(a.body));
+"""
+
+DN_GROUP = "CN=Vault Users,OU=Groups,DC=example,DC=org"
+
+
+def test_a_required_group_whose_name_holds_a_comma_is_saved_whole():
+    """Groups are one on each line: a comma is part of a group's name (a distinguished name has several), and the
+    group is matched letter for letter, so it is never cut at a comma."""
+    got = _node(SAVE_ECHOES + r"""
+await openPage('access');
+const help = helpOf('sso-groups');
+byId('sso-groups').value = %s + '\nFinance';
+byId('sso-save').click();
+await tick(); await tick();
+out({ help, sent: patches(), shown: byId('sso-groups').value.split('\n') });
+""" % json.dumps(DN_GROUP))
+    assert got["help"] == ("A person must be in at least one of these groups. One on each line, written as the "
+                           "provider sends it: a comma is part of the name.")
+    assert got["sent"] == [{"policy": {"sso_required_groups": [DN_GROUP, "Finance"]}}]
+    assert got["shown"] == [DN_GROUP, "Finance"]          # the page drawn again after the save: two lines
+
+
+def test_a_stored_group_with_a_comma_is_left_alone_by_a_save_of_another_field():
+    got = _node(SAVE_ECHOES + r"""
+PROVIDER.policy = Object.assign({}, POLICY, { sso_required_groups: [%s, 'Finance'] });
+await openPage('access');
+byId('sso-tenants').value = 't-1';
+byId('sso-save').click();
+await tick(); await tick();
+out(patches());
+""" % json.dumps(DN_GROUP))
+    assert got == [{"policy": {"sso_allowed_tenants": ["t-1"]}}]

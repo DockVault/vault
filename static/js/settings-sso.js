@@ -50,6 +50,9 @@
     }
 
     const lines = (value) => String(value || '').split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+    // Required groups are one on each line: a group's name may hold a comma (a distinguished name has several), and
+    // a group is matched letter for letter (sso_policy.restriction), so it is never cut at one.
+    const groupLines = (value) => String(value || '').split(/\n+/).map((s) => s.trim()).filter(Boolean);
     const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
     // The deployment's lock, as the last read of the list says.
     const lockedNow = () => !!(data && data.locked);
@@ -460,7 +463,8 @@
             + 'accounts are then made only by invitation.'));
         box.appendChild(field('Tenants', tenants, 'Microsoft Entra ID: the tenant ids whose accounts may sign in.'));
         box.appendChild(field('Domains', domains, 'Google Workspace: the hosted domains, else the verified email\'s domain.'));
-        box.appendChild(field('Required groups', groups, 'A person must be in at least one of these groups.'));
+        box.appendChild(field('Required groups', groups, 'A person must be in at least one of these groups. One on each '
+            + 'line, written as the provider sends it: a comma is part of the name.'));
         box.appendChild(signup.group);
         box.appendChild(field('Accounts', creation));
         box.appendChild(field('Role of the accounts made', role));
@@ -473,7 +477,7 @@
         box.appendChild(saveBar(() => {
             const now = {
                 sso_allowed_tenants: lines(tenants.value), sso_allowed_domains: lines(domains.value),
-                sso_required_groups: lines(groups.value), sso_use_signup_domains: signup.box.checked,
+                sso_required_groups: groupLines(groups.value), sso_use_signup_domains: signup.box.checked,
                 sso_account_creation: creation.value, sso_default_role: role.value,
                 sso_link_by_email: byEmail.box.checked, sso_password_login: password.value,
                 sso_jit_password: madeHere.box.checked,
