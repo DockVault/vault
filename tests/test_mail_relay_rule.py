@@ -538,6 +538,30 @@ def test_a_password_sent_alone_never_lands_on_a_server_set_while_its_save_was_co
     assert stored["smtp_server"] == "elsewhere.example" and not stored.get("smtp_password")
 
 
+def test_a_password_sent_alone_does_not_overwrite_one_saved_while_it_was_confirmed(db, admin, monkeypatch):
+    # Same server throughout; another administrator replaces the stored password meanwhile. The later save would
+    # overwrite a password it never saw: it is refused, and the other one stays.
+    _store(db)
+    other = _other_session(db)
+    grace = _other_admin(db, other)
+    meanwhile = []
+
+    def step_up(db_, user, request):
+        if not meanwhile:
+            meanwhile.append(user.username)
+            run_coroutine(api.update_settings(payload={"smtp_password": "replaced-meanwhile-3"}, request=_request(),
+                                              current_user=grace, db=other))
+    monkeypatch.setattr(api, "_mail_relay_step_up", step_up)
+    try:
+        with pytest.raises(HTTPException) as refused:
+            _save(db, admin, {"smtp_password": FRESH})
+    finally:
+        other.close()
+    assert meanwhile == ["ada"]
+    assert refused.value.status_code == 409 and refused.value.detail["reason"] == "smtp_settings_changed"
+    assert _stored(db)["smtp_password"] == "replaced-meanwhile-3"
+
+
 def test_a_save_that_leaves_the_smtp_settings_alone_is_not_refused_for_a_change_made_meanwhile(
         db, admin, monkeypatch):
     _store(db)
