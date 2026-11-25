@@ -339,6 +339,18 @@ def test_a_real_code_that_is_refused_is_recorded_for_the_account_it_named(finish
     code, verifier = _code(f, f.alice, pending_id=str(uuid.uuid4()))
     redeem(code, verifier=verifier)
     assert failures()[-1] == ("failure", "alice", "sign-in code after its held sign-in ended", "alice")
+    # The provider the sign-in came through refused the person after the code was made, in the minute it lives.
+    from app.core import sign_in_codes
+    asked = []
+    monkeypatch.setattr(sign_in_codes, "_refused_since",
+                        lambda db, provider_id, user_id, created_at: asked.append(provider_id) or True)
+    through = str(uuid.uuid4())
+    code, verifier = _code(f, f.alice, provider_id=through)
+    redeem(code, verifier=verifier)
+    assert asked == [through]
+    assert failures()[-1] == ("failure", "alice", "sign-in code after the provider refused the person", "alice")
+    assert failures()[-1][2] == sign_in_codes.REFUSED_SINCE
+    monkeypatch.setattr(sign_in_codes, "_refused_since", lambda db, provider_id, user_id, created_at: False)
     # The account turned off meanwhile.
     f.alice.is_active = False
     code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
@@ -357,7 +369,7 @@ def test_a_real_code_that_is_refused_is_recorded_for_the_account_it_named(finish
                               provider_id="p-1", ended=0,
                               invitation={"invitation_id": "i-1", "answer": {"subject": "s-1", "issuer": "https://idp.example.org"}})
     redeem(f.codes.store(record, redis=f.redis), verifier="not-it")
-    assert f.made["audit"][-1] == ("action", "sso_sign_in_refused") and len(failures()) == 4
+    assert f.made["audit"][-1] == ("action", "sso_sign_in_refused") and len(failures()) == 5
     # One answer for all of them, and no session.
     assert set(answers) == {(401, "This sign-in code is not valid; start again.")} and f.made["sessions"] == []
     # A record that cannot be written changes nothing of the answer.
