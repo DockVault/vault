@@ -313,10 +313,10 @@ def test_an_identity_linked_by_email_loses_the_providers_mfa_while_the_account_h
     """Carol's identity was put on her account by its email address, and the provider's MFA is trusted. While she
     holds a factor she can give (an authenticator, a passkey that can be used), a sign-in through that identity
     is asked for it: the provider's word does not stand in for her own factor. Nor does it while she is to set a
-    factor up again (a reset she has not answered, a key of a removed algorithm): the sign-in is held for that
-    set-up, which her provider's sign-in proves, as she has no password. With passkeys kept while they are
-    switched off nothing is owed, and with nothing at all she goes on as an account without a factor does, on
-    the provider's trusted MFA. No new link by email reaches her in any state but the last
+    factor up again (a reset she has not answered, a key of a removed algorithm, passkeys kept while they are
+    switched off): the sign-in is held for that set-up, which her provider's sign-in proves, as she has no
+    password. With nothing at all she goes on as an account without a factor does, on the provider's trusted
+    MFA. No new link by email reaches her in any state but the last
     (sso_sign_in.set_up_its_own_factor)."""
     from app.core.models import SecondFactorEnrollment, WebAuthnCredential
     from app.services import sign_in, sso_sign_in
@@ -334,7 +334,8 @@ def test_an_identity_linked_by_email_loses_the_providers_mfa_while_the_account_h
     usable = state != "a key that can no longer be used"
     monkeypatch.setattr(w.wss, "algorithm_usable", lambda db, cose_alg, now=None: (usable, False))
     holds = state in ("an authenticator", "a passkey that can be used")
-    owes = state in ("a reset it has not answered", "a key that can no longer be used")
+    owes = state in ("a reset it has not answered", "a key that can no longer be used",
+                     "passkeys kept while they are switched off")
     identity = w.identity(carol)
     assert sign_in.holds_a_factor(w.db, carol) is holds
     assert bool(w.S._second_factor_to_set_up_again(w.db, carol)) is owes
