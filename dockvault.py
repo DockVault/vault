@@ -318,6 +318,12 @@ CONTAINER_LOG_ENV_KEYS = (
     ("docker_log_max_size", "DOCKER_LOG_MAX_SIZE", "10m"),
     ("docker_log_max_file", "DOCKER_LOG_MAX_FILE", "5"),
 )
+
+# The passkey settings' deployment values (see .env.example): what Settings -> Sign-in methods starts from, and what
+# SETTINGS_LOCKED_KEYS holds. Setup asks for none of them; each one the current .env sets is kept, as written, across a
+# fresh volume set. An empty line is kept too: for WEBAUTHN_SIGN_IN it says that no role signs in with a passkey alone.
+WEBAUTHN_ENV_KEYS = ("WEBAUTHN_MODE", "WEBAUTHN_REQUIRED_ROLES", "WEBAUTHN_ENROLLMENT_GRACE_DAYS", "WEBAUTHN_SIGN_IN",
+                     "WEBAUTHN_REQUIRE_UV", "WEBAUTHN_ALLOWED_ALGS", "WEBAUTHN_DEVICE_BOUND_ROLES")
 # A size as Docker reads it (a number, then k/m/g/t/p, optionally "i" and "b"; decimal units).
 _LOG_SIZE = re.compile(r"^(\d+(?:\.\d+)?) ?([kmgtp])?i?b?$", re.IGNORECASE)
 _LOG_SIZE_UNITS = {None: 1, "k": 10 ** 3, "m": 10 ** 6, "g": 10 ** 9, "t": 10 ** 12, "p": 10 ** 15}
@@ -1216,6 +1222,13 @@ def build_env_lines(cfg):
     roots = str(cfg.get("webauthn_attestation_roots") or "").strip()
     if roots:
         bare("WEBAUTHN_ATTESTATION_ROOTS", roots)
+    # The passkey settings' deployment values: written only when the .env before this one set them (an empty value
+    # too), so an install that never mentions them authors the .env it always did.
+    for name in WEBAUTHN_ENV_KEYS:
+        value = cfg.get(name.lower())
+        if value is not None:
+            value = str(value).strip()
+            bare(name, "'%s'" % value if re.search(r"\s", value) else value)
     if cfg.get("plan_log_pull"):
         # Opting in here closes the log-404 trap: the endpoint needs BOTH the plan flag and a
         # strong pepper before it will serve (then an admin still ticks a component in the UI).
@@ -2526,6 +2539,8 @@ def new_set_config(current_env, new_prefix, new_id):
         # And a changed hold on the zero-knowledge key envelope after an administrator's change.
         "zk_envelope_hold_days": (current_env.get("ZK_ENVELOPE_HOLD_DAYS") or "").strip() or None,
         "webauthn_attestation_roots": (current_env.get("WEBAUTHN_ATTESTATION_ROOTS") or "").strip() or None,
+        # And the passkey settings' deployment values, each one the current .env sets (an empty one too).
+        **{name.lower(): str(current_env[name]).strip() for name in WEBAUTHN_ENV_KEYS if name in current_env},
     }
     return cfg
 
