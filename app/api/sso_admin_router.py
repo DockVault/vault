@@ -175,6 +175,7 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     identity.refused_at = None
     user = db.query(User).filter(User.id == identity.user_id).first()
     provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
+    sso_freshness.note_the_lift(identity, provider)       # the lift counts for a removal that asked for it
     label = ((provider.name or provider.label) if provider is not None else None) or "an identity provider"
     # What the lifting gives back, said as it is: the provider's days may have run out under the hold.
     to_the_person = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="your")

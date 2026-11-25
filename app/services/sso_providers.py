@@ -262,7 +262,9 @@ def hold_lapsed(db, row, *, now=None, into=None) -> int:
     the people who stopped signing in there (the ones the window is for) would get their SSH keys, temporary
     credentials and devices back for good once it is removed. A held identity is lifted as a refusal is: by a
     later sign-in the provider admits, or by another administrator; and a provider is not removed while it holds
-    one. Returns how many were held.
+    one. Returns how many were held. An identity whose hold an administrator lifted is not held again for the
+    deadline that lift answered (app/services/sso_freshness.py, note_the_lift): the removal that asked for the
+    lift then goes through.
 
     Nothing is written for a provider that is off and closes the other ways in after its days
     (``sso_lapse_ends_sign_in``). There a hold also ends the person's password, and while a provider is off its
@@ -280,6 +282,8 @@ def hold_lapsed(db, row, *, now=None, into=None) -> int:
     held = 0
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all():
         standing = sso_freshness.deadline_of(identity, row)
+        if sso_freshness.lift_answers(identity, standing):
+            continue
         if standing is not None and not standing.refused and standing.due <= now:
             identity.refused_at = now
             held += 1

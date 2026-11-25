@@ -404,6 +404,88 @@ def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_
     assert status == 200 and out == {"removed": True}, out
 
 
+def test_a_removal_goes_through_once_an_administrator_has_lifted_the_holds_it_made(monkeypatch):
+    """The removal holds the people whose days ran out and says: clear each under Identities, then remove again.
+    Clearing gave the identity no new deadline (nobody signs in through a provider that is off), so the next
+    removal held the same people again, recorded and told again, and refused again, for as long as anyone tried.
+    The lift is remembered against the deadline it answered, and the identity is not held again for that one."""
+    from datetime import datetime, timedelta
+    from app.api import sso_admin_router as A
+    from app.core import owner_notices
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
+    alice, bob = _user("alice"), _user("bob")
+    now = datetime.utcnow()
+    last = now - timedelta(days=30)
+    lapsed = _identity(alice, row, last_sign_in_at=last, linked_at=now - timedelta(days=60), refused_at=None,
+                       hold_lifted_for=None)
+    other = _identity(bob, row, last_sign_in_at=last, linked_at=now - timedelta(days=60), refused_at=None,
+                      hold_lifted_for=None)
+    h = Admin(monkeypatch, [row], users=[alice, bob], identities=[lapsed, other])
+    monkeypatch.setattr(A, "_step_up", lambda db, user, request: None)
+    monkeypatch.setattr(owner_notices, "notify_in_transaction", lambda db, ids, *, title, body, ntype, target: None)
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and out["detail"]["reason"] == "refusals_in_force" and "2 accounts have not" in out["detail"]["message"]
+    assert lapsed.refused_at is not None and other.refused_at is not None
+    told, recorded = len(h.accounts_told), len(h.audit("sso_provider_updated"))
+    # One of the two is lifted, through the route: the other still stands in the way, and nothing is held or told again.
+    status, out = h.call("POST", f"/admin/sso/identities/{lapsed.id}/clear-refusal")
+    assert status == 200 and out == {"cleared": True}, out
+    assert lapsed.refused_at is None and lapsed.hold_lifted_for == last + timedelta(days=7)
+    assert lapsed.last_sign_in_at == last                       # the lift gives no sign-in
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and "Clear it under Identities first" in out["detail"]["message"], out
+    assert lapsed.refused_at is None and len(h.accounts_told) == told and len(h.audit("sso_provider_updated")) == recorded
+    # Both lifted: the removal goes through, and nobody is held, recorded or told again.
+    status, out = h.call("POST", f"/admin/sso/identities/{other.id}/clear-refusal")
+    assert status == 200, out
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 200 and out == {"removed": True}, out
+    # Nobody is held again or told of a hold again: what is told now is the removal itself.
+    assert [t[1] for t in h.accounts_told].count("Your keys stay paused on this vault") == 1
+    assert len(h.audit("sso_provider_updated")) == recorded
+
+
+def test_a_lift_answers_the_deadline_it_was_given_for_and_no_later_one():
+    """The lift says nothing of a deadline the identity gets afterwards: signed in since and past the days
+    again, it is held as anyone is. A provider that asks no days gives a lift nothing to answer."""
+    from datetime import datetime, timedelta
+    from app.services import sso_freshness as F
+    from app.services import sso_providers
+    now = datetime.utcnow()
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    row.policy = {"sso_freshness_days": 7, "sso_lapse_ends_sign_in": False}
+    alice = _user("alice")
+    first = now - timedelta(days=30)
+    identity = _identity(alice, row, last_sign_in_at=first, linked_at=now - timedelta(days=60), refused_at=now,
+                         hold_lifted_for=None)
+    identity.refused_at = None
+    F.note_the_lift(identity, row)
+    assert identity.hold_lifted_for == first + timedelta(days=7)
+    assert F.lift_answers(identity, F.deadline_of(identity, row)) is True
+
+    class DB:
+        def query(self, model):
+            return self
+
+        def filter(self, *a):
+            return self
+
+        def all(self):
+            return [identity]
+    held = []
+    assert sso_providers.hold_lapsed(DB(), row, into=held) == 0 and identity.refused_at is None and held == []
+    # Signed in since, and past the days again: another deadline, which the lift does not answer.
+    identity.last_sign_in_at = now - timedelta(days=10)
+    assert F.lift_answers(identity, F.deadline_of(identity, row)) is False
+    assert sso_providers.hold_lapsed(DB(), row, into=held) == 1 and identity.refused_at is not None and held == [alice.id]
+    # No days asked: the lift has no deadline to answer, and none is kept.
+    identity.refused_at = None
+    row.policy = {"sso_freshness_days": 0}
+    F.note_the_lift(identity, row)
+    assert identity.hold_lifted_for is None and F.lift_answers(identity, None) is False
+
+
 def test_a_removal_that_is_refused_ends_nobodys_password(monkeypatch):
     """A provider that closes the other ways in after its days: while it is off, its days end no password (nobody
     could sign in through it). A hold does, so the removal writes none there: it is refused, with the two ways on,

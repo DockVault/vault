@@ -267,6 +267,25 @@ def way_in_text(db, found: Deadline) -> str:
             f"allows, so its password and passkeys do not sign it in until it does. {_how_to_reach(row, name)}")
 
 
+def note_the_lift(identity, provider) -> None:
+    """An administrator lifted the hold on ``identity`` (its ``refused_at`` is cleared): the deadline the lift
+    answered is kept on the identity, in the caller's transaction. The provider's days went on counting under the
+    hold and the lift does not start them again, so the identity is as far past them as before. A removal of the
+    provider holds every identity past its days first and is refused while one is held; told to clear each and
+    remove again, the administrator cleared them and the next removal held the same people again, and told them
+    and every administrator again, for as long as anyone tried. With the deadline kept, the lift counts: the
+    identity is not held again for the deadline its lift answered (app/services/sso_providers.py, hold_lapsed).
+    A later sign-in gives it another deadline, which the lift says nothing of."""
+    standing = deadline_of(identity, provider)
+    identity.hold_lifted_for = standing.due if standing is not None else None
+
+
+def lift_answers(identity, standing: Optional[Deadline]) -> bool:
+    """Whether an administrator's lift answered the deadline ``identity`` has now (``standing``)."""
+    lifted_for = getattr(identity, "hold_lifted_for", None)
+    return standing is not None and lifted_for is not None and lifted_for == standing.due
+
+
 def after_a_hold_is_lifted(db, user, identity, provider, *, whose: str, now: Optional[datetime] = None) -> str:
     """What is said of an account's keys once an administrator lifted the hold on record for ``identity``
     (``whose``: "your" to the person, "its" to the administrators). They work again, unless the provider's days

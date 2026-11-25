@@ -29237,6 +29237,9 @@ def _run_lightweight_migrations():
             # The address a passkey was made at (see WebAuthnCredential in models.py). For a database whose table
             # an earlier build of this release made; create_all builds it with the column everywhere else.
             "ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS rp_id VARCHAR(253)",
+            # The deadline an administrator's lift of a hold answered (see ExternalIdentity in models.py). For a
+            # database whose table an earlier build of this release made.
+            "ALTER TABLE external_identities ADD COLUMN IF NOT EXISTS hold_lifted_for TIMESTAMP",
             # When a role's passkey requirement first applied to the account, and the host operator's clearance.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_required_since TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS passkey_requirement_cleared_at TIMESTAMP",

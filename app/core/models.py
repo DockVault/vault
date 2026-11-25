@@ -3923,6 +3923,11 @@ class ExternalIdentity(Base):
     # each is told once, in the same transaction as its audit row.
     freshness_warned_for = Column(DateTime, nullable=True)
     freshness_paused_for = Column(DateTime, nullable=True)
+    # The deadline an administrator's lift of a hold answered (the day the provider's days ran out for this
+    # identity, as it stood at the lift). A removal of the provider holds an identity past its days first, and
+    # does not hold again one whose lift answered the deadline it still has. NULL: no lift, or none that a
+    # deadline stood behind.
+    hold_lifted_for = Column(DateTime, nullable=True)
 
     user = relationship('User', backref=backref('external_identities', cascade='all, delete-orphan',
                                                 passive_deletes=True))
