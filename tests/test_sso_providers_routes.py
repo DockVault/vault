@@ -44,7 +44,7 @@ class Admin(Harness):
         monkeypatch.setitem(self.S.app.dependency_overrides, get_db, lambda: self.db)
         self.order, self.told, self.is_locked = [], [], False
         self.accounts_told = []            # what account owners were told: (usernames, title, text)
-        monkeypatch.setattr(R, "_tell_accounts", lambda users, title, change: users and self.accounts_told.append(
+        monkeypatch.setattr(R, "_tell_accounts", lambda users, title, change, once_for=None: users and self.accounts_told.append(
             (sorted(name for _id, name, _email in users), title, change)))
         monkeypatch.setattr(R, "_step_up", lambda db, user, request: self.order.append("step_up"))
         monkeypatch.setattr(R, "_tell_administrators", lambda by, title, body: self.told.append((by, title, body)))
@@ -1724,3 +1724,55 @@ def test_the_newly_held_are_told_what_was_changed(monkeypatch):
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}",
                          {"policy": {"sso_lapse_ends_sign_in": True, "sso_freshness_days": 10}})
     assert status == 200 and h.accounts_told[-1][2].startswith(f"An administrator changed how often {label} must have")
+
+
+def test_an_account_two_saves_hold_at_once_is_told_once(monkeypatch):
+    """Two administrators shorten a provider's days at about the same time. Each save reads whom the provider
+    holds before it takes the provider's row, so the second counts the people the first has just held as its
+    own: they were told twice, in the app and by email. The telling is kept in the notice's ledger for the
+    provider and the day, and an account in it is told nothing more."""
+    from app.api import sso_providers_router as R
+    sent, mailed, ledger = [], [], set()
+
+    class Api:
+        @staticmethod
+        def _notify_users(ids, ntype, title=None, body=None, target=None, dedup_prefix=None, once=False):
+            new = [uid for uid in ids if dedup_prefix is None or (dedup_prefix, uid) not in ledger]
+            if dedup_prefix is not None:
+                assert once is True                               # kept after the person dismisses it
+                ledger.update((dedup_prefix, uid) for uid in new)
+            sent.extend((uid, title, dedup_prefix) for uid in new)
+            return new
+
+        @staticmethod
+        def _fire_action_email(db, action, *, email, username, action_context):
+            mailed.append((username, action))
+
+        @staticmethod
+        def _change_time_text():
+            return "now"
+    import contextlib
+    from app.core import database
+
+    @contextlib.contextmanager
+    def context():
+        yield object()
+    monkeypatch.setattr(database, "get_db_context", context)
+    monkeypatch.setattr(R, "_api", lambda: Api)
+    people = [("id-ann", "ann", "ann@example.test"), ("id-ben", "ben", "")]
+    R._tell_accounts(people, "Held", "words", once_for="sso_newly_held:p-1:2026-11-26")
+    R._tell_accounts(people, "Held", "words", once_for="sso_newly_held:p-1:2026-11-26")      # the second save
+    assert [s[0] for s in sent] == ["id-ann", "id-ben"] and mailed == [("ann", "sign_in_method_changed")]
+    # Another day, or another provider, is another telling.
+    R._tell_accounts(people[:1], "Held", "words", once_for="sso_newly_held:p-1:2026-11-27")
+    R._tell_accounts(people[:1], "Held", "words", once_for="sso_newly_held:p-2:2026-11-26")
+    assert len(sent) == 4 and len(mailed) == 3
+    # A telling with no key is made each time, as every other notice of a change is.
+    R._tell_accounts(people[:1], "Changed", "words")
+    R._tell_accounts(people[:1], "Changed", "words")
+    assert len(sent) == 6 and len(mailed) == 5 and sent[-1][2] is None
+    # The save names the provider and the day.
+    import inspect
+    source = inspect.getsource(R.update_provider)
+    assert 'today = f"sso_newly_held:{row.id}:{datetime.utcnow():%Y-%m-%d}"' in source
+    assert source.count("once_for=today)") == 2

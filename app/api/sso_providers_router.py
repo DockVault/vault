@@ -119,16 +119,26 @@ def _row_or_404(db, provider_id, *, lock: bool = False) -> SsoProvider:
     return row
 
 
-def _tell_accounts(users, title: str, change: str) -> None:
+def _tell_accounts(users, title: str, change: str, *, once_for: Optional[str] = None) -> None:
     """Tell each of ``users`` of a change an administrator made to how their account signs in: in the app, and by
-    email when the account has an address and email is configured. After the commit; never raises."""
+    email when the account has an address and email is configured. After the commit; never raises.
+
+    ``once_for``: what this telling is about, when it must reach an account once however often it is asked for
+    (a key for the notice's ledger). An account already told of it is told nothing more, in the app or by
+    email."""
     api = _api()
     try:
         from app.core.database import get_db_context
         with get_db_context() as db:
             for user_id, username, email in users:
                 try:
-                    api._notify_users([str(user_id)], "account_changed", title=title, body=change, target="#profile")
+                    if once_for:
+                        if not api._notify_users([str(user_id)], "account_changed", title=title, body=change,
+                                                 target="#profile", dedup_prefix=once_for, once=True):
+                            continue
+                    else:
+                        api._notify_users([str(user_id)], "account_changed", title=title, body=change,
+                                          target="#profile")
                     if (email or "").strip():
                         api._fire_action_email(db, "sign_in_method_changed", email=email, username=username,
                                                action_context={"change": change, "when": api._change_time_text()})
@@ -426,13 +436,18 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
                     if "policy.sso_freshness_days" in outcome["changed"] else
                     f"An administrator changed what stops when {label} has not seen you within its days: your "
                     "password and passkeys now stop as well as your keys.")
+    # Once a day for a provider, whatever the saves: the accounts held before a save are read before the
+    # provider's row is taken, so of two saves made at about the same time the second counts the people the
+    # first has just held as its own, and told them again, in the app and by email.
+    from datetime import datetime
+    today = f"sso_newly_held:{row.id}:{datetime.utcnow():%Y-%m-%d}"
     _tell_accounts(newly_by_days, f"Sign in through {label} to keep signing in here", (
         f"{what_changed} Your last sign-in through {label} is older than that: your password and passkeys do not "
-        f"sign you in to this vault until you have signed in through {label} again."))
+        f"sign you in to this vault until you have signed in through {label} again."), once_for=today)
     _tell_accounts(newly_by_a_refusal, f"Sign in through {label} to keep signing in here", (
         f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
         f"sign-in through {label}: its password and passkeys do not sign it in to this vault until {label} has "
-        "admitted it again. If it does not, ask your administrator."))
+        "admitted it again. If it does not, ask your administrator."), once_for=today)
     _tell_accounts(owners, f"{label} was pointed somewhere else", (
         f"An administrator changed where this vault finds {label}, a sign-in your account is linked to. Nobody signs "
         f"in through {label} until an administrator has tested it again and turned it on. If the sign-in you meet "
