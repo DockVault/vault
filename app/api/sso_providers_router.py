@@ -688,12 +688,21 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     # Each account linked to it loses a way to sign in, and its flag follows the providers it is still linked to
     # (one held to no password by this provider alone may hold a password again; nothing is minted).
     kept, may_set, to_ask = [], [], []
+    # The accounts past the provider's days whose hold an administrator lifted: the removal passes them over, and
+    # their keys wait for a sign-in through it no more. Counted, so that the removal's record and its notice say
+    # how many keys it gave back (an account that is turned off uses none).
+    from datetime import datetime
+    from app.services import sso_freshness
+    removed_at, given_back = datetime.utcnow(), 0
     # In the one order every route takes several accounts' turns in (sso_router._owners_of): by the account's id.
     for identity in sorted(db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all(),
                            key=lambda linked: str(linked.user_id)):
         user = db.query(User).filter(User.id == identity.user_id).first()
         if user is None:
             continue
+        standing = sso_freshness.deadline_of(identity, row)
+        if standing is not None and standing.due <= removed_at and user.is_active:
+            given_back += 1
         settled = sso_only.settle(db, user, without=identity, unknown_hash=unknown_hash)
         # Told how to get a password: an account that may hold one again, and one that has none it can type and
         # no other provider that is on (its passkey signs in after a provider only: nothing else would sign it in).
@@ -710,7 +719,8 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
         else:
             kept.append(told)
     _record(db, "sso_provider_deleted", user=current_user, ip=api.get_client_ip(request), row_id=gone["provider_id"],
-            details={"provider_id": gone["provider_id"], "name": gone["name"], "identities": gone["identities"]})
+            details={"provider_id": gone["provider_id"], "name": gone["name"], "identities": gone["identities"],
+                     **({"keys_given_back": given_back} if given_back else {})})
     db.delete(row)
     db.commit()
     removed = f"An administrator removed {label} from this vault: your account can no longer sign in through it."
@@ -719,7 +729,10 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     _tell_accounts(to_ask, "A sign-in method was removed from your account", f"{removed} {sso_only.NO_PROVIDER_ON}")
     _tell_administrators(current_user.username, "A single sign-on provider was removed",
                          f"{current_user.username} removed the single sign-on provider {gone['name']}"
-                         + (f", with the links of {gone['identities']} account(s) to it." if gone["identities"] else "."))
+                         + (f", with the links of {gone['identities']} account(s) to it." if gone["identities"] else ".")
+                         + (f" {given_back} of them had not signed in through it within its days, and an "
+                            "administrator had lifted the hold on each: their SSH keys, temporary credentials and "
+                            "devices wait for a sign-in through it no more." if given_back else ""))
     return JSONResponse(status_code=200, content={"removed": True})
 # --------------------------------------------------------------------------- a provider's group mappings
 

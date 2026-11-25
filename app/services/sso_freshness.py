@@ -288,17 +288,34 @@ def way_in_text(db, found: Deadline) -> str:
             f"allows, so its password and passkeys do not sign it in until it does. {_how_to_reach(row, name)}")
 
 
-def note_the_lift(identity, provider) -> None:
-    """An administrator lifted the hold on ``identity`` (its ``refused_at`` is cleared): the deadline the lift
-    answered is kept on the identity, in the caller's transaction. The provider's days went on counting under the
-    hold and the lift does not start them again, so the identity is as far past them as before. A removal of the
-    provider holds every identity past its days first and is refused while one is held; told to clear each and
-    remove again, the administrator cleared them and the next removal held the same people again, and told them
-    and every administrator again, for as long as anyone tried. With the deadline kept, the lift counts: the
-    identity is not held again for the deadline its lift answered (app/services/sso_providers.py, hold_lapsed).
-    A later sign-in gives it another deadline, which the lift says nothing of."""
+def lift_the_hold(identity, provider, *, now: Optional[datetime] = None) -> bool:
+    """An administrator lifts the hold on record for ``identity``: its ``refused_at`` is cleared, in the caller's
+    transaction. Returns whether the lift counts for a removal of the provider.
+
+    It counts where the hold was the vault's own, written for days that had run out when the provider was turned
+    off or was to be removed (app/services/sso_providers.py, hold_lapsed, which marks it), and those days are
+    still run out: the deadline the lift answered is then kept on the identity. The provider's days went on
+    counting under the hold and the lift does not start them again, so the identity is as far past them as
+    before. A removal holds every identity past its days first and is refused while one is held; told to clear
+    each and remove again, the administrator cleared them and the next removal held the same people again, and
+    told them and every administrator again, for as long as anyone tried. With the deadline kept, the identity is
+    not held again for the deadline its lift answered. A later sign-in gives it another deadline, which the lift
+    says nothing of.
+
+    It does not count where the hold was the provider's own refusal. Lifting that says the refusal was a mistake.
+    It does not say that the person should have their keys back when the provider goes: where their days have
+    run out as well, they and the administrators are told that the keys stay paused. Kept for that lift too, the
+    deadline let a removal months later pass the person over and give those keys back with nobody asked. Nor
+    does it count while the days have not run out (they were made longer since the hold): nothing waits for a
+    deadline that has not passed. A mark an earlier lift left is dropped with either."""
+    now = now or datetime.utcnow()
+    held = deadline_of(identity, provider)
+    the_vaults_own = held is not None and held.keys_only_hold
+    identity.refused_at = None
     standing = deadline_of(identity, provider)
-    identity.hold_lifted_for = standing.due if standing is not None else None
+    counts = the_vaults_own and standing is not None and standing.due <= now
+    identity.hold_lifted_for = standing.due if counts else None
+    return counts
 
 
 def lift_answers(identity, standing: Optional[Deadline]) -> bool:

@@ -263,7 +263,7 @@ def hold_lapsed(db, row, *, now=None, into=None) -> int:
     credentials and devices back for good once it is removed. A held identity is lifted as a refusal is: by a
     later sign-in the provider admits, or by another administrator; and a provider is not removed while it holds
     one. Returns how many were held. An identity whose hold an administrator lifted is not held again for the
-    deadline that lift answered (app/services/sso_freshness.py, note_the_lift): the removal that asked for the
+    deadline that lift answered (app/services/sso_freshness.py, lift_the_hold): the removal that asked for the
     lift then goes through.
 
     Nothing is written for a provider that is off and closes the other ways in after its days
