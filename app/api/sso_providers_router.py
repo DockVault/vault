@@ -5,6 +5,10 @@ send a browser back to; ``POST`` makes a draft (so its two addresses exist befor
 touched); ``PATCH`` changes one; ``POST .../state`` turns it on or off; ``DELETE`` removes it. The rules are in
 app/services/sso_providers.py. A test sign-in starts and finishes in app/api/sso_router.py.
 
+``/admin/sso/providers/{id}/group-mappings`` (``GET``, ``POST``, ``PATCH .../{mapping}``, ``DELETE .../{mapping}``)
+keeps the provider's groups mapped to departments and roles (app/services/sso_group_mappings.py), under the same
+order as every other write here.
+
 Every write is refused while the deployment has locked single sign-on (app/core/sso_settings.py), is judged before
 anything is asked of the administrator, then asks the fixed step-up every sign-in setting is written under, then
 judges again on the row as it stands, writes, and records what changed in the transaction that changes it: the
@@ -27,6 +31,7 @@ from app.api.user_management_api import require_interactive_admin
 from app.core import fixed_step_up, sso_presets, sso_settings
 from app.core.database import get_db
 from app.core.models import SsoProvider, User
+from app.services import sso_group_mappings as mappings
 from app.services import sso_providers as providers
 
 router = APIRouter(tags=["Single sign-on administration"])
@@ -501,3 +506,146 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
                          f"{current_user.username} removed the single sign-on provider {gone['name']}"
                          + (f", with the links of {gone['identities']} account(s) to it." if gone["identities"] else "."))
     return JSONResponse(status_code=200, content={"removed": True})
+# --------------------------------------------------------------------------- a provider's group mappings
+
+def _mapping_or_404(db, row, mapping_id):
+    mapping = mappings.one(db, row, mapping_id)
+    if mapping is None:
+        raise HTTPException(status_code=404, detail="Unknown group mapping.")
+    return mapping
+
+
+def _mapping_record(row, shown: dict, **more) -> dict:
+    """What the audit log keeps of a mapping: the provider, the mapping, the group as the provider sends it, the
+    department (its id and its name) and the role."""
+    department = shown["department"] or {}
+    return {"provider_id": str(row.id), "name": row.name, "mapping_id": shown["id"],
+            "provider_group": shown["provider_group"], "group_id": department.get("id"),
+            "department": department.get("name"), "role": shown["role"], **more}
+
+
+def _mapping_words(shown: dict) -> str:
+    """What a mapping gives, in words, for the administrators' notice."""
+    gives = []
+    if shown["department"]:
+        gives.append(f"the department {shown['department']['name']}")
+    if shown["role"] == "admin":
+        gives.append("a request for the administrator role, which another administrator decides")
+    elif shown["role"]:
+        gives.append(f"the role {shown['role']}")
+    return " and ".join(gives)
+
+
+@router.get("/admin/sso/providers/{provider_id}/group-mappings")
+def list_group_mappings(provider_id: str, current_user: User = Depends(require_interactive_admin),
+                        db: Session = Depends(get_db)):
+    """The provider's groups mapped to departments and roles, with what the page needs to add one: the departments,
+    the roles, whether the administrator role can be mapped as the provider stands (and why not), the claim the
+    groups are read from and the groups the last test sign-in carried."""
+    row = _row_or_404(db, provider_id)
+    return {"provider": {"id": str(row.id), "name": row.name, "label": row.label, "state": row.state},
+            **mappings.listing(db, row), "locked": sso_settings.locked(), "step_up": STEP_UP_ACTION}
+
+
+@router.post("/admin/sso/providers/{provider_id}/group-mappings", status_code=201)
+def add_group_mapping(provider_id: str, body: Dict[str, Any], request: Request,
+                      current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """Map a group of the provider, named exactly as the provider sends it, to a department, a role, or both. It
+    applies from the next sign-in through the provider. The administrator role is mapped only while the provider
+    may raise administrator requests and its people can hold a password."""
+    api = _api()
+    _refuse_locked()
+    row = _row_or_404(db, provider_id)
+    try:
+        fields = mappings.fields_of(body, new=True)
+        mappings.judge(db, row, **fields)          # reads only: nothing is changed before the step-up
+    except (providers.Invalid, providers.Conflict) as exc:
+        raise _refused(exc)
+    _step_up(db, current_user, request)        # may commit (a receipt is used once)
+    # The provider's row is held as a save of it holds it: one change at a time, and none while a sign-in through
+    # the provider applies its mappings.
+    row = _row_or_404(db, provider_id, lock=True)
+    try:
+        mapping = mappings.create(db, row, fresh=True, **fields)
+        db.flush()                                 # the row has its id: the record names it
+        shown = mappings.public(db, row, mapping)
+        _record(db, "sso_group_mapping_added", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
+                details=_mapping_record(row, shown))
+        db.commit()
+    except (providers.Invalid, providers.Conflict) as exc:
+        db.rollback()
+        raise _refused(exc)
+    _tell_administrators(current_user.username, "A single sign-on group was mapped", (
+        f"{current_user.username} mapped the group {shown['provider_group']} of the single sign-on provider "
+        f"{row.name} to {_mapping_words(shown)}. It applies from each person's next sign-in through the provider."))
+    return {"mapping": shown}
+
+
+@router.patch("/admin/sso/providers/{provider_id}/group-mappings/{mapping_id}")
+def change_group_mapping(provider_id: str, mapping_id: str, body: Dict[str, Any], request: Request,
+                         current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """Change a mapping: its group, its department, its role. A department or a role sent as null is taken away;
+    a mapping keeps at least one of the two. People who joined a department through it are not moved: the next
+    sign-in of each applies the mapping as it is then."""
+    api = _api()
+    _refuse_locked()
+    row = _row_or_404(db, provider_id)
+    mapping = _mapping_or_404(db, row, mapping_id)
+    try:
+        fields = mappings.fields_of(body, new=False)
+        would, _values = mappings.differences(db, row, mapping, fields)      # reads only
+    except (providers.Invalid, providers.Conflict) as exc:
+        raise _refused(exc)
+    if not would:
+        return {"mapping": mappings.public(db, row, mapping), "changed": []}
+    _step_up(db, current_user, request)        # may commit (a receipt is used once)
+    row = _row_or_404(db, provider_id, lock=True)
+    mapping = mappings.one(db, row, mapping_id, fresh=True)
+    if mapping is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Unknown group mapping.")
+    try:
+        changes = mappings.change(db, row, mapping, fields, fresh=True)
+        shown = mappings.public(db, row, mapping)
+        if changes:
+            _record(db, "sso_group_mapping_changed", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
+                    details=_mapping_record(row, shown, changed=sorted(changes), changes=changes))
+        db.commit()
+    except (providers.Invalid, providers.Conflict) as exc:
+        db.rollback()
+        raise _refused(exc)
+    if changes:
+        _tell_administrators(current_user.username, "A single sign-on group mapping was changed", (
+            f"{current_user.username} changed how the group {shown['provider_group']} of the single sign-on provider "
+            f"{row.name} is mapped: it now gives {_mapping_words(shown)}. It applies from each person's next "
+            "sign-in through the provider."))
+    return {"mapping": shown, "changed": sorted(changes)}
+
+
+@router.delete("/admin/sso/providers/{provider_id}/group-mappings/{mapping_id}")
+def remove_group_mapping(provider_id: str, mapping_id: str, request: Request,
+                         current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """Remove a mapping. Nobody is changed by it: a person who joined a department through it stays until an
+    administrator takes them out, and a role it gave stays. A request for the administrator role it opened can no
+    longer be approved."""
+    api = _api()
+    _refuse_locked()
+    row = _row_or_404(db, provider_id)
+    _mapping_or_404(db, row, mapping_id)
+    _step_up(db, current_user, request)        # may commit (a receipt is used once)
+    row = _row_or_404(db, provider_id, lock=True)
+    mapping = mappings.one(db, row, mapping_id, fresh=True)
+    if mapping is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail="Unknown group mapping.")
+    shown = mappings.public(db, row, mapping)
+    _record(db, "sso_group_mapping_removed", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
+            details=_mapping_record(row, shown))
+    db.delete(mapping)
+    db.commit()
+    _tell_administrators(current_user.username, "A single sign-on group mapping was removed", (
+        f"{current_user.username} removed the mapping of the group {shown['provider_group']} of the single sign-on "
+        f"provider {row.name} (it gave {_mapping_words(shown)}). Nobody's department or role was changed by that."
+        + (" A request for the administrator role it opened can no longer be approved."
+           if shown["role"] == "admin" else "")))
+    return {"removed": True, "mapping": shown}

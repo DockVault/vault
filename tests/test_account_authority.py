@@ -264,6 +264,12 @@ CHANGES_AN_ACCOUNT = {
     ("PATCH", "/admin/sso/providers/{provider_id}"),
     ("POST", "/admin/sso/providers/{provider_id}/state"),
     ("DELETE", "/admin/sso/providers/{provider_id}"),
+    # A provider's groups mapped to departments and roles reach every account that signs in through it: its
+    # departments and its role at its next sign-in, and a request for the administrator role. An interactive
+    # administrator only.
+    ("POST", "/admin/sso/providers/{provider_id}/group-mappings"),
+    ("PATCH", "/admin/sso/providers/{provider_id}/group-mappings/{mapping_id}"),
+    ("DELETE", "/admin/sso/providers/{provider_id}/group-mappings/{mapping_id}"),
     # One identity of somebody's account, unlinked for them: the account's flag follows the providers it is still
     # linked to, and the sessions that came through the identity end. An interactive administrator only.
     ("DELETE", "/admin/sso/identities/{identity_id}"),

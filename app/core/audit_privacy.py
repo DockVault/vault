@@ -185,6 +185,9 @@ _IDENTIFIER_KEYS = (
     # a sign-in through a provider: whether the provider's own second factor stood in for the vault's; an unlink:
     # whether the identity's provider held the account (a refusal, days run out) when it was removed
     "provider_mfa", "held",
+    # a provider's group mapped to a department or a role by an administrator: the mapping's row, and the
+    # department by the name administrators gave it (its id is under "group_id")
+    "mapping_id", "department",
     # legal holds: the case's number, a hold's dates, and what it kept and why (never a name)
     "case_number", "confirm_by", "hold_only", "purge_after", "by_release", "kept_reason", "kept_at", "held_by_case",
     # an owner's notice of compliance access: whether its email waits or there is no address, whether a copy goes
@@ -231,7 +234,8 @@ _IDENTIFIER_KEYS = (
     "ttl_minutes", "interval_minutes", "window_minutes", "window_seconds", "retention_days",
     "previous_retention_days", "attempts", "failed_attempts", "files_deleted", "files_left", "deleted",
     "deletions", "rows_deleted", "revoked_count", "terminated_count", "sessions_closed", "keys_deactivated",
-    "deactivated_creds", "revoked_credentials", "deadlines_removed", "children_moved_up", "unclassified_rows",
+    "deactivated_creds", "revoked_credentials", "deadlines_removed", "children_moved_up", "sso_group_mappings",
+    "unclassified_rows",
     "unclassified_rows_deleted", "wraps", "vaults", "epoch", "key_version", "team_key_version",
     "from_version", "to_version", "retired_below_version", "retired_dek_below", "retired_team_below",
     "expires_at", "locked_until", "effective_at", "requested_at", "oldest", "newest", "timestamp",

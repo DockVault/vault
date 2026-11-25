@@ -1251,6 +1251,8 @@ class GroupResponse(BaseModel):
 class GroupDetailResponse(GroupResponse):
     members: List[GroupMemberRef] = []
     children: List[GroupResponse] = []
+    # How many single sign-on group mappings name this department: they are removed with it.
+    sso_group_mappings: int = 0
 
 
 class GroupMembersAdd(BaseModel):
@@ -14515,7 +14517,9 @@ async def get_group(
         for c in sorted(group.children, key=lambda x: x.name)
     ]
     base = _group_to_response(group, members_map, children_map)
-    return GroupDetailResponse(**base.model_dump(), members=members, children=children)
+    from app.services import sso_group_mappings
+    return GroupDetailResponse(**base.model_dump(), members=members, children=children,
+                               sso_group_mappings=sso_group_mappings.naming(db, group.id))
 
 
 @app.patch("/groups/{group_id}", response_model=GroupResponse)
@@ -14580,11 +14584,16 @@ async def delete_group(
     for child in children:
         child.parent_id = group.parent_id
     name = group.name
+    # The single sign-on group mappings that name the department go with it (their rows cascade): counted
+    # before, said in the answer and kept in the record, so that a provider's group that stops giving a
+    # department is not a surprise found later.
+    from app.services import sso_group_mappings
+    mapped = sso_group_mappings.naming(db, group.id)
     db.delete(group)
     db.commit()
     _audit_change(db, current_user, "group_deleted", "group", group_id,
-                  {"name": name, "children_moved_up": len(children)})
-    return {"message": f"Group '{name}' deleted"}
+                  {"name": name, "children_moved_up": len(children), "sso_group_mappings": mapped})
+    return {"message": f"Group '{name}' deleted", "sso_group_mappings_removed": mapped}
 
 
 # ---------------------------------------------------------------------------

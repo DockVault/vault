@@ -394,8 +394,11 @@ def _counts(db, row) -> dict:
             only += 1
         if not sign_in.has_a_password_it_can_type(user) and not sso_only.another_way_in(db, user, without=identity):
             only_way_in += 1
+    from app.core.models import SsoGroupMapping
     return {"identities": len(identities), "sso_only_accounts": only, "only_way_in_accounts": only_way_in,
-            "refusals": sum(1 for i in identities if sso_freshness.refusal_in_force(i))}
+            "refusals": sum(1 for i in identities if sso_freshness.refusal_in_force(i)),
+            # How many of its groups are mapped to a department or a role (app/services/sso_group_mappings.py).
+            "group_mappings": len(db.query(SsoGroupMapping).filter(SsoGroupMapping.provider_id == row.id).all())}
 
 
 def made_here_and_held(db, row) -> int:
