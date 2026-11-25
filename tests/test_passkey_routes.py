@@ -705,6 +705,47 @@ def test_a_second_factor_reset_retires_every_passkey_and_a_gone_key_is_reported(
                                       actor_name="root") == {"passkey_gone": True}
 
 
+@pytest.mark.parametrize("held, said", [
+    (2, "Your 2 passkeys no longer sign you in or prove a step-up: add new ones after your next sign-in."),
+    (1, "Your passkey no longer signs you in or proves a step-up: add a new one after your next sign-in."),
+    (0, None)])
+def test_the_owner_of_a_reset_is_told_the_passkeys_it_retired(monkeypatch, held, said):
+    """A reset of the second factor retires every passkey of the account as well. Someone who signs in with a passkey
+    alone was told only that the second factor was reset, and met "That passkey was not accepted" at the next
+    sign-in. The notice, in the app and by email, says how many stopped working, and says nothing of passkeys to an
+    account that held none."""
+    from app.core import credential_changes as cc
+    from app.core.models import SecondFactorEnrollment, SecondFactorRecoveryCode, WebAuthnCredential, User
+    S = _api()
+    admin, target = _user("root", role="admin"), _user("carol")
+    keys = [types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, uv_initialized=True, retired_at=None)
+            for _ in range(held)]
+    enrollments = [types.SimpleNamespace(id=uuid.uuid4(), user_id=target.id, method="totp", status="active")]
+    db = MemoryDB({User: [admin, target], WebAuthnCredential: keys, SecondFactorEnrollment: enrollments,
+                   SecondFactorRecoveryCode: []})
+    monkeypatch.setattr(S, "_revoke_sessions", lambda db, **kw: None)
+    from app.core import auditor_rights, legal_holds
+    monkeypatch.setattr(auditor_rights, "after_credential_change", lambda *a, **k: None)
+    monkeypatch.setattr(legal_holds, "after_starter_change", lambda *a, **k: None)
+    result = S._apply_credential_change(db, cc.SECOND_FACTOR, target, {}, actor_id=admin.id, actor_name="root")
+    assert result["passkeys_retired"] == held
+    in_app, emails = [], []
+    monkeypatch.setattr(S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
+        in_app.append(body) or list(ids)))
+    monkeypatch.setattr(S, "_fire_action_email", lambda db, key, *, email, username=None, action_context=None: (
+        emails.append(action_context["change"])))
+    S._notify_credential_change(db, cc.SECOND_FACTOR, target, result, by_name="root")
+    ((body,), (change,)) = in_app, emails
+    assert change.startswith("An administrator reset your second factor") and change in body
+    if said is None:
+        assert "passkey" not in change
+    else:
+        assert change.endswith(said)
+    # A reset another administrator approved is told from the same result, the same way.
+    title, sentence = S._credential_change_notice(cc.SECOND_FACTOR, result)
+    assert title == "Your second factor was reset" and sentence == change
+
+
 def test_registration_has_a_budget_per_account_that_fails_closed(monkeypatch):
     """Asking for registration options is counted per account, on a budget of its own: refused with 429 when it is
     spent and with 503 while the limiter cannot count, and no challenge is made either time."""

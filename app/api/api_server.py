@@ -7163,8 +7163,16 @@ def _credential_change_notice(kind, result, by_host=False, *, mask_new_email=Fal
     if kind == cc.SECOND_FACTOR:
         how = ("a new one, with your own password, at your next sign-in." if own_password
                else "a new one at your next sign-in through your organisation.")
+        # The reset retires every passkey of the account too (_apply_credential_change): someone who signs in with
+        # one alone is told it stopped working, not left to meet "That passkey was not accepted".
+        retired = int(result.get("passkeys_retired") or 0)
+        keys = ("" if retired <= 0 else
+                " Your passkey no longer signs you in or proves a step-up: add a new one after your next sign-in."
+                if retired == 1 else
+                f" Your {retired} passkeys no longer sign you in or prove a step-up: add new ones after your next "
+                "sign-in.")
         return ("Your second factor was reset",
-                f"{who} reset your second factor and signed your account out everywhere. You will set up {how}")
+                f"{who} reset your second factor and signed your account out everywhere. You will set up {how}{keys}")
     if kind == cc.EMAIL and result.get("confirmed_only"):
         from app.core import envelope_hold
         days = envelope_hold.hold_days()
