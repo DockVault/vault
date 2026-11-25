@@ -120,12 +120,32 @@ def signup_domain_gate(account_policy: Optional[dict]) -> tuple:
             [d for d in domains if isinstance(d, str)] if isinstance(domains, list) else [])
 
 
-def is_restricted(policy: dict, account_policy: Optional[dict] = None) -> bool:
+def tenants_the_issuer_names(policy: dict, issuer) -> list:
+    """The tenants on ``policy``'s list that ``issuer`` names itself, as a segment of its path.
+
+    Microsoft Entra's issuer is ``https://login.microsoftonline.com/<tenant id>/v2.0`` (Entra External ID's has
+    the same shape), and the vault accepts a token only from the issuer written on the provider, exactly. Every
+    token it accepts therefore carries that tenant already: the same id on the tenant list admits everybody the
+    list is asked about, guests the tenant invited among them, and any other id on it admits nobody. Such a list
+    keeps nobody out."""
+    if not isinstance(issuer, str) or not issuer.strip():
+        return []
+    from urllib.parse import urlsplit
+    try:
+        segments = {part.lower() for part in urlsplit(issuer.strip()).path.split("/") if part}
+    except ValueError:
+        return []
+    return [t for t in policy["sso_allowed_tenants"] if isinstance(t, str) and t.strip().lower() in segments]
+
+
+def is_restricted(policy: dict, account_policy: Optional[dict] = None, *, issuer=None) -> bool:
     """A restricted provider admits a named set of people: a tenant list, a domain list, a required group, or the
     sign-up domain allow-list when the administrator ticked it. A deny-list bars some and admits the rest, so it
-    does not count; neither does a list that is empty. Account creation at the first sign-in and linking by email
-    are only ever meant for a restricted provider."""
-    if policy["sso_allowed_tenants"] or policy["sso_allowed_domains"] or policy["sso_required_groups"]:
+    does not count; neither does a list that is empty, nor a tenant list that names the tenant ``issuer`` names
+    itself (:func:`tenants_the_issuer_names`: it narrows nothing). Account creation at the first sign-in and
+    linking by email are only ever meant for a restricted provider."""
+    tenants = policy["sso_allowed_tenants"] and not tenants_the_issuer_names(policy, issuer)
+    if tenants or policy["sso_allowed_domains"] or policy["sso_required_groups"]:
         return True
     if policy["sso_use_signup_domains"]:
         mode, domains = signup_domain_gate(account_policy)

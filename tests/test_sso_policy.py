@@ -211,3 +211,36 @@ def test_an_exclusion_wins_over_a_missing_claim():
     assert _judge(stored, tenant_id=None, groups=["other"]) == P.RESTRICTED
     assert _judge(stored, tenant_id=None, groups=None) == P.RESTRICTION_CLAIM_MISSING
     assert _judge(stored, tenant_id="t-1", groups=["g"]) is None
+
+
+def test_a_tenant_the_issuer_already_names_restricts_nobody():
+    """Entra's issuer names the tenant, and the vault takes tokens from that issuer alone: the same tenant on the
+    list admits everybody the tenant lets sign in, guests it invited among them. Such a list is no restriction
+    for making accounts or linking them by address; a tenant claim that is not in the issuer is one, and so are
+    a domain and a group."""
+    T = "8f0d6c3a-1111-4222-8333-444455556666"
+    entra = f"https://login.microsoftonline.com/{T}/v2.0"
+    external = f"https://contoso.ciamlogin.com/{T.upper()}/v2.0"
+    legacy = f"https://sts.windows.net/{T}/"
+
+    def policy(**more):
+        return P.effective({"sso_allowed_tenants": [T], **more})
+    for issuer in (entra, external, legacy, entra + "/", "  " + entra):
+        assert P.tenants_the_issuer_names(policy(), issuer) == [T], issuer
+        assert P.is_restricted(policy(), issuer=issuer) is False, issuer
+        assert P.is_restricted(policy(sso_required_groups=["vault-users"]), issuer=issuer) is True
+        assert P.is_restricted(policy(sso_allowed_domains=["example.org"]), issuer=issuer) is True
+    # However the id is written on the list or in the issuer.
+    assert P.tenants_the_issuer_names(P.effective({"sso_allowed_tenants": [T.upper()]}), entra) == [T.upper()]
+    assert P.is_restricted(P.effective({"sso_allowed_tenants": [T.upper()]}), issuer=entra) is False
+    # Another tenant beside it changes nothing: every token of this issuer carries the issuer's own.
+    both = P.effective({"sso_allowed_tenants": ["another-tenant", T]})
+    assert P.is_restricted(both, issuer=entra) is False
+    # A tenant the issuer does not name is a rule of its own (a provider with one issuer for many tenants).
+    for issuer in ("https://idp.example.org", "https://idp.example.org/realms/main", None, "", 7,
+                   f"https://login.microsoftonline.com/{T[:-1]}/v2.0", f"https://{T}.example.org/v2.0"):
+        assert P.tenants_the_issuer_names(policy(), issuer) == [], issuer
+        assert P.is_restricted(policy(), issuer=issuer) is True, issuer
+    assert P.is_restricted(policy()) is True                       # asked without an issuer: as the list says
+    # The check of the person is unchanged: the tenant claim is still compared.
+    assert _judge({"sso_allowed_tenants": [T]}, tenant_id="someone-else") == P.RESTRICTED

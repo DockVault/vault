@@ -451,19 +451,28 @@ def check(db, row, changes: dict, *, account_policy=None) -> dict:
     from app.core import sso_only
     if "name" in changes and _name_taken(db, changes["name"], but=row):
         raise Conflict(NAME_TAKEN, "Another provider already has this name.")
-    if "policy" not in changes:
+    if "policy" not in changes and "issuer" not in changes:
         return None
-    stored = {**(row.policy if isinstance(row.policy, dict) else {}), **changes["policy"]}
+    # Judged as it would stand: the policy with what the request changes of it, at the issuer it would have (a
+    # change of the issuer alone can make a tenant list say nothing more than the issuer does).
+    stored = {**(row.policy if isinstance(row.policy, dict) else {}), **changes.get("policy", {})}
     policy = sso_policy.effective(stored)
-    restricted = sso_policy.is_restricted(policy, account_policy)
+    issuer = changes.get("issuer", getattr(row, "issuer", None))
+    restricted = sso_policy.is_restricted(policy, account_policy, issuer=issuer)
+    # A tenant list that only repeats the issuer's own tenant: said for what it is, with what does keep people out.
+    repeats = ("" if restricted or not sso_policy.tenants_the_issuer_names(policy, issuer) else (
+        " The tenant entered is the one the issuer already names: it keeps nobody out, guests of that tenant "
+        "included. Require a group (Access), and at the provider let only assigned people use the app."))
     if policy["sso_account_creation"] == "jit" and not restricted:
         raise Conflict(NEEDS_RESTRICTION, (
             "Accounts are made at the first sign-in only for a provider that says who may sign in. Set a tenant, a "
-            "domain or a required group first."))
+            "domain or a required group first." + repeats))
     if policy["sso_link_by_email"] and not restricted:
         raise Conflict(NEEDS_RESTRICTION, (
             "An account is linked by its verified email address only for a provider that says who may sign in. Set a "
-            "tenant, a domain or a required group first."))
+            "tenant, a domain or a required group first." + repeats))
+    if "policy" not in changes:
+        return None
     was = sso_policy.effective(row.policy)["sso_password_login"]
     if policy["sso_password_login"] == "disabled" and was != "disabled":
         why = sso_only.disabled_refusal(db, row)

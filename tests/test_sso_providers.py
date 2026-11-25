@@ -516,3 +516,44 @@ def test_a_provider_is_removed_only_when_nothing_depends_on_it(P, db):
     for state in ("draft", "disabled"):
         row.state = state
         assert P.remove_refusal(db, row) is None
+
+
+def test_accounts_are_not_made_or_linked_on_a_tenant_the_issuer_already_names(P, db):
+    """The Entra preset as an administrator fills it in: the tenant's id in the issuer and on the tenant list. That
+    list keeps nobody out, so it does not open account creation at a first sign-in or the link by address; the
+    refusal says why and what does. A required group opens both. A change of the issuer alone is judged too."""
+    T = "8f0d6c3a-1111-4222-8333-444455556666"
+    row = _ready(P, db)
+    row.issuer = f"https://login.microsoftonline.com/{T}/v2.0"
+    db.commit()
+    for wanted in ({"sso_account_creation": "jit"}, {"sso_link_by_email": True}):
+        with pytest.raises(P.Conflict) as refused:
+            P.check(db, row, P.clean({"policy": {"sso_allowed_tenants": [T], **wanted}}))
+        assert refused.value.reason == P.NEEDS_RESTRICTION
+        assert "The tenant entered is the one the issuer already names: it keeps nobody out" in str(refused.value)
+        assert "Require a group" in str(refused.value)
+        stored = P.check(db, row, P.clean({"policy": {"sso_allowed_tenants": [T], "sso_required_groups": ["staff"],
+                                                      **wanted}}))
+        assert stored["sso_required_groups"] == ["staff"]
+    # A provider whose issuer names no tenant: the tenant list is a rule, as before, and the plain sentence.
+    other = _ready(P, db, name="other")
+    assert P.check(db, other, P.clean({"policy": {"sso_allowed_tenants": [T], "sso_account_creation": "jit"}}))
+    with pytest.raises(P.Conflict) as refused:
+        P.check(db, other, P.clean({"policy": {"sso_account_creation": "jit"}}))
+    assert "already names" not in str(refused.value)
+    # Pointed at the tenant's own issuer afterwards: refused, though the policy is not touched.
+    P.apply(db, other, {}, {"sso_allowed_tenants": [T], "sso_account_creation": "jit"})
+    db.commit()
+    with pytest.raises(P.Conflict) as refused:
+        P.check(db, other, {"issuer": f"https://login.microsoftonline.com/{T}/v2.0"})
+    assert refused.value.reason == P.NEEDS_RESTRICTION
+    assert P.check(db, other, {"issuer": "https://idp.example.org/other"}) is None
+
+
+def test_the_entra_preset_says_what_keeps_guests_out():
+    from app.core import sso_presets
+    entra = sso_presets.get("entra")
+    assert entra["restriction"] == "sso_required_groups"
+    assert "keeps nobody out" in entra["restriction_help"] and "guests" in entra["restriction_help"]
+    assert "“Assignment required” to Yes" in entra["console"]
+    assert "only your organisation's accounts sign in" not in str(entra)

@@ -528,7 +528,7 @@ def _create_account(db, row, answer: ProviderAnswer, policy: dict):
     from app.core.security import hash_password
     api = _api()
     account_policy = api._account_policy(db)
-    if not sso_policy.is_restricted(policy, account_policy):
+    if not sso_policy.is_restricted(policy, account_policy, issuer=getattr(row, "issuer", None)):
         return None
     if subject_owner(db, row, answer) is not None:
         raise Refusal(ALREADY_LINKED, "subject_linked_elsewhere")     # the same subject, pinned to another tenant
@@ -677,7 +677,7 @@ def _email_match(db, row, answer: ProviderAnswer, policy: dict):
     from app.core.models import ExternalIdentity
     api = _api()
     account_policy = api._account_policy(db) if policy["sso_use_signup_domains"] else None
-    if not sso_policy.is_restricted(policy, account_policy):
+    if not sso_policy.is_restricted(policy, account_policy, issuer=getattr(row, "issuer", None)):
         return None
     email = usable_email(answer.email) if answer.email_verified else None
     if email is None or not sso_policy.address_admitted(policy, email):
@@ -919,7 +919,7 @@ def would_do(db, row, answer: ProviderAnswer, tester=None) -> dict:
         if said is not None:
             return said
     if policy["sso_account_creation"] == "jit":
-        if sso_policy.is_restricted(policy, _api()._account_policy(db)):
+        if sso_policy.is_restricted(policy, _api()._account_policy(db), issuer=getattr(row, "issuer", None)):
             if address_holder(db, answer) is not None:
                 return {"restriction": "passes", "would": (
                     "refuse: an account here already holds this verified address, and no second one is made; its "

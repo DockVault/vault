@@ -261,6 +261,36 @@ def test_an_address_the_provider_did_not_verify_says_nothing_about_whose_it_is(m
     assert carol.email is None and not any(n[0] == [str(bob.id)] for n in h.notices)
 
 
+def test_a_tenant_the_issuer_names_makes_and_links_no_account_at_a_sign_in(monkeypatch):
+    """Held at the sign-in too, for a row saved before the rule or edited by hand: a provider whose only rule is
+    the tenant its issuer already names is not restricted, so nobody is given an account at a first sign-in and
+    no account is linked by its address. A required group makes it one."""
+    from app.services import sso_sign_in as sso
+    T = "8f0d6c3a-1111-4222-8333-444455556666"
+    bob = _user("bob")
+    wanted = {"sso_account_creation": "jit", "sso_link_by_email": True, "sso_allowed_tenants": [T]}
+    p = _provider(issuer=f"https://login.microsoftonline.com/{T}/v2.0", policy=dict(wanted))
+    h = Resolving(monkeypatch, [bob], [p], account_policy={"email_requirement": "optional"})
+    monkeypatch.setattr(h.S, "_enforce_user_cap", lambda db: None)
+
+    def answer(email, name):
+        return sso.ProviderAnswer(claims={"preferred_username": name}, subject="s-" + name, issuer=p.issuer,
+                                  tenant_id=T, email=email, email_verified=True, display_name=None, auth_time=None,
+                                  groups=["staff"])
+    for said in (answer("bob@example.test", "bob"), answer("guest@elsewhere.test", "guest")):
+        assert sso._email_match(h.db, p, said, sso.policy_of(p)) is None
+        assert sso._create_account(h.db, p, said, sso.policy_of(p)) is None
+        with pytest.raises(sso.Refusal) as refused:
+            sso.resolve_account(h.db, p, said)
+        assert refused.value.code == sso.NO_ACCOUNT
+    assert h.identities() == [] and h.users_named("guest") == []
+    # With a group required, it says who may sign in: the account that holds the address is linked.
+    p.policy = {**wanted, "sso_required_groups": ["staff"]}
+    assert sso._email_match(h.db, p, answer("bob@example.test", "bob"), sso.policy_of(p)) is bob
+    made = sso._create_account(h.db, p, answer("new@example.test", "newcomer"), sso.policy_of(p))
+    assert made is not None and made.created is True
+
+
 def test_the_administrators_are_told_of_a_first_sign_in_that_met_an_unconfirmed_address(monkeypatch):
     """The address on that account may be the person's own, or somebody typed a colleague's on theirs. Nobody is
     given a second account either way, and nobody is left to find out alone: the administrators can correct it."""

@@ -19,9 +19,14 @@ PRESETS = (
                        "tenant, and the vault accepts only the one written here.",
         "scopes": "openid profile email",
         "claims": {"tenant": "tid", "groups": "groups"},
-        "restriction": "sso_allowed_tenants",
-        "restriction_help": "Enter your tenant id under Access, so that only your organisation's accounts sign in.",
-        "console": "Entra admin center: App registrations, your app, Authentication. Add the redirect address as "
+        "restriction": "sso_required_groups",
+        "restriction_help": "The issuer already names your tenant, so a tenant id under Access keeps nobody out: "
+                            "guests your tenant invited sign in too. In Entra, let only assigned people use the "
+                            "app (below), and require a group under Access before accounts are made at a first "
+                            "sign-in or linked by their address.",
+        "console": "Entra admin center: Enterprise applications, your app, Properties: set “Assignment "
+                   "required” to Yes, then assign the people or groups who may sign in under Users and groups. "
+                   "App registrations, your app, Authentication. Add the redirect address as "
                    "a Web redirect URI, and the sign-out return address as a second one when signing out here "
                    "also signs out there. Leave the front-channel logout URL empty: Entra has no back-channel "
                    "logout, and the vault takes none through a frame; the freshness window and the refusal rule "
