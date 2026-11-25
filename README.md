@@ -855,8 +855,9 @@ one.
   provider, the person's SSH keys, temporary credentials and devices pause, and their password, a passkey by itself
   and Stay signed in are refused until they sign in through the provider again.
 - **Administrators always keep a password.** An administrator types the password after a passkey. Neither an
-  administrator nor a holder of the auditor right is ever held to a provider, so when a provider cannot be reached
-  an administrator signs in with the password and can turn the provider off. From the host,
+  administrator nor the holder of an auditor right in force (not one that is proposed or suspended) is ever held
+  to a provider, so when a provider cannot be reached an administrator signs in with the password and can turn the
+  provider off. From the host,
   `python dockvault.py accounts` resets an administrator's password or second factor, and
   `--action clear-passkey-requirement` lets one account whose browser cannot make the passkey its role requires
   sign in without it (see [Account changes from the host](#account-changes-from-the-host)).

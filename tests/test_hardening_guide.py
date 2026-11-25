@@ -94,3 +94,27 @@ def test_the_guide_and_the_readme_say_how_sftp_agrees_its_keys():
     assert kex_policy.PREFERRED == "pq-preferred" and "`SFTP_KEX_POLICY=pq-preferred`, the default" in guide
     assert "kex.agreed.classical" in guide
     assert "in the one-container shape the whole vault stops with it" in guide
+
+
+def test_the_guide_and_the_readme_keep_from_a_providers_hold_only_an_auditor_right_in_force(monkeypatch):
+    """A provider's hold reaches every account but an administrator and the holder of an auditor right in force
+    (app/services/sso_freshness.py may_be_held): a right that is only proposed, or is suspended, is held like any
+    other account. Both texts say so, and neither says that a holder of the right is never held."""
+    import types
+    import uuid
+    from app.core import auditor_rights
+    from app.core.models import RoleEnum
+    from app.services import sso_freshness
+    said = "auditor right in force (not one that is proposed or suspended)"
+    guide = _flat(_guide())
+    readme = _flat((ROOT / "README.md").read_text(encoding="utf-8"))
+    assert said in guide and said in readme
+    assert "holder of the auditor right is ever held" not in readme
+    assert "holder of the auditor right is held" not in guide
+    grants = {}
+    monkeypatch.setattr(auditor_rights, "open_grant", lambda db, user_id: grants.get("now"))
+    person = types.SimpleNamespace(id=uuid.uuid4(), role=RoleEnum.USER)
+    for status, held in (("active", False), ("suspended", True), ("proposed", True), (None, True)):
+        grants["now"] = types.SimpleNamespace(status=status) if status else None
+        assert sso_freshness.may_be_held(object(), person) is held, status
+    assert sso_freshness.may_be_held(object(), types.SimpleNamespace(id=uuid.uuid4(), role=RoleEnum.ADMIN)) is False

@@ -96,9 +96,9 @@ sign-on needs an `https` address, and an IP address serves it where the provider
   during an incident gives nobody a password back: the accounts it held stay held.
 - **Count a provider's second factor only on purpose** (off by default), and only with the `amr` or `acr` values
   you list. The Second factor page shows what the last test sign-in carried.
-- **Administrators keep their password.** No administrator or holder of the auditor right is held to a provider.
-  When a provider cannot be reached, an administrator signs in with the password (and the second factor), and can
-  turn the provider off.
+- **Administrators keep their password.** No administrator, and no holder of an auditor right in force (not one
+  that is proposed or suspended), is held to a provider. When a provider cannot be reached, an administrator signs
+  in with the password (and the second factor), and can turn the provider off.
 
 **Locking.** `SETTINGS_LOCKED_KEYS=sso` freezes the providers as they are: nothing is added, changed, turned on or
 off, or removed in the panel, while reading them and running a test sign-in stay open. The passkey settings take
