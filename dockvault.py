@@ -1150,7 +1150,9 @@ def build_env_lines(cfg):
     if hold is not None and hold != ENVELOPE_HOLD_DAYS_DEFAULT:
         bare("ZK_ENVELOPE_HOLD_DAYS", str(hold))
     # Root certificates for direct passkey attestation: written only when the operator set a path, so a fresh
-    # volume set keeps it (the setting itself is turned on in the app's Settings -> Sign-in).
+    # volume set keeps it (the setting itself is turned on in the app's Settings -> Sign-in). The file goes in the
+    # repository's certs/ directory, which the HTTPS compose this tool starts mounts read-only at /app/certs; the
+    # quickstart compose keeps /app/certs in memory and never sees it (see .env.example).
     roots = str(cfg.get("webauthn_attestation_roots") or "").strip()
     if roots:
         bare("WEBAUTHN_ATTESTATION_ROOTS", roots)

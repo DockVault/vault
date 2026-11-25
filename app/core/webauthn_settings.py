@@ -779,8 +779,9 @@ def save_refusal(db, key: str, value, *, settings_now: Optional[dict] = None) ->
         return "Requiring passkeys needs the vault's public address. " + why_no_passkeys()
     if key in (ATTESTATION, ALLOWED_AAGUIDS) and proposed[ATTESTATION] == DIRECT and not trust_anchors():
         return ("Direct attestation needs trust anchors: put a PEM bundle of root certificates in the deployment's "
-                "certs folder, set WEBAUTHN_ATTESTATION_ROOTS in .env to its path as the server sees it "
-                "(/app/certs/<file name>), restart, and try again.")
+                "certs folder (the HTTPS compose, deploy/docker-compose.secure.yml, mounts it at /app/certs; the "
+                "quickstart compose does not), set WEBAUTHN_ATTESTATION_ROOTS in .env to its path as the server "
+                "sees it (/app/certs/<file name>), restart, and try again.")
     if key == ALLOWED_AAGUIDS and proposed[ATTESTATION] != DIRECT:
         return "A list of allowed authenticator makes proves nothing without direct attestation: turn that on first."
     on_administrators = required and "admin" in (proposed[REQUIRED_ROLES] or ())
