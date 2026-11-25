@@ -45,7 +45,8 @@ def get_sign_in_settings(current_user: User = Depends(require_interactive_admin)
     """The passkey settings as the page shows them: each with its value in force, where it comes from and whether
     the deployment locked it; the public address's readiness (passkeys need one) and, when no passkey can be made at
     it, what to change, in words, and whether a requirement on some role waits because of it; whether trust anchors
-    exist, and under direct attestation how many passkeys in use were added without it; how many passkeys in use
+    exist, and when none do, why (in words that never name the file's path); under direct attestation, how many
+    passkeys in use were added without it; how many passkeys in use
     never verified the person, and how many accounts hold no other (with the rule on, the ones that no longer
     count; with it off, the ones that would stop counting if it were turned on); how many accounts, and how many
     administrators among them, hold a passkey as their only second factor (the ones that set an authenticator app
@@ -62,7 +63,8 @@ def get_sign_in_settings(current_user: User = Depends(require_interactive_admin)
             "requirement_lifted_for": ws_settings.lifted_for(db),
             "accounts_with_only_a_passkey": only["accounts"],
             "administrators_with_only_a_passkey": only["administrators"],
-            "trust_anchors": len(ws_settings.trust_anchors()), "step_up": ws_settings.STEP_UP_ACTION}
+            "trust_anchors": len(ws_settings.trust_anchors()),
+            "trust_anchors_problem": ws_settings.trust_anchors_problem(), "step_up": ws_settings.STEP_UP_ACTION}
 
 
 @router.put("/settings/sign-in/{setting}")

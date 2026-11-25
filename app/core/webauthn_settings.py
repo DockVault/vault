@@ -199,33 +199,62 @@ def device_bound_for(user) -> bool:
 
 # --------------------------------------------------------------------------- trust anchors (direct attestation)
 
-_anchors_cache: dict = {"path": None, "mtime": None, "anchors": ()}
+_anchors_cache: dict = {"path": None, "mtime": None, "anchors": (), "problem": None}
+
+# Why no trust anchors were found, one fragment per cause. None names the configured path: these texts reach the
+# Sign-in page and the log (as public_url.why_not_usable keeps the address out of its own).
+ANCHORS_UNSET = "WEBAUTHN_ATTESTATION_ROOTS is not set in .env"
+ANCHORS_NOT_FOUND = ("the server finds no file where WEBAUTHN_ATTESTATION_ROOTS points (only the HTTPS compose "
+                     "mounts the certs folder at /app/certs)")
+ANCHORS_UNREADABLE = "the server cannot read the file WEBAUTHN_ATTESTATION_ROOTS names"
+ANCHORS_NOT_PEM = ("the file WEBAUTHN_ATTESTATION_ROOTS names holds no PEM certificate (a DER file must be converted "
+                   "to PEM first)")
+
+
+def _anchors_and_problem() -> Tuple[Tuple[bytes, ...], Optional[str]]:
+    """The anchors read from the bundle WEBAUTHN_ATTESTATION_ROOTS names, and why there are none (None when there
+    are some). Kept while the file's path and time of change stay the same."""
+    from app.core.config import settings
+    path = (getattr(settings, "webauthn_attestation_roots", "") or "").strip()
+    if not path:
+        return (), ANCHORS_UNSET
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return (), ANCHORS_NOT_FOUND
+    if _anchors_cache["path"] == path and _anchors_cache["mtime"] == mtime:
+        return _anchors_cache["anchors"], _anchors_cache.get("problem")
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        # Not kept: a change of the file's owner or mode leaves its time of change as it was.
+        return (), ANCHORS_UNREADABLE
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        anchors = tuple(cert.public_bytes(serialization.Encoding.DER)
+                        for cert in x509.load_pem_x509_certificates(raw))
+    except Exception:  # noqa: BLE001 -- an unreadable bundle is no anchors, never a crash at sign-in
+        anchors = ()
+    problem = None if anchors else ANCHORS_NOT_PEM
+    _anchors_cache.update(path=path, mtime=mtime, anchors=anchors, problem=problem)
+    return anchors, problem
 
 
 def trust_anchors() -> Tuple[bytes, ...]:
     """The operator's root certificates for direct attestation, DER, from the PEM bundle named by
     WEBAUTHN_ATTESTATION_ROOTS; empty without one (direct attestation is then refused at save)."""
-    from app.core.config import settings
-    path = (getattr(settings, "webauthn_attestation_roots", "") or "").strip()
-    if not path:
-        return ()
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return ()
-    if _anchors_cache["path"] == path and _anchors_cache["mtime"] == mtime:
-        return _anchors_cache["anchors"]
-    anchors = []
-    try:
-        from cryptography import x509
-        with open(path, "rb") as handle:
-            for cert in x509.load_pem_x509_certificates(handle.read()):
-                from cryptography.hazmat.primitives import serialization
-                anchors.append(cert.public_bytes(serialization.Encoding.DER))
-    except Exception:  # noqa: BLE001 -- an unreadable bundle is no anchors, never a crash at sign-in
-        anchors = []
-    _anchors_cache.update(path=path, mtime=mtime, anchors=tuple(anchors))
-    return _anchors_cache["anchors"]
+    return _anchors_and_problem()[0]
+
+
+def trust_anchors_problem() -> Optional[str]:
+    """Why there are no trust anchors, as a fragment of a sentence that never names the configured path, or None
+    when there are some: the variable is not set, no file is where it points, the server cannot read the file, or
+    the file holds no PEM certificate. The save refusal of direct attestation and the Sign-in page say it."""
+    if trust_anchors():
+        return None
+    return _anchors_and_problem()[1] or ANCHORS_NOT_PEM
 
 
 def policy():
@@ -782,11 +811,14 @@ def save_refusal(db, key: str, value, *, settings_now: Optional[dict] = None) ->
     if key in (MODE, REQUIRED_ROLES) and required and not readiness().get("usable"):
         from app.core.public_url import why_no_passkeys
         return "Requiring passkeys needs the vault's public address. " + why_no_passkeys()
-    if key in (ATTESTATION, ALLOWED_AAGUIDS) and proposed[ATTESTATION] == DIRECT and not trust_anchors():
-        return ("Direct attestation needs trust anchors: put a PEM bundle of root certificates in the deployment's "
-                "certs folder (the HTTPS compose, deploy/docker-compose.secure.yml, mounts it at /app/certs; the "
-                "quickstart compose does not), set WEBAUTHN_ATTESTATION_ROOTS in .env to its path as the server "
-                "sees it (/app/certs/<file name>), restart, and try again.")
+    direct = key in (ATTESTATION, ALLOWED_AAGUIDS) and proposed[ATTESTATION] == DIRECT
+    missing = trust_anchors_problem() if direct else None
+    if missing:
+        return ("Direct attestation needs trust anchors, and " + missing + ". Put a PEM bundle of root certificates "
+                "in the deployment's certs folder (the HTTPS compose, deploy/docker-compose.secure.yml, mounts it at "
+                "/app/certs; the quickstart compose does not), set WEBAUTHN_ATTESTATION_ROOTS in .env to its path as "
+                "the server sees it (/app/certs/<file name>), then restart the vault (python dockvault.py restart; a "
+                "plain docker restart keeps the old .env), and try again.")
     if key == ALLOWED_AAGUIDS and proposed[ATTESTATION] != DIRECT:
         return "A list of allowed authenticator makes proves nothing without direct attestation: turn that on first."
     on_administrators = required and "admin" in (proposed[REQUIRED_ROLES] or ())

@@ -71,6 +71,6 @@ def test_the_server_says_where_the_file_goes_when_it_refuses_direct_attestation_
     monkeypatch.setattr(public_url, "readiness", lambda: {"usable": True})
     monkeypatch.setattr(wss, "trust_anchors", lambda: ())
     said = wss.save_refusal(MemoryDB({User: [], WebAuthnCredential: []}), wss.ATTESTATION, "direct")
-    assert said.startswith("Direct attestation needs trust anchors: put a PEM bundle of root certificates in the "
-                           "deployment's certs folder (the HTTPS compose, deploy/docker-compose.secure.yml, mounts it "
-                           "at /app/certs; the quickstart compose does not)")
+    assert said.startswith("Direct attestation needs trust anchors, and "), said
+    assert ("Put a PEM bundle of root certificates in the deployment's certs folder (the HTTPS compose, "
+            "deploy/docker-compose.secure.yml, mounts it at /app/certs; the quickstart compose does not)") in said

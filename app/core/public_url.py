@@ -212,8 +212,9 @@ def why_not_usable() -> str:
     base = link_base()
     if not base:
         return ("The vault has no public address. Set ALLOWED_HOSTS in .env to the address people open the vault "
-                "at (dockvault.py setup writes it), then restart.")
-    return (problem(base) or "") and f"{problem(base)}. Change ALLOWED_HOSTS in .env, then restart."
+                "at (dockvault.py setup writes it), then restart the vault (python dockvault.py restart).")
+    return (problem(base) or "") and (f"{problem(base)}. Change ALLOWED_HOSTS in .env, then restart the vault "
+                                         "(python dockvault.py restart).")
 
 
 def why_no_passkeys() -> str:
@@ -225,5 +226,5 @@ def why_no_passkeys() -> str:
         return ""
     if ready["reason"] == IP_ADDRESS:
         return ("Browsers make no passkey for an address reached by IP. Put the vault's host name first in "
-                "ALLOWED_HOSTS in .env, then restart.")
+                "ALLOWED_HOSTS in .env, then restart the vault (python dockvault.py restart).")
     return why_not_usable()

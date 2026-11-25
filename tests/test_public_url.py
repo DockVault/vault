@@ -168,6 +168,7 @@ def test_with_no_address_configured_sign_in_has_none(monkeypatch, allowed_hosts)
     assert pu.readiness() == {"usable": False, "rp_id": "", "origin": "", "reason": "no_public_host"}
     why = pu.why_not_usable()
     assert "no public address" in why and "ALLOWED_HOSTS" in why and "dockvault.py setup" in why
+    assert why.endswith("then restart the vault (python dockvault.py restart).")
     assert pu.why_no_passkeys() == why
 
 
@@ -186,7 +187,7 @@ def test_an_address_the_links_use_and_sign_in_cannot_is_not_replaced_by_another_
     assert pu.public_base_url() == "" and pu.rp_id() == "" and pu.expected_origin() == ""
     assert pu.readiness() == {"usable": False, "rp_id": "", "origin": "", "reason": "address_not_usable"}
     why = pu.why_not_usable()
-    assert words in why and "ALLOWED_HOSTS" in why and why.endswith("then restart.")
+    assert words in why and "ALLOWED_HOSTS" in why and why.endswith("then restart the vault (python dockvault.py restart).")
     # The reason never repeats the address.
     assert "vault.lan" not in why and "example" not in why and "bad host" not in why
     assert pu.why_no_passkeys() == why
@@ -200,6 +201,7 @@ def test_an_address_reached_by_ip_is_no_relying_party(monkeypatch):
     assert pu.why_not_usable() == ""
     why = pu.why_no_passkeys()
     assert "reached by IP" in why and "host name first in ALLOWED_HOSTS" in why and "10.0.0.5" not in why
+    assert why.endswith("then restart the vault (python dockvault.py restart).")
     pu = _with_settings(monkeypatch, "192.168.1.20")
     assert pu.readiness()["reason"] == "ip_address"
     pu = _with_settings(monkeypatch, "http://localhost:8200")

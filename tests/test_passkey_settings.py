@@ -102,10 +102,53 @@ def test_trust_anchors_come_from_the_operators_pem_bundle(monkeypatch, tmp_path)
     wss._anchors_cache.update(path=None, mtime=None, anchors=())
     anchors = wss.trust_anchors()
     assert len(anchors) == 2 and anchors[0] == cert.public_bytes(serialization.Encoding.DER)
+    assert wss.trust_anchors_problem() is None
     monkeypatch.setattr(settings, "webauthn_attestation_roots", str(tmp_path / "missing.pem"), raising=False)
     assert wss.trust_anchors() == ()
     monkeypatch.setattr(settings, "webauthn_attestation_roots", "", raising=False)
     assert wss.trust_anchors() == ()
+
+
+def test_the_reason_no_trust_anchors_were_found_is_told_apart_and_never_names_the_path(monkeypatch, tmp_path):
+    """Unset, no file where it points, a file the server cannot read, a file with no PEM certificate in it: each is
+    a different thing for the operator to fix, and the refusal of direct attestation says which, with the step
+    that makes the server read .env again. The path is never repeated (the text reaches a page and the log)."""
+    registry, wss = _mod()
+    from app.core.config import settings
+    from app.core.models import User, WebAuthnCredential
+    import app.core.public_url as public_url
+
+    def problem_with(path):
+        monkeypatch.setattr(settings, "webauthn_attestation_roots", path, raising=False)
+        wss._anchors_cache.update(path=None, mtime=None, anchors=())
+        return wss.trust_anchors_problem()
+
+    assert "WEBAUTHN_ATTESTATION_ROOTS is not set" in problem_with("")
+    missing = str(tmp_path / "gone-roots.pem")
+    said = problem_with(missing)
+    assert "finds no file" in said and "gone-roots" not in said
+    garbage = tmp_path / "garbage-roots.pem"
+    garbage.write_bytes(b"not a certificate")
+    said = problem_with(str(garbage))
+    assert "holds no PEM certificate" in said and "garbage-roots" not in said
+    assert wss.trust_anchors() == ()
+    # A file that is there and cannot be opened (a root-owned file the app's user cannot read).
+    locked = tmp_path / "locked-roots.pem"
+    locked.write_bytes(b"whatever")
+
+    def refusing(file, *args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(file))
+    monkeypatch.setattr(wss, "open", refusing, raising=False)
+    said = problem_with(str(locked))
+    monkeypatch.delattr(wss, "open")
+    assert "cannot read the file" in said and "locked-roots" not in said
+    # The refusal names the cause and the step that makes the server read .env again.
+    monkeypatch.setattr(public_url, "readiness", lambda: {"usable": True})
+    problem_with(missing)
+    refused = wss.save_refusal(MemoryDB({User: [], WebAuthnCredential: []}), wss.ATTESTATION, "direct")
+    assert refused.startswith("Direct attestation needs trust anchors, and the server finds no file"), refused
+    assert "python dockvault.py restart" in refused and ", restart, and try again" not in refused
+    assert "gone-roots" not in refused
 
 
 # --------------------------------------------------------------------------- the requirement and its grace
@@ -288,6 +331,7 @@ def test_the_settings_route_lists_and_writes_under_the_step_up(monkeypatch):
     status, body = _call(S, "GET", "/settings/sign-in")
     assert status == 200 and {s["key"] for s in body["settings"]} == set(wss.KEYS) and body["readiness"]["usable"] is True
     assert body["step_up"] == "admin.auth_policy.write" and body["trust_anchors"] == 0
+    assert "WEBAUTHN_ATTESTATION_ROOTS is not set" in body["trust_anchors_problem"]
     assert body["why_not"] == ""                          # a passkey can be made here: nothing to change
     assert body["requirement_paused"] is False
     # A requirement saved while the address worked, and the address gone since: the page is told that it waits.
