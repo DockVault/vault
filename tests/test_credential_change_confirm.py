@@ -171,7 +171,9 @@ const local = (v) => new Date(v).toLocaleDateString(undefined, { day: 'numeric',
 process.stdout.write(JSON.stringify({ day: local(at), end: local(ends),
     other: credentialChangeNoteText({ kind: 'reset_link', label: 'Password reset link', by: 'bob', at, window_ends: ends }),
     mine: credentialChangeNoteText({ kind: 'email', label: 'Email address change', by: 'alice', at, window_ends: ends }),
-    host: credentialChangeNoteText({ kind: 'second_factor', label: 'Second factor reset', by: 'operator@host', at, window_ends: ends }) }));
+    host: credentialChangeNoteText({ kind: 'second_factor', label: 'Second factor reset', by: 'operator@host', at, window_ends: ends }),
+    confirmed: credentialChangeNoteText({ kind: 'email', confirmed: true, label: 'Email address confirmed', by: 'alice', at, window_ends: ends }),
+    changed: credentialChangeNoteText({ kind: 'email', confirmed: false, label: 'Email address change', by: 'bob', at, window_ends: ends }) }));
 """)
     done = subprocess.run([node, "-"], input=harness, capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert done.returncode == 0, done.stdout + done.stderr
@@ -180,6 +182,16 @@ process.stdout.write(JSON.stringify({ day: local(at), end: local(ends),
                             "to this account’s sign-in details needs a second administrator’s approval.")
     assert out["mine"].startswith(f"Email address changed by you on {out['day']}.")
     assert out["host"].startswith("Second factor reset by the server’s operator on ")
+    # An administrator who confirmed the address the account holds changed nothing: the note says confirmed.
+    assert out["confirmed"].startswith(f"Email address confirmed by you on {out['day']}.")
+    assert out["changed"].startswith(f"Email address changed by bob on {out['day']}.")
+
+
+def test_the_users_list_says_when_the_last_change_only_confirmed_the_address():
+    source = (Path(__file__).resolve().parent.parent / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    listing = source[source.index("async def list_users("):]
+    listing = listing[:listing.index("\n@app.")]
+    assert '"confirmed": cc.is_confirmation(*cc.what_of(change))' in listing
 
 
 def test_an_address_change_that_will_be_held_says_the_rest_is_saved_now():

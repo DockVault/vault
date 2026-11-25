@@ -7546,15 +7546,17 @@ async function resetUserSecondFactor(userId, btn) {
 // What the last change to someone's sign-in details was, as done: "Password reset link created".
 const _CHANGE_MADE = {
     password: 'New password set', reset_link: 'Password reset link created', second_factor: 'Second factor reset',
-    email: 'Email address changed', ssh_key: 'SSH key added', passkey: 'Passkey removed',
+    email: 'Email address changed', email_confirmed: 'Email address confirmed', ssh_key: 'SSH key added',
+    passkey: 'Passkey removed',
 };
 
 // "Password reset link created by admin on 28 Sep. Until 12 Oct, another change ..." in the viewer's
-// own date format; "by you" when it was the viewer.
+// own date format; "by you" when it was the viewer. A confirmation of the address the account holds is recorded
+// as an email change and moved no address: it reads "Email address confirmed".
 function credentialChangeNoteText(c) {
     const who = (currentUser && c.by === currentUser.username) ? 'you'
         : (c.by === 'operator@host' ? 'the server’s operator' : c.by);
-    return (_CHANGE_MADE[c.kind] || c.label) + ' by ' + who + ' on ' + formatDayMonth(c.at) + '. Until '
+    return (_CHANGE_MADE[c.confirmed ? 'email_confirmed' : c.kind] || c.label) + ' by ' + who + ' on ' + formatDayMonth(c.at) + '. Until '
         + formatDayMonth(c.window_ends) + ', another change to this account’s sign-in details needs a second administrator’s approval.';
 }
 

@@ -1162,8 +1162,9 @@ class UserResponse(BaseModel):
     # by the admin users list.
     sign_in_block: Optional[Dict[str, Any]] = None
     # The newest credential change an administrator made to this account within the last 14 days
-    # ({kind, label, by, at, window_ends}), or None. Until window_ends, a further change needs a
-    # second administrator's approval. Filled in by the admin users list.
+    # ({kind, label, confirmed, by, at, window_ends}; confirmed: it only confirmed the address the account holds),
+    # or None. Until window_ends, a further change needs a second administrator's approval. Filled in by the admin
+    # users list.
     credential_change: Optional[Dict[str, Any]] = None
     # Single sign-on freshness, for an account a provider asks to sign in again: when its SSH keys, temporary
     # credentials and devices pause (or paused), through which provider, and whether the provider refused it.
@@ -11267,6 +11268,9 @@ async def list_users(
         if change is not None:
             item.credential_change = {
                 "kind": change.kind, "label": cc.label(*cc.what_of(change)), "by": change.requested_by_name,
+                # An administrator's confirmation of the address the account holds: recorded as an email change,
+                # it moved no address, and the page says it was confirmed.
+                "confirmed": cc.is_confirmation(*cc.what_of(change)),
                 "at": change.applied_at.isoformat() + "Z",
                 "window_ends": cc.window_ends(change).isoformat() + "Z",
             }
