@@ -274,13 +274,18 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
     is not told again here. What was told is kept on the identity row (``freshness_warned_for``,
     ``freshness_paused_for``) in ``db``, with the audit rows, so a pass that rolls back tells again and a notice the
     person deleted is not sent again; the notices commit in their own sessions and keep their own dedup keys, so a
-    retried pass adds no second notice or email. The caller commits. Returns the counts."""
+    retried pass adds no second notice or email. The caller commits. Returns the counts.
+
+    While a provider is turned off here nobody is told to sign in through it, before the deadline or after: the
+    sign-in page has no way to it, and the sentence would send the person where nothing answers. Nothing is kept
+    as told either, so the first pass after the provider is turned on tells what then holds (the days went on
+    counting meanwhile, as the provider's page says)."""
     from app.api import api_server as api
     from app.core.models import User
     now = now or datetime.utcnow()
     warned, paused, held = 0, [], 0
     for identity, found in _identities_with_deadlines(db):
-        if found.refused:
+        if found.refused or not found.provider_on:
             continue
         if found.due > now:
             lead = warning_lead(found.window_days)

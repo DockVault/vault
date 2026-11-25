@@ -512,3 +512,35 @@ def test_told_once_is_kept_on_the_identity_whatever_becomes_of_the_notices(told)
     told.seen.clear()
     assert F.sweep(db, NOW + 5 * DAY) == {"warned": 0, "lapsed": 0}
 
+
+def test_the_sweep_sends_nobody_to_a_provider_that_is_turned_off_and_tells_them_once_it_is_on(told):
+    """An administrator turns a provider off for a while. The days go on counting. Told to sign in through it by
+    a date, or again, the person would be sent where nothing answers: the sign-in page has no way to a provider
+    that is off. Nothing is told and nothing is kept as told; the first pass after it is on again tells what
+    holds then."""
+    admin = _user("root")
+    told.admins.append(admin)
+    alice, bob = _user("alice"), _user("bob")
+    p = _provider(30, sso_lapse_ends_sign_in=False)
+    ia = _identity(alice, p, signed_in=NOW - 27 * DAY)                 # due in 3 days
+    ib = _identity(bob, p, signed_in=NOW - 31 * DAY)                   # lapsed a day ago
+    db = _db([admin, alice, bob], [p], [ia, ib])
+    p.state = "disabled"
+    assert [d.provider_on for d in F.deadlines(db, alice.id)] == [False]
+    assert F.sweep(db, NOW) == {"warned": 0, "lapsed": 0}
+    assert told.notices == [] and told.emails == [] and told.audits == []
+    assert not hasattr(ia, "freshness_warned_for") and not hasattr(ib, "freshness_paused_for")     # nothing kept as told
+    # A draft that never was on is the same.
+    p.state = "draft"
+    assert F.sweep(db, NOW) == {"warned": 0, "lapsed": 0} and told.notices == []
+    # Turned on again: each is told what holds now, once.
+    p.state = "enabled"
+    assert F.sweep(db, NOW + DAY) == {"warned": 1, "lapsed": 1}
+    assert [(n[0], n[1]) for n in told.notices] == [(str(alice.id), F.WARNED), (str(bob.id), F.EXPIRED),
+                                                    (str(admin.id), F.EXPIRED)]
+    assert [(a, u) for a, u, _ in told.audits] == [(F.WARNED, "alice"), (F.EXPIRED, "bob")]
+    assert F.sweep(db, NOW + DAY + timedelta(hours=1)) == {"warned": 0, "lapsed": 0}
+    # A refusal by the provider was told when it happened, whatever the provider's state: still not told here.
+    ia.refused_at = NOW + DAY
+    p.state = "disabled"
+    assert F.sweep(db, NOW + 2 * DAY) == {"warned": 0, "lapsed": 0} and len(told.notices) == 3
