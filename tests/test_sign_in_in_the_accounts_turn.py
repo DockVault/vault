@@ -696,6 +696,100 @@ def test_a_refusal_with_no_session_of_a_proof_touches_nothing(db, monkeypatch):
         "@a_refusal_leaves_no_session\ndef in_the_accounts_turn(")
 
 
+class _Waited(Exception):
+    """What the database driver raises, as SQLAlchemy carries it: the code of the failure is on ``orig``."""
+
+    def __init__(self, pgcode):
+        super().__init__(pgcode)
+        self.pgcode = pgcode
+
+
+def _lock_wait(pgcode="55P03"):
+    from sqlalchemy.exc import OperationalError
+    return OperationalError("UPDATE users SET last_login = now()", {}, _Waited(pgcode))
+
+
+@pytest.mark.parametrize("where", ["a later statement of the step", "the step that takes the turn"])
+def test_a_lock_wait_that_ran_out_inside_a_step_is_a_busy_refusal_that_leaves_no_session(db, monkeypatch, where):
+    """The password door committed its session. In the step that judges the sign-in, a statement waits for a
+    lock for longer than the connection waits (a row held by something outside the order of the locks) and
+    fails. Only the wait for the turn itself was answered: this one passed as an error, the session of the proof
+    stayed among the account's, and where a one-time sign-in code had carried the sign-in the answer said "try
+    again" for a code that was spent. It is the busy refusal, with the wait, nothing kept."""
+    from app.services.auth_service import AuthService
+    alice = _user(db, "alice")
+    made = AuthService(db)._create_session(alice, None, IP, channel="web")
+    assert _rows(db, "active_sessions", alice) == 1
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, session_token=made,
+                                  sessions_ended=sign_in.as_read(alice))
+    monkeypatch.setattr(api, "_login_second_factor_in_effect", lambda db_, user: False)
+
+    def writes_and_then_waits_too_long(db_, *args, **kwargs):
+        db_.execute(sa.text("UPDATE users SET sessions_ended = sessions_ended + 5 WHERE id = :id"),
+                    {"id": alice.id.hex})
+        raise _lock_wait()
+    if where == "the step that takes the turn":
+        monkeypatch.setattr(api, "_sessions_turn", writes_and_then_waits_too_long)
+        step = sign_in.in_the_accounts_turn
+    else:
+        monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: None)
+        monkeypatch.setattr(sign_in, "refuse_without_the_provider", writes_and_then_waits_too_long)
+        step = sign_in.finish
+    with pytest.raises(HTTPException) as answer:
+        step(db, result)
+    assert answer.value.status_code == 503 and answer.value.detail == sign_in.BUSY
+    assert answer.value.headers == {"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}
+    # The database's error, which carries the statement, is not shown with the answer.
+    assert answer.value.__suppress_context__ is True and result.session_token is None
+    db.rollback()
+    assert _rows(db, "active_sessions", alice) == 0 and _count(db, alice) == 0
+    # The one answer for it, as the function gives it.
+    assert (sign_in.busy().status_code, sign_in.busy().detail, sign_in.busy().headers) == (
+        503, sign_in.BUSY, {"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)})
+
+
+def test_a_lock_wait_that_ran_out_with_no_session_of_a_proof_is_busy_and_keeps_nothing(db, monkeypatch):
+    """A sign-in whose proof made no session (a passkey, a code after a held sign-in): the failed statement left
+    the transaction unusable, so it is rolled back all the same, and the answer is the busy one."""
+    alice = _user(db, "alice")
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, sessions_ended=sign_in.as_read(alice))
+    monkeypatch.setattr(api, "_login_second_factor_in_effect", lambda db_, user: False)
+    monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: None)
+
+    def writes_and_then_waits_too_long(db_, *args, **kwargs):
+        db_.execute(sa.text("UPDATE users SET sessions_ended = sessions_ended + 5 WHERE id = :id"),
+                    {"id": alice.id.hex})
+        raise _lock_wait()
+    monkeypatch.setattr(sign_in, "refuse_without_the_provider", writes_and_then_waits_too_long)
+    ended = []
+    rollback = db.rollback
+    monkeypatch.setattr(db, "rollback", lambda: (ended.append("rollback"), rollback())[1])
+    with pytest.raises(HTTPException) as answer:
+        sign_in.finish(db, result)
+    assert answer.value.status_code == 503 and answer.value.detail == sign_in.BUSY and ended == ["rollback"]
+    assert _count(db, alice) == 0
+
+
+def test_another_error_of_the_database_is_not_taken_for_a_lock_wait(db, monkeypatch):
+    """A statement cancelled, a connection lost, a deadlock: none of them says "busy, try again in a moment" of
+    itself, and none is answered as that here. Each passes as it is, and the session of the proof is left to
+    whatever handles the error."""
+    from sqlalchemy.exc import OperationalError
+    from app.services.auth_service import AuthService
+    alice = _user(db, "alice")
+    made = AuthService(db)._create_session(alice, None, IP, channel="web")
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, session_token=made,
+                                  sessions_ended=sign_in.as_read(alice))
+    monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: None)
+    for pgcode in ("40P01", "57014", None):
+        def broken(db_, user, client_ip, pgcode=pgcode):
+            raise _lock_wait(pgcode)
+        monkeypatch.setattr(sign_in, "refuse_unless_the_account_may_sign_in", broken)
+        with pytest.raises(OperationalError):
+            sign_in.finish(db, result)
+        assert result.session_token == made and _rows(db, "active_sessions", alice) == 1, pgcode
+
+
 def test_what_is_not_a_refusal_is_not_taken_for_one(db, monkeypatch):
     """An error that is no refusal (the database's, a bug's) passes as it is: the guard drops a session only for
     an answer the pipeline gave."""

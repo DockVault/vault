@@ -359,6 +359,13 @@ def with_a_short_wait(db, take):
     return taken
 
 
+def busy() -> HTTPException:
+    """The refusal of a sign-in that could not be written now and can be a moment later: 503 with the wait."""
+    from app.core import sign_in_lockout
+    return HTTPException(status_code=503, detail=BUSY,
+                         headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)})
+
+
 def a_refusal_leaves_no_session(step):
     """For a step of the pipeline that takes ``(db, result, ...)``: a refusal it raises leaves no session of the
     sign-in's proof behind. The password door writes its session in its own turn and commits it before the
@@ -366,9 +373,17 @@ def a_refusal_leaves_no_session(step):
     locked or turned off meanwhile, a held sign-in already spent, whatever a later step of the pipeline
     refuses), the sign-in got no token, and its session stayed: of no use to anyone, shown among the account's
     sessions and counted with them. With a proof's session to drop, what the refused sign-in had written and not
-    committed is rolled back first, so that the drop's commit keeps none of it; without one nothing is touched."""
+    committed is rolled back first, so that the drop's commit keeps none of it; without one nothing is touched.
+
+    A lock that stayed held for longer than the step waited is such a refusal, wherever in the step it was
+    waited for: the account's turn at its sessions, held by a change that settles many accounts at once, or a
+    row a later statement writes. Nothing of the step was written, the session of the proof goes, and the answer
+    is the busy one. Left to pass, it was an error to the caller with the session left behind, and where a
+    one-time sign-in code had carried the sign-in, the answer told the page to send again a code that was spent.
+    Any other error of the database is not a refusal, and passes as it is."""
     @functools.wraps(step)
     def guarded(db, result, *args, **kwargs):
+        from sqlalchemy.exc import OperationalError
         try:
             return step(db, result, *args, **kwargs)
         except HTTPException:
@@ -376,6 +391,12 @@ def a_refusal_leaves_no_session(step):
                 db.rollback()
                 drop_the_session_the_proof_made(db, result)
             raise
+        except OperationalError as waited:
+            if getattr(getattr(waited, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
+                raise
+            db.rollback()
+            drop_the_session_the_proof_made(db, result)
+            raise busy() from None
     return guarded
 
 
@@ -396,7 +417,7 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
     A temporary credential's sign-in is not the account's own and is left as it is."""
     if result.is_temporary:
         return
-    from sqlalchemy.exc import InvalidRequestError, OperationalError
+    from sqlalchemy.exc import InvalidRequestError
     from app.api import api_server as api
     user = result.user
     # A sign-in that came through a provider: the provider's row first, under a share lock (it stands before the
@@ -404,19 +425,10 @@ def in_the_accounts_turn(db, result: "SignInResult") -> None:
     # so it comes wholly before this write, which then finds the provider as it left it, or wholly after, and
     # ends what was written.
     hold_the_providers_row(db, result)
-    try:
-        with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))
-    except OperationalError as waited:
-        # The turn was held for longer than a sign-in waits where it is written (a change that settles many
-        # accounts at once). Nothing was written: the sign-in is refused as busy, and a session its proof made
-        # goes with it.
-        if getattr(getattr(waited, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
-            raise
-        db.rollback()
-        drop_the_session_the_proof_made(db, result)
-        from app.core import sign_in_lockout
-        raise HTTPException(status_code=503, detail=BUSY,
-                            headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)}) from None
+    # A turn held for longer than a sign-in waits where it is written (a change that settles many accounts at
+    # once) refuses the sign-in as busy, with nothing written and no session of its proof left: the guard of
+    # this step answers a lock wait that ran out, here and in whatever it writes below.
+    with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))
     refresh = getattr(db, "refresh", None)
     if refresh is not None:
         try:
