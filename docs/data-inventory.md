@@ -679,6 +679,11 @@ Passkeys and single sign-on:
   random bytes (a password taken back when the account was made an administrator; an account made through an
   identity provider). It says that nobody can type a password for the account, so the vault asks it for none,
   and it counts only while the hash is unchanged. It goes with the account.
+- `users.had_a_password_at`: when a password somebody could type (the person's own, or one somebody set for
+  them) was first replaced on the account by one nobody knows (an identity provider that stops its people's
+  passwords; a password taken back when the account was made an administrator). It says the account has had a
+  password, so the rule that holds an account made at its first sign-in through a provider to that provider no
+  longer applies to it. It goes with the account.
 - `credential_changes` gained the kind `passkey` (an administrator removing someone's passkey), under the same
   two-person rule and 14-day retention as the other kinds.
 - Single sign-on: the identity providers administrators configure (`sso_providers`, with who made each and the

@@ -131,6 +131,7 @@ def _user(username="alice", role="user", **extra):
                   is_locked=False, locked_until=None, password_hash="x", second_factor_reset_at=None, created_at=now,
                   last_login=None, sftp_enabled=True, sftp_password_auth=True, storage_quota_bytes=None, groups=[],
                   failed_login_attempts=0, sso_only=False, _is_temp_session=False, sessions_ended=0,
+                  had_a_password_at=None,
                   email_confirmed_at=now)          # an address an administrator set, unless the test says otherwise
     fields.update(extra)
     if "email_confirmed_for" not in fields:          # the mark is for the address the account is made with

@@ -247,6 +247,10 @@ class User(Base):
     # included, knows a password for it (app/core/password_origin.py, mark_nobody_knows). It counts only while the
     # hash is that very hash, so whatever sets a password later ends it without knowing of it. Nullable.
     password_nobody_knows = Column(String(64), nullable=True)
+    # When a password somebody could type was first replaced on the account by one nobody knows
+    # (app/core/password_origin.py, note_it_was_known): the account has had a password, which the rule for
+    # accounts made at a first sign-in through a provider asks (app/core/sso_only.py). Nullable.
+    had_a_password_at = Column(DateTime, nullable=True)
 
     # How many times the account's sessions were ended as a whole (a new password, a second-factor reset, a
     # sign-out everywhere, a lock or a deactivation). A sign-in notes the count it read with the account, and is

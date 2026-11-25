@@ -533,6 +533,88 @@ def test_the_setting_settles_the_accounts_the_provider_made_both_ways(monkeypatc
     assert own.sso_only is False and own.password_hash == "chosen-by-its-owner" and linked.sso_only is False
 
 
+def test_an_account_that_has_had_a_password_is_let_go_with_the_others_when_passwords_are_allowed_again(monkeypatch):
+    """Made at a first sign-in, it set a password of its own. The provider's people then hold no password for a
+    while. Allowed again, it is let go with the accounts that linked themselves: the rule for accounts made at a
+    first sign-in was over for it the day it had a password, though that password is gone. The account that
+    never had one stays held."""
+    from app.core import password_origin, sso_only
+    made, own, linked, p, db = _made_and_linked(monkeypatch)
+    assert own.had_a_password_at is None
+    p.policy = {"sso_password_login": "disabled"}
+    assert sso_only.apply_password_login(db, p) == {"made_sso_only": ["linked", "own"], "restored": []}
+    assert own.sso_only is True and password_origin.nobody_knows(own) and own.had_a_password_at is not None
+    assert linked.had_a_password_at is not None and made.had_a_password_at is None
+    first = own.had_a_password_at
+    p.policy = {"sso_password_login": "allowed"}
+    assert sso_only.apply_password_login(db, p) == {"made_sso_only": [], "restored": ["linked", "own"]}
+    assert own.sso_only is False and password_origin.nobody_knows(own)            # nothing is minted
+    assert made.sso_only is True and own.had_a_password_at == first               # the first time is kept
+    # And again: an account restored with a password nobody knows is not taken for one that never had any.
+    p.policy = {"sso_password_login": "disabled"}
+    assert sso_only.apply_password_login(db, p)["made_sso_only"] == ["linked", "own"]
+    p.policy = None
+    assert sso_only.apply_password_login(db, p) == {"made_sso_only": [], "restored": ["linked", "own"]}
+    assert own.had_a_password_at == first
+
+
+def test_an_account_that_has_had_a_password_is_let_go_when_it_leaves_a_provider_without_passwords(monkeypatch):
+    """The other way a password of its own goes: the account links a provider whose people hold none, and leaves
+    it later."""
+    from app.core import sso_only
+    made, own, linked, p, db = _made_and_linked(monkeypatch)
+    strict = _provider(name="strict", policy={"sso_password_login": "disabled"})
+    db.rows_of(SsoProvider).append(strict)
+    there = _identity(own, strict, subject="s-strict")
+    db.rows_of(ExternalIdentity).append(there)
+    assert sso_only.settle(db, own) == sso_only.MADE and own.had_a_password_at is not None
+    assert sso_only.settle(db, own, without=there) == sso_only.RESTORED and own.sso_only is False
+    # The account that never had a password, through the same two steps, stays held by the provider that made it.
+    made.sso_only = False                                # as the provider's option left it for a while
+    theirs = _identity(made, strict, subject="s-strict-2")
+    db.rows_of(ExternalIdentity).append(theirs)
+    assert sso_only.settle(db, made) == sso_only.MADE and made.had_a_password_at is None
+    assert sso_only.settle(db, made, without=theirs) is None and made.sso_only is True
+
+
+def test_that_an_account_has_had_a_password_is_recorded_where_one_somebody_knew_is_replaced(monkeypatch):
+    from datetime import datetime
+    from app.core import password_origin, privileged_accounts, security, sso_only
+    monkeypatch.setattr(privileged_accounts, "kind", lambda db, user: None)
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    monkeypatch.setattr(sso_only, "end_sessions_no_provider_made", lambda db, user, keep=None: 0)
+    at = datetime(2026, 11, 1, 12, 0, 0)
+    # A password somebody could type: recorded once, and the first time stays.
+    alice = _user("alice", password_hash="chosen")
+    password_origin.note_it_was_known(alice, at)
+    assert alice.had_a_password_at == at and password_origin.has_had_one(alice)
+    password_origin.note_it_was_known(alice, datetime(2027, 1, 1))
+    assert alice.had_a_password_at == at
+    # One nobody knows: nothing to record, whatever replaces it.
+    bob = _user("bob", password_hash="random")
+    password_origin.mark_nobody_knows(bob)
+    password_origin.note_it_was_known(bob, at)
+    assert bob.had_a_password_at is None and not password_origin.has_had_one(bob)
+    sso_only.make_sso_only(None, bob)
+    sso_only.allow_password_sign_in(None, bob)
+    assert bob.had_a_password_at is None
+    # Each place that replaces a password asks before it writes the new hash.
+    carol = _user("carol", password_hash="chosen")
+    sso_only.make_sso_only(None, carol)
+    assert carol.had_a_password_at is not None and password_origin.nobody_knows(carol)
+    dave = _user("dave", password_hash="chosen", sso_only=True)          # flagged by an earlier release, with a password
+    sso_only.allow_password_sign_in(None, dave)
+    assert dave.had_a_password_at is not None
+    erin = _user("erin", password_hash="chosen", sso_only=True)          # a privileged account keeps its password
+    sso_only.allow_password_sign_in(None, erin, keep_password=True)
+    assert erin.had_a_password_at is None and erin.password_hash == "chosen"
+    # The rule asks both: the password is one nobody knows, and none somebody knew came before it.
+    p = _provider()
+    assert sso_only.holds_to_no_password(p, bob, "jit") is True
+    assert sso_only.holds_to_no_password(p, carol, "jit") is False
+    assert sso_only.holds_to_no_password(p, alice, "jit") is False
+
+
 def test_a_save_of_the_setting_settles_the_linked_accounts(monkeypatch):
     from app.core import sso_only
     from app.services import sso_providers as providers

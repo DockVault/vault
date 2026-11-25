@@ -24,7 +24,11 @@ through the provider and has never had a password of its own, and the provider d
 provider stays the one way in, and a person the provider has stopped vouching for cannot make themselves a
 password with a reset link and stay. Such an account gets a password of its own only by an administrator's act:
 the option turned on, or the account made an administrator (the promotion ends the flag and sends the person a
-link to choose a password). A password it has once set is its own from then on, whatever the option says later.
+link to choose a password). A password it has once set is its own from then on, whatever the option says later,
+and the rule is over for the account for good: also when that password is replaced later by one nobody knows (a
+provider whose people hold no password, linked for a while or set so for a while), the account is let go with
+the others when that ends. The account remembers that it has had a password (``users.had_a_password_at``,
+app/core/password_origin.note_it_was_known), written where a password somebody knew is replaced.
 """
 from __future__ import annotations
 
@@ -67,7 +71,9 @@ def make_sso_only(db, user, *, keep_session=None, unknown_hash=None) -> None:
     kind = privileged_accounts.kind(db, user)
     if kind is not None:
         raise Privileged(f"{user.username} is {privileged_accounts.TEXTS[kind]} and keeps a local password")
+    from app.core import password_origin
     user.sso_only = True
+    password_origin.note_it_was_known(user)          # a password of its own goes: that it had one is kept
     user.password_hash = unknown_hash or a_password_nobody_knows()     # a reset sets a real one
     user.sftp_password_auth = False
     _password_is_nobodys(user)
@@ -125,9 +131,11 @@ def allow_password_sign_in(db, user, *, keep_password: bool = False, unknown_has
     it is still the one nobody knows, its mark still says so.
 
     ``unknown_hash``: as for :func:`make_sso_only`."""
+    from app.core import password_origin
     user.sso_only = False
     if keep_password:
         return
+    password_origin.note_it_was_known(user)
     user.password_hash = unknown_hash or a_password_nobody_knows()
     _password_is_nobodys(user)
 
@@ -151,13 +159,14 @@ def made_here_holds_no_password(provider) -> bool:
 def holds_to_no_password(provider, user, linked_by) -> bool:
     """Whether ``provider`` holds ``user``, linked to it in the way ``linked_by`` says, to no password: its people
     hold none; or the account was made at its first sign-in there, the provider does not let such accounts set a
-    password, and the account's password is still the one nobody knows it was made with."""
+    password, and the account has never had a password somebody could type: the one it holds is one nobody knows,
+    and none was replaced by such a one before (app/core/password_origin.py)."""
     if password_less(provider):
         return True
     if linked_by != MADE_AT_A_FIRST_SIGN_IN or not made_here_holds_no_password(provider):
         return False
     from app.core import password_origin
-    return password_origin.nobody_knows(user)
+    return password_origin.nobody_knows(user) and not password_origin.has_had_one(user)
 
 
 def held_by_a_password_less_provider(db, user) -> bool:
@@ -244,7 +253,7 @@ def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None
         # moment ago (a reset link used) is written in this same turn.
         from app.api import api_server as api
         api._sessions_turn(db, user.id)
-        read_again(db, user, ["sso_only", "role", "password_hash", "password_nobody_knows"])
+        read_again(db, user, ["sso_only", "role", "password_hash", "password_nobody_knows", "had_a_password_at"])
         should = should_be_sso_only(db, user, also=also, also_by=also_by, without=without)
         flagged = bool(getattr(user, "sso_only", False))
     if should and not flagged:

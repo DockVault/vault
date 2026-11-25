@@ -70,6 +70,23 @@ def mark_nobody_knows(user) -> None:
     user.password_nobody_knows = _digest(user.password_hash) if getattr(user, "password_hash", None) else None
 
 
+def note_it_was_known(user, now: Optional[datetime] = None) -> None:
+    """Call it right before ``user``'s password is replaced by one nobody knows (a provider that stops its
+    people's passwords, a password taken back at a promotion). When the password that goes is one somebody could
+    type (the person's own, or one somebody set for them), the account records that it has had one
+    (``users.had_a_password_at``), the first time and for good: the hash that said so is about to be gone, and
+    the mark of the new one would say that the account never had a password."""
+    if (getattr(user, "password_hash", None) and not nobody_knows(user)
+            and getattr(user, "had_a_password_at", None) is None):
+        user.had_a_password_at = now or _now()
+
+
+def has_had_one(user) -> bool:
+    """Whether ``user`` once held a password somebody could type that has been replaced since
+    (:func:`note_it_was_known`)."""
+    return getattr(user, "had_a_password_at", None) is not None
+
+
 def nobody_knows(user) -> bool:
     """Whether ``user``'s password is one nobody can type (:func:`mark_nobody_knows`). Such an account is asked
     for no password where one would otherwise be owed: it could not answer, and would be shut out."""

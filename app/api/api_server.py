@@ -7254,6 +7254,7 @@ def _take_back_password_at_promotion(db, user, *, by) -> Optional[dict]:
         return None
     set_by = (db.query(User.username).filter(User.id == user.password_set_by).scalar()
               if user.password_set_by is not None else None)
+    password_origin.note_it_was_known(user)                          # it has had a password: recorded for good
     user.password_hash = hash_password(_secrets.token_urlsafe(32))   # nobody knows it
     password_origin.mark_nobody_knows(user)
     user.updated_at = datetime.now(timezone.utc)
@@ -29256,6 +29257,8 @@ END $$;""",
             _RETIRE_PASSKEYS_FROM_BEFORE_A_RECORDED_RESET,
             # The mark of a password nobody knows (see User in models.py). Nullable.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_nobody_knows VARCHAR(64)",
+            # When a password somebody knew was first replaced by one nobody knows (see User). Nullable.
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS had_a_password_at TIMESTAMP",
             # The revision of the role defaults an account has been given, so a start grants each default
             # once instead of granting again one an administrator revoked. Nullable, for the same reason.
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS permission_defaults_revision INTEGER",

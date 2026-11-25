@@ -531,3 +531,15 @@ def test_the_columns_are_filled_only_when_they_are_added(monkeypatch):
     monkeypatch.setattr(po, "columns_exist", lambda db: False)
     assert po.add_columns_once(fake) == 3
     assert ran[-2:] == [po.COLUMNS_DDL, "backfill"]
+
+
+def test_a_password_taken_back_at_a_promotion_leaves_the_record_that_the_account_had_one(db, world):
+    """The account's password was set by somebody else: the promotion replaces it by one nobody knows. That the
+    account has had a password stays on the account (the hash that said so is gone)."""
+    ada, bob = _user(db, "ada", RoleEnum.ADMIN), _user(db, "bob")
+    po.set_by_other(bob, ada.id)
+    db.commit()
+    assert bob.had_a_password_at is None
+    assert api._take_back_password_at_promotion(db, bob, by=ada) == {"user_id": bob.id}
+    db.commit()
+    assert po.nobody_knows(bob) and bob.had_a_password_at is not None and po.has_had_one(bob)

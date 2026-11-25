@@ -885,7 +885,8 @@ def decide_in_the_accounts_turn(db, user) -> None:
         raise Refusal(oc.TEMPORARILY_UNAVAILABLE, ACCOUNT_BUSY) from None
     refresh = getattr(db, "refresh", None)
     if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
-        refresh(user, attribute_names=["sso_only", "role", "password_hash", "password_nobody_knows"])
+        refresh(user, attribute_names=["sso_only", "role", "password_hash", "password_nobody_knows",
+                                       "had_a_password_at"])
 
 
 def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str, keep_session=None):
