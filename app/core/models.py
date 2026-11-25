@@ -3841,7 +3841,8 @@ class SsoProvider(Base):
     schema at save. The ``saml_*`` columns are NULL for an OpenID Connect provider. ``last_test`` is the
     summary of the last test sign-in: the outcome, the claim names seen, whether ``auth_time`` was
     present, the ``amr``/``acr`` values, ``email_verified``, the group names, and what the vault would
-    do; the tester's own identifiers only, cleared when the tester is erased.
+    do. Of people it names the tester's username, and the account a sign-in would link or create; an erase
+    replaces either name with its placeholder (in the sentence of what the vault would do, as a whole word).
 
     A NEW table, so create_all builds it on an existing deployment and a release that does not know it
     simply ignores it."""

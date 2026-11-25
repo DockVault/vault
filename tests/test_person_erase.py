@@ -518,6 +518,69 @@ def test_the_list_says_each_erase_as_the_chain_holds_it(env):
     assert "eve" not in json.dumps(list(listed.values()))
 
 
+# --------------------------------------------------------------------------- a provider's last test
+
+# What a passed test sign-in keeps on the provider (app/services/sso_sign_in.py, test_summary): who ran it, and what
+# a sign-in of that identity would do, which can name the account it would link or create.
+PASSED_TEST = {"outcome": "ok", "at": "2026-11-20T10:00:00Z", "tester": "alice",
+               "would": "link the account alice by its verified email address and sign it in", "restriction": "passes",
+               "claim_names": ["email", "sub"], "config": "fp", "groups": ["g"]}
+# What a test that did not pass keeps (failed_test_summary).
+FAILED_TEST = {"outcome": "token_invalid", "at": "2026-11-20T10:00:00Z", "tester": "alice",
+               "message": "The provider's token could not be verified.", "config": "fp"}
+
+
+def _provider(db, last_test, created_by_name="root"):
+    from app.core.models import SsoProvider
+    pid = uuid.uuid4()
+    db.add(SsoProvider(id=pid, name=f"p-{pid.hex[:6]}", kind="oidc", state="tested", created_by_name=created_by_name,
+                       last_test=json.loads(json.dumps(last_test))))
+    return pid
+
+
+@pytest.mark.parametrize("summary", [PASSED_TEST, FAILED_TEST], ids=["passed", "failed"])
+def test_an_erase_gives_the_placeholder_to_a_name_in_a_providers_last_test(env, summary):
+    """The tester's name, and a whole-word name in what the sign-in would do, get the placeholder; who configured
+    the provider stays, and so do the fingerprint that lets it be turned on and the groups the test saw."""
+    from app.core.models import SsoProvider
+    env.row(T0 - timedelta(hours=30), username="alice")
+    env.run_until_sealed()
+    with env.session() as db:
+        pid = _provider(db, summary)
+        db.commit()
+    with env.session() as db:
+        counts = {s["key"]: s["count"] for s in pe.preview(db, "alice", env.clock(), env.st)["stores"]}
+    assert counts["sso_providers"] == 1
+    asked = env.ask("alice")
+    env.passes(24 * 7 + 6)
+    assert env.request_row(asked["id"]).status == pe.COMPLETED
+    ph = asked["placeholder"]
+    with env.session() as db:
+        row = db.get(SsoProvider, pid)
+        last = row.last_test
+        assert last["tester"] == ph and "alice" not in json.dumps(last)
+        if "would" in summary:
+            assert last["would"] == f"link the account {ph} by its verified email address and sign it in"
+            assert last["groups"] == ["g"] and last["claim_names"] == ["email", "sub"]
+        assert last["config"] == "fp" and last["outcome"] == summary["outcome"]
+        assert set(last) == set(summary)
+        assert row.created_by_name == "root"
+        assert env.request_row(asked["id"]).counts["stores"]["sso_providers"] == 1
+
+
+def test_a_name_that_is_only_a_field_of_the_last_test_is_left_alone(env):
+    """The summary's own field names are not anybody's, and its "config" is the fingerprint the provider is turned
+    on against: an erase of a name spelled like either changes nothing there, and is not counted."""
+    env.run_until_sealed()
+    with env.session() as db:
+        _provider(db, PASSED_TEST)
+        db.commit()
+    for name in ("groups", "tester", "config", "fp"):
+        with env.session() as db:
+            counts = {s["key"]: s["count"] for s in pe.preview(db, name, env.clock(), env.st)["stores"]}
+        assert counts["sso_providers"] == 0, name
+
+
 # --------------------------------------------------------------------------- what it covers
 
 def _inventory_tables():

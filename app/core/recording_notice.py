@@ -126,7 +126,8 @@ STORES = (
           "on, the provider's token for that sign-in, encrypted.",
           _sessions_kept, table="sso_sessions"),
     Store("sso_providers", "The identity providers administrators configured, who configured each, and the summary "
-          "of its last test sign-in (the tester's own identifiers).",
+          "of its last test sign-in (the tester's username, and the account a sign-in of the tester's identity "
+          "would link or create).",
           lambda: "Until an administrator removes the provider.", table="sso_providers"),
     Store("sso_admin_requests", "A sign-in that found you in a provider group mapped to the administrator role: the "
           "request waiting for another administrator, and who decided it.",

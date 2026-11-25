@@ -599,6 +599,27 @@ def _notifications() -> Store:
     return _changing_store("notifications", "Other people's notifications that name them", rows, change)
 
 
+def _sso_providers() -> Store:
+    from sqlalchemy import or_
+
+    def rows(db, name, also, now):
+        m = _models().SsoProvider
+        return db.query(m).filter(or_(m.created_by_name == name, json_mentions(m.last_test, name, also))).all()
+
+    def change(p, name, placeholder, also):
+        done = _set(p, "created_by_name", placeholder) if p.created_by_name == name else False
+        if isinstance(p.last_test, dict):
+            # The last test's summary names who ran it, and what a sign-in of their identity would do can name the
+            # account it would link or create. Its field names are nobody's, and its "config" is the fingerprint
+            # of the connection that a provider is turned on against: both stay as they are.
+            kept = {key: value if key == "config" else replace_json(value, name, placeholder, also)
+                    for key, value in p.last_test.items()}
+            done = _set(p, "last_test", kept) or done
+        return done
+    return _changing_store("sso_providers", "Identity providers they configured, or whose last test names them",
+                           rows, change)
+
+
 STORES: List[Store] = [
     _security_records(),
     _security_alerts(),
@@ -617,7 +638,7 @@ STORES: List[Store] = [
                   ("requested_by_name", "decided_by_name")),
     _simple_store("audit_value_removals", "Removals of recorded values they asked for or cancelled",
                   "AuditValueRemoval", ("requested_by_name", "decided_by_name")),
-    _simple_store("sso_providers", "Identity providers they configured", "SsoProvider", ("created_by_name",)),
+    _sso_providers(),
     _simple_store("sso_admin_requests", "Administrator requests from a provider group they decided",
                   "SsoAdminRequest", ("decided_by_name",)),
 ]
