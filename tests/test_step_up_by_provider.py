@@ -50,7 +50,7 @@ var API_BASE = '/api';
 var authToken = 'the-token';
 var currentUser = { id: 'me', username: 'dana' };
 const opened = [], toasts = [], posted = [], started = [], asked = [];
-let answers = [];                        // what the step-up route answers, in turn: {ok, json}
+let answers = [];                        // what the step-up route answers, in turn: {ok, status, json}, or {unreachable}
 let providers = [{ id: 'p-1', label: 'Contoso' }];
 function openModal(id) { opened.push(id); }
 function closeModal() { opened.push('closed'); _stepUpSettle(null); }
@@ -61,7 +61,8 @@ function openUserSettingsModal() { opened.push('account'); }
 global.fetch = async (url, options) => {
     posted.push({ url, body: JSON.parse((options || {}).body || 'null') });
     const answer = answers.shift() || { ok: false, json: { detail: 'Nothing was arranged.' } };
-    return { ok: answer.ok, json: async () => answer.json };
+    if (answer.unreachable) throw new TypeError('Failed to fetch');
+    return { ok: answer.ok, status: answer.status || (answer.ok ? 200 : 403), json: async () => answer.json };
 };
 window.Sso = {
     confirmers: async () => { asked.push('confirmers'); return providers; },
@@ -207,6 +208,45 @@ out({ opened, error: error.textContent, shown: error.style.display, buttons: but
     assert got["opened"] == ["stepup-modal"] and got["left"] is None
     assert got["error"] == "Confirm with your organisation's sign-in first, then try again." and got["shown"] == "block"
     assert got["buttons"] == ["Confirm with Contoso", "Cancel"]
+
+
+@pytest.mark.parametrize("answer, said", [
+    ({"ok": False, "status": 429, "json": {"detail": "Too many attempts; please wait a few minutes."}},
+     "Too many attempts; please wait a few minutes."),
+    ({"ok": False, "status": 503, "json": {"detail": "Service temporarily unavailable."}},
+     "Service temporarily unavailable."),
+    ({"ok": False, "status": 503, "json": {"detail": "The vault is busy with this right now. Try again in a moment."}},
+     "The vault is busy with this right now. Try again in a moment."),
+    ({"unreachable": True}, "Could not reach the server. Please try again."),
+], ids=["rate limit", "limiter down", "busy", "no answer"])
+def test_a_confirmation_the_server_did_not_judge_is_kept_and_the_dialog_tries_it_again(answer, said):
+    """The rate limit, a limiter or a lock wait that cannot answer, or no answer at all: the server refused before it
+    looked at the confirmation (or never had the request), so it still holds it. The tab keeps it too, and the dialog
+    opens on it with the server's sentence; Confirm tries again with it, and no new trip to the provider is asked
+    for."""
+    got = _node(r"""
+_noteProviderConfirmation('vault.delete', 120, 'Contoso');
+answers = [%s];
+const pending = requestStepUpReceipt('vault.delete', ['idp_reauth', 'password']);
+await tick(); await tick(); await tick();
+const error = document.querySelector('#stepup-modal-body .alert-error');
+const seen = { opened: opened.slice(), error: error.textContent, shown: error.style.display, kept: !!_providerConfirmation,
+               providers: !!byId('stepup-providers'), password: !!byId('stepup-password-input'),
+               note: byId('stepup-provider-confirmed') && byId('stepup-provider-confirmed').textContent,
+               buttons: inOrder(modalBody, []).filter((b) => b.style.display !== 'none').map((b) => b.textContent) };
+answers = [{ ok: true, json: { receipt: 'the-receipt' } }];
+press('Confirm');
+const receipt = await pending;
+out({ seen, receipt, bodies: posted.map((p) => p.body), left: _providerConfirmation, started });
+""" % json.dumps(answer))
+    seen = got["seen"]
+    assert seen["opened"] == ["stepup-modal"] and seen["kept"] is True
+    assert seen["error"] == said and seen["shown"] == "block"
+    assert seen["providers"] is False and seen["password"] is False
+    assert seen["note"] == "You confirmed it is you with Contoso. Select Confirm to try again."
+    assert seen["buttons"] == ["Cancel", "Confirm"]
+    assert got["receipt"] == "the-receipt" and got["left"] is None and got["started"] == []
+    assert got["bodies"] == [{"action": "vault.delete", "password_method": "idp_reauth"}] * 2
 
 
 def test_a_second_factor_asked_too_is_given_here_with_the_confirmation_in_place_of_the_password():

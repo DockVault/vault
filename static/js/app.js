@@ -2985,7 +2985,10 @@ function _stepUpMeetsFactor(method) {
     return method === 'totp' || method === 'email' || method === 'recovery' || method === 'passkey';
 }
 
-// Ask for the receipt with the staged confirmation as the password part: {receipt} or {message}.
+// Ask for the receipt with the staged confirmation as the password part: {receipt}, or {message, kept}. `kept`: the
+// server did not judge the confirmation, so it still holds it: the rate limit (429) and a limiter or a lock wait that
+// cannot answer (503) refuse before the confirmation is looked at, and with no answer at all the request may never
+// have arrived.
 async function _stepUpByProvider(payload) {
     try {
         const resp = await fetch(`${API_BASE}/auth/second-factor/step-up`, {
@@ -2994,10 +2997,13 @@ async function _stepUpByProvider(payload) {
             body: JSON.stringify(Object.assign({}, payload, { password_method: 'idp_reauth' }))
         });
         const d = await resp.json().catch(() => ({}));
-        if (!resp.ok) return { message: (d && typeof d.detail === 'string') ? d.detail : 'That was not accepted. Try again.' };
+        if (!resp.ok) {
+            return { message: (d && typeof d.detail === 'string') ? d.detail : 'That was not accepted. Try again.',
+                     kept: resp.status === 429 || resp.status >= 500 };
+        }
         return d && d.receipt ? { receipt: d.receipt } : { message: 'That was not accepted. Try again.' };
     } catch (_) {
-        return { message: 'Could not reach the server. Please try again.' };
+        return { message: 'Could not reach the server. Please try again.', kept: true };
     }
 }
 
@@ -3010,10 +3016,11 @@ async function requestStepUpReceipt(action, methods) {
     let said = '';
     // Back from the organisation's sign-in for this very action, with nothing to type here: the confirmation is
     // spent at once and the action goes through without the dialog. One the server no longer holds opens the
-    // dialog with its sentence, and the person confirms again there.
+    // dialog with its sentence, and the person confirms again there. One the server did not judge (a rate limit, a
+    // busy server, no answer) is kept: the dialog opens on it with the server's sentence, and Confirm tries again.
     if (list.includes('idp_reauth') && _providerConfirmationFor(action) && !list.some(_stepUpMeetsFactor)) {
         const tried = await _stepUpByProvider({ action });
-        _providerConfirmation = null;
+        if (!tried.kept) _providerConfirmation = null;
         if (tried.receipt) return tried.receipt;
         // Another step-up was asked for while the server answered: its dialog stays on screen, and this one gives
         // way, as one asked for earlier always does.
@@ -3114,8 +3121,11 @@ function _buildStepUpBody(action, methods, said) {
 
     body.appendChild(_el('p', 'text-secondary text-sm mb-md', 'This action needs an extra confirmation.'));
     if (confirmed) {
+        // With no factor to give, the dialog is open only because the server did not judge the confirmation (it
+        // still holds it): Confirm sends it again.
         const note = _el('p', 'text-sm mb-sm', 'You confirmed it is you with '
-            + (confirmed.label || 'your organisation\'s sign-in') + '. Now give your second factor.');
+            + (confirmed.label || 'your organisation\'s sign-in') + '. '
+            + (methods.some(_stepUpMeetsFactor) ? 'Now give your second factor.' : 'Select Confirm to try again.'));
         note.id = 'stepup-provider-confirmed';
         note.setAttribute('role', 'status');
         body.appendChild(note);
