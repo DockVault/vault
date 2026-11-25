@@ -335,6 +335,9 @@ def an_unlink(identity_id, by, as_administrator):
     sso_router._tell_owner = lambda *a, **k: None
     api._enforce_step_up = lambda *a, **k: None
     api._notify_users = lambda *a, **k: []
+    # The provider's confirmation of an owner's unlink is kept beside the session, not in the database: it
+    # stands still here too. test_sso_unlink_asks_the_provider.py holds it.
+    sso_sign_in.unlink_asks_the_provider = lambda *a, **k: False
 
     def run():
         with SessionLocal() as s:
