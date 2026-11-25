@@ -156,8 +156,22 @@ def attestation() -> str:
     return registry.resolve(ATTESTATION)
 
 
+def canonical_aaguid(value) -> Optional[str]:
+    """An authenticator make as its UUID in the one spelling the vault compares (lower case, with dashes), or
+    None for what is no UUID. The save takes every spelling a UUID is read in (32 hex digits as some tools print
+    it, braces, urn:uuid:), and the makes of the keys are compared as text: a make saved in another spelling
+    matched no authenticator, so every registration of it was refused and its keys stopped proving compliance
+    step-ups, while the save had reported success."""
+    try:
+        return str(uuid.UUID(str(value).strip()))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def allowed_aaguids() -> Tuple[str, ...]:
-    return tuple(str(a) for a in (registry.resolve(ALLOWED_AAGUIDS) or ()))
+    """The makes of authenticator the setting allows, each in the one spelling they are compared in and once."""
+    makes = (canonical_aaguid(a) for a in (registry.resolve(ALLOWED_AAGUIDS) or ()))
+    return tuple(dict.fromkeys(make for make in makes if make))
 
 
 def device_bound_roles() -> Tuple[str, ...]:

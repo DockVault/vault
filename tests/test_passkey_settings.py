@@ -75,10 +75,11 @@ def test_the_policy_is_built_from_the_settings(monkeypatch):
     # Direct without anchors stays direct (the service refuses registrations): a bundle gone after the save never
     # turns attestation off by itself.
     assert policy.require_uv is False and policy.allowed_algs == (-257,) and policy.attestation == "direct"
-    assert policy.allowed_aaguids == ("0" * 32,) and policy.trust_anchors == ()
+    assert policy.allowed_aaguids == ("00000000-0000-0000-0000-000000000000",) and policy.trust_anchors == ()
     monkeypatch.setattr(wss, "trust_anchors", lambda: (b"der",))
     policy = wss.policy()
-    assert policy.attestation == "direct" and policy.allowed_aaguids == ("0" * 32,) and policy.trust_anchors == (b"der",)
+    assert policy.attestation == "direct" and policy.trust_anchors == (b"der",)
+    assert policy.allowed_aaguids == ("00000000-0000-0000-0000-000000000000",)
     assert wss.enabled() is True
     _resolving(monkeypatch, registry, {wss.MODE: "off"})
     assert wss.enabled() is False
@@ -479,3 +480,30 @@ def test_what_a_save_asks_for_beyond_what_is_in_force(monkeypatch):
     # ...and administrators added to a requirement that stands is asked whether one of them can meet it.
     _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["user"]})
     assert "no administrator" in wss.save_refusal(db, wss.REQUIRED_ROLES, ["user", "admin"])
+
+
+def test_a_make_saved_in_another_spelling_of_its_uuid_is_that_make(monkeypatch):
+    """An administrator pastes an authenticator make as a tool printed it: 32 hex digits, in braces, as a urn, in
+    capitals. Each is a UUID and the save takes it. The makes of the keys are compared as text, lower case with
+    dashes: saved otherwise, the make matched no authenticator, every registration of it was refused and its keys
+    stopped proving compliance step-ups. Read back, a make is in the one spelling, and once."""
+    registry, wss = _mod()
+    specs = {s.key: s for s in registry.all_specs() if s.group == wss.GROUP}
+    make = "cb69481e-8ff7-4039-93ec-0a2729a154a8"
+    spellings = ["cb69481e8ff7403993ec0a2729a154a8", "{cb69481e-8ff7-4039-93ec-0a2729a154a8}",
+                 "urn:uuid:cb69481e-8ff7-4039-93ec-0a2729a154a8", "CB69481E-8FF7-4039-93EC-0A2729A154A8", make]
+    for spelled in spellings:
+        assert wss.canonical_aaguid(spelled) == make, spelled
+        assert registry.check_value(specs[wss.ALLOWED_AAGUIDS], [spelled]) is None, spelled     # the save takes it
+    assert wss.canonical_aaguid("  " + make + "  ") == make
+    for nothing in (None, "", "not-a-uuid", 7, [], "cb69481e"):
+        assert wss.canonical_aaguid(nothing) is None, nothing
+    other = "2fc0579f-8113-47ea-b116-bb5a8db9202a"
+    _resolving(monkeypatch, registry, {wss.ALLOWED_AAGUIDS: spellings + [other.upper(), "not-a-uuid"]})
+    assert wss.allowed_aaguids() == (make, other)
+    # What the ceremony compares a key's make against is what the setting gives: the one spelling.
+    from _bare_api_env import set_bare_api_env
+    set_bare_api_env()
+    from app.services import webauthn_service as ws
+    assert str(ws._aaguid(uuid.UUID(make).bytes)) == make
+    assert str(ws._aaguid(uuid.UUID(make).bytes)) in {a.lower() for a in wss.allowed_aaguids()}
