@@ -19,9 +19,12 @@ this module names, so the audit log shows where a relay was pointed and by whom.
 
 A save checks the rule twice: before its step-up, so a refused request spends none, and again after it, on the
 stored relay it writes, locked until the save commits. Another save may have stored a password meanwhile; the
-second check keeps it from being paired with this save's server. A save of the general settings confirmed as
-leaving their SMTP settings alone, which another save changed meanwhile, is refused (CHANGED_MEANWHILE, 409).
-A test send sends what it read, as it read it, and needs no second check.
+second check keeps it from being paired with this save's server. A save of the general settings may send some
+SMTP settings and not others (a password alone, say), and is merged into what is stored: one that would change
+them, on SMTP settings another save changed after it was checked and confirmed, is refused instead
+(CHANGED_MEANWHILE, 409), so a password sent alone never lands on a server set meanwhile. A sending profile's save
+always names its server, port and username. A test send sends what it read, as it read it, and needs no second
+check.
 """
 from typing import Mapping, NamedTuple, Union
 
@@ -32,8 +35,8 @@ REASON = "smtp_password_required"
 REENTER_PASSWORD = ("Re-enter the SMTP password to use a different server, port or username, "
                     "or to stop checking the server's certificate.")
 
-# A save of the general settings confirmed as leaving their SMTP settings alone that would change them, as another
-# save left them meanwhile (409).
+# A save of the general settings that would change their SMTP settings, which another save changed after this one
+# was checked and confirmed (409).
 CHANGED_REASON = "smtp_settings_changed"
 CHANGED_MEANWHILE = ("The mail server settings were changed while this save was being confirmed. "
                      "Load the settings again and save.")
@@ -143,3 +146,10 @@ def settings_change(stored: Mapping, payload) -> bool:
     after = of({**stored, **payload})
     before = of(stored)
     return before != after
+
+
+def settings_relay(values: Mapping) -> tuple:
+    """The SMTP settings held with the general settings, as a save of them must find them still when it merges:
+    the relay and the stored password. Compared, never shown."""
+    values = values or {}
+    return of(values), values.get(PASSWORD) or ""

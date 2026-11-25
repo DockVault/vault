@@ -511,6 +511,56 @@ def test_a_settings_save_confirmed_as_leaving_the_smtp_settings_alone_changes_no
     assert stored["smtp_server"] == "elsewhere.example" and "app_name" not in stored
 
 
+def test_a_password_sent_alone_never_lands_on_a_server_set_while_its_save_was_confirmed(db, admin, monkeypatch):
+    # The settings hold no password. A save sends the password alone, for the server it was checked against; while
+    # its step-up is being answered, another administrator points the settings elsewhere (no password stored, so
+    # nothing asks for one). Merged now, the password would go to the new server: the save is refused instead.
+    db.add(SystemSetting(key=api._SETTINGS_KEY, value={**RELAY, "from_email": "vault@example.test"}))
+    db.commit()
+    other = _other_session(db)
+    grace = _other_admin(db, other)
+    meanwhile = []
+
+    def step_up(db_, user, request):
+        if not meanwhile:
+            meanwhile.append(user.username)
+            run_coroutine(api.update_settings(payload={"smtp_server": "elsewhere.example"}, request=_request(),
+                                              current_user=grace, db=other))
+    monkeypatch.setattr(api, "_mail_relay_step_up", step_up)
+    try:
+        with pytest.raises(HTTPException) as refused:
+            _save(db, admin, {"smtp_password": FRESH})
+    finally:
+        other.close()
+    assert meanwhile == ["ada"]
+    assert refused.value.status_code == 409 and refused.value.detail["reason"] == "smtp_settings_changed"
+    stored = _stored(db)
+    assert stored["smtp_server"] == "elsewhere.example" and not stored.get("smtp_password")
+
+
+def test_a_save_that_leaves_the_smtp_settings_alone_is_not_refused_for_a_change_made_meanwhile(
+        db, admin, monkeypatch):
+    _store(db)
+    other = _other_session(db)
+    grace = _other_admin(db, other)
+    meanwhile = []
+
+    def ordinary_step_up(db_, user, request, action):
+        if not meanwhile:
+            meanwhile.append(action)
+            run_coroutine(api.update_settings(payload={"smtp_server": "elsewhere.example", "smtp_password": FRESH},
+                                              request=_request(), current_user=grace, db=other))
+    monkeypatch.setattr(api, "_enforce_step_up", ordinary_step_up)
+    try:
+        _save(db, admin, {"app_name": "Changed"})
+    finally:
+        other.close()
+    assert meanwhile == ["admin.settings.write"]
+    stored = _stored(db)
+    assert stored["app_name"] == "Changed"
+    assert (stored["smtp_server"], stored["smtp_password"]) == ("elsewhere.example", FRESH)
+
+
 def _statements_after_the_step_up(db, monkeypatch, module, name):
     """What the session runs once the step-up is answered, as PostgreSQL would be sent it, with whether each
     statement refreshes the rows it reads."""

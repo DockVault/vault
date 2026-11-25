@@ -4895,15 +4895,17 @@ async def update_settings(
     _validate_settings_payload(payload, db)
     from app.core.models import SystemSetting
     # The settings this save merges into, locked until it commits, and the mail relay rule again on them: a
-    # password saved while this save's step-up was being answered is never paired with this save's server, and
-    # a save confirmed as leaving the SMTP settings alone changes none of them.
+    # password saved while this save's step-up was being answered is never paired with this save's server. A
+    # save that would change the SMTP settings, which another save changed after this one was checked and
+    # confirmed, is refused: merged into them, a password sent alone would go to a server set meanwhile.
     row = (db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY)
            .populate_existing().with_for_update().first())
     existing = dict(row.value) if row and row.value else {}
     relay_moved = _mail_relay_moved(existing, payload)
     if relay_moved:
         _refuse_mail_relay_change(db, current_user, request, "settings", relay_moved)
-    if not changes_mail_relay and _mail_relay.settings_change(existing, payload):
+    if (_mail_relay.settings_change(existing, payload)
+            and _mail_relay.settings_relay(existing) != _mail_relay.settings_relay(stored_settings)):
         raise HTTPException(status_code=409, detail={"reason": _mail_relay.CHANGED_REASON,
                                                      "message": _mail_relay.CHANGED_MEANWHILE})
     try:
