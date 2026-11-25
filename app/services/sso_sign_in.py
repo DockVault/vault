@@ -70,6 +70,8 @@ REASON_TEXTS = {
     oc.PROVIDER_ERROR: "Your organisation's sign-in did not complete. Try again, or contact your administrator.",
     oc.ISSUER_MISMATCH: "The sign-in answer did not come from the configured provider.",
     oc.TOKEN_INVALID: "The sign-in answer could not be verified.",
+    oc.SIGNING_KEY_TOO_SHORT: ("Your organisation's sign-in signs its answers with a key this vault does not "
+                               "accept. Tell your administrator."),
     oc.NONCE_MISMATCH: "The sign-in answer did not belong to this sign-in. Start again.",
     oc.ENDPOINT_REFUSED: "The provider's address is not one the vault may call. Contact your administrator.",
     oc.TEMPORARILY_UNAVAILABLE: "The provider could not be reached. Try again in a moment.",
@@ -1178,6 +1180,9 @@ TEST_FAILED_TEXTS = {
     oc.TOKEN_INVALID: ("The provider's token could not be verified: the token endpoint refused the client id or "
                        "secret, or the token's signature, audience or times did not check. Enter the client "
                        "secret again, and check the client id and how the secret is sent."),
+    oc.SIGNING_KEY_TOO_SHORT: (f"The provider signs its tokens with an RSA key shorter than {oc.RSA_KEY_MIN_BITS} "
+                               "bits, which the vault does not accept: such a key can be forged. Nothing on this "
+                               "page changes it. The key is replaced at the provider."),
     oc.NONCE_MISMATCH: "The provider's token did not belong to this test. Run the test again.",
     oc.ENDPOINT_REFUSED: ("An address of the provider is not one the vault may call: it is inside the network, or "
                           "not https. Turn on “Inside the network” for a provider there, or correct the address."),

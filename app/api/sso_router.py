@@ -53,7 +53,8 @@ BACKCHANNEL_WAIT_SECONDS = 5.0      # how long a logout waits for one of them be
                                     # may retry; the refusal is recorded)
 _BACKCHANNEL_SLOTS = asyncio.Semaphore(BACKCHANNEL_CONCURRENCY)
 # The refusals that say the token itself is not valid (400, the provider does not retry): its signature, claims or
-# issuer. A failure of the provider's discovery or keys, of the state store or of the vault is a failed logout (501).
+# issuer. A failure of the provider's discovery or keys (a signing key too short to trust among them), of the state
+# store or of the vault is a failed logout (501).
 TOKEN_REFUSALS = frozenset({oc.TOKEN_INVALID, oc.ISSUER_MISMATCH})
 
 

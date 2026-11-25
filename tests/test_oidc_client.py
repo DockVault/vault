@@ -1097,12 +1097,31 @@ def test_a_provider_key_too_short_to_trust_verifies_no_token(alg):
     signer.rsa = rsa.generate_private_key(public_exponent=65537, key_size=1024)
     with pytest.raises(oc.OidcError) as refused:
         _verify(oc, signer, signer.token(signer.id_claims(), alg=alg))
-    assert refused.value.code == oc.TOKEN_INVALID and refused.value.detail == "InvalidKeyError"
+    assert refused.value.code == oc.SIGNING_KEY_TOO_SHORT and refused.value.detail == "an RSA key of 1024 bits"
     with pytest.raises(oc.OidcError) as refused:
         oc.verify_logout_token(_provider(oc), _disc(oc, signer), signer.token(_logout_claims(signer), alg=alg),
                                seen_jti=lambda jti, ttl: False, fetch=_fetch_for(signer), resolve=_PUBLIC, now=NOW)
-    assert refused.value.code == oc.TOKEN_INVALID and refused.value.detail == "InvalidKeyError"
+    assert refused.value.code == oc.SIGNING_KEY_TOO_SHORT and refused.value.detail == "an RSA key of 1024 bits"
+    # The key is what is refused, before the token is looked at: a token that is wrong in other ways as well
+    # (another audience here) is still answered with the reason an administrator can act on.
+    with pytest.raises(oc.OidcError) as refused:
+        _verify(oc, signer, signer.token({**signer.id_claims(), "aud": "another-client"}, alg=alg))
+    assert refused.value.code == oc.SIGNING_KEY_TOO_SHORT
+    assert oc.RSA_KEY_MIN_BITS == 2048 and oc.SIGNING_KEY_TOO_SHORT == "signing_key_too_short"
     # The provider's elliptic-curve key is as it was.
     assert _verify(oc, signer, signer.token(signer.id_claims(), alg="ES256", kid="ec1"))["sub"] == "user-1"
     # (A key of 2048 bits verifies: every other test here signs with one.)
     assert Signer().rsa.key_size == 2048
+
+
+def test_a_key_one_bit_under_the_floor_is_too_short_and_one_at_it_is_not(monkeypatch):
+    """The floor is the number itself: a key of exactly that many bits verifies."""
+    oc = _oc()
+    signer = Signer()
+    assert _verify(oc, signer, signer.token(signer.id_claims(), alg="RS256"))["sub"] == "user-1"
+    monkeypatch.setattr(oc, "RSA_KEY_MIN_BITS", 2049)
+    with pytest.raises(oc.OidcError) as refused:
+        _verify(oc, signer, signer.token(signer.id_claims(), alg="RS256"))
+    assert refused.value.code == oc.SIGNING_KEY_TOO_SHORT and refused.value.detail == "an RSA key of 2048 bits"
+    # An elliptic-curve key has a size too (256), and is no RSA key: the floor is not asked of it.
+    assert _verify(oc, signer, signer.token(signer.id_claims(), alg="ES256", kid="ec1"))["sub"] == "user-1"

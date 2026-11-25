@@ -1494,10 +1494,22 @@ def test_a_persons_refusal_still_comes_back_as_its_reason_and_a_tests_sentences_
     status, location, _ = h.callback(p, state, code=None, error="access_denied")
     assert location == "/#sso-error=provider_error"
     for code in (oc.PROVIDER_ERROR, oc.ISSUER_MISMATCH, oc.TOKEN_INVALID, oc.NONCE_MISMATCH, oc.ENDPOINT_REFUSED,
-                 oc.TEMPORARILY_UNAVAILABLE, oc.DISCOVERY_INVALID):
+                 oc.TEMPORARILY_UNAVAILABLE, oc.DISCOVERY_INVALID, oc.SIGNING_KEY_TOO_SHORT):
         said = sso.test_failure_text(code)
         assert said == sso.TEST_FAILED_TEXTS[code] and said != sso.reason_text(code)
         assert "contact your administrator" not in said.lower() and "your organisation" not in said.lower()
+    # A provider whose signing key is too short fails every sign-in: the administrator is told that it is the
+    # key, and where it is replaced, not to enter the client secret again. The person is told whom to tell.
+    short = sso.test_failure_text(oc.SIGNING_KEY_TOO_SHORT)
+    assert "an RSA key shorter than 2048 bits" in short and "replaced at the provider" in short
+    assert "secret" not in short and "client id" not in short
+    assert sso.reason_text(oc.SIGNING_KEY_TOO_SHORT) == (
+        "Your organisation's sign-in signs its answers with a key this vault does not accept. Tell your "
+        "administrator.")
+    # At the provider's logout it is a failure of the provider's keys, not a token the provider sent wrongly.
+    from app.api import sso_router as _router
+    assert oc.SIGNING_KEY_TOO_SHORT not in _router.TOKEN_REFUSALS
+    assert _router.TOKEN_REFUSALS == frozenset({oc.TOKEN_INVALID, oc.ISSUER_MISMATCH})
     # A reason with no sentence of its own is still said as a failed test.
     assert sso.test_failure_text(sso.PROVIDER_DISABLED) == "The test sign-in did not pass: " + sso.reason_text(sso.PROVIDER_DISABLED)
     # A state with nobody to hand the answer to (no account named) goes back as a reason.
