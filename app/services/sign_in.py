@@ -27,6 +27,7 @@ what a sign-in is.
 """
 from __future__ import annotations
 
+import functools
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -315,6 +316,27 @@ def with_a_short_wait(db, take):
     return taken
 
 
+def a_refusal_leaves_no_session(step):
+    """For a step of the pipeline that takes ``(db, result, ...)``: a refusal it raises leaves no session of the
+    sign-in's proof behind. The password door writes its session in its own turn and commits it before the
+    pipeline judges the sign-in. Refused there for something other than the count or a busy turn (the account
+    locked or turned off meanwhile, a held sign-in already spent, whatever a later step of the pipeline
+    refuses), the sign-in got no token, and its session stayed: of no use to anyone, shown among the account's
+    sessions and counted with them. With a proof's session to drop, what the refused sign-in had written and not
+    committed is rolled back first, so that the drop's commit keeps none of it; without one nothing is touched."""
+    @functools.wraps(step)
+    def guarded(db, result, *args, **kwargs):
+        try:
+            return step(db, result, *args, **kwargs)
+        except HTTPException:
+            if getattr(result, "session_token", None):
+                db.rollback()
+                drop_the_session_the_proof_made(db, result)
+            raise
+    return guarded
+
+
+@a_refusal_leaves_no_session
 def in_the_accounts_turn(db, result: "SignInResult") -> None:
     """Before a session or a held sign-in is written for ``result``: take the account's turn at its sessions and
     judge the sign-in again in it, on the account as it is committed.
@@ -457,6 +479,7 @@ def begin_pending(db, result: SignInResult, stage: str, *, enrollment_required: 
     return PendingStep(stage=stage, body=body)
 
 
+@a_refusal_leaves_no_session
 def finish(db, result: SignInResult):
     """Finish a sign-in or hold it for its next step: a :class:`SignedIn` or a :class:`PendingStep`.
 

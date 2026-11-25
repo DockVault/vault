@@ -621,3 +621,88 @@ def test_an_account_that_loses_its_standing_has_its_row_locked_before_the_rows_o
     for kind, key in ((SESSIONS_TURN, "a"), (CHANGE_ROW, "*")):
         assert late.take(kind, key) == []
     assert late.take(ACCOUNT_ROW, "a") != [], "the row taken only after a row of the auditor right is out of order"
+
+
+@pytest.mark.parametrize("refused", ["turned off while it waited", "locked before it was judged",
+                                     "its held sign-in already spent", "a later step"])
+def test_a_refused_sign_in_leaves_no_session_of_its_proof_whatever_refused_it(db, monkeypatch, refused):
+    """The password door commits its session before the pipeline judges the sign-in. Only a sign-in from before a
+    change, and one that found its turn busy, took that session with them: refused for anything else, the
+    sign-in got no token and its session stayed among the account's, of no use to anyone. Every refusal drops
+    it, and what the refused sign-in had written and not committed goes with it."""
+    import types
+    from app.services.auth_service import AuthService
+    alice = _user(db, "alice")
+    made = AuthService(db)._create_session(alice, None, IP, channel="web")
+    assert _rows(db, "active_sessions", alice) == 1
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, session_token=made,
+                                  sessions_ended=sign_in.as_read(alice))
+    monkeypatch.setattr(api, "_login_second_factor_in_effect", lambda db_, user: False)
+    monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: None)
+    expected = 401
+    if refused == "turned off while it waited":
+        monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: _elsewhere(
+            db, "UPDATE users SET is_active = 0 WHERE id = :id", id=alice.id.hex))
+    elif refused == "locked before it was judged":
+        alice.is_locked = True                         # an administrator's lock, committed after the door's check
+        db.commit()
+        expected = 403
+    elif refused == "its held sign-in already spent":
+        result.pending = types.SimpleNamespace(id=uuid.uuid4())
+    else:
+        def a_step_that_writes_and_then_refuses(db_, pending, commit=True):
+            db_.execute(sa.text("UPDATE users SET sessions_ended = sessions_ended + 5 WHERE id = :id"),
+                        {"id": alice.id.hex})
+            raise HTTPException(status_code=403, detail="refused by a later step")
+        result.pending = types.SimpleNamespace(id=uuid.uuid4())
+        monkeypatch.setattr(sign_in, "consume_pending", a_step_that_writes_and_then_refuses)
+        expected = 403
+    with pytest.raises(HTTPException) as answer:
+        sign_in.finish(db, result)
+    assert answer.value.status_code == expected, answer.value.detail
+    assert result.session_token is None
+    db.rollback()
+    assert _rows(db, "active_sessions", alice) == 0 and _rows(db, "pending_logins", alice) == 0
+    # What the refused sign-in wrote and did not commit was not kept by the drop's commit.
+    assert _count(db, alice) == 0
+
+
+def test_a_refusal_with_no_session_of_a_proof_touches_nothing(db, monkeypatch):
+    """A sign-in whose proof made no session (a code after a held sign-in, a passkey) is refused as it was: the
+    transaction is left to the caller, nothing is rolled back and nothing committed here."""
+    alice = _user(db, "alice")
+    alice.is_locked = True
+    db.commit()
+    ended = []
+    monkeypatch.setattr(db, "rollback", lambda: ended.append("rollback"))
+    monkeypatch.setattr(db, "commit", lambda: ended.append("commit"))
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, sessions_ended=sign_in.as_read(alice))
+    for step in (sign_in.finish, sign_in.in_the_accounts_turn):
+        monkeypatch.setattr(api, "_sessions_turn", lambda db_, user_id: None)
+        with pytest.raises(HTTPException) as answer:
+            step(db, result)
+        assert answer.value.status_code == 403 and ended == [], step
+    # Both steps are guarded, and each is still read as itself (its name, its words, its source).
+    for step in (sign_in.finish, sign_in.in_the_accounts_turn):
+        assert step.__wrapped__.__name__ == step.__name__ and step.__doc__
+    import inspect
+    assert inspect.getsource(sign_in.finish).startswith("@a_refusal_leaves_no_session\ndef finish(")
+    assert inspect.getsource(sign_in.in_the_accounts_turn).startswith(
+        "@a_refusal_leaves_no_session\ndef in_the_accounts_turn(")
+
+
+def test_what_is_not_a_refusal_is_not_taken_for_one(db, monkeypatch):
+    """An error that is no refusal (the database's, a bug's) passes as it is: the guard drops a session only for
+    an answer the pipeline gave."""
+    from app.services.auth_service import AuthService
+    alice = _user(db, "alice")
+    made = AuthService(db)._create_session(alice, None, IP, channel="web")
+    result = sign_in.SignInResult(alice, [sign_in.PASSWORD], IP, session_token=made,
+                                  sessions_ended=sign_in.as_read(alice))
+
+    def broken(db_, user, client_ip):
+        raise RuntimeError("not a refusal")
+    monkeypatch.setattr(sign_in, "refuse_unless_the_account_may_sign_in", broken)
+    with pytest.raises(RuntimeError):
+        sign_in.finish(db, result)
+    assert result.session_token == made and _rows(db, "active_sessions", alice) == 1
