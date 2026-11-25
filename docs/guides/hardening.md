@@ -144,8 +144,8 @@ When you keep it on:
   vault.
 - **Keep the record floor** (`COMPLIANCE_RECORD_MIN_DAYS`, six years by default): the records of a case outlive it.
   The server refuses to start when the audit log's ceiling (`PLAN_LOG_MAX_DAYS`) is shorter.
-- **Tell your people** that compliance access exists and how it works: the page *What this vault records* has a
-  section on it, filled from your settings.
+- **Tell your people** that compliance access exists and how it works: the *Privacy* page (`/recording`), under
+  *What this vault records*, has a section on it, filled from your settings.
 
 ### Owners are told at once: the tipping-off question
 

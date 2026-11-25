@@ -187,7 +187,14 @@ class BrandingConfig(BaseSettings):
         default="/static/assets/logo.png",
         description="Open Graph image for social sharing"
     )
-    
+
+    show_name_beside_logo: bool = Field(
+        default=True,
+        description=("Show the app name beside the logo in the top bar, on the sign-in card and on the "
+                     "public pages. Turn it off when the logo already shows the name; the name still "
+                     "shows on its own when the logo cannot be loaded.")
+    )
+
     # ========================================
     # Theme Colors (CSS color values)
     # ========================================
@@ -236,9 +243,11 @@ class BrandingConfig(BaseSettings):
     # Legal
     # ========================================
     
+    # Empty by default: the operator of a vault publishes their own policy. The vault's Privacy page
+    # (/recording) links to it when it is set; GET /legal reports null until then.
     privacy_policy_url: str = Field(
-        default="https://dockvault.io/privacy",
-        description="Privacy policy URL"
+        default="",
+        description="Privacy policy URL of the organisation that runs this vault (empty = none)"
     )
 
     terms_of_service_url: str = Field(

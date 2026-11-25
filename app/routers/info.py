@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from typing import Dict, Any
 
 from app.config.branding import branding
-from app.config.effective import get_effective_branding, branding_public_payload
+from app.config.effective import get_effective_branding, branding_public_payload, brand_asset_urls
 from app.core.account_policy import effective_account_policy
 from app.core.database import get_db
 from app.core.models import SystemSetting
@@ -51,7 +51,9 @@ async def get_branding_endpoint(db: Session = Depends(get_db)):
     and theme colours. Includes:
     - identity + company + support email + key URLs + copyright (``to_public_dict``)
     - ``colors``: the 8 theme colours as CSS custom properties (``:root`` ready)
-    - ``assets``: logo / favicon / og-image URLs
+    - ``assets``: logo / favicon / og-image URLs (an uploaded file that is gone falls back to
+      the built-in default of its slot)
+    - ``show_name_beside_logo``: whether the name stands beside the logo
 
     **No authentication required** — branding chrome is public. Public fields only; no secrets.
     """
@@ -164,13 +166,15 @@ async def get_theme(db: Session = Depends(get_db)):
         Dict of CSS custom properties and asset URLs
     """
     cfg = get_effective_branding(db)
+    # The same asset URLs as /branding: an uploaded file that is gone falls back to the default.
+    urls = brand_asset_urls(cfg)
     return {
         "colors": cfg.get_theme_css_vars(),
         "assets": {
-            "logo": cfg.logo_url,
-            "logo_dark": cfg.logo_dark_url,
-            "logo_small": cfg.logo_small_url,
-            "favicon": cfg.favicon_url,
+            "logo": urls["logo"],
+            "logo_dark": urls["logo_dark"],
+            "logo_small": urls["logo_small"],
+            "favicon": urls["favicon"],
             "og_image": cfg.og_image_url,
         },
     }
@@ -203,7 +207,8 @@ async def get_legal_links(db: Session = Depends(get_db)):
     """
     Get links to legal documents.
 
-    Returns URLs to privacy policy, terms of service, and other legal documents.
+    Returns URLs to privacy policy, terms of service, and other legal documents. The privacy
+    policy is null until the operator sets one (Settings -> Branding -> Links).
 
     **No authentication required** - legal links are public.
 
@@ -212,7 +217,8 @@ async def get_legal_links(db: Session = Depends(get_db)):
     """
     cfg = get_effective_branding(db)
     return {
-        "privacy_policy": cfg.privacy_policy_url,
+        # The organisation's own policy, or null when none is set (the default).
+        "privacy_policy": (cfg.privacy_policy_url or "").strip() or None,
         "terms_of_service": cfg.terms_of_service_url,
         "cookie_policy": cfg.cookie_policy_url,
         "dpa": cfg.dpa_url,

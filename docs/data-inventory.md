@@ -165,8 +165,9 @@ manages within the deployment's limits, one row per setting, with the id and use
 each one last and when. A row is overwritten by the next change and never deleted.
 
 Everyone can read what the audit log records, how long each store keeps data and who can see it at
-`/recording` (new in 0.34.0), linked from the sign-in, invitation and link pages and the account menu; the
-operator states the legal basis and a contact in Settings, Activity and records.
+`/recording` (new in 0.34.0; titled Privacy since 0.36.0), linked as "Privacy" from the sign-in, invitation and
+link pages and the account menu; the operator states the legal basis and a contact in Settings, Activity and
+records, and the address of their own privacy policy in Settings, Branding, Links (none by default).
 
 `audit_privacy_policies` (new in 0.34.0) holds each version of the recording levels (what the audit log
 records of each kind of personal data), with the id and username of the administrator who saved it, or

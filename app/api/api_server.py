@@ -828,7 +828,7 @@ app.include_router(info_router)
 # SystemSetting key that holds the brand overrides (A3 mirrors the Settings brand
 # fields into it so /branding + the rendered shell update live).
 from app.config.branding import HEX_COLOR_RE
-from app.config.effective import BRAND_SETTINGS_KEY, load_brand_overrides, set_brand_overrides
+from app.config.effective import BRAND_SETTINGS_KEY, brand_asset_dir, load_brand_overrides, set_brand_overrides
 
 # Import and include ECC router (Elliptic Curve Cryptography)
 from app.api.ecc_router import router as ecc_router
@@ -3530,16 +3530,20 @@ _BRAND_TEXT_FIELDS = {          # field -> max length of the stripped value
     "copyright_holder": 120,
 }
 _BRAND_EMAIL_FIELDS = {"support_email"}
-_BRAND_URL_FIELDS = {"company_url", "website_url", "docs_url"}
+_BRAND_URL_FIELDS = {"company_url", "website_url", "docs_url", "privacy_policy_url"}
 _BRAND_COLOR_FIELDS = {
     "primary_color", "secondary_color", "accent_color", "success_color",
     "warning_color", "error_color", "text_color", "background_color",
 }
+# Switches. A switch has no blank state, so the deployment's own value (BRAND_* env, else the
+# built-in default) clears the override instead of an empty field (see update_settings).
+_BRAND_BOOL_FIELDS = {"show_name_beside_logo"}
 _BRAND_FIELDS = (
     set(_BRAND_TEXT_FIELDS)
     | _BRAND_EMAIL_FIELDS
     | _BRAND_URL_FIELDS
     | _BRAND_COLOR_FIELDS
+    | _BRAND_BOOL_FIELDS
 )
 _BRAND_URL_MAX = 500
 
@@ -3603,6 +3607,10 @@ def _validate_brand_overrides(payload: dict) -> None:
         v = val.strip()
         if v and not HEX_COLOR_RE.match(v):
             raise HTTPException(status_code=400, detail=f"{field} must be a hex colour like #2563eb")
+
+    for field in _BRAND_BOOL_FIELDS:
+        if field in payload and not isinstance(payload[field], bool):
+            raise HTTPException(status_code=400, detail=f"{field} must be true or false")
 
 
 def _validate_group_id_list(payload: dict, key: str, db: Session) -> None:
@@ -4634,6 +4642,12 @@ async def get_settings(
     # the self-service reset sends nothing (Settings says so beside its switch) and invitations are copied
     # rather than emailed.
     data["public_address_configured"] = bool(_public_base_url())
+    # Branding: the name switch as in effect (an override, else the deployment's value), and the
+    # uploaded logo or favicon whose file is gone from the brand volume ("logo", "favicon"), so the
+    # Branding page can ask for it again. /branding already serves the built-in default for those.
+    from app.config.effective import get_effective_branding, missing_brand_uploads
+    data["show_name_beside_logo"] = bool(get_effective_branding(db).show_name_beside_logo)
+    data["brand_assets_missing"] = missing_brand_uploads(load_brand_overrides(db), BRAND_ASSET_DIR)
     return data
 
 
@@ -4937,7 +4951,14 @@ async def update_settings(
     if brand_keys:
         # Shared writer (also used by asset uploads): non-empty sets, empty
         # clears -> env default. Values were validated by _validate_brand_overrides above.
-        set_brand_overrides(db, updates={key: payload[key] for key in brand_keys})
+        brand_updates = {key: payload[key] for key in brand_keys}
+        # A switch set to the deployment's own value keeps no override, so a later BRAND_* change in
+        # .env still reaches a vault whose admin never changed the switch.
+        from app.config.branding import get_branding as _env_branding
+        for key in _BRAND_BOOL_FIELDS & brand_keys:
+            if brand_updates[key] == bool(getattr(_env_branding(), key)):
+                brand_updates[key] = None
+        set_brand_overrides(db, updates=brand_updates)
     # The audit row, with each changed key's values before and after, commits with the change or neither
     # does: a save whose record cannot be written is not made.
     try:
@@ -8233,8 +8254,9 @@ async def self_signup(payload: SignupRequest, request: Request, db: Session = De
 # logo/favicon URLs via the 'brand' override row. Reset drops the override -> the
 # baked default returns. Env-level URLs (BRAND_LOGO_URL) still win as a deploy default.
 # ---------------------------------------------------------------------------
-BRAND_ASSET_DIR = os.environ.get(
-    "BRAND_ASSET_DIR", str(PROJECT_ROOT / "brand"))
+# BRAND_ASSET_DIR, else brand/ at the app root: the one folder /branding also checks
+# (app.config.effective.brand_asset_dir), so an uploaded file that is gone falls back to the default.
+BRAND_ASSET_DIR = brand_asset_dir()
 BRAND_ASSET_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
 # slot -> the BrandingConfig override keys it drives. A single uploaded logo drives all
 # three logo slots so it shows on the login screen, header AND sidebar at once.

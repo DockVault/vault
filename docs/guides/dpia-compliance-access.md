@@ -33,7 +33,7 @@ customers, anyone); the people named in a case; the members of those vaults; the
 **What is recorded about the investigation.** Who asked and why (the justification, sealed at rest), who approved,
 the vaults and folders covered, every file opened and every export (with a hash of its list), every name revealed
 and its reason (sealed), every refusal. Kept for ever as the record of the case; its events at least
-`COMPLIANCE_RECORD_MIN_DAYS` after it closes (six years by default). See *What this vault records* and the data
+`COMPLIANCE_RECORD_MIN_DAYS` after it closes (six years by default). See the *Privacy* page and the data
 inventory (`docs/data-inventory.md`).
 
 **Recipients.** The auditor; the administrators who approve; the owners (their notices). An export is a copy the
@@ -72,7 +72,7 @@ decide which vaults a case names]**
   themselves, this server sends email and the owner has an address.
 - **When an auditor reveals a recorded name** from an owner's vault outside a case, the owner is told (once a day
   per auditor and vault) and sees each reveal on *Access to my vaults*: when, by whom and the reason's category.
-- **The page *What this vault records*** describes compliance access as configured.
+- **The *Privacy* page** (`/recording`), under *What this vault records*, describes compliance access as configured.
 - **The product does not tell the people named in a case, or the people whose data is in the files.**
   **[fill in: how you inform them (Art. 13, 14), or the exemption you rely on]**
 

@@ -36,6 +36,7 @@ FIELDS: dict[str, tuple] = {
         ("brand_company_url", A, "0.6.0"),
         ("brand_website_url", A, "0.6.0"),
         ("brand_docs_url", A, "0.6.0"),
+        ("brand_privacy_policy_url", E, "0.36.0"),
         ("brand_primary_color", E, "0.6.0"),
         ("brand_secondary_color", A, "0.6.0"),
         ("brand_accent_color", A, "0.6.0"),
@@ -45,6 +46,7 @@ FIELDS: dict[str, tuple] = {
         ("brand_text_color", A, "0.6.0"),
         ("brand_background_color", A, "0.6.0"),
         ("brand_logo", E, "0.6.0"),
+        ("brand_show_name", E, "0.36.0"),
         ("brand_favicon", A, "0.6.0"),
     ),
     "security": (

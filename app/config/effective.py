@@ -16,11 +16,14 @@ the process restarts.
 """
 
 import logging
-from typing import Any, Dict
+import os
+import threading
+from typing import Any, Dict, List, Optional
 
 from pydantic import ValidationError
 
 from app.config.branding import BrandingConfig, get_branding
+from app.core.paths import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,88 @@ logger = logging.getLogger(__name__)
 # settings row (``_SETTINGS_KEY = "global"`` in api_server — ZK / SMTP / policy) so brand
 # edits and operational settings never clobber each other.
 BRAND_SETTINGS_KEY = "brand"
+
+# Uploaded logos and favicons are served from this path (api_server ``get_brand_asset``), out of
+# the brand volume below.
+BRAND_ASSET_PREFIX = "/brand-assets/"
+
+# The asset slots of the public payload that an upload can point at, and the BrandingConfig field
+# behind each one.
+BRAND_ASSET_FIELDS = {
+    "logo": "logo_url",
+    "logo_dark": "logo_dark_url",
+    "logo_small": "logo_small_url",
+    "favicon": "favicon_url",
+}
+
+# The upload slots of the Branding page (api_server ``_BRAND_ASSET_SLOTS``) and the field each one is
+# checked by: one logo upload drives all three logo fields.
+BRAND_UPLOAD_SLOT_FIELDS = {"logo": "logo_url", "favicon": "favicon_url"}
+
+_missing_logged = set()
+_missing_lock = threading.Lock()
+
+
+def brand_asset_dir() -> str:
+    """The folder that holds uploaded brand assets: BRAND_ASSET_DIR, else ``brand/`` at the app root
+    (the volume mounted at /app/brand in the image)."""
+    return os.environ.get("BRAND_ASSET_DIR", str(PROJECT_ROOT / "brand"))
+
+
+def brand_asset_missing(url: Any, asset_dir: Optional[str] = None) -> bool:
+    """True when ``url`` names an uploaded asset (under /brand-assets/) whose file is not there.
+
+    Any other address (a built-in /static asset, an outside http(s) address) is never checked. A
+    name the asset route would refuse to serve counts as missing too.
+    """
+    if not isinstance(url, str) or not url.startswith(BRAND_ASSET_PREFIX):
+        return False
+    name = url[len(BRAND_ASSET_PREFIX):].split("?", 1)[0].split("#", 1)[0]
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return True
+    base = os.path.realpath(asset_dir or brand_asset_dir())
+    real = os.path.realpath(os.path.join(base, name))
+    if not real.startswith(base + os.sep):
+        return True
+    return not os.path.isfile(real)
+
+
+def _field_default(name: str) -> Any:
+    """The built-in default of a BrandingConfig field, not the env value (pydantic v2 or v1)."""
+    fields = getattr(BrandingConfig, "model_fields", None)
+    if fields is None:  # pydantic v1 fallback
+        fields = BrandingConfig.__fields__
+    return fields[name].default
+
+
+def _note_missing_asset(slot: str) -> None:
+    """Warn once per process per slot. The slot only: the stored path stays out of the log."""
+    with _missing_lock:
+        if slot in _missing_logged:
+            return
+        _missing_logged.add(slot)
+    logger.warning("brand asset for the %s slot is missing; the built-in default is served instead", slot)
+
+
+def brand_asset_urls(cfg: BrandingConfig, asset_dir: Optional[str] = None) -> Dict[str, Any]:
+    """The asset URLs of ``cfg``, with each uploaded asset whose file is gone replaced by the built-in
+    default of its slot, so a lost brand volume shows the stock logo rather than a broken image."""
+    folder = asset_dir or brand_asset_dir()
+    urls = {}
+    for slot, field in BRAND_ASSET_FIELDS.items():
+        url = getattr(cfg, field)
+        if brand_asset_missing(url, folder):
+            _note_missing_asset(slot)
+            url = _field_default(field)
+        urls[slot] = url
+    return urls
+
+
+def missing_brand_uploads(overrides: Dict[str, Any], asset_dir: Optional[str] = None) -> List[str]:
+    """The Branding page's upload slots ("logo", "favicon") whose stored upload has no file."""
+    folder = asset_dir or brand_asset_dir()
+    return [slot for slot, field in BRAND_UPLOAD_SLOT_FIELDS.items()
+            if brand_asset_missing((overrides or {}).get(field), folder)]
 
 
 def _brand_field_names() -> set:
@@ -65,8 +150,9 @@ def set_brand_overrides(db, updates: Dict[str, Any] = None, remove_keys=None) ->
     """Set/remove keys in the ``SystemSetting('brand')`` override row — the store
     :func:`get_effective_branding` merges over the env defaults.
 
-    A non-empty value in ``updates`` sets that key; an empty/whitespace/``None`` value
-    (or a key in ``remove_keys``) drops it, reverting that field to the env default.
+    A non-empty value in ``updates`` sets that key, and so does a boolean, ``False`` included;
+    an empty/whitespace/``None`` value (or a key in ``remove_keys``) drops it, reverting that
+    field to the env default.
     The **single low-level writer** for every branding path — the admin Settings editor
     and logo/favicon uploads — so both feed the same effective store. The caller commits
     (and is responsible for validating values;
@@ -77,7 +163,8 @@ def set_brand_overrides(db, updates: Dict[str, Any] = None, remove_keys=None) ->
     brand = dict(row.value) if (row and row.value) else {}
     for key, value in (updates or {}).items():
         cleaned = value.strip() if isinstance(value, str) else value
-        if cleaned:
+        # A boolean is a value either way: False is a choice, not an empty field.
+        if cleaned or isinstance(cleaned, bool):
             brand[key] = cleaned
         else:
             brand.pop(key, None)  # empty/None -> clear the override
@@ -130,21 +217,28 @@ def get_effective_branding(db) -> BrandingConfig:
     return merge_branding(get_branding(), load_brand_overrides(db))
 
 
-def branding_public_payload(cfg: BrandingConfig) -> Dict[str, Any]:
+def branding_public_payload(cfg: BrandingConfig, asset_dir: Optional[str] = None) -> Dict[str, Any]:
     """The public ``/branding`` response.
 
     Identity + company + key URLs + copyright (via the existing
     :meth:`BrandingConfig.to_public_dict`), plus the full 8-colour theme map (CSS-var
     keyed, ready for ``:root`` injection in A2) and the asset URLs (logos + favicon).
     Public fields only — no analytics tokens, no SMTP / license secrets.
+
+    An uploaded asset whose file is gone from the brand volume is replaced by the built-in
+    default of its slot (:func:`brand_asset_urls`). ``show_name_beside_logo`` tells the shell
+    whether the name stands beside the logo or the logo shows alone.
     """
     payload = dict(cfg.to_public_dict())
+    payload["show_name_beside_logo"] = bool(cfg.show_name_beside_logo)
     payload["colors"] = cfg.get_theme_css_vars()
+    urls = brand_asset_urls(cfg, asset_dir)
+    payload["logo_url"] = urls["logo"]
     payload["assets"] = {
-        "logo": cfg.logo_url,
-        "logo_dark": cfg.logo_dark_url,
-        "logo_small": cfg.logo_small_url,
-        "favicon": cfg.favicon_url,
+        "logo": urls["logo"],
+        "logo_dark": urls["logo_dark"],
+        "logo_small": urls["logo_small"],
+        "favicon": urls["favicon"],
         "og_image": cfg.og_image_url,
     }
     # Persistent product attribution ("powered by <name>"). NOT part of the admin-editable

@@ -33,7 +33,7 @@ ALLOWED_TOP_KEYS = {
     "app_name", "app_full_name", "app_tagline", "app_description", "app_version",
     "company_name", "company_url", "support_email", "website_url", "docs_url",
     "logo_url", "primary_color", "secondary_color", "copyright_notice",
-    "colors", "assets", "powered_by",
+    "colors", "assets", "powered_by", "show_name_beside_logo",
 }
 
 
@@ -411,3 +411,61 @@ def test_settings_brand_rejects_overlong(admin):
     finally:
         _reset_global(admin, ["app_tagline"])
         _delete_brand_quiet()
+
+
+# ---------------------------------------------------------------------------
+# The name beside the logo, and the organisation's privacy policy address
+# ---------------------------------------------------------------------------
+def test_settings_show_name_switch_round_trips_to_branding(admin, anon):
+    """show_name_beside_logo is on by default; PUT /settings turns it off for /branding and GET /settings,
+    and turning it back on keeps no override (the deployment's own value)."""
+    _delete_brand()
+    try:
+        assert anon.get("/branding").json()["show_name_beside_logo"] is True
+        assert admin.get("/settings").json()["show_name_beside_logo"] is True
+        assert admin.put("/settings", json={"show_name_beside_logo": False}).status_code == 200
+        assert anon.get("/branding").json()["show_name_beside_logo"] is False
+        assert admin.get("/settings").json()["show_name_beside_logo"] is False
+        assert _psql("SELECT value->>'show_name_beside_logo' FROM system_settings WHERE key='brand';") == "false"
+        assert admin.put("/settings", json={"show_name_beside_logo": True}).status_code == 200
+        assert anon.get("/branding").json()["show_name_beside_logo"] is True
+        # Back to the deployment's value: no override is kept (no row, or a row without the key).
+        assert _psql("SELECT (value->>'show_name_beside_logo') IS NULL FROM system_settings "
+                     "WHERE key='brand';") in ("t", "")
+        assert admin.put("/settings", json={"show_name_beside_logo": "false"}).status_code == 400
+    finally:
+        try:
+            admin.put("/settings", json={"show_name_beside_logo": True})
+        except Exception:  # noqa: BLE001 — teardown must never raise
+            pass
+        _delete_brand_quiet()
+
+
+def test_privacy_policy_address_is_empty_by_default_and_editable(admin, anon):
+    """GET /legal reports no privacy policy until the operator sets one in Branding; the address passes the
+    same check as the other brand links, and clearing it brings null back."""
+    _delete_brand()
+    try:
+        assert admin.put("/settings", json={"privacy_policy_url": ""}).status_code == 200
+        assert anon.get("/legal").json()["privacy_policy"] is None
+        assert admin.put("/settings", json={"privacy_policy_url": "javascript:alert(1)"}).status_code == 400
+        assert admin.put("/settings", json={"privacy_policy_url": "https://acme.example/privacy"}).status_code == 200
+        assert anon.get("/legal").json()["privacy_policy"] == "https://acme.example/privacy"
+        assert admin.get("/settings").json()["privacy_policy_url"] == "https://acme.example/privacy"
+        assert admin.put("/settings", json={"privacy_policy_url": ""}).status_code == 200
+        assert anon.get("/legal").json()["privacy_policy"] is None
+    finally:
+        _reset_global(admin, ["privacy_policy_url"])
+        _delete_brand_quiet()
+
+
+def test_branding_serves_the_default_logo_when_the_uploaded_file_is_gone(anon):
+    """A brand row that names an uploaded file the volume does not hold: /branding serves the built-in default."""
+    gone = "/brand-assets/logo.00000000.png"
+    with brand_override({"logo_url": gone, "logo_dark_url": gone, "logo_small_url": gone,
+                         "favicon_url": "/brand-assets/favicon.00000000.png"}):
+        assets = anon.get("/branding").json()["assets"]
+        assert assets["logo"] == "/static/assets/logo.png"
+        assert assets["logo_small"] == "/static/assets/logo-small.png"
+        assert assets["favicon"] == "/static/assets/logo-small.png"
+        assert "/brand-assets/" not in str(assets)
