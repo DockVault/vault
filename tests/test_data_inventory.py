@@ -136,3 +136,41 @@ def test_what_0_35_0_adds_to_a_row_is_marked_as_new_in_it(row, added):
 
 def test_no_row_says_from_0_35_0_in_other_words():
     assert not [line for line in _text().splitlines() if line.startswith("| ") and "from 0.35.0" in line]
+
+
+# The columns of `users` the row describes in words rather than by name, with the words it uses for each.
+_USERS_IN_WORDS = {
+    "id": "| `users` |", "username": "Username", "email": "email (optional)", "password_hash": "password hash",
+    "role": "role", "is_active": "active and locked state", "is_locked": "active and locked state",
+    "locked_until": "active and locked state", "failed_login_attempts": "failed sign-in count",
+    "last_login": "last sign-in", "created_at": "creation time and creator", "created_by": "creation time and creator",
+    "updated_at": "time of the last change", "storage_quota_bytes": "storage quota",
+    "sftp_enabled": "SFTP settings", "sftp_password_auth": "SFTP settings",
+}
+
+
+def test_every_column_of_users_is_in_its_row():
+    # Compared with the model itself, not with a list kept by hand: a column a release adds to `users` fails here
+    # until the row names it (or says it in words, as for the columns the row began with).
+    from app.core.models import User
+
+    (row,) = [line for line in _text().splitlines() if line.startswith("| `users` |")]
+    named = set(re.findall(r"`([a-z_]+)`", row.split("|", 2)[2]))
+    missing = [c.name for c in User.__table__.c
+               if c.name not in named and not (c.name in _USERS_IN_WORDS and _USERS_IN_WORDS[c.name] in row)]
+    assert not missing, f"the users row says nothing of these columns of the model: {missing}"
+    assert not [c for c in _USERS_IN_WORDS if c not in User.__table__.c], "a column described in words is gone"
+
+
+def test_what_0_36_0_adds_to_the_users_row_is_marked_as_new_in_it():
+    (row,) = [line for line in _text().splitlines() if line.startswith("| `users` |")]
+    assert row.count("**New in 0.36.0:**") == 1
+    new_part = row.split("**New in 0.36.0:**", 1)[1].split("|", 1)[0]
+    for name in ("email_confirmed_at", "email_confirmed_for", "passkey_required_since",
+                 "passkey_requirement_cleared_at", "sso_only", "password_nobody_knows", "sessions_ended"):
+        assert f"`{name}`" in new_part, f"the users row does not mark {name} as new in 0.36.0"
+    # And the release's own list names each of them too.
+    release = _text().split("\n## What 0.36.0 added\n", 1)[1].split("\n## ", 1)[0]
+    for name in ("email_confirmed_at", "email_confirmed_for", "passkey_required_since",
+                 "passkey_requirement_cleared_at", "sso_only", "password_nobody_knows", "sessions_ended"):
+        assert f"`users.{name}`" in release, name
