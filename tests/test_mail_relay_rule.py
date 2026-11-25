@@ -365,3 +365,163 @@ def test_the_settings_test_send_reads_nothing_from_the_request():
     reads = {ast.unparse(n) for n in ast.walk(tree)
              if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "request"}
     assert reads <= {"request.headers", "request.client"}, reads
+
+
+# --------------------------------------------------------------------------- two saves at once
+
+def _other_session(db):
+    """A second session on the same database, as a second request has: it sees what the first commits."""
+    return sessionmaker(bind=db.get_bind(), autocommit=False, autoflush=False)()
+
+
+def _other_admin(db, other):
+    user = User(username="grace", email="grace@example.test", password_hash="x", role=RoleEnum.ADMIN,
+                is_active=True, is_locked=False)
+    db.add(user)
+    db.commit()
+    return other.get(User, user.id)
+
+
+@pytest.mark.parametrize("receipt_commits", [False, True], ids=["receipt-not-committed", "receipt-committed"])
+def test_a_password_saved_while_a_profile_save_is_confirmed_is_not_paired_with_its_server(
+        db, admin, monkeypatch, receipt_commits):
+    # The profile holds no password, so a save pointing it elsewhere without one passes the rule. While that save
+    # waits on its step-up, another administrator saves the real password for the profile's own server. The
+    # first save, checked again on the row it writes, is refused: the password stays with its own server.
+    p = _profile(db, password=None)
+    other = _other_session(db)
+    grace = _other_admin(db, other)
+    meanwhile = []
+
+    def step_up(db_, user, request):
+        if not meanwhile:
+            meanwhile.append(user.username)
+            body = {"name": "Relay", **RELAY, "from_email": "vault@example.test", "smtp_password": FRESH}
+            run_coroutine(studio.update_profile(profile_id=p.id, payload=studio.ProfileIn(**body),
+                                                request=_request(), admin=grace, db=other))
+        if receipt_commits:
+            db_.commit()          # a receipt kept in the database is used up with a commit
+    monkeypatch.setattr(studio, "_step_up", step_up)
+    try:
+        with pytest.raises(HTTPException) as refused:
+            _update(db, admin, p, smtp_server="elsewhere.example", smtp_allow_insecure_tls=True)
+    finally:
+        other.close()
+    assert meanwhile == ["ada"]
+    assert refused.value.status_code == 400 and refused.value.detail == REFUSAL
+    kept = _reloaded(db, p)
+    assert (kept.smtp_server, kept.smtp_allow_insecure_tls) == (RELAY["smtp_server"], False)
+    assert decrypt_secret(kept.smtp_password) == FRESH
+    [row] = _refusals(db)
+    assert row.details["surface"] == "profile_update"
+    assert set(row.details["changes"]) == {"smtp_server", "smtp_allow_insecure_tls"}
+
+
+@pytest.mark.parametrize("receipt_commits", [False, True], ids=["receipt-not-committed", "receipt-committed"])
+def test_a_password_saved_while_a_settings_save_is_confirmed_is_not_paired_with_its_server(
+        db, admin, monkeypatch, receipt_commits):
+    db.add(SystemSetting(key=api._SETTINGS_KEY, value={**RELAY, "from_email": "vault@example.test"}))
+    db.commit()
+    other = _other_session(db)
+    grace = _other_admin(db, other)
+    meanwhile = []
+
+    def step_up(db_, user, request):
+        if not meanwhile:
+            meanwhile.append(user.username)
+            run_coroutine(api.update_settings(payload={"smtp_password": FRESH}, request=_request(),
+                                              current_user=grace, db=other))
+        if receipt_commits:
+            db_.commit()
+    monkeypatch.setattr(api, "_mail_relay_step_up", step_up)
+    try:
+        with pytest.raises(HTTPException) as refused:
+            _save(db, admin, {"smtp_server": "elsewhere.example"})
+    finally:
+        other.close()
+    assert meanwhile == ["ada"]
+    assert refused.value.status_code == 400 and refused.value.detail == REFUSAL
+    stored = _stored(db)
+    assert stored["smtp_server"] == RELAY["smtp_server"] and stored["smtp_password"] == FRESH
+    [row] = _refusals(db)
+    assert row.details["surface"] == "settings" and set(row.details["changes"]) == {"smtp_server"}
+    assert len(_rows(db, "settings_updated")) == 1          # the other administrator's save only
+
+
+def test_a_settings_save_confirmed_as_leaving_the_smtp_settings_alone_changes_none_changed_meanwhile(
+        db, admin, monkeypatch):
+    # It sends the server as it was stored and takes the ordinary step-up. Meanwhile another administrator points
+    # the settings elsewhere; this save would now point them back, under a step-up that was not for that.
+    db.add(SystemSetting(key=api._SETTINGS_KEY, value={**RELAY, "from_email": "vault@example.test"}))
+    db.commit()
+    other = _other_session(db)
+    grace = _other_admin(db, other)
+    meanwhile = []
+
+    def ordinary_step_up(db_, user, request, action):
+        if not meanwhile:
+            meanwhile.append(action)
+            run_coroutine(api.update_settings(payload={"smtp_server": "elsewhere.example"}, request=_request(),
+                                              current_user=grace, db=other))
+    monkeypatch.setattr(api, "_enforce_step_up", ordinary_step_up)
+    try:
+        with pytest.raises(HTTPException) as refused:
+            _save(db, admin, {"smtp_server": RELAY["smtp_server"], "app_name": "Changed"})
+    finally:
+        other.close()
+    assert meanwhile == ["admin.settings.write"]
+    assert refused.value.status_code == 409
+    assert refused.value.detail == {"reason": "smtp_settings_changed", "message": mail_relay.CHANGED_MEANWHILE}
+    stored = _stored(db)
+    assert stored["smtp_server"] == "elsewhere.example" and "app_name" not in stored
+
+
+def _statements_after_the_step_up(db, monkeypatch, module, name):
+    """What the session runs once the step-up is answered, as PostgreSQL would be sent it, with whether each
+    statement refreshes the rows it reads."""
+    from sqlalchemy.dialects import postgresql
+    seen = []
+
+    def record(state):
+        if seen and seen[0] == "step-up":
+            refreshes = state.is_select and (state.execution_options.get("populate_existing")
+                                             or getattr(state.load_options, "_populate_existing", False))
+            seen.append((" ".join(str(state.statement.compile(dialect=postgresql.dialect())).split()),
+                         bool(refreshes)))
+    sa.event.listen(db, "do_orm_execute", record)
+    monkeypatch.setattr(module, name, lambda *a, **k: seen.append("step-up"))
+    return seen
+
+
+def test_a_profile_save_that_makes_it_the_default_locks_the_default_first(db, admin, monkeypatch):
+    # Deleting the default profile locks it and then the profile it promotes; a save that makes a profile the
+    # default takes the two in the same order, so neither waits on the other in a circle.
+    _profile(db)
+    p = EmailProfile(name="Second", smtp_server="mail.example.test", smtp_port=587, from_email="vault@example.test",
+                     is_default=False)
+    db.add(p)
+    db.commit()
+    seen = _statements_after_the_step_up(db, monkeypatch, studio, "_step_up")
+    assert _update(db, admin, p, is_default=True)["is_default"] is True
+    default_lock, row_lock = seen[1], seen[2]
+    assert "WHERE email_profiles.is_default IS true FOR UPDATE" in default_lock[0], default_lock
+    assert "WHERE email_profiles.id = " in row_lock[0] and row_lock[0].endswith("FOR UPDATE"), row_lock
+    assert row_lock[1], "the locked row is read again, not taken from before the step-up"
+
+
+def test_a_profile_save_that_keeps_the_default_locks_only_its_row(db, admin, monkeypatch):
+    p = _profile(db)
+    seen = _statements_after_the_step_up(db, monkeypatch, studio, "_step_up")
+    _update(db, admin, p, name="Renamed")
+    row_lock = seen[1]
+    assert "WHERE email_profiles.id = " in row_lock[0] and row_lock[0].endswith("FOR UPDATE"), row_lock
+    assert row_lock[1], "the locked row is read again, not taken from before the step-up"
+    assert not any("is_default IS true" in s[0] for s in seen[1:])
+
+
+def test_a_settings_save_locks_and_reads_again_the_settings_it_merges_into(db, admin, monkeypatch):
+    _store(db)
+    seen = _statements_after_the_step_up(db, monkeypatch, api, "_mail_relay_step_up")
+    _save(db, admin, {"smtp_server": "elsewhere.example", "smtp_password": FRESH})
+    reads = [s for s in seen[1:] if "FROM system_settings" in s[0]]
+    assert reads and reads[0][0].endswith("FOR UPDATE") and reads[0][1], reads

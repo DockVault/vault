@@ -16,6 +16,12 @@ Saving or testing a relay is also under the fixed step-up STEP_UP_ACTION (app/co
 administrator's own password every time, and their second factor when they have one, whatever the step-up
 matrix says. The routes record each refusal under REFUSED_ACTION, and each change they accept with the changes
 this module names, so the audit log shows where a relay was pointed and by whom.
+
+A save checks the rule twice: before its step-up, so a refused request spends none, and again after it, on the
+stored relay it writes, locked until the save commits. Another save may have stored a password meanwhile; the
+second check keeps it from being paired with this save's server. A save of the general settings confirmed as
+leaving their SMTP settings alone, which another save changed meanwhile, is refused (CHANGED_MEANWHILE, 409).
+A test send sends what it read, as it read it, and needs no second check.
 """
 from typing import Mapping, NamedTuple, Union
 
@@ -25,6 +31,12 @@ STEP_UP_ACTION = "admin.mail_relay.write"
 REASON = "smtp_password_required"
 REENTER_PASSWORD = ("Re-enter the SMTP password to use a different server, port or username, "
                     "or to stop checking the server's certificate.")
+
+# A save of the general settings confirmed as leaving their SMTP settings alone that would change them, as another
+# save left them meanwhile (409).
+CHANGED_REASON = "smtp_settings_changed"
+CHANGED_MEANWHILE = ("The mail server settings were changed while this save was being confirmed. "
+                     "Load the settings again and save.")
 
 # The audit row of a refused request.
 REFUSED_ACTION = "mail_relay_change_refused"

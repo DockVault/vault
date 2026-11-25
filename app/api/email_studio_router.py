@@ -219,6 +219,14 @@ def _refuse_relay_change(db: Session, request: Request, admin: User, surface: st
                         detail={"reason": mail_relay.REASON, "message": mail_relay.REENTER_PASSWORD})
 
 
+def _relay_save_refusal(p: EmailProfile, after: mail_relay.Relay, payload: ProfileIn) -> tuple:
+    """(the relay the stored profile ``p`` describes, what a save pointing it at ``after`` would move of where
+    its stored password goes without carrying the password): the save is refused when the second is not empty."""
+    before = mail_relay.of_profile(p)
+    return before, mail_relay.refused(before, after, password_stored=bool(p.smtp_password),
+                                      password_kept=not payload.smtp_password)
+
+
 def _rate_limit(admin_id, *, limit: int, window: int, prefix: str, detail: str) -> None:
     """Fail-closed rate limit for the outbound/side-effecting Email Studio routes. Raises 429 when
     the limit is hit, and a CLEAN 503 (not a 500) when the limiter itself is unavailable — matching
@@ -290,15 +298,26 @@ async def update_profile(profile_id: uuid.UUID, payload: ProfileIn, request: Req
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
     _validate_profile_fields(payload)
     # Where the stored password would go after this save: a new target, or the certificate check turned off,
-    # needs the password in this request (an empty one keeps the stored password).
-    before = mail_relay.of_profile(p)
+    # needs the password in this request (an empty one keeps the stored password). Refused here, the request
+    # spends no step-up.
     after = mail_relay.relay(payload.smtp_server, payload.smtp_port, payload.smtp_username,
                              payload.smtp_allow_insecure_tls)
-    moved = mail_relay.refused(before, after, password_stored=bool(p.smtp_password),
-                               password_kept=not payload.smtp_password)
+    before, moved = _relay_save_refusal(p, after, payload)
     if moved:
         _refuse_relay_change(db, request, admin, "profile_update", moved, profile_id=p.id)
     _step_up(db, admin, request)       # may commit (a receipt is used once): nothing is changed before it
+    # The rule again, on the row this save writes, locked until the save commits: a password entered for this
+    # profile while the step-up was being answered is never paired with this save's server. A save that makes
+    # this profile the default locks the current default first, in the order deleting the default takes them.
+    if payload.is_default is True:
+        db.query(EmailProfile.id).filter(EmailProfile.is_default.is_(True)).with_for_update().all()
+    p = (db.query(EmailProfile).filter(EmailProfile.id == profile_id)
+         .populate_existing().with_for_update().first())
+    if p is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
+    before, moved = _relay_save_refusal(p, after, payload)
+    if moved:
+        _refuse_relay_change(db, request, admin, "profile_update", moved, profile_id=p.id)
     relay_changes = mail_relay.changes(before, after)
     if payload.smtp_password:
         relay_changes[mail_relay.PASSWORD] = {"old": "(set)" if p.smtp_password else None, "new": "(set)"}

@@ -4894,8 +4894,18 @@ async def update_settings(
         _enforce_step_up(db, current_user, request, "admin.settings.write")
     _validate_settings_payload(payload, db)
     from app.core.models import SystemSetting
-    row = db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY).first()
+    # The settings this save merges into, locked until it commits, and the mail relay rule again on them: a
+    # password saved while this save's step-up was being answered is never paired with this save's server, and
+    # a save confirmed as leaving the SMTP settings alone changes none of them.
+    row = (db.query(SystemSetting).filter(SystemSetting.key == _SETTINGS_KEY)
+           .populate_existing().with_for_update().first())
     existing = dict(row.value) if row and row.value else {}
+    relay_moved = _mail_relay_moved(existing, payload)
+    if relay_moved:
+        _refuse_mail_relay_change(db, current_user, request, "settings", relay_moved)
+    if not changes_mail_relay and _mail_relay.settings_change(existing, payload):
+        raise HTTPException(status_code=409, detail={"reason": _mail_relay.CHANGED_REASON,
+                                                     "message": _mail_relay.CHANGED_MEANWHILE})
     try:
         payload = zk_rules.settle_switches(payload, existing, _allowed_vault_types())
     except ValueError as exc:
