@@ -488,6 +488,12 @@ def test_what_the_administrators_are_told_of_an_owners_unlink():
                "passkeys) and its SSH keys no longer wait for a sign-in there.")
     assert told(asked=True) == ("alice removed Contoso from the ways their account signs in, after a fresh sign-in "
                                 "through Contoso." + closing + tail)
+    # A provider that asks no days still watches the account while its refusal ends access: the unlink ends that
+    # watch, and the notice says so. Said as "asked nothing of this account's other ways in", it was false.
+    watches_by_refusal = sso_policy.effective({"sso_freshness_days": 0})
+    assert watches_by_refusal["sso_refusal_ends_access"] is True
+    assert told(policy=watches_by_refusal).endswith(closing + tail)
+    assert not told(policy=nothing).endswith(closing + tail)
     # The one unlink that stays one step: the record's reader must be able to find it, three days before it is due.
     assert told(linked_by="email", standing=standing(3)) == (
         "alice removed Contoso from the ways their account signs in. Contoso had put the identity on the account "
