@@ -1,10 +1,12 @@
 """The web app at phone width (390 x 844 CSS px), in both skins.
 
   * unit — the phone stylesheet loads after both skins, and no stylesheet uses the --spacing-* names,
-           which are defined nowhere (the toasts lost their padding and gaps to them).
+           which are defined nowhere (the toasts lost their padding and gaps to them); a row of text and
+           buttons (passkeys, linked providers, the providers and their linked accounts) wraps.
   * ui   — the sidebar is a drawer behind a menu button; no section is wider than the screen; a file
-           row's actions are on screen; the notifications panel stays on screen; a PDF preview says to
-           download it when the browser has no inline PDF viewer; toasts have room between icon and text.
+           row's actions are on screen; the notifications panel stays on screen; a passkey's buttons go
+           under its text; a PDF preview says to download it when the browser has no inline PDF viewer;
+           toasts have room between icon and text.
 
 The ui tests log in as a THROWAWAY admin: applyServerPreferences() replaces the skin with the account's
 stored one after login, so a skin chosen against a shared account can be silently discarded. Each test
@@ -38,6 +40,35 @@ def test_no_stylesheet_uses_the_undefined_spacing_names():
     for css in (ROOT / "static" / "css").glob("*.css"):
         text = css.read_text(encoding="utf-8")
         assert "var(--spacing-" not in text, f"{css.name} uses --spacing-*, which no stylesheet defines"
+
+
+def _phone_rules():
+    """The rules of mobile.css's phone block (max-width: 640px), each as (its selectors, its declarations)."""
+    css = re.sub(r"/\*.*?\*/", "", (ROOT / "static" / "css" / "mobile.css").read_text(encoding="utf-8"), flags=re.S)
+    start = css.index("{", css.index("@media (max-width: 640px)")) + 1
+    depth, end = 1, start
+    while depth:
+        depth += {"{": 1, "}": -1}.get(css[end], 0)
+        end += 1
+    rules = []
+    for selectors, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css[start:end - 1]):
+        declared = dict((k.strip(), v.strip()) for k, _, v in (d.partition(":") for d in body.split(";")) if v.strip())
+        rules.append(({" ".join(s.split()) for s in selectors.split(",")}, declared))
+    return rules
+
+
+# A row of a name and its details beside up to three buttons: on a phone the buttons take a line of their own.
+ROWS_WITH_BUTTONS = (".passkey-row", ".identity-row", ".sso-provider-row", ".sso-identity-row")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("row", ROWS_WITH_BUTTONS)
+def test_a_row_of_text_and_buttons_wraps_on_a_phone(row):
+    rules = _phone_rules()
+    assert any(row in sel and decl.get("flex-wrap") == "wrap" for sel, decl in rules), \
+        f"{row} does not wrap at phone width: its text column shrinks to a word a line beside its buttons"
+    assert any(f"{row} > .flex-1" in sel and decl.get("flex") == "1 1 100%" for sel, decl in rules), \
+        f"{row}'s text column does not take the whole line at phone width"
 
 
 # --------------------------------------------------------------------------- ui lane
@@ -193,6 +224,39 @@ def test_the_notifications_panel_stays_on_the_phone_screen(page: Page, phone_adm
     page.wait_for_timeout(300)                                   # its open transition
     box = panel.bounding_box()
     assert box["x"] >= 0 and box["x"] + box["width"] <= PHONE["width"], f"panel off screen: {box}"
+
+
+# A provisional passkey that something older on the account can confirm: its row has Confirm, Rename and Remove.
+PROVISIONAL_KEY = {"id": "k-phone", "label": "Work laptop", "created_at": "2026-11-01T10:00:00Z",
+                   "last_used_at": None, "synced": True, "usable": True, "user_verified": True, "provisional": True,
+                   "confirmable": True, "provisional_until": "2026-12-01T10:00:00Z"}
+
+
+@pytest.mark.ui
+@pytest.mark.parametrize("skin", ["v1", "v2"])
+def test_a_passkey_rows_buttons_go_under_its_text_on_the_phone(page: Page, phone_admin, skin):
+    """Squeezed beside three buttons, the passkey's name and details broke after nearly every word."""
+    page.route("**/users/me/passkeys", lambda route: route.fulfill(status=200, json={
+        "enabled": True, "passkeys": [PROVISIONAL_KEY], "limit": 10, "requirement": {}, "origin": None}))
+    _login(page, phone_admin, skin)
+    page.click("#profile-btn")
+    page.click("#settings-btn")
+    expect(page.locator("#user-settings-modal")).to_be_visible(timeout=8000)
+    row = page.locator("#us-passkeys-body .passkey-row")
+    expect(row).to_have_count(1, timeout=8000)
+    row.scroll_into_view_if_needed()
+    fit = page.evaluate("""() => {
+        const row = document.querySelector('#us-passkeys-body .passkey-row');
+        const text = row.querySelector(':scope > .flex-1');
+        const buttons = [...row.querySelectorAll(':scope > button')];
+        const remove = buttons.find((b) => b.textContent === 'Remove');
+        return {row: row.getBoundingClientRect().width, text: text.getBoundingClientRect().width,
+                textBottom: text.getBoundingClientRect().bottom, removeTop: remove.getBoundingClientRect().top,
+                buttons: buttons.map((b) => b.textContent)};
+    }""")
+    assert fit["buttons"] == ["Confirm", "Rename", "Remove"], fit
+    assert fit["text"] >= 0.9 * fit["row"], f"the passkey's text is squeezed beside its buttons: {fit}"
+    assert fit["removeTop"] >= fit["textBottom"], f"the buttons are not under the text: {fit}"
 
 
 

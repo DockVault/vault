@@ -117,6 +117,11 @@
 
     /* Pending invitations: each row's name, email, status, expiry and Revoke wrap onto more lines. */
     .invite-row { flex-wrap: wrap; row-gap: var(--space-xs); }
+    /* Passkeys, linked providers, the providers in Settings and their linked accounts: the name and its
+       details take the whole line, and the buttons (up to three) go on the line under it. */
+    .passkey-row, .identity-row, .sso-provider-row, .sso-identity-row { flex-wrap: wrap; row-gap: var(--space-xs); }
+    .passkey-row > .flex-1, .identity-row > .flex-1, .sso-provider-row > .flex-1,
+    .sso-identity-row > .flex-1 { flex: 1 1 100%; }
     /* Changes waiting for approval: the buttons take their own line, large enough to tap. */
     .credential-request-actions { flex: 1 1 100%; }
     .credential-request-actions .btn { flex: 1 1 auto; min-height: 40px; }
