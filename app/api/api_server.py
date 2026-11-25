@@ -1108,6 +1108,10 @@ class UserResponse(BaseModel):
     sftp_password_auth: bool = True
     sso_only: Optional[bool] = None       # signs in only through its identity provider
     sso_providers: List[str] = Field(default_factory=list)   # the providers the account is linked to, by label
+    # What an administrator is told before setting a password on this account: it was made at its first sign-in
+    # through a provider and never had a password, and one ends that for good (app/core/sso_only.py,
+    # password_set_notes). Filled in by the admin users list; null for every other account.
+    password_set_note: Optional[str] = None
     # The account's storage override in bytes: null = inherits the deployment default,
     # -1 = exempt, otherwise an exact budget. The effective number (and what the account has
     # already allocated) comes from /users/{id}/storage.
@@ -11101,9 +11105,12 @@ async def list_users(
     freshness = sso_freshness.standing_of(db)
     from app.services import sso_sign_in
     confirm_wanted = sso_sign_in.confirmed_address_wanted_among(db, users)
+    from app.core import sso_only
+    password_notes = sso_only.password_set_notes(db, users)
     result = []
     for user in users:
         item = UserResponse.model_validate(user)
+        item.password_set_note = password_notes.get(user.id)
         item.sso_freshness = freshness.get(str(user.id))
         item.second_factor_enabled = user.id in mfa_user_ids
         item.second_factor_reset_pending = user.second_factor_reset_at is not None

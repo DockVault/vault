@@ -136,3 +136,35 @@ def test_the_page_names_the_providers_and_says_when_an_account_has_no_password()
         assert row["escaped"] == row["words"]
     # A provider's name is an administrator's text: it reaches the markup escaped.
     assert "<img" not in rows[4]["badges"] and "&lt;img src=x" in rows[4]["badges"]
+
+
+def test_the_list_says_what_a_password_means_for_an_account_made_at_a_first_sign_in(S, db):
+    """Before an administrator sets a password on an account that a provider made at a first sign-in and that
+    never had one, the page says what that does: the account keeps a password from then on. For that account
+    only: not for one that linked itself, one that has or had a password, or one a password is refused for."""
+    from app.core import password_origin, sso_only
+    from app.core.models import ExternalIdentity
+    made, own, had, held, linked, plain = (_user(db, n) for n in ("made", "own", "had", "held", "linked", "plain"))
+    entra = _provider(db, "entra", "Company sign-in")
+    for user in (made, own, had, held):
+        db.add(ExternalIdentity(user_id=user.id, provider_id=entra.id, issuer="https://idp.example.test",
+                                subject=uuid.uuid4().hex, subject_source="oidc:sub", linked_by="jit"))
+    _link(db, linked, entra)
+    for user in (made, had, held, linked):
+        user.password_hash = "random-bytes"
+        password_origin.mark_nobody_knows(user)
+    had.had_a_password_at = entra.created_at or __import__("datetime").datetime(2026, 11, 1)
+    held.sso_only = True
+    db.commit()
+    notes = sso_only.password_set_notes(db, [made, own, had, held, linked, plain])
+    assert notes == {made.id: (
+        "made was made at its first sign-in through Company sign-in and has never had a password. With one, this "
+        "account keeps a password from now on, also if Company sign-in later stops letting the accounts it makes "
+        "set one.")}
+    # The list's rows carry it, and nothing for anybody else.
+    assert S.UserResponse.model_fields["password_set_note"].default is None
+    import inspect
+    listing = inspect.getsource(inspect.unwrap(S.list_users))
+    assert "sso_only.password_set_notes(db, users)" in listing
+    assert "item.password_set_note = password_notes.get(user.id)" in listing
+    assert sso_only.password_set_notes(db, [own, plain]) == {} and sso_only.password_set_notes(db, []) == {}

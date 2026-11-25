@@ -169,6 +169,36 @@ def holds_to_no_password(provider, user, linked_by) -> bool:
     return password_origin.nobody_knows(user) and not password_origin.has_had_one(user)
 
 
+def password_set_notes(db, users) -> dict:
+    """For the Users page: what an administrator is told before they set a password on an account that was made
+    at its first sign-in through a provider and has never had a password somebody could type. A password ends
+    the rule for accounts made that way, for the account and for good (:func:`holds_to_no_password`): that is a
+    deliberate act, and the page says so before it is done. ``{account id: sentence}``, with nothing for every
+    other account, and nothing for one that signs in only through its provider now (a password is refused for
+    it). Two queries for the whole list."""
+    from app.core import password_origin
+    from app.core.models import ExternalIdentity, SsoProvider
+    from app.core.table_presence import has_table
+    never = {u.id: u for u in users if not getattr(u, "sso_only", False)
+             and password_origin.nobody_knows(u) and not password_origin.has_had_one(u)}
+    if not never or not has_table(db, ExternalIdentity.__tablename__):
+        return {}
+    made = (db.query(ExternalIdentity.user_id, ExternalIdentity.provider_id)
+            .filter(ExternalIdentity.user_id.in_(list(never)), ExternalIdentity.linked_by == MADE_AT_A_FIRST_SIGN_IN).all())
+    if not made:
+        return {}
+    shown = {p.id: ((p.label or "").strip() or (p.name or "").strip() or "its provider")
+             for p in db.query(SsoProvider).filter(SsoProvider.id.in_({pid for _uid, pid in made})).all()}
+    notes = {}
+    for user_id, provider_id in made:
+        through = shown.get(provider_id, "its provider")
+        notes[user_id] = (
+            f"{never[user_id].username} was made at its first sign-in through {through} and has never had a "
+            f"password. With one, this account keeps a password from now on, also if {through} later stops "
+            "letting the accounts it makes set one.")
+    return notes
+
+
 def held_by_a_password_less_provider(db, user) -> bool:
     """Whether ``user`` is linked to a provider whose people hold no password at all: the one case in which an
     account that signs in only through its provider cannot be given a standing that needs a password."""
