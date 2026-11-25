@@ -32,6 +32,7 @@ from app.core import fixed_step_up, sso_presets, sso_settings
 from app.core.database import get_db
 from app.core.models import SsoProvider, User
 from app.services import sso_group_mappings as mappings
+from app.services import sso_groups
 from app.services import sso_providers as providers
 
 router = APIRouter(tags=["Single sign-on administration"])
@@ -626,6 +627,16 @@ def _mapping_record(row, shown: dict, **more) -> dict:
             "department": department.get("name"), "role": shown["role"], **more}
 
 
+def _said_of_who_may_leave(leaving: list, row) -> str:
+    """The sentence of a mapping's notice for the people a sign-in may now take out of a department, or ""."""
+    said = ""
+    for one in leaving:
+        said += (f" {one['accounts']} account(s) linked to {row.name} are in the department "
+                 f"{one['department']['name']} now: each leaves it at its next sign-in through the provider unless "
+                 "that sign-in names a group mapped to it.")
+    return said
+
+
 def _mapping_words(shown: dict) -> str:
     """What a mapping gives, in words, for the administrators' notice."""
     gives = []
@@ -654,7 +665,12 @@ def add_group_mapping(provider_id: str, body: Dict[str, Any], request: Request,
                       current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """Map a group of the provider, named exactly as the provider sends it, to a department, a role, or both. It
     applies from the next sign-in through the provider. The administrator role is mapped only while the provider
-    may raise administrator requests and its people can hold a password."""
+    may raise administrator requests and its people can hold a password.
+
+    A department that has members already follows the provider's groups from now on: a linked account in it
+    leaves it at its next sign-in through the provider unless that sign-in names a group mapped to it. The answer
+    (``may_leave``) and the administrators' notice say how many such accounts there are. An administrator mapping
+    demotes nobody it did not approve."""
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
@@ -673,22 +689,28 @@ def add_group_mapping(provider_id: str, body: Dict[str, Any], request: Request,
         shown = mappings.public(db, row, mapping)
         _record(db, "sso_group_mapping_added", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
                 details=_mapping_record(row, shown))
+        touched = [mapping.department_id]
         db.commit()
     except (providers.Invalid, providers.Conflict) as exc:
         db.rollback()
         raise _refused(exc)
+    leaving = sso_groups.may_leave(db, row, touched)
     _tell_administrators(current_user.username, "A single sign-on group was mapped", (
         f"{current_user.username} mapped the group {shown['provider_group']} of the single sign-on provider "
-        f"{row.name} to {_mapping_words(shown)}. It applies from each person's next sign-in through the provider."))
-    return {"mapping": shown}
+        f"{row.name} to {_mapping_words(shown)}. It applies from each person's next sign-in through the provider."
+        + _said_of_who_may_leave(leaving, row)))
+    return {"mapping": shown, "may_leave": leaving}
 
 
 @router.patch("/admin/sso/providers/{provider_id}/group-mappings/{mapping_id}")
 def change_group_mapping(provider_id: str, mapping_id: str, body: Dict[str, Any], request: Request,
                          current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
     """Change a mapping: its group, its department, its role. A department or a role sent as null is taken away;
-    a mapping keeps at least one of the two. People who joined a department through it are not moved: the next
-    sign-in of each applies the mapping as it is then."""
+    a mapping keeps at least one of the two. Nobody is moved by the change itself: the next sign-in of each person
+    applies the mappings as they are then. A linked account in a department that a mapping still names leaves it
+    at that sign-in unless the token names a group mapped to it; the answer (``may_leave``) and the notice say how
+    many such accounts there are, for the department the mapping had and for the one it has now. An administrator
+    approved through the group the mapping had keeps the role."""
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
@@ -707,7 +729,9 @@ def change_group_mapping(provider_id: str, mapping_id: str, body: Dict[str, Any]
         db.rollback()
         raise HTTPException(status_code=404, detail="Unknown group mapping.")
     try:
+        touched = [mapping.department_id]
         changes = mappings.change(db, row, mapping, fields, fresh=True)
+        touched.append(mapping.department_id)
         shown = mappings.public(db, row, mapping)
         if changes:
             _record(db, "sso_group_mapping_changed", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
@@ -716,20 +740,24 @@ def change_group_mapping(provider_id: str, mapping_id: str, body: Dict[str, Any]
     except (providers.Invalid, providers.Conflict) as exc:
         db.rollback()
         raise _refused(exc)
+    leaving = sso_groups.may_leave(db, row, touched)
     if changes:
         _tell_administrators(current_user.username, "A single sign-on group mapping was changed", (
             f"{current_user.username} changed how the group {shown['provider_group']} of the single sign-on provider "
             f"{row.name} is mapped: it now gives {_mapping_words(shown)}. It applies from each person's next "
-            "sign-in through the provider."))
-    return {"mapping": shown, "changed": sorted(changes)}
+            "sign-in through the provider." + _said_of_who_may_leave(leaving, row)))
+    return {"mapping": shown, "changed": sorted(changes), "may_leave": leaving}
 
 
 @router.delete("/admin/sso/providers/{provider_id}/group-mappings/{mapping_id}")
 def remove_group_mapping(provider_id: str, mapping_id: str, request: Request,
                          current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
-    """Remove a mapping. Nobody is changed by it: a person who joined a department through it stays until an
-    administrator takes them out, and a role it gave stays. A request for the administrator role it opened can no
-    longer be approved."""
+    """Remove a mapping. Nobody is changed by the removal itself, and a role it gave stays: an administrator
+    approved through its group keeps the role. A department no other mapping of the provider names is no longer
+    touched by a sign-in, and its members stay until an administrator takes them out. One that another mapping
+    still names goes on following the provider's groups: a linked account in it leaves it at its next sign-in
+    unless the token names a group still mapped to it, and the answer (``may_leave``) and the notice say how many
+    such accounts there are. A request for the administrator role it opened can no longer be approved."""
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
@@ -743,11 +771,15 @@ def remove_group_mapping(provider_id: str, mapping_id: str, request: Request,
     shown = mappings.public(db, row, mapping)
     _record(db, "sso_group_mapping_removed", user=current_user, ip=api.get_client_ip(request), row_id=row.id,
             details=_mapping_record(row, shown))
+    touched = [mapping.department_id]
     db.delete(mapping)
     db.commit()
+    leaving = sso_groups.may_leave(db, row, touched)
     _tell_administrators(current_user.username, "A single sign-on group mapping was removed", (
         f"{current_user.username} removed the mapping of the group {shown['provider_group']} of the single sign-on "
         f"provider {row.name} (it gave {_mapping_words(shown)}). Nobody's department or role was changed by that."
         + (" A request for the administrator role it opened can no longer be approved."
-           if shown["role"] == "admin" else "")))
-    return {"removed": True, "mapping": shown}
+           if shown["role"] == "admin" else "")
+        + (" Another group is still mapped to the department." + _said_of_who_may_leave(leaving, row)
+           if leaving else "")))
+    return {"removed": True, "mapping": shown, "may_leave": leaving}

@@ -612,7 +612,7 @@ def test_a_stale_approval_demotes_nobody_made_an_administrator_since(monkeypatch
     # The approval of another provider's mapping does not count for this one.
     h.db.rows_of(AdminGrant).clear()
     _grant(h, bob, decided + timedelta(seconds=1), granted_by_id=root.id)
-    _request_for(h, q, bob, state="approved", decided_by=root.id, decided_at=decided)
+    _request_for(h, q, bob, state="approved", decided_by=root.id, decided_at=decided, provider_group="admins-q")
     _sign_in(h, q, sub="s-q", groups=["nothing"])            # q's approval, q's token lacks the group: q demotes
     assert bob.role == RoleEnum.USER and len(h.role_sets) == 1
     # An external mapping present and no user mapping: the demotion lands on external.
@@ -626,3 +626,126 @@ def test_a_stale_approval_demotes_nobody_made_an_administrator_since(monkeypatch
     _grant(h, carol, decided + timedelta(seconds=1), granted_by_id=root.id)
     _sign_in(h, p, sub="s-carol", groups=["ext"])
     assert carol.role == RoleEnum.EXTERNAL and h.role_sets[-1] == ("carol", "external", None)
+
+
+def _approved_administrator(h, p, who, root, through):
+    """``who`` as an approved request of ``p`` made them an administrator, through the group ``through``."""
+    decided = datetime.utcnow() - timedelta(days=10)
+    approval = _request_for(h, p, who, state="approved", decided_by=root.id, decided_at=decided, provider_group=through)
+    _grant(h, who, decided + timedelta(seconds=1), granted_by_id=root.id)
+    return approval
+
+
+def test_removing_one_of_two_administrator_mappings_demotes_nobody_it_approved(monkeypatch):
+    """Two groups are mapped to the administrator role. Bob was approved through one of them, and that mapping
+    is removed: the removal says a role it gave stays. Bob's next sign-in demoted him all the same, because some
+    administrator mapping remained and his token named no group mapped to the role."""
+    from app.core.models import RoleEnum, SsoGroupMapping
+    bob, root = _user("bob", role="admin"), _user("root", role="admin")
+    p = _provider(policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, root], [p], identities=[_identity(bob, p)])
+    through = h.mapping(p, "vault-admins", role="admin")
+    h.mapping(p, "it-admins", role="admin")
+    approval = _approved_administrator(h, p, bob, root, "vault-admins")
+    h.db.rows_of(SsoGroupMapping).remove(through)
+    for groups in (["vault-admins"], ["staff"], []):
+        _sign_in(h, p, groups=groups)
+        assert bob.role == RoleEnum.ADMIN and h.role_sets == [] and h.lost == [], groups
+    assert approval.state == "approved"
+    # The group mapped again: the approval is that group's, and leaving it demotes as it always did.
+    h.mapping(p, "vault-admins", role="admin")
+    _sign_in(h, p, groups=["staff"])
+    assert bob.role == RoleEnum.USER and approval.state == "demoted"
+
+
+def test_an_administrator_mapping_added_later_demotes_nobody_it_did_not_approve(monkeypatch):
+    """The only administrator mapping is removed, and Bob keeps the role, as promised. Months later another
+    group is mapped to the role. Bob is not in it, and his next sign-in demoted him: the new mapping took back a
+    role it never gave."""
+    from app.core.models import RoleEnum, SsoGroupMapping
+    bob, root = _user("bob", role="admin"), _user("root", role="admin")
+    p = _provider(policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, root], [p], identities=[_identity(bob, p)])
+    only = h.mapping(p, "vault-admins", role="admin")
+    _approved_administrator(h, p, bob, root, "vault-admins")
+    h.db.rows_of(SsoGroupMapping).remove(only)
+    _sign_in(h, p, groups=["vault-admins"])
+    assert bob.role == RoleEnum.ADMIN
+    h.mapping(p, "security-admins", role="admin")
+    for groups in (["vault-admins"], ["staff"]):
+        _sign_in(h, p, groups=groups)
+        assert bob.role == RoleEnum.ADMIN and h.role_sets == [] and h.lost == [], groups
+    # A mapping whose group was renamed is the same: the group Bob was approved through is mapped no more.
+    from app.services import sso_groups
+    assert sso_groups.approved_through(h.db, bob, p) == "vault-admins"
+    assert sso_groups.made_administrator_through(h.db, bob, p) is True
+    assert sso_groups.approved_through(h.db, root, p) is None and sso_groups.made_administrator_through(h.db, root, p) is False
+
+
+def test_an_administrator_in_another_group_mapped_to_the_role_keeps_it(monkeypatch):
+    """Approved through one group and since moved to another that is mapped to the role too: the token names a
+    group mapped to the role, and the role is kept, as before."""
+    from app.core.models import RoleEnum
+    bob, root = _user("bob", role="admin"), _user("root", role="admin")
+    p = _provider(policy={"sso_admin_mapping": True})
+    h = Grouping(monkeypatch, [bob, root], [p], identities=[_identity(bob, p)])
+    h.mapping(p, "vault-admins", role="admin")
+    h.mapping(p, "it-admins", role="admin")
+    _approved_administrator(h, p, bob, root, "vault-admins")
+    _sign_in(h, p, groups=["it-admins"])
+    assert bob.role == RoleEnum.ADMIN and h.role_sets == []
+    _sign_in(h, p, groups=["staff"])
+    assert bob.role == RoleEnum.USER
+
+
+def test_a_department_follows_the_groups_still_mapped_to_it(monkeypatch):
+    """Engineering is mapped from two groups, and Alice joined through one of them. That mapping is removed. The
+    department is still named by the other, so it goes on following the provider's groups: Alice's next sign-in,
+    which names only the group no longer mapped, takes her out. (The removal says how many accounts that may
+    be.) Once no mapping names the department, a sign-in leaves it alone."""
+    from app.core.models import SsoGroupMapping
+    alice = _user("alice")
+    p = _provider()
+    h = Grouping(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    engineering = h.department("Engineering")
+    eng = h.mapping(p, "eng", engineering)
+    contractors = h.mapping(p, "eng-contractors", engineering)
+    _sign_in(h, p, groups=["eng"])
+    assert _names(alice.groups) == ["Engineering"]
+    h.db.rows_of(SsoGroupMapping).remove(eng)
+    _sign_in(h, p, groups=["eng"])
+    assert _names(alice.groups) == []
+    # No mapping names it: an administrator's own choice of members is not touched.
+    h.department("Legal", alice)
+    h.db.rows_of(SsoGroupMapping).remove(contractors)
+    _sign_in(h, p, groups=["eng"])
+    assert _names(alice.groups) == ["Legal"]
+
+
+def test_how_many_linked_accounts_are_in_a_department_is_one_count_of_active_accounts(tmp_path):
+    """The count a mapping's write gives: accounts linked to the provider, able to sign in, that are in the
+    department. Not somebody linked to another provider, not a member who is not linked, not an account that is
+    turned off (it signs in nowhere), and an account linked twice once."""
+    import sqlalchemy as sa
+    from sqlalchemy.orm import sessionmaker
+    from app.services import sso_groups
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'members.db'}")
+    p, q, finance, legal = (uuid.uuid4() for _ in range(4))
+    people = {name: uuid.uuid4() for name in ("ann", "ben", "cy", "dee", "eve")}
+    with sessionmaker(bind=engine)() as db:
+        db.execute(sa.text("CREATE TABLE users (id CHAR(32) PRIMARY KEY, is_active BOOLEAN)"))
+        db.execute(sa.text("CREATE TABLE external_identities (id CHAR(32) PRIMARY KEY, user_id CHAR(32), provider_id CHAR(32))"))
+        db.execute(sa.text("CREATE TABLE user_groups (user_id CHAR(32), group_id CHAR(32))"))
+        for name, uid in people.items():
+            db.execute(sa.text("INSERT INTO users VALUES (:id, :on)"), {"id": uid.hex, "on": name != "dee"})
+        for name, provider in (("ann", p), ("ann", p), ("ben", p), ("cy", q), ("dee", p)):
+            db.execute(sa.text("INSERT INTO external_identities VALUES (:id, :u, :p)"),
+                       {"id": uuid.uuid4().hex, "u": people[name].hex, "p": provider.hex})
+        for name, group in (("ann", finance), ("ben", legal), ("cy", finance), ("dee", finance), ("eve", finance)):
+            db.execute(sa.text("INSERT INTO user_groups VALUES (:u, :g)"), {"u": people[name].hex, "g": group.hex})
+        db.commit()
+        row = types.SimpleNamespace(id=p)
+        assert sso_groups.linked_members(db, row, finance) == 1          # ann, once; not cy, dee or eve
+        assert sso_groups.linked_members(db, row, legal) == 1            # ben
+        assert sso_groups.linked_members(db, types.SimpleNamespace(id=q), finance) == 1     # cy
+        assert sso_groups.linked_members(db, row, uuid.uuid4()) == 0

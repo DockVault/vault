@@ -472,3 +472,99 @@ def test_the_three_records_are_catalogued_with_the_other_provider_changes():
     for key in ("mapping_id", "department", "provider_group", "group_id", "role", "name", "provider_id", "changed"):
         assert audit_privacy.kind_of(key) == audit_privacy.IDENTIFIER, key
     assert audit_privacy.kind_of("changes.department") == audit_privacy.IDENTIFIER
+
+
+def _members(monkeypatch, counts):
+    """``counts``: department id -> how many accounts linked to the provider are in it."""
+    from app.services import sso_groups
+    asked = []
+
+    def linked_members(db, row, department_id):
+        asked.append(department_id)
+        return counts.get(department_id, 0)
+    monkeypatch.setattr(sso_groups, "linked_members", linked_members)
+    return asked
+
+
+def test_a_mapping_added_to_a_department_with_members_says_how_many_may_leave_it(monkeypatch):
+    """An administrator put people in Finance by hand. A group of the provider is then mapped to Finance: from now
+    on the department follows the provider's groups, and a linked account in it leaves at its next sign-in unless
+    the token names the group. The route said only "it applies from each person's next sign-in"."""
+    h = Mappings(monkeypatch)
+    finance, legal = h.department("Finance"), h.department("Legal")
+    asked = _members(monkeypatch, {finance.id: 3})
+    status, out = h.add(provider_group="fin", department_id=str(finance.id))
+    assert status == 201 and out["may_leave"] == [
+        {"department": {"id": str(finance.id), "name": "Finance"}, "accounts": 3}], out
+    assert asked == [finance.id]
+    assert h.told[-1][2] == (
+        "root mapped the group fin of the single sign-on provider contoso to the department Finance. It applies "
+        "from each person's next sign-in through the provider. 3 account(s) linked to contoso are in the department "
+        "Finance now: each leaves it at its next sign-in through the provider unless that sign-in names a group "
+        "mapped to it.")
+    # Nobody linked in it, or a role alone: nothing to say.
+    status, out = h.add(provider_group="law", department_id=str(legal.id))
+    assert status == 201 and out["may_leave"] == [] and h.told[-1][2].endswith("next sign-in through the provider.")
+    status, out = h.add(provider_group="staff", role="user")
+    assert status == 201 and out["may_leave"] == [] and h.told[-1][2].endswith("next sign-in through the provider.")
+
+
+def test_a_removal_says_who_may_leave_a_department_another_mapping_still_names(monkeypatch):
+    """Finance is mapped from two groups. One mapping is removed. "Nobody's department was changed by that" holds
+    for the removal, and no further: the department is still mapped, so a linked member whose next sign-in names
+    only the removed group leaves it. Said nowhere, the notice promised that nobody would move."""
+    h = Mappings(monkeypatch)
+    finance = h.department("Finance")
+    first = h.add(provider_group="fin", department_id=str(finance.id))[1]["mapping"]["id"]
+    second = h.add(provider_group="fin-contractors", department_id=str(finance.id))[1]["mapping"]["id"]
+    _members(monkeypatch, {finance.id: 5})
+    status, out = h.call("DELETE", f"{h.path}/{first}")
+    assert status == 200 and out["may_leave"] == [
+        {"department": {"id": str(finance.id), "name": "Finance"}, "accounts": 5}], out
+    assert h.told[-1][2] == (
+        "root removed the mapping of the group fin of the single sign-on provider contoso (it gave the department "
+        "Finance). Nobody's department or role was changed by that. Another group is still mapped to the "
+        "department. 5 account(s) linked to contoso are in the department Finance now: each leaves it at its next "
+        "sign-in through the provider unless that sign-in names a group mapped to it.")
+    # The last mapping that names the department: a sign-in no longer touches it, and nobody is counted.
+    status, out = h.call("DELETE", f"{h.path}/{second}")
+    assert status == 200 and out["may_leave"] == []
+    assert h.told[-1][2].endswith("(it gave the department Finance). Nobody's department or role was changed by that.")
+
+
+def test_a_change_says_who_may_leave_the_department_it_had_and_the_one_it_has(monkeypatch):
+    h = Mappings(monkeypatch)
+    finance, legal = h.department("Finance"), h.department("Legal")
+    mapping = h.add(provider_group="fin", department_id=str(finance.id))[1]["mapping"]["id"]
+    h.add(provider_group="fin-2", department_id=str(finance.id))
+    asked = _members(monkeypatch, {finance.id: 4, legal.id: 2})
+    # The group is renamed: the department follows the new name.
+    status, out = h.call("PATCH", f"{h.path}/{mapping}", {"provider_group": "finance"})
+    assert status == 200 and out["changed"] == ["provider_group"]
+    assert out["may_leave"] == [{"department": {"id": str(finance.id), "name": "Finance"}, "accounts": 4}]
+    assert asked == [finance.id]                       # one department touched, counted once
+    assert h.told[-1][2].endswith("4 account(s) linked to contoso are in the department Finance now: each leaves it "
+                                  "at its next sign-in through the provider unless that sign-in names a group mapped "
+                                  "to it.")
+    # Moved to another department: the one it had is still named by another mapping, and the one it has is named now.
+    status, out = h.call("PATCH", f"{h.path}/{mapping}", {"department_id": str(legal.id)})
+    assert status == 200 and out["may_leave"] == [
+        {"department": {"id": str(finance.id), "name": "Finance"}, "accounts": 4},
+        {"department": {"id": str(legal.id), "name": "Legal"}, "accounts": 2}], out
+    # Nothing changed: nothing is counted or said.
+    del asked[:]
+    told = len(h.told)
+    status, out = h.call("PATCH", f"{h.path}/{mapping}", {"department_id": str(legal.id)})
+    assert status == 200 and out["changed"] == [] and "may_leave" not in out and asked == [] and len(h.told) == told
+
+
+def test_a_count_that_cannot_be_made_holds_up_no_change(monkeypatch):
+    from app.services import sso_groups
+    h = Mappings(monkeypatch)
+    finance = h.department("Finance")
+
+    def down(db, row, department_id):
+        raise RuntimeError("down")
+    monkeypatch.setattr(sso_groups, "linked_members", down)
+    status, out = h.add(provider_group="fin", department_id=str(finance.id))
+    assert status == 201 and out["may_leave"] == [] and len(h.stored()) == 1

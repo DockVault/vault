@@ -8,9 +8,11 @@ of ``user`` or ``external`` applies at once (an administrator is never demoted b
 by a sign-in: with the provider's ``sso_admin_mapping`` on, a **held request** (``sso_admin_requests``) is opened
 for another administrator to approve, under the approver rules of the credential changes with no requester, and
 on approval the promotion path records the grant with the approver as the grantor. An administrator made that way
-who leaves the mapped group is demoted at the next sign-in through the provider, except the last administrator
-able to act. Nothing here commits: :func:`apply` writes in the caller's transaction, :func:`tell` records and
-notifies after the commit.
+is demoted at the next sign-in through the provider whose token names no group mapped to the administrator role,
+while the group they were approved through is still mapped to it; never the last administrator able to act. Once
+that group's mapping is removed or changed, the role is nobody's to take back through the provider: it stays, as
+the removal says, and a mapping added later demotes nobody it did not approve. Nothing here commits:
+:func:`apply` writes in the caller's transaction, :func:`tell` records and notifies after the commit.
 """
 from __future__ import annotations
 
@@ -112,10 +114,14 @@ def apply(db, row, user, answer) -> Applied:
     if leaves:
         _leave(db, user, leaves, applied)
     roles = {m.role for m in mappings if m.role and m.provider_group in present}
+    admin_groups = {m.provider_group for m in mappings if m.role == "admin"}
     admin_group = next((m.provider_group for m in mappings if m.role == "admin" and m.provider_group in present), None)
-    maps_admin = any(m.role == "admin" for m in mappings)
     if getattr(user, "role", None) == RoleEnum.ADMIN:
-        if maps_admin and admin_group is None and made_administrator_through(db, user, row):
+        # Demoted only through the group the person was approved through, while it is still mapped to the role.
+        # Asked of any administrator mapping at all, removing one of two mappings demoted the people approved
+        # through it at their next sign-in, and so did a mapping added months after theirs was removed, while the
+        # removal had said that a role it gave stays.
+        if admin_group is None and approved_through(db, user, row) in admin_groups:
             _demote(db, row, user, roles, applied)
         return applied
     if admin_group is not None and policy["sso_admin_mapping"] and not _providers_without_passwords(db, user):
@@ -247,17 +253,18 @@ def _approvals_of(db, user, row) -> list:
                                             SsoAdminRequest.state == APPROVED).all()
 
 
-def made_administrator_through(db, user, row) -> bool:
-    """Whether ``user``'s administrator role is the one an approved request of this provider's mapping granted: the
-    approval stands, and the account's current grant record is that approval's (made by its approver, at or after
-    the decision). One made by hand since, or by another provider's mapping, keeps the role."""
+def approved_through(db, user, row) -> Optional[str]:
+    """The provider's group ``user`` was approved through, when the account's administrator role is the one an
+    approved request of this provider's mapping granted: the approval stands, and the account's current grant
+    record is that approval's (made by its approver, at the decision). None otherwise: a role made by hand
+    since, or by another provider's mapping, is not this provider's to take back."""
     from app.core import admin_grants
     approvals = _approvals_of(db, user, row)
     if not approvals:
-        return False
+        return None
     grant = admin_grants.of(db, [user.id]).get(user.id)
     if grant is None:
-        return False
+        return None
     for r in approvals:
         if r.decided_by is None or r.decided_at is None or grant.granted_at is None:
             continue
@@ -265,8 +272,51 @@ def made_administrator_through(db, user, row) -> bool:
         # The approval records the grant at the decision's moment; a grant made by hand later, even by the same
         # administrator, is another decision and keeps the role.
         if str(getattr(grant, "granted_by_id", None)) == str(r.decided_by) and since <= GRANT_MATCH_SECONDS:
-            return True
-    return False
+            return r.provider_group
+    return None
+
+
+def made_administrator_through(db, user, row) -> bool:
+    """Whether ``user``'s administrator role is the one an approved request of this provider's mapping granted."""
+    return approved_through(db, user, row) is not None
+
+
+# --------------------------------------------------------------------------- whom a change of the mappings may move
+
+def linked_members(db, row, department_id) -> int:
+    """How many accounts that can sign in (active) are linked to ``row`` and in the department now. One count."""
+    from sqlalchemy import func, select
+    from app.core.models import ExternalIdentity, User, user_groups
+    linked = (select(ExternalIdentity.user_id).join(User, User.id == ExternalIdentity.user_id)
+              .where(ExternalIdentity.provider_id == row.id, User.is_active.is_(True)))
+    counted = select(func.count()).select_from(user_groups).where(
+        user_groups.c.group_id == department_id, user_groups.c.user_id.in_(linked))
+    return int(db.execute(counted).scalar() or 0)
+
+
+def may_leave(db, row, department_ids) -> list:
+    """For the departments a write touched: those a mapping of ``row`` names now, with how many linked accounts are
+    in each, as ``[{"department": {"id", "name"}, "accounts": n}]``. Each of those accounts leaves the department
+    at its next sign-in through the provider unless that sign-in names a group mapped to it. A department no
+    mapping names any more is left out (a sign-in no longer touches it), and so is one with nobody linked in it.
+    Read as the mappings are committed. A count that cannot be made says nothing, and holds up nothing."""
+    from app.core.models import Group
+    try:
+        from app.services import sso_group_mappings
+        named = {m.department_id for m in sso_group_mappings.of(db, row, fresh=True)
+                 if m.department_id is not None}
+        out = []
+        for department_id in dict.fromkeys(d for d in department_ids if d is not None):
+            if department_id not in named:
+                continue
+            accounts = linked_members(db, row, department_id)
+            department = db.query(Group).filter(Group.id == department_id).first()
+            if accounts and department is not None:
+                out.append({"department": {"id": str(department.id), "name": department.name}, "accounts": accounts})
+        return out
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        return []
 
 
 # --------------------------------------------------------------------------- after the commit

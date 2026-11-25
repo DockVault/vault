@@ -13,8 +13,14 @@ gives it a department, a role, or both:
   which an administrator needs: on a provider whose people hold none, no request would ever be raised, and the
   save says what to change instead of keeping a mapping that does nothing.
 
-Removing a mapping changes nobody: a person who joined a department through it stays until an administrator takes
-them out, and a role it gave stays. A request an administrator mapping opened can no longer be approved once the
+Removing a mapping changes nobody when it is removed, and a role it gave stays: an administrator approved through
+its group keeps the role, whatever is mapped to the role later. A department follows the groups still mapped to
+it. While another mapping of the provider names the department, a person in it stays only as long as their
+sign-ins through the provider name one of those groups, and leaves it at the first that names none; once no
+mapping names it, a sign-in no longer touches it, and its members stay until an administrator takes them out. The
+same holds when a mapping is added to a department that has members already, and when a mapping's group or
+department is changed. Each of the three writes says how many accounts linked to the provider are in such a
+department (app/services/sso_groups.py, may_leave). A request an administrator mapping opened can no longer be approved once the
 mapping is gone (app/services/sso_groups.py, decision_refusal).
 
 A route judges a write twice: before it asks the administrator for anything, and again once it holds the provider's
