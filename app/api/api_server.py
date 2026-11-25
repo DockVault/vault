@@ -12273,6 +12273,26 @@ def _passkey_raw_id(credential) -> Optional[bytes]:
     return _passkey_b64url_decode(credential.get("rawId")) if isinstance(credential, dict) else None
 
 
+SIGN_COUNT_REGRESSED = "sign_count_regressed"
+
+
+def _passkey_may_have_been_copied(db, user, request, what: str) -> None:
+    """A device-bound passkey was refused because its counter went backwards: a copy of the key was used in
+    between, or this is the copy. Recorded as an event of its own and told to the owner, wherever the key was
+    presented (``what``: "A sign-in", "A step-up"): by itself, as the second step after the password, or for a
+    step-up. Said only for the first of these, the warning never reached an administrator, who always types the
+    password first: the owner whose key was copied saw "That passkey was not accepted" and nothing else."""
+    _passkey_audit(db, user, request, "passkey_sign_count_regressed", {"reason": SIGN_COUNT_REGRESSED},
+                   status="failure")
+    try:
+        _notify_users([str(user.id)], "security", title="A passkey may have been copied",
+                      body=(f"{what} with one of your passkeys was refused because its counter went backwards, "
+                            "which can mean the key was copied. Review your passkeys and remove any you do not "
+                            "recognize."), target="#profile")
+    except Exception as e:      # noqa: BLE001
+        print(f"⚠ passkey notice skipped: {type(e).__name__}")
+
+
 async def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str, record: bool = True):
     """The generic refusal of a passkey sign-in: an audit row (naming the account only when a known key named
     it), the security monitor's counter, and, for a known key whose own proof failed (``record``), the lockouts'
@@ -12293,15 +12313,7 @@ async def _passkey_sign_in_refused(db, request, client_ip, *, user, reason: str,
         except Exception:      # noqa: BLE001 -- the count is best-effort; the refusal stands
             db.rollback()
     if user is not None and reason.endswith("sign_count_regressed"):
-        _passkey_audit(db, user, request, "passkey_sign_count_regressed", {"reason": "sign_count_regressed"},
-                       status="failure")
-        try:
-            _notify_users([str(user.id)], "security", title="A passkey may have been copied",
-                          body=("A sign-in with one of your passkeys was refused because its counter went backwards, "
-                                "which can mean the key was copied. Review your passkeys and remove any you do not "
-                                "recognize."), target="#profile")
-        except Exception as e:      # noqa: BLE001
-            print(f"⚠ passkey notice skipped: {type(e).__name__}")
+        _passkey_may_have_been_copied(db, user, request, "A sign-in")
     # Awaited in the offload pool, as the password door does: the brute-force counter must advance on every
     # refusal and is never shed under a spray.
     await run_offloaded(_record_failed_login_bg, username, client_ip, reason, record_id)
@@ -12550,6 +12562,8 @@ def _passkey_step_up_factor(db, user, request, body) -> str:
         row, assertion = _passkey_assert(db, user, purpose="step_up", challenge_id=body.challenge_id,
                                          credential=body.credential, policy=policy)
     except ws.Refused as refused:
+        if refused.code == SIGN_COUNT_REGRESSED:
+            _passkey_may_have_been_copied(db, user, request, "A step-up")
         raise _refuse(refused.code, "That passkey was not accepted.")
     if compliance:
         now = datetime.utcnow()
@@ -12653,6 +12667,8 @@ async def passkey_second_factor_verify(
                                                       details={"method": "passkey", "reason": refused.code})
         except Exception:  # noqa: BLE001
             pass
+        if refused.code == SIGN_COUNT_REGRESSED:
+            _passkey_may_have_been_copied(db, user, request, "A sign-in")
         raise HTTPException(status_code=401, detail="That passkey was not accepted.")
     method = sign_in.SOFTWARE_KEY if row.backup_eligible else sign_in.HARDWARE_KEY
     outcome = sign_in.finish(db, sign_in.SignInResult(

@@ -375,3 +375,74 @@ def test_the_fixed_policies_know_a_passkey():
         "password": False, "otp": True, "must_enroll": False}
     assert pol.resolve_fixed_requirement(pol.POLICY_FACTOR_WHEN_ENROLLED, active_method=None) == {
         "password": False, "otp": False, "must_enroll": False}
+
+
+def _told(monkeypatch, h):
+    notices = []
+    monkeypatch.setattr(h.S, "_notify_users", lambda ids, ntype, title=None, body=None, target=None, dedup_prefix=None: (
+        notices.append((list(ids), ntype, title, body)) or list(ids)))
+    return notices
+
+
+def _regressions(h):
+    return [a for a in h.audits if a[0] == "action" and a[1] == "passkey_sign_count_regressed"]
+
+
+def test_a_counter_that_went_backwards_at_the_second_step_tells_the_owner(monkeypatch):
+    """Whoever copied a device-bound key and knows the password signs in with both, and the vault records the
+    copy's counter. The owner's next sign-in, password and then the real key, is refused: its counter is lower.
+    That refusal is the check doing its work, and it told the owner nothing but "That passkey was not accepted":
+    the warning and its record were written only where a passkey signs in alone, which an administrator never
+    does. Both are written at the second step too; another refusal there warns of no copy."""
+    alice = _user()
+    h = Harness(monkeypatch, [alice])
+    notices = _told(monkeypatch, h)
+    auth, row = h.enroll(alice, sign_count=9)
+    pending, headers = h.pending_for(alice)
+    status, body = _call_h(h.S, "POST", "/auth/second-factor/passkey/options", None, headers)
+    credential = auth.get_assertion(body["options"], ORIGIN, sign_count=3)
+    status, out = _call_h(h.S, "POST", "/auth/second-factor/passkey/verify",
+                          {"challenge_id": body["challenge_id"], "credential": credential}, headers)
+    assert status == 401 and out == {"detail": "That passkey was not accepted."} and pending.attempts == 1
+    assert len(_regressions(h)) == 1
+    (ids, kind, title, said), = notices
+    assert ids == [str(alice.id)] and kind == "security" and title == "A passkey may have been copied"
+    assert said.startswith("A sign-in with one of your passkeys was refused because its counter went backwards")
+    assert row.sign_count == 9                               # the stored counter is not lowered by the refusal
+    # A signature that does not verify is a wrong answer, and no sign of a copy.
+    del notices[:], h.audits[:]
+    status, body = _call_h(h.S, "POST", "/auth/second-factor/passkey/options", None, headers)
+    credential = auth.get_assertion(body["options"], ORIGIN, sign_count=12, bad_signature=True)
+    status, out = _call_h(h.S, "POST", "/auth/second-factor/passkey/verify",
+                          {"challenge_id": body["challenge_id"], "credential": credential}, headers)
+    assert status == 401 and notices == [] and _regressions(h) == []
+
+
+def test_a_counter_that_went_backwards_at_a_step_up_tells_the_owner(monkeypatch):
+    alice = _user()
+    h = Harness(monkeypatch, [alice])
+    notices = _told(monkeypatch, h)
+    auth, row = h.enroll(alice, sign_count=9)
+    status, body = h.step_up_with_passkey(auth, "account.second_factor", sign_count=3)
+    assert status == 403 and body == {"detail": "That passkey was not accepted."}, body
+    assert len(_regressions(h)) == 1
+    (ids, kind, title, said), = notices
+    assert ids == [str(alice.id)] and title == "A passkey may have been copied"
+    assert said.startswith("A step-up with one of your passkeys was refused because its counter went backwards")
+    # Another refusal of a step-up (no user verification) warns of no copy.
+    del notices[:], h.audits[:]
+    status, body = h.step_up_with_passkey(auth, "account.second_factor", flags=FLAG.UP, sign_count=12)
+    assert status == 403 and notices == [] and _regressions(h) == []
+
+
+def test_the_three_places_a_passkey_is_presented_warn_of_a_copy_through_one_helper():
+    import inspect
+    from _bare_api_env import set_bare_api_env
+    set_bare_api_env()
+    import app.api.api_server as S
+    source = inspect.getsource(S)
+    assert source.count('_passkey_may_have_been_copied(db, user, request, "A sign-in")') == 2      # alone, second step
+    assert source.count('_passkey_may_have_been_copied(db, user, request, "A step-up")') == 1
+    assert source.count('title="A passkey may have been copied"') == 1
+    assert source.count('"passkey_sign_count_regressed"') == 1
+    assert S.SIGN_COUNT_REGRESSED == "sign_count_regressed"
