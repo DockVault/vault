@@ -204,10 +204,10 @@ def test_no_reset_link_and_no_password_change_for_an_sso_only_account(monkeypatc
     import pytest as _pytest
     from fastapi import HTTPException
     with _pytest.raises(HTTPException) as refused:
-        S._refuse_sftp_password_for_sso_only(alice, True)              # the administrator's update asks the same
+        S._refuse_sftp_password_for_sso_only(h.db, alice, True)        # the administrator's update asks the same
     assert refused.value.status_code == 409
-    S._refuse_sftp_password_for_sso_only(alice, False)                  # turning it off is always allowed
-    S._refuse_sftp_password_for_sso_only(root, True)                    # an ordinary account may turn it on
+    S._refuse_sftp_password_for_sso_only(h.db, alice, False)            # turning it off is always allowed
+    S._refuse_sftp_password_for_sso_only(h.db, root, True)              # an ordinary account may turn it on
 
 
 def test_no_administrator_sets_a_password_on_or_promotes_an_sso_only_account(monkeypatch):

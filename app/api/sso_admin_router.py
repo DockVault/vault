@@ -223,8 +223,9 @@ def no_way_in_left(db, user, identity, settled=None) -> Optional[str]:
         # Another provider still holds the account to no password, and is not a way in now (off, or it refused
         # the person): a reset link would be refused for it.
         return (f"This is the only way {user.username} can sign in now: the account signs in only through its "
-                "providers, and no other provider it is linked to is on. Turn that provider on, or allow password "
-                "sign-in for it, first. To take the account's access away, turn the account off or delete it.")
+                "providers, and no other provider it is linked to is on. Turn that provider on, or "
+                f"{sso_only.password_remedy(db, user)}, first. To take the account's access away, turn the account "
+                "off or delete it.")
     return (f"This is the only way {user.username} can sign in: the account has no password anybody can type. "
             "Make a reset link for it first (Users), so that it can set a password, then unlink. To take the "
             "account's access away, turn the account off or delete it.")

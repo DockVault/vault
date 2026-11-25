@@ -133,8 +133,8 @@ def _describe(db, user):
 
 
 PROVIDER_ONLY = ("{name} signs in only through its organisation's provider and holds no password: a reset link "
-                 "would be refused when it is used, and no temporary password is set for it. An administrator "
-                 "allows password sign-in on the provider first (Settings, Sign-in), or turns the provider on.")
+                 "would be refused when it is used, and no temporary password is set for it. An administrator can "
+                 "{remedy} (Settings, Sign-in); until then the account signs in through its provider.")
 
 
 def linked_providers(db, user) -> list:
@@ -470,7 +470,8 @@ def _run(args, api) -> int:
             # the person told; a temporary password is refused where it is set. Said here, before anything is
             # written, in the words the web app uses for the same request.
             if getattr(user, "sso_only", False):
-                return _refuse(PROVIDER_ONLY.format(name=user.username))
+                from app.core import sso_only
+                return _refuse(PROVIDER_ONLY.format(name=user.username, remedy=sso_only.password_remedy(db, user)))
             if args.temporary_password or not pepper_ok(api._reset_pepper()):
                 from app.core.security import hash_password
                 secret = temporary_password()

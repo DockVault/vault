@@ -279,10 +279,11 @@ def test_an_administrators_unlink_that_would_leave_no_way_in_is_refused_with_wha
                         "a reset link for it first (Users), so that it can set a password, then unlink. To take "
                         "the account's access away, turn the account off or delete it.")
     else:
+        # The provider that holds the account to no password is named: the one whose setting to change.
         assert said == ("This is the only way dana can sign in now: the account signs in only through its "
                         "providers, and no other provider it is linked to is on. Turn that provider on, or allow "
-                        "password sign-in for it, first. To take the account's access away, turn the account off "
-                        "or delete it.")
+                        "password sign-in on fabrikam, first. To take the account's access away, turn the account "
+                        "off or delete it.")
     # Nothing was done: the identity is there, no session was ended, nothing was committed, recorded or told.
     assert identities[0] in h.identities() and ended == [] and ("commit",) not in h.db.log
     assert ("rollback",) in h.db.log and told == [] and owners == []

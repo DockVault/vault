@@ -228,6 +228,36 @@ def password_less_providers_of(db, user) -> List[str]:
     return names
 
 
+def password_remedy(db, user) -> str:
+    """What an administrator changes so that ``user``, which signs in only through its provider, may hold a
+    password: said wherever a password, a reset link or SFTP password sign-in is refused for it. Password sign-in
+    on a provider whose people hold none; for an account held only because a provider made it
+    (:data:`MADE_THROUGH_THE_PROVIDER`), that provider's setting for the accounts it makes. Every such refusal
+    said "allow password sign-in on the provider": for the second kind an administrator found it allowed already,
+    and nothing to change."""
+    from app.core.models import ExternalIdentity, SsoProvider
+    less, made = [], []
+    try:
+        for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
+            provider = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
+            if provider is None:
+                continue
+            name = (getattr(provider, "name", None) or "").strip() or "its provider"
+            if password_less(provider):
+                if name not in less:
+                    less.append(name)
+            elif holds_to_no_password(provider, user, getattr(identity, "linked_by", None)) and name not in made:
+                made.append(name)
+    except Exception:  # noqa: BLE001 -- the words of a refusal never stand in the refusal's way
+        less, made = [], []
+    if less:
+        return "allow password sign-in on " + " and ".join(less)
+    if made:
+        return ("let the accounts made through " + " and ".join(made)
+                + " set a password (its setting for the accounts it makes)")
+    return "allow password sign-in on its provider"
+
+
 def should_be_sso_only(db, user, *, also=None, also_by=None, without=None) -> bool:
     """The rule the flag follows: linked to at least one provider that holds the account to no password
     (:func:`holds_to_no_password`), and not an account that must keep a password of its own (an administrator, a

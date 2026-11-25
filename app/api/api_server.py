@@ -6519,9 +6519,13 @@ def _apply_credential_change(db, kind, target, payload, *, actor_id, actor_name,
     return result
 
 
-RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT = (
-    "This account signs in only through its organisation's provider and holds no password. Allow password "
-    "sign-in on the provider before sending a reset link.")
+def _no_reset_link_for_a_provider_only_account(db, account) -> HTTPException:
+    """The refusal of a reset link for an account that signs in only through its provider, with what would change
+    that for this account (app/core/sso_only.py, password_remedy)."""
+    from app.core import sso_only
+    return HTTPException(status_code=409, detail=(
+        "This account signs in only through its organisation's provider and holds no password, so no reset link "
+        f"is made for it; {sso_only.password_remedy(db, account)} first."))
 
 
 def _signs_in_only_through_its_provider_now(db, account) -> bool:
@@ -6552,9 +6556,10 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         if _signs_in_only_through_its_provider_now(db, target):
             # Held and approved later, or made at once: a password is never set on an account that signs in only
             # through its provider (app/core/sso_only.py); the provider's setting changes first.
+            from app.core import sso_only
             raise HTTPException(status_code=409, detail=(
-                "This account signs in only through its organisation's provider and holds no password; allow "
-                "password sign-in on the provider first."))
+                "This account signs in only through its organisation's provider and holds no password; "
+                f"{sso_only.password_remedy(db, target)} first."))
         from app.core import password_origin
         target.password_hash = payload["password_hash"]
         target.updated_at = datetime.now(timezone.utc)
@@ -6574,7 +6579,7 @@ def _make_credential_change(db, kind, target, payload, *, actor_id, actor_name, 
         # that signs in only through its provider. The link was refused as "invalid or expired" when the person
         # used it, after the change had been recorded and the person told to expect it.
         if _signs_in_only_through_its_provider_now(db, target):
-            raise HTTPException(status_code=409, detail=RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT)
+            raise _no_reset_link_for_a_provider_only_account(db, target)
         base_url = _public_base_url()
         # Made by another account (an administrator, or a user who manages users, or the administrator who
         # approved a held request): judged again when it is used. Not one the server's operator makes.
@@ -7744,7 +7749,7 @@ async def admin_send_reset_link(user_id: uuid.UUID, request: Request,
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     if getattr(user, "sso_only", False):
-        raise HTTPException(status_code=409, detail=RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT)
+        raise _no_reset_link_for_a_provider_only_account(db, user)
     _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not (user.email or "").strip():
         raise HTTPException(status_code=400, detail="That user has no email address to send a reset link to.")
@@ -7796,7 +7801,7 @@ async def admin_mint_reset_link(user_id: uuid.UUID, request: Request,
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     if getattr(user, "sso_only", False):
-        raise HTTPException(status_code=409, detail=RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT)
+        raise _no_reset_link_for_a_provider_only_account(db, user)
     _refuse_change_above_caller(db, current_user, user, what="reset_link")
     if not getattr(user, "is_active", True):
         raise HTTPException(status_code=400,
@@ -9776,14 +9781,15 @@ def _count_the_end_of_the_accounts_sessions(db, user_id) -> None:
         {User.sessions_ended: int(counted[0] or 0) + 1}, synchronize_session=False)
 
 
-def _refuse_sftp_password_for_sso_only(user, wanted) -> None:
+def _refuse_sftp_password_for_sso_only(db, user, wanted) -> None:
     """An account that signs in only through its identity provider holds no password of its own (app/core/sso_only.py),
     so its SFTP password sign-in cannot be turned on, by the account or by an administrator: SSH keys remain its way
     in over SFTP."""
     if wanted and getattr(user, "sso_only", False):
+        from app.core import sso_only
         raise HTTPException(status_code=409, detail=(
             "This account signs in only through its organisation's provider and has no password for SFTP either; "
-            "use an SSH key, or allow password sign-in on the provider first."))
+            f"use an SSH key, or {sso_only.password_remedy(db, user)} first."))
 
 
 def _revoke_sessions(db, *, user_id=None, temp_credential_id=None, actor_username="system",
@@ -11273,7 +11279,7 @@ async def update_own_account(
         user.sftp_enabled = body.sftp_enabled
         changes.append("sftp_enabled")
     if body.sftp_password_auth is not None and body.sftp_password_auth != user.sftp_password_auth:
-        _refuse_sftp_password_for_sso_only(user, body.sftp_password_auth)
+        _refuse_sftp_password_for_sso_only(db, user, body.sftp_password_auth)
         user.sftp_password_auth = body.sftp_password_auth
         changes.append("sftp_password_auth")
 
@@ -13786,7 +13792,7 @@ async def update_user(
         changes['sftp_enabled'] = {'old': user.sftp_enabled, 'new': user_update.sftp_enabled}
         user.sftp_enabled = user_update.sftp_enabled
     if user_update.sftp_password_auth is not None:
-        _refuse_sftp_password_for_sso_only(user, user_update.sftp_password_auth)
+        _refuse_sftp_password_for_sso_only(db, user, user_update.sftp_password_auth)
         changes['sftp_password_auth'] = {'old': user.sftp_password_auth, 'new': user_update.sftp_password_auth}
         user.sftp_password_auth = user_update.sftp_password_auth
 

@@ -901,15 +901,16 @@ def test_the_host_tool_refuses_a_reset_for_a_provider_only_account_before_anythi
     from app.core import host_operator
     source = inspect.getsource(host_operator)
     reset = source[source.index('if args.action == "reset-password":'):source.index('if args.action == "unlock":')]
-    assert reset.index('if getattr(user, "sso_only", False):') < reset.index("return _refuse(PROVIDER_ONLY.format(name=user.username))") \
+    assert reset.index('if getattr(user, "sso_only", False):') < reset.index(
+        "return _refuse(PROVIDER_ONLY.format(name=user.username, remedy=sso_only.password_remedy(db, user)))") \
         < reset.index("api._credential_change(db, None, user, cc.PASSWORD") < reset.index("api._credential_change(db, None, user, cc.RESET_LINK")
     assert reset.count("except HTTPException as exc:\n                    db.rollback()\n                    return _refuse(_refusal_text(exc))") == 1
     assert reset.count("except HTTPException as exc:\n                db.rollback()\n                return _refuse(_refusal_text(exc))") == 1
     factor = source[source.index('if args.action == "reset-second-factor":'):source.index('return _refuse("Nothing to do.")')]
     assert "except HTTPException as exc:" in factor and '"sso_only": bool(getattr(user, "sso_only", False))' in factor
-    said = host_operator.PROVIDER_ONLY.format(name="bob")
+    said = host_operator.PROVIDER_ONLY.format(name="bob", remedy="allow password sign-in on Contoso")
     assert said.startswith("bob signs in only through its organisation's provider and holds no password")
-    assert "allows password sign-in on the provider first" in said
+    assert "An administrator can allow password sign-in on Contoso (Settings, Sign-in)" in said
     # A refusal's words, whatever shape the web app's code gave it.
     text = host_operator._refusal_text
     assert text(HTTPException(status_code=409, detail="No password to change.")) == "No password to change."
@@ -950,9 +951,9 @@ def test_no_reset_link_is_made_for_an_account_that_signs_in_only_through_its_pro
     with pytest.raises(HTTPException) as refused:
         S._make_credential_change(db, cc.RESET_LINK, held, {"delivery": "copy"}, actor_id=root.id, actor_name="root")
     assert refused.value.status_code == 409 and minted == []
-    assert refused.value.detail == S.RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT == (
-        "This account signs in only through its organisation's provider and holds no password. Allow password "
-        "sign-in on the provider before sending a reset link.")
+    assert refused.value.detail == (
+        "This account signs in only through its organisation's provider and holds no password, so no reset link is "
+        "made for it; allow password sign-in on its provider first.")
     # Emailed or copied: refused before either.
     with pytest.raises(HTTPException) as refused:
         S._make_credential_change(db, cc.RESET_LINK, held, {"delivery": "email"}, actor_id=root.id, actor_name="root")
@@ -963,5 +964,60 @@ def test_no_reset_link_is_made_for_an_account_that_signs_in_only_through_its_pro
     # The two routes that ask for a link say the same sentence, and nothing else writes it.
     import inspect
     source = inspect.getsource(S)
-    assert source.count("raise HTTPException(status_code=409, detail=RESET_LINK_FOR_A_PROVIDER_ONLY_ACCOUNT)") == 3
-    assert source.count("before sending a reset link.") == 1
+    assert source.count("raise _no_reset_link_for_a_provider_only_account(db, ") == 3
+    assert source.count("so no reset link \"\n        f\"is made for it") == 1
+
+
+def test_a_refusal_names_what_would_let_this_account_hold_a_password(monkeypatch):
+    """Every refusal for an account that signs in only through its provider said "allow password sign-in on the
+    provider". For an account held only because a provider made it (at a first sign-in, or through an
+    invitation), password sign-in on that provider is allowed already: the administrator found nothing to change.
+    The refusal names the setting that holds this account: the provider's password sign-in, or its setting for
+    the accounts it makes."""
+    from fastapi import HTTPException
+    import app.api.api_server as S
+    from app.core import credential_changes as cc
+    from app.core import host_operator, password_origin, sso_only
+    monkeypatch.setattr(S, "_sessions_turn", lambda db, user_id: None)
+    root = _user("root", role="admin")
+    # Linked itself to a provider whose people hold no password.
+    less, p_less, _i, db_less = _world(policy={"sso_password_login": "disabled"}, sso_only=True, username="less")
+    assert sso_only.password_remedy(db_less, less) == "allow password sign-in on Contoso"
+    # Made at its first sign-in through a provider that lets its people hold a password, with one nobody knows.
+    for came_by in ("jit", "invitation"):
+        made, p_made, _j, db_made = _world(linked_by=came_by, sso_only=True, username="made",
+                                           password_hash="random-bytes")
+        password_origin.mark_nobody_knows(made)
+        assert sso_only.password_remedy(db_made, made) == (
+            "let the accounts made through Contoso set a password (its setting for the accounts it makes)"), came_by
+    # Flagged, and no provider that holds it is found (a state the next settle mends): the plain sentence.
+    odd, _p, _k, db_odd = _world(sso_only=True, username="odd")
+    assert sso_only.password_remedy(db_odd, odd) == "allow password sign-in on its provider"
+    # A password set by an administrator, a reset link, SFTP password sign-in: each says the one for its account.
+    with pytest.raises(HTTPException) as refused:
+        S._make_credential_change(db_made, cc.PASSWORD, made, {"password_hash": "h"}, actor_id=root.id, actor_name="root")
+    assert refused.value.detail == (
+        "This account signs in only through its organisation's provider and holds no password; let the accounts "
+        "made through Contoso set a password (its setting for the accounts it makes) first.")
+    with pytest.raises(HTTPException) as refused:
+        S._make_credential_change(db_less, cc.PASSWORD, less, {"password_hash": "h"}, actor_id=root.id, actor_name="root")
+    assert refused.value.detail.endswith("holds no password; allow password sign-in on Contoso first.")
+    with pytest.raises(HTTPException) as refused:
+        S._make_credential_change(db_made, cc.RESET_LINK, made, {"delivery": "copy"}, actor_id=root.id, actor_name="root")
+    assert refused.value.detail.endswith(
+        "so no reset link is made for it; let the accounts made through Contoso set a password (its setting for "
+        "the accounts it makes) first.")
+    with pytest.raises(HTTPException) as refused:
+        S._refuse_sftp_password_for_sso_only(db_made, made, True)
+    assert refused.value.detail.endswith(
+        "use an SSH key, or let the accounts made through Contoso set a password (its setting for the accounts it "
+        "makes) first.")
+    said = host_operator.PROVIDER_ONLY.format(name="made", remedy=sso_only.password_remedy(db_made, made))
+    assert "An administrator can let the accounts made through Contoso set a password" in said
+    # Two providers that hold it: both are named, each once.
+    from app.core.models import ExternalIdentity, SsoProvider
+    other = _provider(policy={"sso_password_login": "disabled"}, name="Fabrikam")
+    other.id = uuid.uuid4()
+    db_less.tables[SsoProvider].append(other)
+    db_less.tables[ExternalIdentity].extend([_identity(less, other, subject="s-2"), _identity(less, p_less, subject="s-3")])
+    assert sso_only.password_remedy(db_less, less) == "allow password sign-in on Contoso and Fabrikam"
