@@ -12056,7 +12056,7 @@ async def acknowledge_recovery_codes(
     # have. Sent once the factor stands and before the held sign-in goes on: it stands whatever that then does.
     _passkey_notice(db, current_user, "An authenticator app was set up for your account",
                     "An authenticator app was set up for your account while signing in." if pending is not None
-                    else "You set up an authenticator app for your account.")
+                    else "You set up an authenticator app for your account.", undo="turn it off under Your account")
 
     if pending is not None:
         # Forced-enrollment login: the pipeline spends the pending row (single winner) and mints the real
@@ -12445,14 +12445,16 @@ def _passkey_first_proof(db, user, request, current_password) -> None:
             "providers": [{"id": str(p.id), "label": p.label or p.name} for p in providers]})
 
 
-def _passkey_notice(db, user, title: str, change: str) -> None:
+def _passkey_notice(db, user, title: str, change: str, *, removed: bool = False,
+                    undo: str = "remove it under Your account") -> None:
     """Tell the owner what was just done to the factors of their own account (a passkey added or removed, an
     authenticator app set up): in the app, and by email when the account has an address and email is configured.
-    Best-effort, after the commit."""
+    What to do if it was not them follows what was done (``removed``; ``undo``: how what was added is undone) and
+    whether the account has a password anybody can type (sso_router.owners_advice). Best-effort, after the commit."""
     try:
-        _notify_users([str(user.id)], "account_changed", title=title,
-                      body=f"{change} If you did not do this, remove what you do not recognize and change your password.",
-                      target="#profile")
+        from app.api import sso_router as sso_routes
+        advice = sso_routes.owners_advice(user, removed=removed, undo=undo)
+        _notify_users([str(user.id)], "account_changed", title=title, body=f"{change} {advice}", target="#profile")
     except Exception as e:      # noqa: BLE001
         print(f"⚠ passkey notice skipped: {type(e).__name__}")
     try:
@@ -12776,7 +12778,7 @@ async def remove_my_passkey(
     _passkey_audit(db, current_user, request, "passkey_removed", {"passkey_id": passkey_id_text})
     named = f"the passkey \"{label}\"" if label else "a passkey"
     _passkey_notice(db, current_user, "A passkey was removed from your account",
-                    f"You removed {named} from your account.")
+                    f"You removed {named} from your account.", removed=True)
     return {"removed": True}
 
 

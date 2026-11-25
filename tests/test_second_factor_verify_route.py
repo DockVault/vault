@@ -294,7 +294,7 @@ def test_an_authenticator_set_up_at_a_held_sign_in_is_recorded_whatever_the_sign
     assert notice["ids"] == [str(user.id)] and notice["type"] == "account_changed" and notice["target"] == "#profile"
     assert notice["title"] == "An authenticator app was set up for your account"
     assert notice["body"] == ("An authenticator app was set up for your account while signing in. If you did not do "
-                              "this, remove what you do not recognize and change your password.")
+                              "this, turn it off under Your account and change your password.")
     assert notice["committed"] is True and notice["active"] == "active"
     assert email == {"key": "sign_in_method_changed", "email": "alice@example.test", "username": user.username,
                      "change": "An authenticator app was set up for your account while signing in."}

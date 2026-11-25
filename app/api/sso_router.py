@@ -1097,7 +1097,10 @@ def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
     if found.linked_by == sso.LINKED_BY_EMAIL:
         _tell_owner(db, user, row, "A sign-in method was added",
                     f"Single sign-on with {label} was linked to your account by a sign-in with your verified email address."
-                    + (PASSWORD_STOPPED.format(label=label) if found.password_stopped else ""))
+                    + (PASSWORD_STOPPED.format(label=label) if found.password_stopped else ""),
+                    # Not made from the account: a sign-in at the provider with the person's address made it.
+                    advice=(f"If you did not sign in through {label} just now, tell an administrator at once: your "
+                            "address there may be in someone else's hands."))
         # A link nobody at the vault asked for: the administrators are told of each, as of an account made at a
         # first sign-in.
         try:
@@ -1566,15 +1569,29 @@ def _how_to_set_a_password(db, user) -> str:
 BY_AN_ADMINISTRATOR = "If you did not expect this, ask an administrator."
 
 
-def _tell_owner(db, user, row, title: str, change: str, *, advice: Optional[str] = None) -> None:
+def owners_advice(user, *, removed: bool = False, undo: str = "unlink it under Your account") -> str:
+    """What the owner of ``user`` does about a change made from their own account, if they did not make it. What was
+    added is undone under Your account (``undo``); what was removed is gone, and an administrator is told. Only an
+    account with a password anybody can type changes it: one that signs in only through its provider, or whose
+    password nobody knows, has none to change, and its owner tells an administrator."""
+    from app.services import sign_in
+    typable = sign_in.has_a_password_it_can_type(user)
+    if removed:
+        return f"If you did not do this, {'change your password and ' if typable else ''}tell an administrator at once."
+    if not typable:
+        return "If you did not do this, tell an administrator at once."
+    return f"If you did not do this, {undo} and change your password."
+
+
+def _tell_owner(db, user, row, title: str, change: str, *, advice: Optional[str] = None,
+                removed: bool = False) -> None:
     """Tell ``user`` of a change to how their account signs in, in the app and by email. ``advice``: what to do
     about it, when the change was not the owner's own (the default speaks to the one who may have been
-    impersonated: it was done from their own account)."""
+    impersonated: it was done from their own account, and is an addition unless ``removed``)."""
     api = _api()
     try:
         if advice is None:
-            advice = ("If you did not do this, tell an administrator at once." if getattr(user, "sso_only", False)
-                      else "If you did not do this, remove it and change your password.")
+            advice = owners_advice(user, removed=removed)
         api._notify_users([str(user.id)], "account_changed", title=title, body=f"{change} {advice}", target="#profile")
     except Exception as exc:  # noqa: BLE001
         log.info("sso owner notice skipped: %s", type(exc).__name__)
@@ -1914,7 +1931,8 @@ async def unlink_my_identity(
     _tell_owner(db, current_user, row, "A sign-in method was removed from your account",
                 f"You unlinked your account from {label}: it can no longer sign in through it."
                 + (" Your account may hold a password again and has none yet: "
-                   + _how_to_set_a_password(db, current_user) if may_set_password else ""))
+                   + _how_to_set_a_password(db, current_user) if may_set_password else ""),
+                removed=True)
     answer = {"removed": True, "sessions_ended": ended}
     if may_set_password:
         answer["may_set_password"] = True

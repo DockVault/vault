@@ -559,8 +559,10 @@ def test_the_owners_unlink_records_how_the_identity_was_linked_and_tells_the_adm
 
 
 def test_the_owner_is_advised_by_who_made_the_change(monkeypatch):
-    """A change made from the owner's own account ends with what to do if it was not them. One an administrator
-    made ends with the advice for that: the owner did not do it, and has nothing to remove."""
+    """A change made from the owner's own account ends with what to do if it was not them: an identity added is
+    unlinked under Your account; one removed is gone, and an administrator is told. The password is changed only
+    by an account that has one anybody can type. One an administrator made ends with the advice for that: the
+    owner did not do it, and has nothing to remove."""
     from app.api import sso_router
     said = []
     api = types.SimpleNamespace(
@@ -568,14 +570,19 @@ def test_the_owner_is_advised_by_who_made_the_change(monkeypatch):
         _fire_action_email=lambda *a, **k: None, _change_time_text=lambda: "now")
     monkeypatch.setattr(sso_router, "_api", lambda: api)
     alice = _user()
-    sso_router._tell_owner(None, alice, None, "t", "You unlinked your account from Contoso.")
+    sso_router._tell_owner(None, alice, None, "t", "You unlinked your account from Contoso.", removed=True)
+    sso_router._tell_owner(None, alice, None, "t", "You linked Contoso.")
     sso_router._tell_owner(None, alice, None, "t", "root unlinked your account from Contoso.",
                            advice=sso_router.BY_AN_ADMINISTRATOR)
     alice.sso_only = True
     sso_router._tell_owner(None, alice, None, "t", "You linked Contoso.")
-    assert said == ["You unlinked your account from Contoso. If you did not do this, remove it and change your password.",
+    sso_router._tell_owner(None, alice, None, "t", "You unlinked your account from Contoso.", removed=True)
+    assert said == ["You unlinked your account from Contoso. If you did not do this, change your password and tell an "
+                    "administrator at once.",
+                    "You linked Contoso. If you did not do this, unlink it under Your account and change your password.",
                     "root unlinked your account from Contoso. If you did not expect this, ask an administrator.",
-                    "You linked Contoso. If you did not do this, tell an administrator at once."]
+                    "You linked Contoso. If you did not do this, tell an administrator at once.",
+                    "You unlinked your account from Contoso. If you did not do this, tell an administrator at once."]
 
 
 def test_the_owners_unlink_waits_a_short_time_for_the_accounts_turn_and_is_answered_as_busy(monkeypatch):

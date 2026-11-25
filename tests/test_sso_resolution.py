@@ -806,9 +806,11 @@ def test_a_verified_email_links_an_existing_account_when_the_provider_allows_it_
     assert ("sso_identity_linked", "success", {"provider_id": str(p.id), "linked_by": "email",
                                                "identity_id": str(identity.id), "made_sso_only": False}) in h.audits
     assert ([str(bob.id)], "A sign-in method was added") in h.notices
-    # The account keeps its password here: what to do if it was not them is to remove the link and change it.
+    # Nobody at the vault made this link: a sign-in at the provider with the person's address did. If it was not
+    # them, the address there is in other hands, and only an administrator can act on that.
     (said,) = [body for ids, title, body in h.notice_bodies if title == "A sign-in method was added"]
-    assert said.endswith("If you did not do this, remove it and change your password.")
+    assert said.endswith(f"If you did not sign in through {p.label} just now, tell an administrator at once: your "
+                         f"address there may be in someone else's hands.")
     assert any(e[0] == "sign_in_method_changed" and e[1] == "bob@example.test" for e in h.emails), h.emails
     status, body = h.finish(location)
     assert status == 200 and _claims(body["access_token"])["sub"] == str(bob.id)
@@ -1425,7 +1427,7 @@ def test_a_provider_turned_off_while_it_answered_links_nobody_and_changes_no_acc
     # The link ended bob's password: he is not told to change a password he no longer has.
     (said,) = [body for ids, title, body in h.notice_bodies
                if ids == [str(bob.id)] and title == "A sign-in method was added"]
-    assert said.endswith("If you did not do this, tell an administrator at once.") and "change your password" not in said
+    assert "just now, tell an administrator at once" in said and "change your password" not in said
 
 
 def test_a_link_from_your_account_is_made_on_the_provider_as_it_stands_when_the_person_is_back(monkeypatch):

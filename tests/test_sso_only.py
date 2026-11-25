@@ -541,6 +541,9 @@ def test_the_flag_follows_the_providers_an_account_is_still_linked_to(monkeypatc
     said = [body for ids, title, body in h.notice_bodies if ids == [str(alice.id)]]
     assert "may hold a password again" in said[-1] and "ask an administrator for a reset link." in said[-1]
     assert "Forgot" not in said[-1]                     # self-service reset is off here
+    # Nobody can type its password yet: none to change, and an unlink it did not make goes to an administrator.
+    assert said[-1].endswith(" If you did not do this, tell an administrator at once.")
+    assert "change your password" not in said[-1]
     # Linked to two that hold their people to no password: allowing passwords at one lifts nothing.
     from app.core.models import ExternalIdentity
     on_a2, on_c = _identity(alice, a, subject="s-a"), _identity(alice, c, subject="s-c")

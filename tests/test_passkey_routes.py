@@ -471,6 +471,33 @@ def test_rename_cleans_the_label_and_remove_needs_the_step_up(monkeypatch):
     assert status == 403 and out["detail"]["reason"] == "enroll_required"
 
 
+def test_the_owner_is_advised_by_what_was_done_and_by_whether_the_account_has_a_password(monkeypatch):
+    """A passkey added is removed under Your account; one removed is gone, and an administrator is told. The password
+    is changed only by an account that has one anybody can type: one that signs in only through its provider has
+    none, and is sent to an administrator."""
+    h = Harness(monkeypatch, _user())
+    status, shown, _ = h.register(label="one")
+    assert status == 201, shown
+    assert h.notices[-1]["body"].endswith(
+        "If you did not do this, remove it under Your account and change your password.")
+    (row,) = h.rows()
+    status, out = _call(h.S, "DELETE", f"/users/me/passkeys/{row.id}", None, {"X-Second-Factor": "ok"})
+    assert status == 200, out
+    removed = h.notices[-1]["body"]
+    assert removed.endswith("If you did not do this, change your password and tell an administrator at once.")
+    assert "remove what you do not recognize" not in removed
+    provider_only = _user("bob", sso_only=True)
+    h.S._passkey_notice(h.db, provider_only, "A passkey was added to your account",
+                        "You added a passkey to your account.")
+    said = h.notices[-1]["body"]
+    assert said.endswith("If you did not do this, tell an administrator at once.") and "change your password" not in said
+    h.S._passkey_notice(h.db, provider_only, "A passkey was removed from your account",
+                        "You removed a passkey from your account.", removed=True)
+    said = h.notices[-1]["body"]
+    assert said.endswith("If you did not do this, tell an administrator at once.") and "change your password" not in said
+    assert "remove what you do not recognize" not in said
+
+
 def test_the_last_factor_of_a_required_or_sso_only_account_stays(monkeypatch):
     from app.core.models import SystemSetting
     h = Harness(monkeypatch, _user())
