@@ -514,3 +514,70 @@ def test_an_attestation_the_library_does_not_verify_is_an_attestation_refused(mo
     # The record gets the error's class, never its text; and what is no such error is malformed.
     told = ws._refused_for(RuntimeError("anything else, with words that must not be shown"))
     assert (told.code, str(told)) == ("malformed", "malformed: RuntimeError")
+
+
+def _in_a_frame(credential, **said):
+    """``credential`` with its client data saying what ``said`` says. The signature covers the client data, so
+    the test authenticator signs again where it has to: here the registration takes no attestation, and an
+    assertion is signed again by the caller."""
+    import json
+    from fido2.utils import websafe_decode, websafe_encode
+    data = json.loads(websafe_decode(credential["response"]["clientDataJSON"]))
+    data.update(said)
+    raw = json.dumps({k: v for k, v in data.items() if v is not ...}, separators=(",", ":")).encode()
+    credential["response"]["clientDataJSON"] = websafe_encode(raw)
+    return raw
+
+
+@pytest.mark.parametrize("said, refused", [
+    ({"crossOrigin": True}, True),
+    ({"crossOrigin": True, "topOrigin": "https://attacker.example"}, True),
+    ({"crossOrigin": False, "topOrigin": "https://attacker.example"}, True),      # a top page that is not the vault
+    ({"crossOrigin": "yes"}, True),                                                # anything but false is not "no"
+    ({"crossOrigin": False}, False),
+    ({"crossOrigin": ...}, False),                                                 # a browser that does not say
+    ({"crossOrigin": False, "topOrigin": ORIGIN}, False),
+])
+def test_a_ceremony_made_in_another_sites_frame_is_refused_by_the_ceremony_itself(said, refused):
+    """An answer made in a cross-origin frame on an attacker's page passed both ceremonies: the origin matched,
+    and nothing read whether the page was framed. Only the headers that forbid framing stood in the way. The
+    client data's own word is read now, at a registration and at a use."""
+    import hashlib
+    from fido2.utils import websafe_decode, websafe_encode
+    ws = _svc()
+    rp, policy, challenge = _rp(), ws.PasskeyPolicy(), os.urandom(32)
+    auth = SoftAuthenticator(ES256)
+    options = ws.registration_options(rp, policy, challenge=challenge, user_id=USER_ID.bytes, username="alice",
+                                      display_name="Alice")
+    credential = auth.make_credential(options, ORIGIN)
+    _in_a_frame(credential, **said)                       # no attestation is asked: nothing signs the client data
+    if refused:
+        with pytest.raises(ws.Refused) as e:
+            ws.verify_registration(rp, policy, challenge=challenge, credential=credential)
+        assert e.value.code == "cross_origin"
+    else:
+        assert ws.verify_registration(rp, policy, challenge=challenge, credential=credential).credential_id
+    # At a use, with the assertion signed over the client data as it is sent.
+    registered, _, _ = _register(ws, auth)
+    key = _key(ws, registered)
+    challenge = os.urandom(32)
+    options = ws.authentication_options(rp, policy, challenge=challenge, allow=[(key.credential_id, key.transports)])
+    assertion = auth.get_assertion(options, ORIGIN)
+    raw = _in_a_frame(assertion, **said)
+    signed = websafe_decode(assertion["response"]["authenticatorData"]) + hashlib.sha256(raw).digest()
+    assertion["response"]["signature"] = websafe_encode(auth.sign(signed))
+    if refused:
+        with pytest.raises(ws.Refused) as e:
+            ws.verify_authentication(rp, policy, challenge=challenge, credential=assertion, key=key,
+                                     allow_ids=[key.credential_id])
+        assert e.value.code == "cross_origin"
+    else:
+        assert ws.verify_authentication(rp, policy, challenge=challenge, credential=assertion, key=key,
+                                        allow_ids=[key.credential_id]).up is True
+
+
+def test_the_person_is_told_what_to_do_about_a_framed_registration():
+    set_bare_api_env()
+    import app.api.api_server as S
+    assert S._PASSKEY_REFUSALS["cross_origin"] == (
+        "The vault was opened inside another site's page. Open it at its own address and try again.")

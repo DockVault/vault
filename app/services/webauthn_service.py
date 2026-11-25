@@ -279,6 +279,7 @@ def verify_registration(rp: RelyingParty, policy: PasskeyPolicy, *, challenge: b
         raise Refused("malformed", type(exc).__name__) from exc
     except Exception as exc:  # noqa: BLE001 -- see _refused_for
         raise _refused_for(exc) from exc
+    _refuse_a_ceremony_in_a_frame(rp, credential)
     cred = auth_data.credential_data
     if cred is None:
         raise Refused("malformed", "no credential in the authenticator data")
@@ -373,6 +374,7 @@ def verify_authentication(rp: RelyingParty, policy: PasskeyPolicy, *, challenge:
         raise Refused("malformed", type(exc).__name__) from exc
     except Exception as exc:  # noqa: BLE001 -- see _refused_for
         raise _refused_for(exc) from exc
+    _refuse_a_ceremony_in_a_frame(rp, credential)
     try:
         auth_data = AuthenticatorData(raw_auth_data)
     except Exception as exc:  # noqa: BLE001 -- the library read these bytes a moment ago; refused all the same
@@ -397,6 +399,30 @@ def verify_authentication(rp: RelyingParty, policy: PasskeyPolicy, *, challenge:
 
 
 # --------------------------------------------------------------------------- helpers
+
+def _refuse_a_ceremony_in_a_frame(rp: RelyingParty, credential: dict) -> None:
+    """The standard's step for a ceremony made inside a frame, after the library has checked the origin: the
+    browser says in the client data whether the page that asked was framed by another site (``crossOrigin``), and
+    which page was on top (``topOrigin``). The vault is never shown inside another site's page, so a ceremony
+    that says it was, or that names a top page which is not the vault's own address, is refused.
+
+    The library reads neither. What kept a framed prompt from ever happening was the headers every answer of the
+    server carries (no framing at all); the ceremony itself took an answer made in an attacker's frame. A route
+    served without those headers one day, or a proxy that drops them, would have been the only thing missing."""
+    import json
+    response = credential.get("response")
+    try:
+        data = json.loads(websafe_decode(response["clientDataJSON"]))
+    except Exception as exc:  # noqa: BLE001 -- the library read it a moment ago; refused all the same
+        raise _refused_for(exc) from exc
+    if not isinstance(data, dict):
+        raise Refused("malformed", "client data that is no object")
+    if data.get("crossOrigin") not in (None, False):
+        raise Refused("cross_origin", "made in a frame of another site")
+    top = data.get("topOrigin")
+    if top is not None and top != rp.origin:
+        raise Refused("cross_origin", "another site's page on top")
+
 
 def _refuse_backed_up_but_not_eligible(flags) -> None:
     """The standard's step for the two backup flags, at a registration and at every use: a key that says it is
