@@ -31,7 +31,7 @@ from __future__ import annotations
 import secrets
 from typing import List, Optional
 
-from app.core import privileged_accounts
+from app.core import after_commit, privileged_accounts
 
 
 class Privileged(ValueError):
@@ -199,6 +199,22 @@ def should_be_sso_only(db, user, *, also=None, also_by=None, without=None) -> bo
 MADE, RESTORED = "made_sso_only", "restored"
 
 
+def read_again(db, user, names) -> None:
+    """Read ``names`` of ``user`` again as they are committed, each unless the caller has set it on the account
+    and not written it yet (the role of a demotion that is being made, a password that is being set). Read
+    again, such a value would be put back to what the database still holds: the caller's change undone without a
+    word, while everything it did beside it stands (a demotion whose grant record and permissions were already
+    dropped left an administrator with a user's permissions)."""
+    refresh = getattr(db, "refresh", None)
+    if refresh is None or getattr(user, "_sa_instance_state", None) is None:
+        return
+    from sqlalchemy import inspect
+    state = inspect(user)
+    written = [name for name in names if not state.attrs[name].history.has_changes()]
+    if written:
+        refresh(user, attribute_names=written)
+
+
 def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None,
            unknown_hash=None) -> Optional[str]:
     """Bring ``user``'s flag in line with the providers it is linked to, in the caller's transaction: ``MADE`` when
@@ -228,9 +244,7 @@ def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None
         # moment ago (a reset link used) is written in this same turn.
         from app.api import api_server as api
         api._sessions_turn(db, user.id)
-        refresh = getattr(db, "refresh", None)
-        if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
-            refresh(user, attribute_names=["sso_only", "role", "password_hash", "password_nobody_knows"])
+        read_again(db, user, ["sso_only", "role", "password_hash", "password_nobody_knows"])
         should = should_be_sso_only(db, user, also=also, also_by=also_by, without=without)
         flagged = bool(getattr(user, "sso_only", False))
     if should and not flagged:
@@ -241,6 +255,80 @@ def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None
                                unknown_hash=unknown_hash)
         return RESTORED
     return None
+
+
+# What an account stopped being, for the sentence it is told.
+WAS_AN_ADMINISTRATOR = "is no longer an administrator"
+HELD_THE_AUDITOR_RIGHT = "no longer holds the auditor right"
+
+# Work for after a commit (app/core/after_commit.py): the notice to an account held to its provider again, and the
+# settling of an account whose auditor grant has ended.
+_HELD_AGAIN = "sso_only.held_again"
+_GRANT_ENDED = "sso_only.grant_ended"
+
+
+def settle_when_a_privilege_ends(db, user, *, standing: str) -> Optional[str]:
+    """``user`` has just stopped being an administrator, or holding the auditor right, in the caller's
+    transaction (``standing``: which). An account with that standing keeps a password of its own whatever its
+    providers say; without it the account's flag follows its providers again (:func:`settle`). So an account
+    made at its first sign-in that was promoted and is demoted before the person chose a password signs in only
+    through its provider again, as before the promotion: left as it was, it held no flag and a password nobody
+    knew, and a reset link gave whoever asked a password, for good. The promotion's own link is refused from
+    here on (the account is flagged). The person is told once the transaction commits.
+
+    The account's turn is the caller's to hold before it changes the account (every demotion takes it). What the
+    caller has set and not written (the new role) is decided on as set, and stays (:func:`read_again`)."""
+    from app.core.models import ExternalIdentity
+    from app.core.table_presence import has_table
+    if not has_table(db, ExternalIdentity.__tablename__):
+        return None                 # a database built without the identity tables links nobody to a provider
+    outcome = settle(db, user)
+    if outcome == MADE and getattr(db, "info", None) is not None:
+        names, _buttons = _providers_to_name(db, user)
+        through = " or ".join(names) or "your organisation's sign-in"
+        after_commit.later(db, _HELD_AGAIN, (user.id, user.username, user.email, (
+            f"Your account signs in only through {through}"), (
+            f"Your account {standing}. It signs in only through {through} from now on: its password and its "
+            "SFTP password sign-in no longer work.")))
+    return outcome
+
+
+def after_a_grant_ended(db, user_id) -> None:
+    """An auditor grant of ``user_id`` has just stopped being open, in the caller's transaction. Once that
+    transaction commits, the account's password rule is settled in a transaction of its own
+    (:func:`settle_when_a_privilege_ends`).
+
+    Not in the caller's: what ends a grant holds the grant's row, and the settling takes the account's turn at
+    its sessions. A change of the account's sign-in details takes the turn first and the grant's row after it,
+    so the two orders in one transaction each would wait for each other."""
+    if user_id is not None and getattr(db, "info", None) is not None:
+        after_commit.later(db, _GRANT_ENDED, str(user_id))
+
+
+def _settle_after_a_grant_ended(user_ids) -> None:
+    import logging
+    import uuid
+    from app.core.database import get_db_context
+    from app.core.models import User
+    for user_id in dict.fromkeys(user_ids):
+        try:
+            with get_db_context() as db:
+                user = db.get(User, uuid.UUID(str(user_id)))
+                if user is not None:
+                    settle_when_a_privilege_ends(db, user, standing=HELD_THE_AUDITOR_RIGHT)
+        except Exception as exc:  # noqa: BLE001 -- the grant's end is committed; the account's next settling decides
+            logging.getLogger(__name__).warning("an account was not settled after its auditor grant ended: %s",
+                                                type(exc).__name__)
+
+
+def _tell_held_again(notices) -> None:
+    from app.api import sso_providers_router
+    for user_id, username, email, title, change in notices:
+        sso_providers_router._tell_accounts([(user_id, username, email)], title, change)
+
+
+after_commit.handler(_GRANT_ENDED, _settle_after_a_grant_ended)
+after_commit.handler(_HELD_AGAIN, _tell_held_again)
 
 
 def settle_privileged(db) -> list:

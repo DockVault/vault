@@ -7164,6 +7164,11 @@ def _set_role(db, user, new_role, *, actor) -> list:
             details={"target_username": user.username, "old_role": old_role,
                      "new_role": getattr(new_role, "value", new_role), "removed": change["removed"],
                      "added": change["added"], "kept": change["kept"]}))
+    if old_role == RoleEnum.ADMIN.value:
+        # No longer an administrator: the account's password rule follows its providers again
+        # (app/core/sso_only.py). Decided on the role as set here, which that settling leaves as set.
+        from app.core import sso_only
+        sso_only.settle_when_a_privilege_ends(db, user, standing=sso_only.WAS_AN_ADMINISTRATOR)
     return change["removed"]
 
 

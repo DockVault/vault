@@ -10,7 +10,8 @@ rows.
 - An administrator: never held.
 - An account made at its first sign-in: provider-only whatever the provider's password setting, until the provider
   lets such accounts set a password, and back when it no longer does; made an administrator, it loses the flag and
-  its password is taken back.
+  its password is taken back; demoted before the person chose a password, it signs in only through its provider
+  again, and the demotion stands.
 
 The last two tests go through the stack's own doors, over HTTP and SFTP, on an account of the stack linked to a
 provider row of the test's own: the sign-in form, an SFTP sign-in with the password and with a key, connections
@@ -219,6 +220,26 @@ with SessionLocal() as s:
     user = s.get(User, uid)
     out["made here"]["after the promotion"] = {"role": user.role.value, "kind": privileged_accounts.kind(s, user),
                                                "settled": sso_only.settle(s, user)}
+
+
+def demote():
+    """The demotion the Users page makes: the grant record dropped, the role set with its permissions."""
+    from app.core import admin_grants
+    with SessionLocal() as s:
+        admin = s.query(User).filter(User.role == RoleEnum.ADMIN, User.id != uid).first()
+        user = s.get(User, uid)
+        api._sessions_turn(s, user.id)
+        admin_grants.forget(s, user.id)
+        api._set_role(s, user, RoleEnum.USER, actor=admin)
+        s.commit()
+        return "demoted"
+
+
+out["made here"]["demoted"] = [outcome(demote), flags()]
+with SessionLocal() as s:
+    user = s.get(User, uid)
+    out["made here"]["after the demotion"] = {"role": user.role.value, "kind": privileged_accounts.kind(s, user),
+                                              "settled": sso_only.settle(s, user)}
 print(json.dumps(out))
 '''
 
@@ -295,6 +316,12 @@ def test_an_account_made_at_a_first_sign_in_follows_the_providers_setting_and_a_
     assert promoted == ["ok", {"password taken back": True}], promoted
     assert flags["made"] is False and flags["made holds a password nobody knows"] is True
     assert made["after the promotion"] == {"role": "admin", "kind": "administrator", "settled": None}
+    # Demoted before the person chose a password: held to the provider again, and the demotion stands.
+    demoted, flags = made["demoted"]
+    assert demoted == ["ok", "demoted"], demoted
+    assert flags["made"] is True and flags["made holds a password nobody knows"] is True
+    assert flags["made may sign in to SFTP with a password"] is False
+    assert made["after the demotion"] == {"role": "user", "kind": None, "settled": None}
 
 
 # --------------------------------------------------------------------------- through the stack's own doors

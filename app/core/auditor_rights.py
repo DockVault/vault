@@ -516,11 +516,20 @@ def approve(db, grant, *, approver=None, now: Optional[datetime] = None):
     return grant
 
 
+def _no_longer_open(db, grant) -> None:
+    """``grant`` has just stopped being open (rejected, revoked, lapsed, expired, ended). Its account may no
+    longer be one that keeps a password of its own whatever its identity providers say: that rule is settled for
+    it once this transaction commits (app/core/sso_only.py, after_a_grant_ended)."""
+    from app.core import sso_only
+    sso_only.after_a_grant_ended(db, grant.user_id)
+
+
 def reject(db, grant, *, rejecter, reason: str, now: Optional[datetime] = None):
     """Turn the proposal ``grant`` down (locked and checked by the caller)."""
     from app.core.security import seal_case_field
     now = now or utcnow()
     grant.status = "rejected"
+    _no_longer_open(db, grant)
     grant.rejected_by, grant.rejected_by_username, grant.rejected_at = rejecter.id, rejecter.username, now
     grant.reject_reason_enc = seal_case_field(grant.id, reason, "grant_reject_reason")
     grant.ended_at = grant.updated_at = now
@@ -539,6 +548,7 @@ def revoke(db, grant, *, actor=None, reason: Optional[str] = None, because: Opti
     now = now or utcnow()
     before = grant.status
     grant.status = "revoked"
+    _no_longer_open(db, grant)
     grant.revoked_at = grant.ended_at = grant.updated_at = now
     grant.revoked_by = actor.id if actor is not None else None
     grant.revoked_by_username = actor.username if actor is not None else HOST_OPERATOR
@@ -567,6 +577,7 @@ def end_due(db, now: Optional[datetime] = None) -> int:
     for grant in rows:
         if is_lapsed(grant, now):
             grant.status, grant.ended_at, grant.updated_at = "lapsed", now, now
+            _no_longer_open(db, grant)
             _audit(db, "auditor_grant_lapsed", grant, details={"proposed_by": grant.proposed_by_username})
             queue(db, {"event": "lapsed", "grant_id": str(grant.id),
                        "holder_id": str(grant.user_id) if grant.user_id else None, "holder": grant.username_at_grant,
@@ -575,6 +586,7 @@ def end_due(db, now: Optional[datetime] = None) -> int:
         elif is_expired(grant, now):
             before = grant.status
             grant.status, grant.ended_at, grant.updated_at = "expired", now, now
+            _no_longer_open(db, grant)
             _audit(db, "auditor_grant_expired", grant, details={"status": before,
                                                                 "expires_at": _iso(effective_expiry(grant))})
             queue(db, {"event": "expired", "grant_id": str(grant.id),
@@ -744,6 +756,7 @@ def end(db, grant, reason: str, *, by_id=None, by_name: Optional[str] = None, no
     now = now or utcnow()
     before = grant.status
     grant.status, grant.suspend_reason = "ended", reason
+    _no_longer_open(db, grant)
     grant.ended_at = grant.updated_at = now
     _audit_by(db, "auditor_suspended", grant, by_id, by_name, {"reason": reason, "outcome": "ended", "status": before})
     queue(db, {"event": "ended", "grant_id": str(grant.id), "holder_id": _id_text(grant.user_id),

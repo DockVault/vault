@@ -1,0 +1,246 @@
+"""An account that stops being an administrator, or whose auditor grant ends, follows its providers' password rule
+again (app/core/sso_only.py settle_when_a_privilege_ends, after_a_grant_ended; app/api/api_server.py _set_role;
+app/core/auditor_rights.py).
+
+An administrator and the holder of an auditor grant keep a password of their own whatever their providers say. An
+account made at its first sign-in through a provider that lets such accounts set no password signs in only
+through that provider; made an administrator, it loses the flag and is sent a link to choose a password. Demoted
+before the person chose one, it was left with no flag and a password nobody knew: a reset link then gave whoever
+asked for it a password, and the provider's word was no longer needed, for good. The demotion now settles the
+rule in its own transaction, and the role it set stays as set: read again from the database there, it came back
+as the administrator's, with the grant record and the permissions already gone. Offline, on a database with every
+table. tests/test_sso_leavers_live.py does the promotion and the demotion on PostgreSQL."""
+import contextlib
+import uuid
+from datetime import datetime, timedelta
+
+import pytest
+
+from test_password_origin import _user, api, world  # noqa: F401
+from test_sso_unlink_meets_the_password_rule import _another, db  # noqa: F401
+
+pytestmark = pytest.mark.unit
+
+RANDOM = "argon2:of-random-bytes"
+
+
+def _made_here(db, role, *, own_password=False, policy=None):
+    """Jay, made at a first sign-in through Contoso, which lets such accounts set no password; with ``role``
+    now, and (unless ``own_password``) the password nobody knows that a promotion leaves behind."""
+    from app.core import password_origin
+    from app.core.models import ExternalIdentity, SsoProvider
+    provider = SsoProvider(id=uuid.uuid4(), state="enabled", kind="oidc", name="contoso", label="Contoso",
+                           issuer="https://idp.example/", client_id="c", client_secret_enc="e", policy=policy)
+    db.add(provider)
+    jay = _user(db, "jay", role)
+    if not own_password:
+        jay.password_hash = RANDOM
+        password_origin.set_by_other(jay, None)
+        password_origin.mark_nobody_knows(jay)
+    db.add(ExternalIdentity(user_id=jay.id, provider_id=provider.id, issuer="https://idp.example/", subject="s-1",
+                            subject_source="oidc:sub", linked_by="jit"))
+    db.commit()
+    return provider, jay
+
+
+def _told(monkeypatch):
+    from app.api import sso_providers_router
+    told = []
+    monkeypatch.setattr(sso_providers_router, "_tell_accounts",
+                        lambda users, title, change: told.append((list(users), title, change)))
+    return told
+
+
+def _as_it_stands(db, account_id):
+    from app.core import password_origin
+    from app.core.models import User
+    after = _another(db)
+    try:
+        account = after.get(User, account_id)
+        return (account.role.value, bool(account.sso_only), password_origin.nobody_knows(account),
+                account.sftp_password_auth)
+    finally:
+        after.close()
+
+
+def test_a_demotion_holds_an_account_made_at_a_first_sign_in_to_its_provider_again_and_the_role_stays(
+        db, world, monkeypatch):
+    from app.core import sso_only
+    from app.core.models import RoleEnum, User
+    told = _told(monkeypatch)
+    provider, jay = _made_here(db, RoleEnum.ADMIN)
+    root = _user(db, "root", RoleEnum.ADMIN)
+    target = db.query(User).filter(User.id == jay.id).first()
+    assert sso_only.should_be_sso_only(db, target) is False              # an administrator keeps a password
+    api._set_role(db, target, RoleEnum.USER, actor=root)
+    assert told == []                                                    # told once it is committed, not before
+    db.commit()
+    assert _as_it_stands(db, jay.id) == ("user", True, True, False)      # demoted, and held to Contoso again
+    assert told == [([(jay.id, "jay", "jay@example.com")], "Your account signs in only through contoso", (
+        "Your account is no longer an administrator. It signs in only through contoso from now on: its password "
+        "and its SFTP password sign-in no longer work."))]
+
+
+def test_a_demotion_that_is_rolled_back_changes_nothing_and_tells_nobody(db, world, monkeypatch):
+    from app.core.models import RoleEnum, User
+    told = _told(monkeypatch)
+    provider, jay = _made_here(db, RoleEnum.ADMIN)
+    target = db.query(User).filter(User.id == jay.id).first()
+    api._set_role(db, target, RoleEnum.USER, actor=None)
+    db.rollback()
+    assert _as_it_stands(db, jay.id)[:3] == ("admin", False, True) and told == []
+
+
+@pytest.mark.parametrize("case", ["a password of its own", "the provider lets it set one", "linked by its owner",
+                                  "to another role than an administrator's"])
+def test_a_demotion_leaves_an_account_the_rule_does_not_hold(db, world, monkeypatch, case):
+    from app.core.models import ExternalIdentity, RoleEnum, User
+    told = _told(monkeypatch)
+    provider, jay = _made_here(db, RoleEnum.ADMIN if case != "to another role than an administrator's" else RoleEnum.USER,
+                               own_password=case == "a password of its own",
+                               policy={"sso_jit_password": True} if case == "the provider lets it set one" else None)
+    if case == "linked by its owner":
+        db.query(ExternalIdentity).update({"linked_by": "self"})
+        db.commit()
+    target = db.query(User).filter(User.id == jay.id).first()
+    before = _as_it_stands(db, jay.id)
+    api._set_role(db, target, RoleEnum.EXTERNAL if case == "to another role than an administrator's" else RoleEnum.USER,
+                  actor=None)
+    db.commit()
+    after = _as_it_stands(db, jay.id)
+    if case == "to another role than an administrator's":
+        # No privilege ended: the rule is not asked here (it is asked where the account's links change).
+        assert after == ("external",) + before[1:] and told == []
+    else:
+        assert after == ("user", False) + before[2:] and told == []
+
+
+def test_what_the_caller_set_and_did_not_write_is_not_read_again(db, world):
+    from app.core import sso_only
+    from app.core.models import RoleEnum, User
+    provider, jay = _made_here(db, RoleEnum.ADMIN)
+    target = db.query(User).filter(User.id == jay.id).first()
+    other = _another(db)
+    other.get(User, jay.id).sso_only = True                              # committed by somebody else meanwhile
+    other.commit()
+    other.close()
+    target.role = RoleEnum.USER                                          # set here, not written
+    sso_only.read_again(db, target, ["sso_only", "role"])
+    assert target.role == RoleEnum.USER and target.sso_only is True
+    db.flush()                                                           # written: it is read again like the rest
+    other = _another(db)
+    other.close()
+    sso_only.read_again(db, target, ["sso_only", "role"])
+    assert target.role == RoleEnum.USER
+    # A stand-in with no session behind it is left as it is.
+    from types import SimpleNamespace
+    sso_only.read_again(SimpleNamespace(), SimpleNamespace(role="x"), ["role"])
+
+
+def _grant(db, account, status, **dates):
+    from app.core.models import AuditorGrant
+    grant = AuditorGrant(id=uuid.uuid4(), user_id=account.id, username_at_grant=account.username, status=status,
+                         proposed_by_username="root", credential_changers=[], **dates)
+    db.add(grant)
+    db.commit()
+    return grant
+
+
+@pytest.fixture
+def settled_after(db, monkeypatch):
+    """The settling after a commit runs in a transaction of its own: on this test's database."""
+    from app.core import after_commit, database
+    from app.core import auditor_rights as rights
+    from app.core import security
+
+    @contextlib.contextmanager
+    def fresh():
+        session = _another(db)
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+    monkeypatch.setattr(database, "get_db_context", fresh)
+    monkeypatch.setitem(after_commit._HANDLERS, rights._NOTICES, lambda notices: None)
+    monkeypatch.setattr(security, "seal_case_field", lambda *a, **k: "sealed")
+
+
+@pytest.mark.parametrize("how", ["revoked", "rejected", "ended", "lapsed", "expired"])
+def test_an_auditor_grant_that_is_no_longer_open_has_the_rule_settled_once_it_is_committed(
+        db, world, monkeypatch, settled_after, how):
+    from app.core import after_commit, sso_only
+    from app.core import auditor_rights as rights
+    from app.core.models import RoleEnum, User
+    told = _told(monkeypatch)
+    provider, jay = _made_here(db, RoleEnum.USER)
+    root = _user(db, "root", RoleEnum.ADMIN)
+    now = datetime.utcnow()
+    long_ago = now - timedelta(days=3650)
+    grant = _grant(db, jay, "proposed" if how in ("rejected", "lapsed") else "active",
+                   proposed_at=long_ago if how == "lapsed" else now,
+                   approved_at=long_ago if how == "expired" else (None if how in ("rejected", "lapsed") else now),
+                   expires_at=now - timedelta(days=1) if how == "expired" else None)
+    target = db.query(User).filter(User.id == jay.id).first()
+    assert sso_only.should_be_sso_only(db, target) is False              # the grant keeps it a password of its own
+    if how == "revoked":
+        rights.revoke(db, grant, actor=root)
+    elif how == "rejected":
+        rights.reject(db, grant, rejecter=root, reason="not now")
+    elif how == "ended":
+        rights.end(db, grant, rights.SECOND_FACTOR)
+    else:
+        assert rights.end_due(db) == 1
+    assert grant.status == how
+    assert after_commit.pending(db, sso_only._GRANT_ENDED) == [str(jay.id)]
+    assert _as_it_stands(db, jay.id)[:2] == ("user", False) and told == []      # nothing before the commit
+    db.commit()
+    assert _as_it_stands(db, jay.id) == ("user", True, True, False)
+    assert told == [([(jay.id, "jay", "jay@example.com")], "Your account signs in only through contoso", (
+        "Your account no longer holds the auditor right. It signs in only through contoso from now on: its "
+        "password and its SFTP password sign-in no longer work."))]
+
+
+def test_an_administrator_whose_auditor_grant_ends_keeps_its_password(db, world, monkeypatch, settled_after):
+    from app.core import auditor_rights as rights
+    from app.core.models import RoleEnum
+    told = _told(monkeypatch)
+    provider, jay = _made_here(db, RoleEnum.ADMIN)
+    grant = _grant(db, jay, "active", approved_at=datetime.utcnow())
+    rights.revoke(db, grant, actor=None)
+    db.commit()
+    assert _as_it_stands(db, jay.id)[:3] == ("admin", False, True) and told == []
+
+
+def test_a_grant_whose_end_is_rolled_back_settles_nothing(db, world, monkeypatch, settled_after):
+    from app.core import after_commit, sso_only
+    from app.core import auditor_rights as rights
+    from app.core.models import RoleEnum
+    told = _told(monkeypatch)
+    provider, jay = _made_here(db, RoleEnum.USER)
+    grant = _grant(db, jay, "active", approved_at=datetime.utcnow())
+    rights.revoke(db, grant, actor=None)
+    db.rollback()
+    assert after_commit.pending(db, sso_only._GRANT_ENDED) == []
+    assert _as_it_stands(db, jay.id)[:2] == ("user", False) and told == []
+    # A grant of an account that is gone asks for nothing.
+    sso_only.after_a_grant_ended(db, None)
+    assert after_commit.pending(db, sso_only._GRANT_ENDED) == []
+
+
+def test_a_database_without_the_identity_tables_settles_nothing(monkeypatch):
+    """A role is changed on every vault, also on a database built with only the tables a test needs: the rule
+    asks nothing of one that links nobody to a provider."""
+    from types import SimpleNamespace
+    from app.core import sso_only, table_presence
+    monkeypatch.setattr(table_presence, "has_table", lambda db, table: table != "external_identities")
+
+    def settle(db, user, **kw):
+        raise AssertionError("asked of a database without the tables")
+    monkeypatch.setattr(sso_only, "settle", settle)
+    assert sso_only.settle_when_a_privilege_ends(SimpleNamespace(info={}), SimpleNamespace(),
+                                                 standing=sso_only.WAS_AN_ADMINISTRATOR) is None
+
