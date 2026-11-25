@@ -8585,7 +8585,16 @@ async def finish_sign_in(
     result = sign_in_codes.to_result(db, handover, client_ip=client_ip) if handover is not None else None
     if result is None:
         raise HTTPException(status_code=401, detail="This sign-in code is not valid; start again.")
-    outcome = sign_in.finish(db, result)
+    try:
+        outcome = sign_in.finish(db, result)
+    except HTTPException as refused:
+        if refused.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+            raise
+        # The pipeline's busy answer says "try again" and gives the wait. Here the code that carried the sign-in
+        # was spent above, whatever came of it: the page that waited and posted it again was told the code is
+        # not valid. Said as it is, with no wait to count down: the sign-in is started again.
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=sign_in.BUSY_START_AGAIN) from None
     if isinstance(outcome, sign_in.PendingStep):
         return JSONResponse(status_code=200, content=outcome.body)
     return LoginResponse(access_token=outcome.access_token, user=UserResponse.model_validate(result.user),

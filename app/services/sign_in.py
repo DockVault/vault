@@ -72,6 +72,9 @@ ENROLLMENT_METHODS = ("totp",)
 
 # What a held sign-in is told once its account's sessions were ended, and where its time ran out.
 BUSY = "Signing in is busy right now. Try again in a moment."
+# The same, where what carried the sign-in was spent by the try (a one-time sign-in code): there is nothing to
+# send again, so the answer says what works and gives no wait.
+BUSY_START_AGAIN = "Signing in is busy right now. Start the sign-in again in a moment."
 EXPIRED = "This login attempt has expired; start again."
 
 # The order of the locks.

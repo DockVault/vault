@@ -254,3 +254,59 @@ def test_the_desktop_app_proves_itself_with_pkce(finish):
     code = f.codes.store(record, redis=f.redis)
     status, body = _post(f.S, "/auth/finish", {"code": code, "code_verifier": code_verifier})
     assert status == 200 and _claims(body["access_token"])["amr"] == ["hwk"]
+
+
+def _post_with_headers(S, path, body):
+    out = {}
+
+    async def _drive():
+        scope = {"type": "http", "http_version": "1.1", "method": "POST", "path": path, "raw_path": path.encode(),
+                 "query_string": b"", "headers": [(b"content-type", b"application/json")],
+                 "client": ("127.0.0.1", 1234), "server": ("testserver", 80), "scheme": "http"}
+        payload = json.dumps(body).encode()
+        chunks = []
+
+        async def receive():
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        async def send(msg):
+            if msg["type"] == "http.response.start":
+                out["status"] = msg["status"]
+                out["headers"] = {k.decode().lower(): v.decode() for k, v in msg["headers"]}
+            elif msg["type"] == "http.response.body":
+                chunks.append(msg.get("body", b""))
+
+        await S.app(scope, receive, send)
+        out["body"] = json.loads(b"".join(chunks) or b"null")
+
+    run_coroutine(_drive(), timeout=30)
+    return out["status"], out["headers"], out["body"]
+
+
+def test_a_busy_finish_says_to_start_again_because_its_code_is_spent(finish, monkeypatch):
+    """The account's turn is held for longer than a sign-in waits. The pipeline's busy answer says "try again in
+    a moment" with the wait, and this route passed it on: but the one-time code was spent by the try, so the page
+    that waited and posted it again was told the code is not valid. The answer here says to start the sign-in
+    again and gives no wait; any other refusal of the pipeline passes as it is."""
+    from sqlalchemy.exc import OperationalError
+    from app.services import sign_in
+    f = finish
+
+    def held(db, user_id):
+        raise OperationalError("SELECT pg_advisory_xact_lock", {}, types.SimpleNamespace(pgcode="55P03"))
+    monkeypatch.setattr(f.S, "_sessions_turn", held)
+    code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    status, headers, body = _post_with_headers(f.S, "/auth/finish", {"code": code, "verifier": verifier})
+    assert status == 503, body
+    assert body == {"detail": "Signing in is busy right now. Start the sign-in again in a moment."}
+    assert body["detail"] == sign_in.BUSY_START_AGAIN != sign_in.BUSY
+    assert "retry-after" not in headers and f.made["sessions"] == []
+    # The code is spent: posted again it is no code, which is why the answer did not say to try it again.
+    monkeypatch.setattr(f.S, "_sessions_turn", lambda db, user_id: None)
+    status, _headers, body = _post_with_headers(f.S, "/auth/finish", {"code": code, "verifier": verifier})
+    assert status == 401 and body == {"detail": "This sign-in code is not valid; start again."}
+    # Another refusal of the pipeline is not rewritten: its own status, words and headers.
+    f.alice.is_locked = True
+    code, verifier = _code(f, f.alice, user_verified=True, passwordless_allowed=True)
+    status, _headers, body = _post_with_headers(f.S, "/auth/finish", {"code": code, "verifier": verifier})
+    assert status == 403 and "locked" in body["detail"].lower()
