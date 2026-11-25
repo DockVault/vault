@@ -109,7 +109,8 @@ _spec(ATTESTATION, "enum", NONE, "Attestation", choices=(NONE, DIRECT), level=re
 _spec(ALLOWED_AAGUIDS, "list", [], "Allowed authenticator makes", level=registry.ADVANCED, validate=_uuids,
       help="Authenticator identifiers (AAGUIDs); only with direct attestation, which alone proves them. A "
            "passkey of a make not on the list is not added; one added earlier keeps signing in, and no longer "
-           "proves a compliance step-up.")
+           "proves a compliance step-up. While attestation is not direct the list is kept and applies to "
+           "nothing.")
 _spec(DEVICE_BOUND_ROLES, "list", [], "Roles whose passkeys must be device-bound", choices=ROLES,
       level=registry.ADVANCED,
       help="A synced passkey (one copied between devices) is refused for these roles at registration and in "
@@ -542,9 +543,34 @@ def algorithm_usable(db, cose_alg: int, *, now: Optional[datetime] = None) -> Tu
 
 # --------------------------------------------------------------------------- the guards at save
 
+def asks_for_more(key: str, was, now) -> bool:
+    """Whether a save that takes ``key`` from ``was`` to ``now`` asks for more than what is in force: a requirement
+    turned on, a role added to it, a shorter time to meet it, the rule on verifying the person turned on, direct
+    attestation turned on, an authenticator make added to the list. A save that asks for less, or for the same,
+    is never held back by what the other settings need: it is the way out of a state they no longer fit (the
+    file of root certificates gone, the vault's address changed)."""
+    if key == MODE:
+        return now == REQUIRED_FOR_ROLES and was != REQUIRED_FOR_ROLES
+    if key in (REQUIRED_ROLES, ALLOWED_AAGUIDS):
+        return bool(set(now or ()) - set(was or ()))
+    if key == GRACE_DAYS:
+        return int(now) < int(was)
+    if key == REQUIRE_UV:
+        return bool(now) and not bool(was)
+    if key == ATTESTATION:
+        return now == DIRECT and was != DIRECT
+    return False
+
+
 def save_refusal(db, key: str, value, *, settings_now: Optional[dict] = None) -> Optional[str]:
     """Why ``key`` may not be set to ``value`` now, beyond the spec's own bounds, in plain words, or None.
-    ``settings_now`` may carry the other values as they would be after this save."""
+    ``settings_now`` may carry the other values as they would be after this save.
+
+    What the settings need of each other (a requirement needs the vault's address, direct attestation needs its
+    root certificates, a list of makes needs direct attestation, a requirement on administrators needs one who
+    can meet it) is asked only of a save that asks for more than what is in force (:func:`asks_for_more`). Asked
+    of every save, a state the settings no longer fit could not be left: with the root certificates gone, no
+    passkey setting could be changed at all, turning passkeys off among them."""
     from app.core.public_url import readiness
     current = {k: registry.resolve(k) for k in KEYS}
     current.update(settings_now or {})
@@ -552,17 +578,22 @@ def save_refusal(db, key: str, value, *, settings_now: Optional[dict] = None) ->
     proposed[key] = value if value is not None else registry.spec_for(key).default
     if key == SIGN_IN_ROLES and value is not None and any(r not in SIGN_IN_CHOICES for r in value):
         return "Administrators always type their password after a passkey: 'admin' cannot be in this list."
-    if (proposed[MODE] == REQUIRED_FOR_ROLES and proposed[REQUIRED_ROLES]) and not readiness().get("usable"):
+    if not asks_for_more(key, current[key], proposed[key]):
+        return None
+    required = proposed[MODE] == REQUIRED_FOR_ROLES and bool(proposed[REQUIRED_ROLES])
+    if key in (MODE, REQUIRED_ROLES) and required and not readiness().get("usable"):
         from app.core.public_url import why_no_passkeys
         return "Requiring passkeys needs the vault's public address. " + why_no_passkeys()
-    if proposed[ATTESTATION] == DIRECT and not trust_anchors():
+    if key in (ATTESTATION, ALLOWED_AAGUIDS) and proposed[ATTESTATION] == DIRECT and not trust_anchors():
         return ("Direct attestation needs trust anchors: put a PEM bundle of root certificates in the deployment's "
                 "certs folder, set WEBAUTHN_ATTESTATION_ROOTS in .env to its path as the server sees it "
                 "(/app/certs/<file name>), restart, and try again.")
-    if proposed[ALLOWED_AAGUIDS] and proposed[ATTESTATION] != DIRECT:
+    if key == ALLOWED_AAGUIDS and proposed[ATTESTATION] != DIRECT:
         return "A list of allowed authenticator makes proves nothing without direct attestation: turn that on first."
-    if key in (MODE, REQUIRED_ROLES, GRACE_DAYS, REQUIRE_UV) and proposed[MODE] == REQUIRED_FOR_ROLES \
-            and "admin" in (proposed[REQUIRED_ROLES] or ()):
+    on_administrators = required and "admin" in (proposed[REQUIRED_ROLES] or ())
+    if key == REQUIRED_ROLES and "admin" in (current[REQUIRED_ROLES] or ()):
+        on_administrators = False              # another role was added: nothing new is asked of administrators
+    if key in (MODE, REQUIRED_ROLES, GRACE_DAYS, REQUIRE_UV) and on_administrators:
         why = _last_administrator_refusal(db, int(proposed[GRACE_DAYS]), verification=bool(proposed[REQUIRE_UV]))
         if why:
             return why

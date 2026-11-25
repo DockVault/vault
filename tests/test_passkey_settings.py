@@ -219,12 +219,13 @@ def test_the_guards_at_save(monkeypatch):
     bob = _user("bob", role="admin", passkey_required_since=None, passkey_requirement_cleared_at=None, is_locked=True,
                 locked_until=None)
     db.rows_of(User).append(bob)
-    assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 7)        # bob's unstarted grace does not count
+    # (The grace in force here is 7 days: a shorter one is what asks for more.)
+    assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 6)        # bob's unstarted grace does not count
     bob.is_locked = False
-    assert wss.save_refusal(db, wss.GRACE_DAYS, 7) is None
+    assert wss.save_refusal(db, wss.GRACE_DAYS, 6) is None
     db.rows_of(User).remove(bob)
     root.passkey_requirement_cleared_at = datetime.utcnow()
-    assert wss.save_refusal(db, wss.GRACE_DAYS, 7) is None                       # or was cleared by the operator
+    assert wss.save_refusal(db, wss.GRACE_DAYS, 6) is None                       # or was cleared by the operator
 
 
 def test_a_removed_algorithm_keeps_existing_keys_for_thirty_days(monkeypatch):
@@ -401,3 +402,80 @@ def test_the_settings_routes_name_the_setting_and_no_path_parameter_reads_as_a_s
     paths = sorted({route.path for route in sign_in_settings_router.router.routes})
     assert paths == ["/settings/sign-in", "/settings/sign-in/{setting}"]
 
+
+def test_a_save_that_asks_for_less_is_never_held_back_by_what_the_other_settings_need(monkeypatch):
+    """Direct attestation is on with a list of makes, a role must hold a passkey, and then the file of root
+    certificates is gone (a restore on a new host: the file is not in the backup) and the vault's address no
+    longer carries a passkey. Every registration fails, as designed. The page must still lead back out: each
+    save that asks for less goes through, and each that asks for more is refused as before."""
+    registry, wss = _mod()
+    from app.core import public_url
+    from app.core.models import User, WebAuthnCredential
+    root = _user("root", role="admin", passkey_required_since=datetime.utcnow() - timedelta(days=90),
+                 passkey_requirement_cleared_at=None)
+    db = MemoryDB({User: [root], WebAuthnCredential: []})
+    make, other = str(uuid.uuid4()), str(uuid.uuid4())
+    stuck = {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["user", "admin"], wss.GRACE_DAYS: 14,
+             wss.ATTESTATION: "direct", wss.ALLOWED_AAGUIDS: [make], wss.REQUIRE_UV: True}
+    _resolving(monkeypatch, registry, stuck)
+    monkeypatch.setattr(wss, "trust_anchors", lambda: ())
+    monkeypatch.setattr(public_url, "readiness", lambda: {"usable": False, "reason": "ip_address"})
+    # The ways out, in any order.
+    for key, value in ((wss.MODE, "off"), (wss.MODE, "optional"), (wss.MODE, None), (wss.ATTESTATION, "none"),
+                       (wss.ATTESTATION, None), (wss.ALLOWED_AAGUIDS, []), (wss.ALLOWED_AAGUIDS, None),
+                       (wss.REQUIRED_ROLES, ["admin"]), (wss.REQUIRED_ROLES, []), (wss.GRACE_DAYS, 60),
+                       (wss.REQUIRE_UV, False), (wss.SIGN_IN_ROLES, ["user"]), (wss.ALLOWED_ALGS, ["ES256"]),
+                       # ...and a save of what is in force already.
+                       (wss.MODE, "required_for_roles"), (wss.ATTESTATION, "direct"), (wss.ALLOWED_AAGUIDS, [make]),
+                       (wss.REQUIRED_ROLES, ["admin", "user"]), (wss.GRACE_DAYS, 14), (wss.REQUIRE_UV, True)):
+        assert wss.save_refusal(db, key, value) is None, (key, value)
+    # What asks for more is refused, each for its own reason.
+    assert "anchors" in wss.save_refusal(db, wss.ALLOWED_AAGUIDS, [make, other])
+    assert "public address" in wss.save_refusal(db, wss.REQUIRED_ROLES, ["user", "admin", "external"])
+    assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 7)
+    assert "'admin' cannot be in this list" in wss.save_refusal(db, wss.SIGN_IN_ROLES, ["admin"])
+    # Walked back: attestation none, then the makes list is left alone and applies to nothing; turning direct
+    # attestation on again, or adding a make without it, is refused.
+    _resolving(monkeypatch, registry, dict(stuck, **{wss.ATTESTATION: "none"}))
+    assert wss.policy().allowed_aaguids == () and wss.policy().attestation == "none"
+    assert "anchors" in wss.save_refusal(db, wss.ATTESTATION, "direct")
+    assert "direct attestation" in wss.save_refusal(db, wss.ALLOWED_AAGUIDS, [make, other])
+    assert wss.save_refusal(db, wss.ALLOWED_AAGUIDS, []) is None
+    # The list that is kept is asked about only when it is the thing saved: another save meets its own reason.
+    assert "no administrator" in wss.save_refusal(db, wss.GRACE_DAYS, 7)
+    # Passkeys off, then on again as a requirement: asked for the address once more.
+    _resolving(monkeypatch, registry, dict(stuck, **{wss.MODE: "off", wss.ATTESTATION: "none"}))
+    assert "public address" in wss.save_refusal(db, wss.MODE, "required_for_roles")
+    assert wss.save_refusal(db, wss.MODE, "optional") is None
+
+
+def test_what_a_save_asks_for_beyond_what_is_in_force(monkeypatch):
+    registry, wss = _mod()
+    more, a, b = wss.asks_for_more, "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+    assert more(wss.MODE, "optional", "required_for_roles") and more(wss.MODE, "off", "required_for_roles")
+    assert not more(wss.MODE, "required_for_roles", "required_for_roles") and not more(wss.MODE, "off", "optional")
+    assert not more(wss.MODE, "required_for_roles", "off")
+    assert more(wss.REQUIRED_ROLES, ["user"], ["user", "admin"]) and more(wss.REQUIRED_ROLES, None, ["user"])
+    assert not more(wss.REQUIRED_ROLES, ["user", "admin"], ["admin"]) and not more(wss.REQUIRED_ROLES, ["user"], [])
+    assert more(wss.REQUIRED_ROLES, ["user"], ["admin"])                          # one out, another in
+    assert more(wss.GRACE_DAYS, 14, 13) and not more(wss.GRACE_DAYS, 14, 14) and not more(wss.GRACE_DAYS, 14, 15)
+    assert more(wss.REQUIRE_UV, False, True) and not more(wss.REQUIRE_UV, True, True)
+    assert not more(wss.REQUIRE_UV, True, False)
+    assert more(wss.ATTESTATION, "none", "direct") and not more(wss.ATTESTATION, "direct", "direct")
+    assert not more(wss.ATTESTATION, "direct", "none")
+    assert more(wss.ALLOWED_AAGUIDS, [a], [a, b]) and not more(wss.ALLOWED_AAGUIDS, [a, b], [b])
+    assert not more(wss.ALLOWED_AAGUIDS, [a], [])
+    for key in (wss.SIGN_IN_ROLES, wss.ALLOWED_ALGS, wss.DEVICE_BOUND_ROLES):
+        assert not more(key, ["user"], ["user", "external"])
+    # A role added beside administrators asks nothing new of them: their grace having run out stops no such save.
+    from app.core import public_url
+    from app.core.models import User, WebAuthnCredential
+    root = _user("root", role="admin", passkey_required_since=datetime.utcnow() - timedelta(days=90),
+                 passkey_requirement_cleared_at=None)
+    db = MemoryDB({User: [root], WebAuthnCredential: []})
+    monkeypatch.setattr(public_url, "readiness", lambda: {"usable": True})
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["admin"]})
+    assert wss.save_refusal(db, wss.REQUIRED_ROLES, ["admin", "user"]) is None
+    # ...and administrators added to a requirement that stands is asked whether one of them can meet it.
+    _resolving(monkeypatch, registry, {wss.MODE: "required_for_roles", wss.REQUIRED_ROLES: ["user"]})
+    assert "no administrator" in wss.save_refusal(db, wss.REQUIRED_ROLES, ["user", "admin"])
