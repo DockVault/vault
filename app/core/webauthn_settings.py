@@ -325,6 +325,34 @@ def never_verified(db) -> dict:
             "accounts_with_no_other": sum(1 for owner in owners if owner not in did)}
 
 
+def made_at_another_address(db) -> dict:
+    """The passkeys in use that were made at another address than the vault has now: ``{"passkeys": how many,
+    "accounts": of how many accounts}``. Read at start, for the line that tells the operator who changed the
+    vault's host name what it did to the passkeys there are. A key with no address on record is taken as made
+    here; while the vault has no address a passkey can be made at, every key is one made elsewhere."""
+    from app.core.models import WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not has_table(db, WebAuthnCredential.__tablename__):
+        return {"passkeys": 0, "accounts": 0}
+    here = address_now()
+    elsewhere = [key.user_id for key in db.query(WebAuthnCredential).filter(
+        WebAuthnCredential.retired_at.is_(None)).all() if not at_this_address(key, here)]
+    return {"passkeys": len(elsewhere), "accounts": len(set(elsewhere))}
+
+
+def made_at_another_address_line(elsewhere: dict) -> Optional[str]:
+    """What the start says of :func:`made_at_another_address`, or None when there is nothing to say: no such key,
+    or passkeys turned off (none is used at any address then)."""
+    keys, accounts = int(elsewhere.get("passkeys") or 0), int(elsewhere.get("accounts") or 0)
+    if keys <= 0 or not enabled():
+        return None
+    return ("Passkeys: %d passkey%s of %d account%s %s made at another address than the vault has now and cannot "
+            "be used here. An account left with no other second factor sets one up again at its next sign-in. "
+            "They work again if the address goes back; 'python dockvault.py status' on the host says where they "
+            "were made." % (keys, "" if keys == 1 else "s", accounts, "" if accounts == 1 else "s",
+                            "was" if keys == 1 else "were"))
+
+
 def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None,
                     whatever_the_switch: bool = False, verification: Optional[bool] = None) -> int:
     """How many passkeys of the account can still be used: not retired, made at the address the vault has now

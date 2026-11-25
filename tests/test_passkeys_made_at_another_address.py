@@ -464,6 +464,72 @@ def test_the_start_fills_the_addresses_in_a_step_of_its_own_after_the_column_is_
     column = source.index('"ALTER TABLE webauthn_credentials ADD COLUMN IF NOT EXISTS rp_id VARCHAR(253)"')
     filled = source.index("_passkey_settings.fill_the_addresses_not_recorded(db)")
     assert column < source.index("for stmt in statements:") < filled
+    # Then, the addresses filled in, it says how many keys were made at another one: after the fill, so that a
+    # key with no address on record is not said to be elsewhere, and in a step that stops nothing.
+    said = source.index("_passkey_settings.made_at_another_address_line(_passkey_settings.made_at_another_address(db))")
+    assert filled < said
+    step = source[said - 200:said + 400]
+    assert "try:" in step and "except Exception as e:" in step and 'print(f"⚠ {moved}")' in step
+
+
+def test_the_start_says_how_many_passkeys_were_made_at_another_address(monkeypatch):
+    """The move the operator makes by editing ALLOWED_HOSTS was said by `status` alone, to the one who ran it.
+    The vault says it when it starts again; nothing while every key was made here, or while passkeys are off."""
+    set_bare_api_env()
+    from _kept_db import kept_database
+    from app.core import webauthn_settings as wss
+    from app.core.models import RoleEnum, User, WebAuthnCredential
+    on = [True]
+    monkeypatch.setattr(wss, "enabled", lambda: on[0])
+    monkeypatch.setattr(wss, "address_now", lambda: HERE)
+    with kept_database() as (make, _engine):
+        with make() as db:
+            assert wss.made_at_another_address(db) == {"passkeys": 0, "accounts": 0}
+            who = {n: User(username=n, email=None, password_hash="x", role=RoleEnum.USER, is_active=True)
+                   for n in ("ann", "ben", "cy")}
+            db.add_all(who.values())
+            db.flush()
+            for index, (owner, address, retired) in enumerate((
+                    ("ann", HERE, None), ("ann", ELSEWHERE, None), ("ann", OLDER, None),
+                    ("ben", ELSEWHERE, None), ("ben", ELSEWHERE, datetime(2026, 11, 1)), ("cy", None, None))):
+                db.add(WebAuthnCredential(user_id=who[owner].id, credential_id=bytes([index + 1]) * 8,
+                                          public_key_cose=b"k", cose_alg=-7, rp_id=address, uv_initialized=True,
+                                          retired_at=retired))
+            db.commit()
+            here = wss.made_at_another_address(db)
+            monkeypatch.setattr(wss, "address_now", lambda: ELSEWHERE)
+            moved = wss.made_at_another_address(db)
+            monkeypatch.setattr(wss, "address_now", lambda: "")
+            nowhere = wss.made_at_another_address(db)
+    # ann's two keys made elsewhere are one account's; ben's retired key is not counted; cy's key has no address
+    # on record and is taken as made here.
+    assert here == {"passkeys": 3, "accounts": 2}
+    # The vault at the other address: ann's two keys made at neither it; ben's and cy's count as made there.
+    assert moved == {"passkeys": 2, "accounts": 1}
+    # No address a passkey can be made at: every key in use is one made elsewhere.
+    assert nowhere == {"passkeys": 5, "accounts": 3}
+    line = wss.made_at_another_address_line(here)
+    assert line == ("Passkeys: 3 passkeys of 2 accounts were made at another address than the vault has now and "
+                    "cannot be used here. An account left with no other second factor sets one up again at its next "
+                    "sign-in. They work again if the address goes back; 'python dockvault.py status' on the host "
+                    "says where they were made.")
+    assert wss.made_at_another_address_line({"passkeys": 1, "accounts": 1}).startswith(
+        "Passkeys: 1 passkey of 1 account was made at another address")
+    assert wss.made_at_another_address_line({"passkeys": 0, "accounts": 0}) is None
+    assert wss.made_at_another_address_line({}) is None
+    on[0] = False
+    assert wss.made_at_another_address_line(here) is None      # turned off: none is used at any address
+
+
+def test_the_example_file_says_what_a_change_of_the_host_name_does_to_the_passkeys_there_are():
+    from pathlib import Path
+    example = (Path(__file__).resolve().parents[1] / ".env.example").read_text(encoding="utf-8")
+    before, _, _after = example.partition("\nALLOWED_HOSTS=")
+    said = " ".join(line.lstrip("#").strip() for line in before[-1200:].splitlines())
+    assert ("A passkey answers only at the host name it was made at. Change the first entry's host name later and "
+            "the passkeys made at the old one cannot be used until it is changed back: an account left with no "
+            "other second factor sets one up again at its next sign-in.") in said
+    assert "The vault says how many there are when it starts, and dockvault.py status says where they were made" in said
 
 
 def test_the_lookup_says_how_many_of_an_accounts_passkeys_it_can_sign_in_with(monkeypatch):

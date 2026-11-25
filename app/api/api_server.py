@@ -29008,6 +29008,18 @@ END $$;""",
                 db.rollback()
                 print(f"⚠ webauthn_credentials.rp_id fill skipped: {e}")
                 recorder.record(address_step, SchemaStep.OUTCOME_FAILED, str(e))
+            # A passkey answers only at the address it was made at. The operator who changed the first entry of
+            # ALLOWED_HOSTS to another host name and started the vault again reads here what that did to the
+            # passkeys there are. Nothing is written, and a count that cannot be made stops nothing.
+            try:
+                from app.core import webauthn_settings as _passkey_settings
+                moved = _passkey_settings.made_at_another_address_line(_passkey_settings.made_at_another_address(db))
+                db.rollback()
+                if moved:
+                    print(f"⚠ {moved}")
+            except Exception as e:
+                db.rollback()
+                print(f"⚠ passkeys made at another address were not counted: {e}")
 
             # Whose password each account holds (app/core/password_origin.py): the two columns are added,
             # and filled from the audit log, once, in one transaction. Deliberately NOT a string in the
