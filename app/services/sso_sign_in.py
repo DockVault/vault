@@ -961,6 +961,32 @@ def _would_link_by_email(db, row, answer: ProviderAnswer, policy: dict) -> Optio
     return None
 
 
+def link_freshness_refusal(row, answer: ProviderAnswer, *, now=None) -> None:
+    """Raise :class:`Refusal` unless the provider signed the person in just now for this link, where it says when
+    it did. A link is started with ``prompt=login`` and ``max_age=0``: the identity that is linked is to be the
+    one of whoever is at the keyboard, not of whoever was still signed in at the provider in that browser (a
+    shared computer, a sign-in the provider was tricked into). A provider that honours the request states an
+    ``auth_time`` of a moment ago; an older one means it answered from a session it had. Judged only for a
+    provider whose test sign-in carried ``auth_time``: without it there is nothing to judge by, and the request
+    is made all the same."""
+    last_test = getattr(row, "last_test", None) or {}
+    if not (isinstance(last_test, dict) and last_test.get("auth_time_present") is True):
+        return
+    now = now or datetime.now(timezone.utc)
+    if answer.auth_time is None or not (
+            -oc.SKEW_SECONDS <= (now - answer.auth_time).total_seconds() <= REAUTH_MAX_AGE_SECONDS):
+        raise Refusal(REAUTH_STALE)
+
+
+def identity_shown(identity) -> str:
+    """Who an identity is at its provider, in the provider's words when it was linked: the address, else the name,
+    else nothing. For the account's owner to see which identity stands on their account."""
+    for value in (getattr(identity, "email_at_link", None), getattr(identity, "display_name", None)):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def link_refusal(db, row, user, answer: ProviderAnswer) -> None:
     """Raise :class:`Refusal` when ``answer``'s identity cannot be linked to ``user``: it already belongs to
     another account, or the account already has an identity on this provider."""

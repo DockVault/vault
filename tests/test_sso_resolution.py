@@ -4,6 +4,7 @@ carries it into the login state; the invited account is made at the callback wit
 this identity, and the invitation is claimed once); an existing account linked by its verified email when the
 provider allows it and is restricted; every refusal in between; what a test sign-in says it would do; the words
 the sign-in page fetches for each reason. Offline: fake stores, the records observed."""
+import time
 import types
 import uuid
 from datetime import datetime, timedelta
@@ -306,6 +307,67 @@ def test_the_administrators_are_told_of_a_first_sign_in_that_met_an_unconfirmed_
     assert admins[1] == "A first sign-in through Sign in with Contoso made no account" and admins[3] == "#users"
     assert "written on bob's account, which never confirmed it" in admins[2] and admins[4] is True
     assert "correct it on the Users page" in admins[2]
+
+
+def test_a_link_asks_the_provider_for_a_fresh_sign_in_and_says_who_was_linked(monkeypatch):
+    """What is linked is the identity of whoever is at the provider in that browser. So a link asks the provider
+    to sign the person in again, refuses an answer the provider gave from a session it already had (where the
+    provider says when it signed the person in), and shows the owner which identity now stands on their account:
+    in the answer, in the list and in the notice."""
+    alice = _user()
+    p = _provider(last_test={"outcome": "ok", "auth_time_present": True})
+    quiet = _provider(name="quiet", label="Quiet", last_test={"outcome": "ok", "auth_time_present": False})
+    h = Resolving(monkeypatch, [alice], [p, quiet])
+    h.current_user = alice
+    status, out = h.start_link(p)
+    assert status == 200 and "prompt=login" in out["authorization_url"] and "max_age=0" in out["authorization_url"]
+    # Somebody else was still signed in at the provider, and it answered from that session, three days old.
+    state, _ = h.state_of(out["authorization_url"])
+    h.claims_override = {"sub": "somebody-else", "email": "other@corp.example", "auth_time": int(time.time()) - 3 * 86400}
+    assert h.callback(p, state)[1] == "/#sso-error=reauth_stale"
+    assert h.codes() == [] and h.identities() == []
+    assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "reauth_stale" for a in h.audits)
+    # A token that does not say when is no fresh sign-in either.
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    h.claims_override = {"auth_time": ...}
+    assert h.callback(p, state)[1] == "/#sso-error=reauth_stale" and h.identities() == []
+    # Signed in again just now: linked, and the owner is shown as whom.
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    h.claims_override = {"sub": "alice-at-corp", "email": "alice@corp.example", "name": "Alice Example",
+                         "auth_time": int(time.time()) - 5}
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso-linked="), location
+    status, body = h.finish_link(location)
+    assert status == 200 and body["identity"]["email"] == "alice@corp.example", body
+    assert body["identity"]["display_name"] == "Alice Example"
+    said = [text for ids, title, text in h.notice_bodies if ids == [str(alice.id)]]
+    assert said and said[-1].startswith("You linked your account to Sign in with Contoso as alice@corp.example: ")
+    status, listed, _ = _call(h.S, "GET", "/users/me/identities")
+    assert status == 200 and [(i["email"], i["display_name"]) for i in listed["identities"]] == [
+        ("alice@corp.example", "Alice Example")]
+    # A provider that never said when it signed anybody in: the request is made all the same, and nothing is
+    # judged that cannot be.
+    status, out = h.start_link(quiet)
+    assert "prompt=login" in out["authorization_url"] and "max_age=0" in out["authorization_url"]
+    state, _ = h.state_of(out["authorization_url"])
+    h.claims_override = {"sub": "alice-at-quiet", "email": ..., "name": "Alice Q", "auth_time": int(time.time()) - 3 * 86400}
+    status, location, _ = h.callback(quiet, state)
+    assert location.startswith("/#sso-linked="), location
+    status, body = h.finish_link(location)
+    assert status == 200 and body["identity"]["email"] is None and body["identity"]["display_name"] == "Alice Q"
+    said = [text for ids, title, text in h.notice_bodies if ids == [str(alice.id)]]
+    assert said[-1].startswith("You linked your account to Quiet as Alice Q: ")
+
+
+def test_who_an_identity_is_shown_as():
+    from app.services import sso_sign_in as sso
+    shown = sso.identity_shown
+    assert shown(types.SimpleNamespace(email_at_link=" a@corp.example ", display_name="A")) == "a@corp.example"
+    assert shown(types.SimpleNamespace(email_at_link=None, display_name=" A B ")) == "A B"
+    assert shown(types.SimpleNamespace(email_at_link="  ", display_name=None)) == ""
+    assert shown(types.SimpleNamespace()) == ""
 
 
 def test_what_an_invitations_code_keeps_of_the_providers_answer():

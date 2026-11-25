@@ -609,8 +609,10 @@ async def sign_in_callback(
         if not login.step_up_action:
             return _redirect("sso-error=" + sso.PURPOSE_NOT_READY)
     if login.purpose == sso_state.LINK:
-        # Refusals that need no claim are given now, so the person is told at once.
+        # Refusals that need no claim are given now, so the person is told at once. First that the provider did
+        # sign the person in for this link, where it says when it did.
         try:
+            sso.link_freshness_refusal(row, answer)
             sso.link_refusal(db, row, user, answer)
         except sso.Refusal as exc:
             _audit(db, "sso_sign_in_refused", user=user, ip=client_ip, status_="failure",
@@ -1127,8 +1129,9 @@ async def finish_link(
     _audit(db, "sso_identity_linked", user=current_user, ip=client_ip,
            details={"provider_id": str(row.id), "purpose": sso_state.LINK, "identity_id": str(identity.id), "linked_by": "self"})
     label = row.label or row.name
+    who = sso.identity_shown(identity)
     _tell_owner(db, current_user, row, "A sign-in method was added to your account",
-                f"You linked your account to {label}: it can now sign in through it."
+                f"You linked your account to {label}{' as ' + who if who else ''}: it can now sign in through it."
                 + (PASSWORD_STOPPED.format(label=label) if password_stopped else ""))
     answer = {"linked": True, "identity": _identity_public(identity, row)}
     if password_stopped:
@@ -1207,8 +1210,11 @@ def _refuse_temp(user) -> None:
 def _identity_public(identity: ExternalIdentity, row: Optional[SsoProvider]) -> dict:
     def _t(value):
         return value.isoformat() + "Z" if value else None
+    # Who the identity is at the provider, as the provider said when it was linked: the owner sees which identity
+    # stands on their account, and a wrong one shows.
     return {"id": str(identity.id), "provider_id": str(identity.provider_id),
             "provider": (row.label or row.name) if row is not None else "a removed provider",
+            "email": getattr(identity, "email_at_link", None), "display_name": getattr(identity, "display_name", None),
             "linked_at": _t(identity.linked_at), "linked_by": identity.linked_by,
             "last_sign_in_at": _t(identity.last_sign_in_at)}
 
@@ -1375,9 +1381,11 @@ async def start_link(
     view, user_id, session_hash = _provider_view(row), current_user.id, api._current_session_hash(request)
     _release_database(db)
     try:
+        # The provider is asked to sign the person in again: what is linked is to be the identity of whoever is
+        # here now, not of whoever was still signed in at the provider in this browser.
         url = await _provider_call(sso.start, view, purpose=sso_state.LINK, source=sign_in_lockout.source_of(client_ip),
                                    client_ip=client_ip, verifier_hash=body.verifier_hash, user_id=user_id,
-                                   session_hash=session_hash, deadline=_provider_deadline())
+                                   session_hash=session_hash, reauthenticate=True, deadline=_provider_deadline())
     except (sso.Refusal, oc.OidcError, sso_state.TooManyAbandoned, sso_state.Unavailable) as exc:
         raise _refused_start(exc)
     return {"authorization_url": url, "expires_in": sso_state.STATE_TTL_SECONDS}
