@@ -31,6 +31,9 @@ for (const id of ['sso-provider-title', 'sso-provider-body']) {
 }
 const add = document.createElement('button'); add.id = 'signin-sso-add'; document.body.appendChild(add);
 global.location = { origin: 'https://vault.example.test' };
+// The page's clock, frozen: a date the list gives is before or after it whatever day the test runs on.
+const NOW = Date.parse('2026-10-25T10:00:00Z');
+Date.now = () => NOW;
 var currentUser = { id: 'root-id', username: 'root', role: 'admin' };
 const asked = [], toasts = [], confirms = [];
 let answers = {};
@@ -73,10 +76,11 @@ const LIST = { provider_id: 'p-1', total: 3, skip: 0, limit: 50, counts: { refus
     identities: [
         { id: 'i-carol', user_id: 'u-carol', username: 'carol', linked_by: 'self', linked_at: '2026-09-01T10:00:00Z',
           last_sign_in_at: '2026-10-01T10:00:00Z', state: 'refused', refused_at: '2026-10-20T10:00:00Z',
-          due_at: '2026-10-31T10:00:00Z', holds_sign_in: true, own: false },
+          due_at: '2026-10-31T10:00:00Z', holds_sign_in: true, own: false,
+          after_lift: { state: 'linked', holds_sign_in: false } },
         { id: 'i-root', user_id: 'root-id', username: 'root', linked_by: 'self', linked_at: '2026-09-01T10:00:00Z',
           last_sign_in_at: null, state: 'refused', refused_at: '2026-10-20T10:00:00Z', due_at: null,
-          holds_sign_in: false, own: true },
+          holds_sign_in: false, own: true, after_lift: { state: 'linked', holds_sign_in: false } },
         { id: 'i-bob', user_id: 'u-bob', username: 'bob', linked_by: 'email', linked_at: '2026-08-01T10:00:00Z',
           last_sign_in_at: '2026-08-02T10:00:00Z', state: 'lapsed', refused_at: null,
           due_at: '2026-09-01T10:00:00Z', holds_sign_in: true, own: false }] };
@@ -122,6 +126,7 @@ out({ tab: byId('sso-tab-identities').textContent, selected: byId('sso-tab-ident
     assert carol["name"] == "carol" and carol["state"] == "Refused or held" and carol["action"] == "Lift refusal"
     assert carol["bits"].startswith("Account u-carol · Linked by its owner on ")
     assert "refused or held since " in carol["bits"] and "its password and passkeys do not sign it in now" in carol["bits"]
+    assert "its days run out on " in carol["bits"] and "ran out" not in carol["bits"]      # still to come
     # The administrator's own refusal is another administrator's to lift.
     assert root["state"] == "Refused or held" and root["action"] == "Your own: another administrator lifts it."
     assert "never signed in through it" in root["bits"]
@@ -152,12 +157,54 @@ out({ declined, confirm: confirms[0], posts: asked.filter((a) => a.method === 'P
     assert got["declined"] == 0                              # nothing is sent before the person says yes
     message, title, label = got["confirm"]
     assert title == "Lift refusal" and label == "Lift refusal"
-    assert message.startswith("Lift the refusal or hold on carol? Their SSH keys, temporary credentials and devices "
-                              "work again, unless another rule pauses them")
+    assert message == ("Lift the refusal or hold on carol? Their SSH keys, temporary credentials and devices work "
+                       "again, unless another rule pauses them. Their password and passkeys sign them in again. They "
+                       "and the other administrators are told. Lift it when the refusal was a mistake the provider "
+                       "cannot answer.")
     assert got["posts"] == ["/admin/sso/identities/i-carol/clear-refusal"]
     assert got["toasts"] == [["The refusal on carol was lifted.", "success"]]
     assert got["reads"] == 2 and got["providersRead"] == 2   # the list, and the card's counts, read again
     assert got["rows"][0] == ["carol", "Linked", None]
+
+
+@pytest.mark.parametrize("case", ["provider on", "provider off", "keys only"])
+def test_a_hold_whose_days_ran_out_says_so_in_the_past_and_its_lift_says_the_keys_stay_paused(case):
+    """A hold the vault wrote when the provider was turned off, after the person's days there had run out: the row
+    says the days ran out (in the past, whatever the state), and the confirmation says what the lift gives as the
+    server says it: the keys stay paused until the person signs in through the provider; their password back while
+    the provider is off, and nothing they can do while it is on. Where the provider's days pause the keys only, the
+    password signed the person in all along, and the confirmation does not say it comes back."""
+    holds_now, holds_after = {"provider on": (True, True), "provider off": (True, False),
+                              "keys only": (False, False)}[case]
+    got = _node(r"""
+const held = { id: 'i-bob', user_id: 'u-bob', username: 'bob', linked_by: 'email', linked_at: '2026-08-01T10:00:00Z',
+    last_sign_in_at: '2026-08-02T10:00:00Z', state: 'refused', refused_at: '2026-10-20T10:00:00Z',
+    due_at: '2026-09-01T10:00:00Z', holds_sign_in: %s, own: false,
+    after_lift: { state: 'lapsed', holds_sign_in: %s } };
+answers[IDS] = { provider_id: 'p-1', total: 1, skip: 0, limit: 50, counts: { refused: 1, lapsed: 0, linked: 0 },
+                 identities: [held] };
+await openIdentities();
+confirmAnswer = false;
+document.querySelector('.sso-identity-row button').click();
+await tick(); await tick();
+out({ row: rows()[0], confirm: confirms[0][0] });
+""" % (json.dumps(holds_now), json.dumps(holds_after)))
+    row = got["row"]
+    assert row["state"] == "Refused or held" and row["action"] == "Lift refusal"
+    assert "refused or held since " in row["bits"] and "its days ran out on " in row["bits"]
+    assert "run out on" not in row["bits"]
+    start = ("Lift the refusal or hold on bob? Their days without a sign-in through this provider have run out all the "
+             "same, so their SSH keys, temporary credentials and devices stay paused until they sign in through it")
+    if case == "provider on":
+        assert got["confirm"] == start + (", and their password and passkeys still do not sign them in: until then, "
+                                          "lifting it changes nothing they can do. They and the other administrators "
+                                          "are told.")
+    elif case == "provider off":
+        assert got["confirm"] == start + (". Their password and passkeys sign them in again. They and the other "
+                                          "administrators are told.")
+    else:
+        assert got["confirm"] == start + ". They and the other administrators are told."
+    assert "work again" not in got["confirm"]
 
 
 def test_a_lift_the_server_refuses_says_why_and_still_reads_the_list_again():

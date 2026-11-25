@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -166,6 +167,14 @@ def _standing(identity, provider, now):
     return LINKED, found
 
 
+def _lifted(identity):
+    """``identity`` as it is once its refusal or hold is lifted (POST /admin/sso/identities/{id}/clear-refusal
+    clears the date and nothing else): the same link and the same sign-ins, with no refusal."""
+    return SimpleNamespace(id=identity.id, user_id=identity.user_id, provider_id=identity.provider_id,
+                           linked_at=getattr(identity, "linked_at", None),
+                           last_sign_in_at=getattr(identity, "last_sign_in_at", None), refused_at=None)
+
+
 @router.get("/admin/sso/providers/{provider_id}/identities")
 def list_provider_identities(provider_id: str, skip: int = Query(0, ge=0, le=1_000_000),
                              limit: int = Query(IDENTITIES_PAGE, ge=1, le=IDENTITIES_PAGE_MAX),
@@ -179,6 +188,9 @@ def list_provider_identities(provider_id: str, skip: int = Query(0, ge=0, le=1_0
     admits or by another administrator (POST /admin/sso/identities/{id}/clear-refusal). ``lapsed`` once the provider's
     days without a sign-in there have run out (``due_at``); only a sign-in through the provider ends that.
     ``holds_sign_in``: the account's password and passkeys do not sign it in because of this identity.
+    ``after_lift``, for a refused or held account: where lifting it would leave the account (``state`` and
+    ``holds_sign_in``), so the page says what a lift gives. The days count as they stand, so a hold the vault wrote
+    after they had run out leaves the account lapsed.
 
     Refused first, then lapsed, then by username; ``state`` keeps one of the three. ``skip`` and ``limit`` page through
     them; ``total`` counts them all, ``counts`` each state. Never the provider's identifier for the person, the address
@@ -205,16 +217,23 @@ def list_provider_identities(provider_id: str, skip: int = Query(0, ge=0, le=1_0
     def _t(value):
         return value.isoformat() + "Z" if value else None
 
+    def holds(user, found):
+        return bool(found is not None and sso_freshness.closes_now(found, now) and user is not None
+                    and privileged_accounts.kind(db, user) is None)
+
     def shown(identity, held, found):
         user = users.get(identity.user_id)
+        after = None
+        if held == REFUSED:
+            then, then_found = _standing(_lifted(identity), row, now)
+            after = {"state": then, "holds_sign_in": holds(user, then_found)}
         return {
             "id": str(identity.id), "user_id": str(identity.user_id), "username": names.get(identity.user_id),
             "linked_by": identity.linked_by, "linked_at": _t(identity.linked_at),
             "last_sign_in_at": _t(getattr(identity, "last_sign_in_at", None)), "state": held,
             "refused_at": _t(getattr(identity, "refused_at", None)) if held == REFUSED else None,
             "due_at": _t(found.due) if found is not None and found.window_days > 0 else None,
-            "holds_sign_in": bool(found is not None and sso_freshness.closes_now(found, now) and user is not None
-                                  and privileged_accounts.kind(db, user) is None),
+            "holds_sign_in": holds(user, found), "after_lift": after,
             # An administrator's own refusal is lifted by another administrator.
             "own": str(identity.user_id) == str(current_user.id),
         }

@@ -18,7 +18,7 @@ pytestmark = pytest.mark.unit
 NOW = datetime.utcnow()
 POLICY = {"sso_freshness_days": 30, "sso_lapse_ends_sign_in": True}
 FIELDS = {"id", "user_id", "username", "linked_by", "linked_at", "last_sign_in_at", "state", "refused_at", "due_at",
-          "holds_sign_in", "own"}
+          "holds_sign_in", "after_lift", "own"}
 
 
 def _t(value):
@@ -71,10 +71,12 @@ def test_the_page_lists_a_providers_accounts_with_where_each_stands_and_its_date
                      "linked_at": _t(w.refused.linked_at), "last_sign_in_at": _t(w.refused.last_sign_in_at),
                      "state": "refused", "refused_at": _t(w.refused.refused_at),
                      "due_at": _t(w.refused.last_sign_in_at + timedelta(days=30)), "holds_sign_in": True,
-                     "own": False}
+                     "after_lift": {"state": "linked", "holds_sign_in": False}, "own": False}
     bob = by_name["Bob"]
     assert bob["state"] == "lapsed" and bob["refused_at"] is None and bob["linked_by"] == "email"
     assert bob["due_at"] == _t(w.gone.last_sign_in_at + timedelta(days=30)) and bob["holds_sign_in"] is True
+    # What a lift would leave is said for a refused or held account only.
+    assert all(r["after_lift"] is None for r in rows if r["state"] != "refused")
     # The days have run out for an administrator too, but an administrator keeps the password as the way in.
     assert by_name["erin"]["state"] == "lapsed" and by_name["erin"]["holds_sign_in"] is False
     # An answered refusal holds nobody: the account is linked, and the old stamp is not shown as a refusal.
@@ -205,6 +207,36 @@ def test_a_refusal_on_a_provider_that_counts_no_days_has_no_date_for_its_days(mo
     assert carol["state"] == "refused" and carol["refused_at"] == _t(w.refused.refused_at)
     assert carol["due_at"] is None and carol["holds_sign_in"] is True
     assert all(r["due_at"] is None and r["state"] == "linked" for name, r in rows.items() if name != "carol")
+    # No days to run out: lifting the refusal leaves the account linked and its password signing it in.
+    assert carol["after_lift"] == {"state": "linked", "holds_sign_in": False}
+
+
+@pytest.mark.parametrize("ends_sign_in", [True, False], ids=["days end sign-in", "days pause keys only"])
+@pytest.mark.parametrize("how", ["on", "turned off"])
+def test_what_a_lift_would_leave_is_where_the_account_stands_once_lifted(monkeypatch, ends_sign_in, how):
+    """For each refused or held account the page says where a lift leaves it, and it is where the account stands once
+    the lift is made. A refusal the provider made before the days ran out leaves the account linked; a hold (or a
+    refusal) after they ran out leaves it lapsed, its keys paused, and held to the provider's sign-in while the
+    provider is on and says so."""
+    from app.api import sso_admin_router as A
+    w = _world(monkeypatch, policy={"sso_freshness_days": 30, "sso_lapse_ends_sign_in": ends_sign_in})
+    if how == "turned off":
+        status, out = w.h.call("POST", f"/admin/sso/providers/{w.p.id}/state", {"state": "disabled"})
+        assert status == 200 and out["held"] == 2, out
+    else:
+        w.gone.refused_at = NOW - timedelta(days=1)      # refused after the days had run out
+    monkeypatch.setattr(A, "_step_up", lambda db, user, request: w.h.order.append("step_up"))
+    said = {r["username"]: r["after_lift"] for r in _list(w.h, w.p.id)[1]["identities"] if r["state"] == "refused"}
+    assert set(said) >= {"carol", "Bob"}
+    assert said["carol"] == {"state": "linked", "holds_sign_in": False}
+    assert said["Bob"] == {"state": "lapsed", "holds_sign_in": ends_sign_in and how == "on"}
+    ids = {"carol": w.refused.id, "Bob": w.gone.id, "erin": w.admin_lapsed.id}
+    for name, after in said.items():
+        status, out = w.h.call("POST", f"/admin/sso/identities/{ids[name]}/clear-refusal")
+        assert status == 200 and out == {"cleared": True}, (name, out)
+        now = {r["username"]: r for r in _list(w.h, w.p.id)[1]["identities"]}[name]
+        assert {"state": now["state"], "holds_sign_in": now["holds_sign_in"]} == after, name
+        assert now["after_lift"] is None
 
 
 def _refused_for(monkeypatch, w, user):

@@ -555,6 +555,27 @@
         }
     }
 
+    // What lifting the refusal or hold on an account gives, from where the server says the lift leaves it
+    // (`after_lift`). A hold the vault wrote after the person's days had run out leaves them run out: the keys stay
+    // paused until the person signs in through the provider, and while the provider is on they sign in only there.
+    function liftSays(name, identity) {
+        const after = identity.after_lift || { state: 'linked', holds_sign_in: false };
+        const signInBack = identity.holds_sign_in && !after.holds_sign_in
+            ? ' Their password and passkeys sign them in again.' : '';
+        const told = ' They and the other administrators are told.';
+        if (after.state === 'lapsed') {
+            return `Lift the refusal or hold on ${name}? Their days without a sign-in through this provider have run `
+                + 'out all the same, so their SSH keys, temporary credentials and devices stay paused until they sign '
+                + 'in through it' + (after.holds_sign_in
+                    ? ', and their password and passkeys still do not sign them in: until then, lifting it changes '
+                      + 'nothing they can do.'
+                    : '.') + signInBack + told;
+        }
+        return `Lift the refusal or hold on ${name}? Their SSH keys, temporary credentials and devices work again, `
+            + 'unless another rule pauses them.' + signInBack + told
+            + ' Lift it when the refusal was a mistake the provider cannot answer.';
+    }
+
     function identityRow(providerId, identity, list) {
         const row = _el('div', 'sso-identity-row flex items-center gap-sm mb-sm');
         row.dataset.identity = identity.id;
@@ -569,7 +590,10 @@
             identity.last_sign_in_at ? 'last signed in through it on ' + day(identity.last_sign_in_at)
                 : 'never signed in through it'];
         if (identity.state === 'refused' && identity.refused_at) bits.push('refused or held since ' + day(identity.refused_at));
-        if (identity.due_at) bits.push((identity.state === 'lapsed' ? 'its days ran out on ' : 'its days run out on ') + day(identity.due_at));
+        if (identity.due_at) {
+            const ranOut = new Date(identity.due_at).getTime() <= Date.now();
+            bits.push((ranOut ? 'its days ran out on ' : 'its days run out on ') + day(identity.due_at));
+        }
         if (identity.holds_sign_in) bits.push('its password and passkeys do not sign it in now');
         text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
         row.appendChild(text);
@@ -580,10 +604,7 @@
             lift.type = 'button';
             lift.setAttribute('aria-label', 'Lift the refusal of ' + name);
             lift.addEventListener('click', async () => {
-                const ok = await showConfirm(`Lift the refusal or hold on ${name}? Their SSH keys, temporary credentials `
-                    + 'and devices work again, unless another rule pauses them, and they and the other administrators '
-                    + 'are told. Lift it when the refusal was a mistake the provider cannot answer.', 'Lift refusal',
-                    null, 'Lift refusal');
+                const ok = await showConfirm(liftSays(name, identity), 'Lift refusal', null, 'Lift refusal');
                 if (!ok) return;
                 lift.disabled = true;
                 try {
