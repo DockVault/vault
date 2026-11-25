@@ -2,7 +2,9 @@
 that lists the accounts linked to it, from GET /admin/sso/providers/{id}/identities, with where each stands and the
 dates the vault keeps; says on the page what a refusal and a hold are and how each is lifted; offers "Lift refusal"
 (POST /admin/sso/identities/{id}/clear-refusal) for a refused or held account that is not the administrator's own,
-after a confirmation that says what lifting does; reads the list again afterwards; and pages through a long list.
+after a confirmation that says what lifting does; offers "Unlink" (DELETE /admin/sso/identities/{id}) for every
+account that is not the administrator's own, after a confirmation that says what the unlink ends; reads the list
+again after either; and pages through a long list.
 
 The card and the dialog under SETTINGS_LOCKED_KEYS: they say so in the server's words and offer nothing that would
 change a provider, while what only reads or tests stays. Each provider's Open button names the provider it opens.
@@ -71,7 +73,7 @@ const rows = () => document.querySelectorAll('.sso-identity-row').map((row) => (
     name: row.children[0].children[0].childNodes[0].textContent,
     state: row.querySelector('.sso-identity-state').textContent,
     bits: row.children[0].children[1].textContent,
-    action: row.children.length > 1 ? row.children[1].textContent : null,
+    actions: row.children.slice(1).map((node) => node.textContent),
 }));
 const out = (value) => console.log(JSON.stringify(value));
 const IDS = '/admin/sso/providers/p-1/identities?skip=0&limit=50';
@@ -123,18 +125,19 @@ out({ tab: byId('sso-tab-identities').textContent, selected: byId('sso-tab-ident
     assert "the provider refused the person when they last signed in there" in about
     assert "turned off or was to be removed" in about and "The vault keeps the date of either" in about
     assert "a sign-in the provider admits lifts it, or you lift it here" in about
-    assert "Days run out: only a sign-in through the provider ends that." in about
+    assert "Days run out: only a sign-in through the provider ends that, or you unlink the account here." in about
     assert got["counts"] == "3 linked accounts: 2 refused or held, 1 with their days run out."
     carol, root, bob = got["rows"]
-    assert carol["name"] == "carol" and carol["state"] == "Refused or held" and carol["action"] == "Lift refusal"
+    assert carol["name"] == "carol" and carol["state"] == "Refused or held"
+    assert carol["actions"] == ["Lift refusal", "Unlink"]
     assert carol["bits"].startswith("Account u-carol · Linked by its owner on ")
     assert "refused or held since " in carol["bits"] and "its password and passkeys do not sign it in now" in carol["bits"]
     assert "its days run out on " in carol["bits"] and "ran out" not in carol["bits"]      # still to come
-    # The administrator's own refusal is another administrator's to lift.
-    assert root["state"] == "Refused or held" and root["action"] == "Your own: another administrator lifts it."
+    # The administrator's own refusal is another administrator's to lift or unlink.
+    assert root["state"] == "Refused or held" and root["actions"] == ["Your own: another administrator lifts or unlinks it."]
     assert "never signed in through it" in root["bits"]
-    # Days run out: nothing to lift here.
-    assert bob["state"] == "Days run out" and bob["action"] is None
+    # Days run out: nothing to lift here, and the account can be unlinked.
+    assert bob["state"] == "Days run out" and bob["actions"] == ["Unlink"]
     assert "Linked by its verified email address" in bob["bits"] and "its days ran out on " in bob["bits"]
 
 
@@ -154,7 +157,7 @@ answers[IDS] = Object.assign({}, LIST, { counts: { refused: 1, lapsed: 1, linked
 document.querySelector('.sso-identity-row button').click();
 await tick(); await tick(); await tick();
 out({ declined, confirm: confirms[0], posts: asked.filter((a) => a.method === 'POST').map((a) => a.path),
-      reads: asked.filter((a) => a.path === IDS).length, toasts, rows: rows().map((r) => [r.name, r.state, r.action]),
+      reads: asked.filter((a) => a.path === IDS).length, toasts, rows: rows().map((r) => [r.name, r.state, r.actions]),
       providersRead: asked.filter((a) => a.path === '/admin/sso/providers').length });
 """)
     assert got["declined"] == 0                              # nothing is sent before the person says yes
@@ -167,7 +170,7 @@ out({ declined, confirm: confirms[0], posts: asked.filter((a) => a.method === 'P
     assert got["posts"] == ["/admin/sso/identities/i-carol/clear-refusal"]
     assert got["toasts"] == [["The refusal on carol was lifted.", "success"]]
     assert got["reads"] == 2 and got["providersRead"] == 2   # the list, and the card's counts, read again
-    assert got["rows"][0] == ["carol", "Linked", None]
+    assert got["rows"][0] == ["carol", "Linked", ["Unlink"]]
 
 
 @pytest.mark.parametrize("case", ["provider on", "provider off", "keys only"])
@@ -193,7 +196,7 @@ await tick(); await tick();
 out({ row: rows()[0], confirm: confirms[0][0] });
 """ % (json.dumps(holds_now), json.dumps(holds_after)))
     row = got["row"]
-    assert row["state"] == "Refused or held" and row["action"] == "Lift refusal"
+    assert row["state"] == "Refused or held" and row["actions"] == ["Lift refusal", "Unlink"]
     assert "refused or held since " in row["bits"] and "its days ran out on " in row["bits"]
     assert "run out on" not in row["bits"]
     start = ("Lift the refusal or hold on bob? Their days without a sign-in through this provider have run out all the "
@@ -220,6 +223,108 @@ await tick(); await tick(); await tick();
 out({ toasts, reads: asked.filter((a) => a.path === IDS).length });
 """)
     assert got == {"toasts": [["No refusal holds this identity.", "error"]], "reads": 2}
+
+
+UNLINK_TAIL = (" If Contoso is what keeps the account from holding a password, it may hold one again, and has none "
+               "anybody can type until it sets one. The vault refuses an unlink that would leave the account no way to "
+               "sign in, and says what to do first. {name} and the other administrators are told.")
+
+
+def test_unlinking_an_account_asks_first_says_what_it_ends_and_reads_the_list_again():
+    """Unlink (DELETE /admin/sso/identities/{id}) on an account whose days ran out: the confirmation says what the
+    unlink ends, that the vault refuses one that leaves no way in, and who is told; the answer's sessions and paused
+    keys are said; the list and the card are read again."""
+    got = _node(r"""
+answers[IDS] = LIST;
+answers['/admin/sso/identities/i-bob'] = { removed: true, sessions_ended: 2, held: false, keys_paused: true };
+await openIdentities();
+const unlink = () => document.querySelector('.sso-identity-row[data-identity="i-bob"] .sso-identity-unlink');
+const label = unlink().getAttribute('aria-label');
+confirmAnswer = false;
+unlink().click();
+await tick(); await tick();
+const declined = asked.filter((a) => a.method === 'DELETE').length;
+confirmAnswer = true;
+unlink().click();
+await tick(); await tick(); await tick();
+out({ label, declined, confirms, deletes: asked.filter((a) => a.method === 'DELETE').map((a) => a.path), toasts,
+      reads: asked.filter((a) => a.path === IDS).length,
+      providersRead: asked.filter((a) => a.path === '/admin/sso/providers').length });
+""")
+    assert got["label"] == "Unlink bob from Contoso"
+    assert got["declined"] == 0                              # nothing is sent before the person says yes
+    message, title, label = got["confirms"][1]
+    assert title == "Unlink" and label == "Unlink"
+    assert message == ("Unlink bob from Contoso? The account can no longer sign in through Contoso, and its sessions "
+                       "that came through Contoso end. Its days without a sign-in through Contoso end with the link."
+                       + UNLINK_TAIL.format(name="bob"))
+    assert got["deletes"] == ["/admin/sso/identities/i-bob"]
+    assert got["toasts"] == [["bob was unlinked from Contoso. 2 session(s) that came through it ended. The pause "
+                              "Contoso had on its SSH keys, temporary credentials and devices ended with the link.",
+                              "success"]]
+    assert got["reads"] == 2 and got["providersRead"] == 2   # the list, and the card's counts, read again
+
+
+def test_unlinking_says_what_ends_with_a_refusal_and_a_hold_and_that_a_password_may_be_set_again():
+    got = _node(r"""
+answers[IDS] = LIST;
+answers['/admin/sso/identities/i-carol'] = { removed: true, sessions_ended: 0, held: true, keys_paused: false,
+                                             may_set_password: true };
+await openIdentities();
+document.querySelector('.sso-identity-row[data-identity="i-carol"] .sso-identity-unlink').click();
+await tick(); await tick(); await tick();
+out({ confirm: confirms[0][0], toasts });
+""")
+    assert got["confirm"] == ("Unlink carol from Contoso? The account can no longer sign in through Contoso, and its "
+                              "sessions that came through Contoso end. The refusal or hold Contoso had on it ends with "
+                              "the link." + UNLINK_TAIL.format(name="carol"))
+    [[told, kind]] = got["toasts"]
+    assert kind == "success"
+    assert told == ("carol was unlinked from Contoso. Contoso held that account to its own sign-in: the hold ended "
+                    "with the link. The account may hold a password again: it has none anybody can type until it sets "
+                    "one. You can make it a reset link on the Users page.")
+    # The sign-in page's own reset is off by default: the account is not sent there.
+    assert "sign-in page" not in told
+
+
+def test_an_unlink_the_server_refuses_says_why_and_still_reads_the_list_again():
+    got = _node(r"""
+answers[IDS] = LIST;
+const refused = new Error('This is the only way bob can sign in: the account has no password anybody can type. Make a '
+    + 'reset link for it first (Users), so that it can set a password, then unlink.');
+refused.status = 409; refused.reason = 'no_way_in_left';
+answers['/admin/sso/identities/i-bob'] = refused;
+await openIdentities();
+document.querySelector('.sso-identity-row[data-identity="i-bob"] .sso-identity-unlink').click();
+await tick(); await tick(); await tick();
+out({ toasts, reads: asked.filter((a) => a.path === IDS).length,
+      providersRead: asked.filter((a) => a.path === '/admin/sso/providers').length });
+""")
+    assert got["toasts"] == [["This is the only way bob can sign in: the account has no password anybody can type. "
+                              "Make a reset link for it first (Users), so that it can set a password, then unlink.",
+                              "error"]]
+    assert got["reads"] == 2 and got["providersRead"] == 2
+
+
+@pytest.mark.parametrize("state, said", [
+    ("refused", "Your own: another administrator lifts or unlinks it."),
+    ("lapsed", "Your own: sign in through it again before you unlink it under Your account, or another "
+               "administrator unlinks it."),
+    ("linked", "Your own: unlink it under Your account."),
+])
+def test_the_administrators_own_account_offers_no_unlink_and_says_where_it_is_unlinked(state, said):
+    """The server refuses an administrator's unlink of their own identity: their row says where it is done instead,
+    as the owner's own unlink allows it (not while a refusal, a hold or days run out stand)."""
+    got = _node(r"""
+const mine = Object.assign({}, LIST.identities[1], { state: %s, refused_at: null });
+answers[IDS] = { provider_id: 'p-1', total: 1, skip: 0, limit: 50, counts: { refused: 0, lapsed: 0, linked: 1 },
+                 identities: [mine] };
+await openIdentities();
+out({ row: rows()[0], unlink: document.querySelectorAll('.sso-identity-unlink').length,
+      buttons: document.querySelectorAll('.sso-identity-row button').length });
+""" % json.dumps(state))
+    assert got["row"]["actions"] == [said]
+    assert got["unlink"] == 0 and got["buttons"] == 0
 
 
 def test_a_long_list_is_paged_and_an_empty_one_says_so():
@@ -285,8 +390,8 @@ LOCKED = ("Single sign-on is locked in this deployment (SETTINGS_LOCKED_KEYS): t
 def test_under_the_lock_the_card_and_the_dialog_say_so_and_offer_no_change(locked):
     """SETTINGS_LOCKED_KEYS naming sso: the card says so in the server's words and offers no "Add a provider"; a
     provider still opens, its dialog says so first and offers no Turn on or off, Remove or Save, and its fields are
-    read-only. What changes nothing stays: Open, the test sign-in, the addresses to copy, the Identities page's
-    Lift. Without the lock all of it is offered."""
+    read-only. What changes nothing stays: Open, the test sign-in, the addresses to copy; and the Identities page's
+    Lift and Unlink, whose routes the lock does not stop. Without the lock all of it is offered."""
     got = _node(r"""
 const LOCK = %s;
 PROVIDER.state = 'disabled';
@@ -317,12 +422,13 @@ const patches = asked.filter((a) => a.method === 'PATCH').length;
 byId('sso-tab-identities').click();
 await tick(); await tick();
 const lift = !!document.querySelector('.sso-identity-row button').disabled;
+const unlink = !!document.querySelector('.sso-identity-unlink').disabled;
 document.listeners.click.forEach((f) => f({ target: byId('signin-sso-add') }));
 await tick();
-out({ card, dialog, patches, lift, wizardAdd: !!byId('sso-new-add').disabled });
+out({ card, dialog, patches, lift, unlink, wizardAdd: !!byId('sso-new-add').disabled });
 """ % (json.dumps(locked), json.dumps(LOCKED)))
     card, dialog = got["card"], got["dialog"]
-    assert card["open"] is False and dialog["test"] is False and got["lift"] is False
+    assert card["open"] is False and dialog["test"] is False and got["lift"] is False and got["unlink"] is False
     assert dialog["copies"] == [False] * 4 and dialog["copyButtons"] == [False] * 4
     if locked:
         assert card["add"] is True and card["line"] == [LOCKED, "alert alert-info mb-md", "status"]

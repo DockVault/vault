@@ -10,13 +10,14 @@
  * Second factor, Sessions. Each page is saved on its own and sends only what changed; a change asks for the
  * administrator's password (and their second factor when they have one), and what the server refuses is shown in
  * its own words. The client secret is typed, sent, and never shown again. A fifth page, Identities, lists the
- * accounts linked to the provider (GET /admin/sso/providers/{id}/identities) and where each stands, and lifts a
- * refusal or a hold (POST /admin/sso/identities/{id}/clear-refusal, under the same step-up as a change).
+ * accounts linked to the provider (GET /admin/sso/providers/{id}/identities) and where each stands, lifts a
+ * refusal or a hold (POST /admin/sso/identities/{id}/clear-refusal) and unlinks an account (DELETE
+ * /admin/sso/identities/{id}), each under the same step-up as a change.
  *
  * When the deployment locks single sign-on (SETTINGS_LOCKED_KEYS naming sso or *), the server refuses every change
  * to a provider, and the card and the dialog say so in the server's words (`locked_message`) and offer none: no "Add
  * a provider", Turn on or off, Remove or Save, and a provider's fields are read-only. Open, the test sign-in, the
- * addresses to copy and the Identities page's Lift stay, as their routes do.
+ * addresses to copy and the Identities page's Lift and Unlink stay, as their routes do.
  *
  * Uses app.js's apiRequest, openModal, closeModal, showConfirm, showToast and _el, and sso.js's Sso.startTest.
  * Builds everything with createElement and textContent.
@@ -532,7 +533,8 @@
             + 'run out when the provider was turned off or was to be removed. The vault keeps the date of either, not '
             + 'which of the two it was; the account\'s SSH keys, temporary credentials and devices are paused, and a '
             + 'sign-in the provider admits lifts it, or you lift it here. Days run out: only a sign-in through the '
-            + 'provider ends that. An account whose password and passkeys no longer sign it in is marked so below.');
+            + 'provider ends that, or you unlink the account here. An account whose password and passkeys no longer '
+            + 'sign it in is marked so below.');
         about.id = 'sso-identities-about';
         box.appendChild(about);
         const list = _el('div', 'sso-identities');
@@ -609,8 +611,62 @@
             + ' Lift it when the refusal was a mistake the provider cannot answer.';
     }
 
+    // What unlinking an account does, said before it is done: what ends with the link, what the vault refuses, who
+    // is told (DELETE /admin/sso/identities/{id}, app/api/sso_admin_router.py).
+    function unlinkSays(name, label, identity) {
+        const ends = identity.state === 'refused' ? ` The refusal or hold ${label} had on it ends with the link.`
+            : identity.state === 'lapsed' ? ` Its days without a sign-in through ${label} end with the link.` : '';
+        return `Unlink ${name} from ${label}? The account can no longer sign in through ${label}, and its sessions `
+            + `that came through ${label} end.` + ends + ` If ${label} is what keeps the account from holding a `
+            + 'password, it may hold one again, and has none anybody can type until it sets one. The vault refuses '
+            + 'an unlink that would leave the account no way to sign in, and says what to do first. '
+            + `${name} and the other administrators are told.`;
+    }
+
+    // What the unlink did, from the server's answer. The sign-in page's own password reset is off by default, so the
+    // account is not sent there: an administrator makes it a reset link.
+    function unlinkDid(name, label, out) {
+        const done = out || {};
+        return `${name} was unlinked from ${label}.`
+            + (done.sessions_ended ? ` ${done.sessions_ended} session(s) that came through it ended.` : '')
+            + (done.held ? ` ${label} held that account to its own sign-in: the hold ended with the link.` : '')
+            + (done.keys_paused ? ` The pause ${label} had on its SSH keys, temporary credentials and devices ended `
+                + 'with the link.' : '')
+            + (done.may_set_password ? ' The account may hold a password again: it has none anybody can type until '
+                + 'it sets one. You can make it a reset link on the Users page.' : '');
+    }
+
+    function unlinkButton(providerId, identity, name, list) {
+        const label = (open && open.id === providerId && (open.label || open.name)) || 'the provider';
+        const unlink = _el('button', 'btn btn-danger btn-sm sso-identity-unlink', 'Unlink');
+        unlink.type = 'button';
+        unlink.setAttribute('aria-label', `Unlink ${name} from ${label}`);
+        unlink.addEventListener('click', async () => {
+            const ok = await showConfirm(unlinkSays(name, label, identity), 'Unlink', null, 'Unlink');
+            if (!ok) return;
+            unlink.disabled = true;
+            try {
+                const out = await apiRequest(`/admin/sso/identities/${encodeURIComponent(identity.id)}`,
+                    { method: 'DELETE', silent: true });
+                showToast(unlinkDid(name, label, out), 'success');
+            } catch (e) { showToast(e.message || 'The account was not unlinked.', 'error'); }
+            // Read again whatever the answer: the list says how the accounts stand now.
+            readIdentities(providerId, list);
+            load();
+        });
+        return unlink;
+    }
+
+    // An administrator's own identity is neither lifted nor unlinked by them here (the server refuses both): where
+    // each is done instead. Their own unlink, under Your account, is refused while a refusal, a hold or days run out
+    // stand (owners_unlink_refusal in app/api/sso_router.py).
+    const OWN_SAYS = { refused: 'Your own: another administrator lifts or unlinks it.',
+        lapsed: 'Your own: sign in through it again before you unlink it under Your account, or another '
+            + 'administrator unlinks it.',
+        linked: 'Your own: unlink it under Your account.' };
+
     function identityRow(providerId, identity, list) {
-        const row = _el('div', 'sso-identity-row flex items-center gap-sm mb-sm');
+        const row = _el('div', 'sso-identity-row flex flex-wrap items-center gap-sm mb-sm');
         row.dataset.identity = identity.id;
         const name = identity.username || 'An account';
         const text = _el('div', 'flex-1');
@@ -630,9 +686,11 @@
         if (identity.holds_sign_in) bits.push('its password and passkeys do not sign it in now');
         text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
         row.appendChild(text);
-        if (identity.state === 'refused' && identity.own) {
-            row.appendChild(_el('span', 'text-secondary text-xs', 'Your own: another administrator lifts it.'));
-        } else if (identity.state === 'refused') {
+        if (identity.own) {
+            row.appendChild(_el('span', 'text-secondary text-xs', OWN_SAYS[identity.state] || OWN_SAYS.linked));
+            return row;
+        }
+        if (identity.state === 'refused') {
             const lift = _el('button', 'btn btn-secondary btn-sm', 'Lift refusal');
             lift.type = 'button';
             lift.setAttribute('aria-label', 'Lift the refusal of ' + name);
@@ -651,6 +709,7 @@
             });
             row.appendChild(lift);
         }
+        row.appendChild(unlinkButton(providerId, identity, name, list));
         return row;
     }
 
