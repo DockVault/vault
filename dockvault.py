@@ -564,11 +564,28 @@ def _port_or(value, default):
     return p if 1 <= p <= 65535 else default
 
 
+def plain_host_name(name):
+    """True if `name` is a plain host name / IP (letters, digits, dots, hyphens only): the characters the setup
+    scripts allow before a name flows into .env, a certificate's subject and docker's arguments."""
+    return bool(name) and re.match(r"^[A-Za-z0-9.-]+$", name) is not None
+
+
 def validate_server_name(name):
-    """True if `name` is a plain host name / IP (letters, digits, dots, hyphens only) — the charset
-    the setup scripts enforce before it flows into .env, the TLS cert subject, and docker args. Not a name
-    written with a dot at its end: the vault builds no sign-in on that spelling (app/core/public_url.py)."""
-    return bool(name) and re.match(r"^[A-Za-z0-9.-]+$", name) is not None and not name.endswith(".")
+    """True if `name` is a plain host name / IP (:func:`plain_host_name`) that is not written with a dot at its
+    end: the vault builds no sign-in on that spelling (app/core/public_url.py). For the server's own name and the
+    address people open the web UI at. An SFTP host is no sign-in address and keeps the wider check: SSH clients
+    take the name with the dot."""
+    return plain_host_name(name) and not name.endswith(".")
+
+
+def server_name_problem(name):
+    """What is wrong with `name` as the server's name, in words for the person who typed it, or None. A dot at
+    its end has its own words: "letters, digits, dots, hyphens only" is true of such a name, and says nothing."""
+    if not plain_host_name(name or ""):
+        return "letters, digits, dots, hyphens only"
+    if name.endswith("."):
+        return "write the host name without the dot at its end"
+    return None
 
 
 def is_ipv4(name):
@@ -5263,6 +5280,11 @@ class DockVault:
                 print(pal.paint("  " + said + ".", "green" if outcome == "rewritten" else "yellow"))
         else:
             server = summary.get("server_name") or "localhost"
+            if plain_host_name(server) and server.endswith("."):
+                # A reused .env whose SERVER_NAME is written with the dot DNS allows at a name's end: one host,
+                # and the certificate is made for the name without the dot, which is the one a browser asks
+                # for. (Taken for an invalid name, it got a certificate for 'localhost'.)
+                server = server.rstrip(".") or "localhost"
             if not validate_server_name(server):   # re-validate a reused .env's SERVER_NAME before it hits openssl
                 print(pal.paint("  SERVER_NAME in .env looks invalid; using 'localhost' for the cert.", "yellow"))
                 server = "localhost"
@@ -5439,8 +5461,9 @@ class DockVault:
         server = a("server_name")
         if interactive and not server:
             server = ask("Public DNS name or IP clients will use (e.g. vault.example.com)", pal)
-        if not validate_server_name(server or ""):
-            self._fail("invalid/missing server name (letters, digits, dots, hyphens only): %r" % server)
+        why = server_name_problem(server or "")
+        if why:
+            self._fail("invalid/missing server name (%s): %r" % (why, server))
 
         admin_user = a("admin_username") or (ask("Admin username", pal, "admin") if interactive else "admin")
         why = admin_username_problem(admin_user)
@@ -5541,7 +5564,8 @@ class DockVault:
                 web_public = public_web_address(a("web_public_address"))
             except ValueError as exc:
                 self._fail("invalid web address (%s): %r" % (exc, a("web_public_address")))
-        if sftp_public_host and not validate_server_name(sftp_public_host):
+        # An SFTP host is no sign-in address: the name with a dot at its end is taken, as SSH clients take it.
+        if sftp_public_host and not plain_host_name(sftp_public_host):
             self._fail("invalid SFTP address (letters, digits, dots, hyphens only): %r" % sftp_public_host)
         if sftp_public_port is not None and not (1 <= int(sftp_public_port) <= 65535):
             self._fail("invalid SFTP client port (1-65535): %r" % sftp_public_port)

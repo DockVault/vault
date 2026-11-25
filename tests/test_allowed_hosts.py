@@ -258,9 +258,15 @@ def test_public_web_address_reads_an_address_as_setup_writes_it():
     assert dv.public_web_address("vault.example.com:9443") == "https://vault.example.com:9443"
     assert dv.public_web_address("HTTP://203.0.113.7:8080") == "http://203.0.113.7:8080"
     for bad in ("ftp://vault.example.com", "vault example.com", "vault.example.com:0", "vault.example.com:x",
-                "vault.example.com/vault", "https://", "'vault.example.com'", "[::1]:8443"):
+                "vault.example.com/vault", "https://", "'vault.example.com'", "[::1]:8443",
+                # A dot at the name's end: setup would write an address into ALLOWED_HOSTS that the vault builds
+                # no sign-in on, and only a note afterwards would say so.
+                "vault.example.com.", "https://vault.example.com.:8443", "http://vault.lan./"):
         with pytest.raises(ValueError):
             dv.public_web_address(bad)
+    for dotted in ("vault.example.com.", "https://vault.example.com.:8443", "http://vault.lan./"):
+        with pytest.raises(ValueError, match="no dot at its end"):
+            dv.public_web_address(dotted)
 
 
 def test_ci_sets_the_public_address_to_the_tests_base_url_in_both_stacks():

@@ -202,6 +202,14 @@ def test_validate_server_name():
     assert dv.validate_server_name("10.0.0.5")
     assert not dv.validate_server_name("")
     assert not dv.validate_server_name("vault.example.com.")    # a dot at its end: no sign-in is built on it
+    # The characters alone (an SFTP host, a certificate's subject): the dot at the end is among them.
+    assert dv.plain_host_name("sftp.example.com.") and dv.plain_host_name("10.0.0.5")
+    assert not dv.plain_host_name("") and not dv.plain_host_name("bad name") and not dv.plain_host_name("a;b")
+    # Said in words that fit what was typed.
+    assert dv.server_name_problem("vault.example.com") is None and dv.server_name_problem("10.0.0.5") is None
+    assert dv.server_name_problem("vault.example.com.") == "write the host name without the dot at its end"
+    for bad in ("", None, "bad name", "a;b", "bad name."):
+        assert dv.server_name_problem(bad) == "letters, digits, dots, hyphens only", bad
     assert not dv.validate_server_name("bad name")          # space
     assert not dv.validate_server_name("a;b")               # metachar
 
@@ -4329,3 +4337,28 @@ def test_unbuffer_stdout_makes_a_cp1252_console_able_to_print_a_matrix_note():
     narrow.reconfigure(line_buffering=True, errors="replace")        # what unbuffer_stdout sets, minus the utf-8
     narrow.write(note + "\n"); narrow.flush()
     assert raw2.getvalue().replace(b"\r\n", b"\n") == b"v0.31.0 ? fixes ?stall? handling for ? 2 devices\n"
+
+
+def test_setup_says_the_dot_of_a_server_name_takes_an_sftp_host_with_one_and_certifies_the_name_without():
+    """The three places setup judges a host name. The server's name with a dot at its end is refused in words
+    that name the dot. An SFTP host is no sign-in address and is taken with it, as SSH clients take it. A reused
+    .env whose SERVER_NAME has the dot gets its certificate for the name without it, not for localhost."""
+    import inspect
+    source = inspect.getsource(dv)
+    assert 'why = server_name_problem(server or "")' in source
+    assert 'self._fail("invalid/missing server name (%s): %r" % (why, server))' in source
+    assert "if sftp_public_host and not plain_host_name(sftp_public_host):" in source
+    assert "not validate_server_name(sftp_public_host)" not in source
+    start = source.index('server = summary.get("server_name") or "localhost"')
+    block = source[start:start + 900]
+    steps = ('if plain_host_name(server) and server.endswith("."):', 'server = server.rstrip(".") or "localhost"',
+             "if not validate_server_name(server):", "server = \"localhost\"")
+    order = [block.index(step) for step in steps]
+    assert order == sorted(order), order
+    # What that block does to a name: the dot goes, anything else that is no name becomes localhost.
+    def certified(server):
+        if dv.plain_host_name(server) and server.endswith("."):
+            server = server.rstrip(".") or "localhost"
+        return server if dv.validate_server_name(server) else "localhost"
+    assert certified("vault.example.com.") == "vault.example.com" and certified("vault.example.com") == "vault.example.com"
+    assert certified("bad name.") == "localhost" and certified(".") == "localhost" and certified("...") == "localhost"

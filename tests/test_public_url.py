@@ -84,6 +84,27 @@ def test_a_name_in_another_script_is_taken_only_as_the_browser_writes_it():
     assert pu.normalize("https://xn--strae-oqa.example") == "https://xn--strae-oqa.example"      # never strasse
 
 
+@pytest.mark.parametrize("written, said", [
+    ("http://vault.lan.", "a dot at its end"),                  # the dot, before "must use https"
+    ("http://vault.lan", "must use https"),
+    ("https://b\u00fccher.example.", "another script"),           # another script, before the dot
+    ("https://b\u00fccher.example", "another script"),
+    ("https://203.0.113.9.", "a dot at its end"),
+    ("https://vault.example.com.:0", "a dot at its end"),       # the dot, before the port
+    ("https://vault.example.com./path", "a dot at its end"),    # the dot, before the path
+    ("https://exam ple.com.", "a dot at its end"),              # the dot, before "no browser accepts"
+])
+def test_the_reasons_an_address_is_refused_for_come_in_one_order(written, said):
+    """An address with two faults is refused for one of them, always the same one: the setup tool judges in the
+    same order (its own table of addresses holds it to that), so the operator who mends what one of them says does
+    not meet the other one's different answer next."""
+    why = _pu().problem(written)
+    assert why and said in why, (written, why)
+    for other in ("a dot at its end", "another script", "must use https", "no browser accepts", "not a number",
+                  "with no path"):
+        assert (other in why) is (other == said), (written, why)
+
+
 def test_a_host_name_written_with_a_dot_at_its_end_is_no_address_sign_in_is_built_on(monkeypatch):
     """One host, two spellings, and the parts of a sign-in do not agree on one (the host check admits what was
     written, a browser there signs an origin with the dot, a provider is sent back without it). The address is
