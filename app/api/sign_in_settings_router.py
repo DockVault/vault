@@ -47,14 +47,19 @@ def get_sign_in_settings(current_user: User = Depends(require_interactive_admin)
     it, what to change, in words, and whether a requirement on some role waits because of it; whether trust anchors
     exist, and under direct attestation how many passkeys in use were added without it; how many passkeys in use
     never verified the person, and how many accounts hold no other (with the rule on, the ones that no longer
-    count; with it off, the ones that would stop counting if it were turned on)."""
+    count; with it off, the ones that would stop counting if it were turned on); how many accounts, and how many
+    administrators among them, hold a passkey as their only second factor (the ones that set an authenticator app
+    up at their next sign-in if passkeys are turned off)."""
     from app.core.public_url import readiness, why_no_passkeys
     never = ws_settings.never_verified(db)
+    only = ws_settings.only_a_passkey(db)
     return {"settings": registry.describe(ws_settings.KEYS), "readiness": readiness(), "why_not": why_no_passkeys(),
             "requirement_paused": ws_settings.requirement_paused(),
             "unattested_passkeys": ws_settings.unattested_count(db),
             "passkeys_without_verification": never["passkeys"],
             "accounts_with_only_such_passkeys": never["accounts_with_no_other"],
+            "accounts_with_only_a_passkey": only["accounts"],
+            "administrators_with_only_a_passkey": only["administrators"],
             "trust_anchors": len(ws_settings.trust_anchors()), "step_up": ws_settings.STEP_UP_ACTION}
 
 
@@ -78,6 +83,7 @@ def put_sign_in_setting(setting: str, body: SignInValue, request: Request,
     limit_statements(db)
     old_algs = ws_settings.allowed_alg_names() if key == ws_settings.ALLOWED_ALGS else None
     verified_before = ws_settings.require_uv()
+    passkeys_before = ws_settings.enabled()
     try:
         outcome = setting_changes.request(db, key, body.value, actor=current_user)
         if key == ws_settings.ALLOWED_ALGS and outcome.status == "applied":
@@ -98,8 +104,29 @@ def put_sign_in_setting(setting: str, body: SignInValue, request: Request,
         registry.refresh()
         if key == ws_settings.REQUIRE_UV and ws_settings.require_uv() and not verified_before:
             _tell_the_owners_of_keys_that_never_verified(db)
+        if key == ws_settings.MODE and passkeys_before and not ws_settings.enabled():
+            _tell_the_accounts_with_only_a_passkey(db)
     setting_changes.announce_outcome(outcome, current_user.username)
     return {"status": outcome.status, "setting": registry.describe([key])[0]}
+
+
+def _tell_the_accounts_with_only_a_passkey(db) -> None:
+    """Passkeys were just turned off: whoever held a passkey as their only second factor is told that they set an
+    authenticator app up at their next sign-in. Best effort: the change is saved, and the sign-in says the same."""
+    try:
+        from datetime import datetime
+        from app.api import api_server as api
+        owners = [str(owner) for owner in ws_settings.only_a_passkey(db)["owners"]]
+        if owners:
+            api._notify_users(owners, "security", title="Passkeys were turned off on this vault",
+                              body=("Your passkey was your only second factor here, and passkeys are no longer "
+                                    "accepted. At your next sign-in you set an authenticator app up, after your "
+                                    "password. Your passkeys are kept, and count again if passkeys are turned "
+                                    "back on."),
+                              target="#profile",
+                              dedup_prefix=f"passkeys_turned_off:{datetime.utcnow().date().isoformat()}")
+    except Exception as exc:  # noqa: BLE001 -- the change is saved; nothing here may undo it
+        log_failure("accounts with only a passkey were not told that passkeys were turned off", exc)
 
 
 def _tell_the_owners_of_keys_that_never_verified(db) -> None:

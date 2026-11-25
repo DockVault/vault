@@ -373,10 +373,14 @@ def test_an_account_whose_only_factor_can_no_longer_be_used_sets_one_up_again_at
     assert "this is its last one" in S._passkey_last_factor_refusal(h.db, erin, good)
     monkeypatch.setattr(S, "_second_factor_effective", effective)
     h.db.rows_of(WebAuthnCredential).remove(good)
-    # With passkeys turned off none is a factor, by the deployment's choice: nothing lapsed, nothing is asked.
+    # With passkeys turned off none is a factor, by the deployment's choice. The account that had made a passkey
+    # its only second factor is not left with its password alone by that choice: it sets one up again.
     _resolving(monkeypatch, registry, {wss.MODE: "off"})
-    assert wss.only_lapsed_passkeys(h.db, erin.id) is False and S._login_second_factor_in_effect(h.db, erin) is False
-    assert after_the_password(erin) is None
+    assert wss.only_lapsed_passkeys(h.db, erin.id) is True and S._login_second_factor_in_effect(h.db, erin) is True
+    assert wss.why_none_can_be_used(h.db, erin.id) == "passkeys_turned_off"
+    held = after_the_password(erin)
+    assert held is not None and held["enrollment_required"] is True, held
+    assert held["set_up_again"] == "passkeys_turned_off"
     # Switched off, a key is not "one that can no longer be used": it is the account's factor again the day
     # passkeys are switched back on, and under a rule that asks for a factor it is kept as before.
     monkeypatch.setattr(S, "_second_factor_effective", lambda db, user: {**effective(db, user), "required": True})

@@ -8445,9 +8445,11 @@ def _second_factor_effective(db, user) -> dict:
 
 def _second_factor_to_set_up_again(db, user, *, has_active: Optional[bool] = None) -> bool:
     """Whether the account had a second factor that was taken from it and has not set the next one up: an
-    administrator reset it (``second_factor_reset_at``), or its only factor was a passkey of an algorithm an
-    administrator removed, refused at every use since its 30 days ran out. The second leaves no mark on the
-    account: it is read from what the account holds, and ends when it holds a factor again. Either way the next
+    administrator reset it (``second_factor_reset_at``), or its only factor was a passkey that cannot be used
+    now (of an algorithm an administrator removed, refused at every use since its 30 days ran out; made at
+    another address; one that never verified the person while the vault asks for that; or passkeys are turned
+    off here). The second leaves no mark on the account: it is read from what the account holds, and ends when
+    it holds a factor again. Either way the next
     sign-in takes the person through setting one up, as after a reset; without this the account would go on as
     one with a password alone, and nothing would say so."""
     if getattr(user, "second_factor_reset_at", None) is not None:

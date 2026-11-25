@@ -68,9 +68,11 @@ def test_a_key_is_one_of_the_address_it_was_made_at(monkeypatch):
     h.db.rows_of(WebAuthnCredential).remove(there)
     monkeypatch.setattr(wss, "algorithm_usable", lambda db, alg, now=None: (False, False))
     assert wss.why_none_can_be_used(h.db, alice.id) == "passkeys_no_longer_accepted"
-    # With passkeys turned off none is a factor, by the deployment's choice: nothing to set up again.
+    # With passkeys turned off none is a factor, by the deployment's choice, and that is what the account is
+    # told, whatever else is true of its keys.
     _resolving(monkeypatch, registry, {wss.MODE: "off"})
-    assert wss.only_lapsed_passkeys(h.db, alice.id) is False and wss.why_none_can_be_used(h.db, alice.id) is None
+    assert wss.only_lapsed_passkeys(h.db, alice.id) is True
+    assert wss.why_none_can_be_used(h.db, alice.id) == "passkeys_turned_off"
 
 def test_an_address_written_with_a_dot_at_its_end_is_one_no_passkey_is_made_or_counted_at(monkeypatch):
     """The vault's address written with the dot: no passkey can be made there, and one made at the name without

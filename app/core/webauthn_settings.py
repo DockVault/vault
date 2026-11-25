@@ -78,8 +78,10 @@ def _spec(key: str, kind: str, default, label: str, help: str = "", level: str =
 
 
 _spec(MODE, "enum", OPTIONAL, "Passkeys", choices=(OFF, OPTIONAL, REQUIRED_FOR_ROLES),
-      help="Off keeps every registered passkey but accepts none. Optional lets people add one. Required for "
-           "roles makes the roles below set one up, after a grace period.")
+      help="Off keeps every registered passkey but accepts none: an account whose only second factor is a "
+           "passkey sets an authenticator app up at its next sign-in, and its passkeys count again when passkeys "
+           "are turned back on. Optional lets people add one. Required for roles makes the roles below set one "
+           "up, after a grace period.")
 _spec(REQUIRED_ROLES, "list", [], "Roles that must have a passkey", choices=ROLES, level=registry.ADVANCED,
       help="Applies with the mode 'required for roles'. No save-time check can know whether every person's "
            "browser can make a passkey: the grace period and the host tool are the safety net.")
@@ -351,21 +353,25 @@ def usable_passkeys(db, user_id, *, without=None, now: Optional[datetime] = None
 PASSKEYS_AT_ANOTHER_ADDRESS = "passkeys_at_another_address"
 PASSKEYS_NO_LONGER_ACCEPTED = "passkeys_no_longer_accepted"
 PASSKEYS_WITHOUT_VERIFICATION = "passkeys_without_verification"
+PASSKEYS_TURNED_OFF = "passkeys_turned_off"
 
 
 def why_none_can_be_used(db, user_id, *, now: Optional[datetime] = None) -> Optional[str]:
     """For an account that holds passkeys of which none can be used: why. ``passkeys_at_another_address`` when
     none was made at the address the vault has now (the vault moved, or its address can carry no passkey);
     ``passkeys_no_longer_accepted`` when the ones made here are of an algorithm that was removed and has run out;
-    ``passkeys_without_verification`` when the ones left never verified the person and the vault asks for that.
-    None for an account that holds none, or one it can use, and with passkeys turned off."""
+    ``passkeys_without_verification`` when the ones left never verified the person and the vault asks for that;
+    ``passkeys_turned_off`` when passkeys are turned off here, whatever the keys are. None for an account that
+    holds none, or one it can use."""
     from app.core.models import WebAuthnCredential
     from app.core.table_presence import has_table
-    if not enabled() or not has_table(db, WebAuthnCredential.__tablename__):
+    if not has_table(db, WebAuthnCredential.__tablename__):
         return None
     now = now or datetime.utcnow()
     keys = db.query(WebAuthnCredential).filter(WebAuthnCredential.user_id == user_id,
                                                WebAuthnCredential.retired_at.is_(None)).all()
+    if keys and not enabled():
+        return PASSKEYS_TURNED_OFF
     here = address_now()
     made_here = [key for key in keys if at_this_address(key, here)]
     accepted = [key for key in made_here if algorithm_usable(db, getattr(key, "cose_alg", None), now=now)[0]]
@@ -377,18 +383,34 @@ def why_none_can_be_used(db, user_id, *, now: Optional[datetime] = None) -> Opti
 
 
 def only_lapsed_passkeys(db, user_id, *, now: Optional[datetime] = None) -> bool:
-    """Whether the account holds passkeys and none of them can be used any more: each is of an algorithm an
+    """Whether the account holds passkeys and none of them can be used now: each is of an algorithm an
     administrator removed more than 30 days ago, was made at another address than the vault has now, or never
-    verified the person while the vault asks for that. Its factor went away under it, by nobody's act on the
-    account: it sets one up again at its next sign-in, as after a reset, and the keys count again by themselves
-    if the algorithm, the address or the rule comes back. False with passkeys turned off (none is a factor then,
-    by the deployment's choice), and for an account that holds none."""
-    from app.core.models import WebAuthnCredential
-    from app.core.table_presence import has_table
-    if not enabled() or not has_table(db, WebAuthnCredential.__tablename__):
-        return False
+    verified the person while the vault asks for that; or passkeys are turned off here. Its factor went away
+    under it, by nobody's act on the account: it sets one up again at its next sign-in, as after a reset, and
+    the keys count again by themselves if the algorithm, the address, the rule or the switch comes back. Turned
+    off, passkeys are no factor by the deployment's choice; the account that had made one its second factor is
+    not left with its password alone because of that choice. False for an account that holds none."""
     now = now or datetime.utcnow()
     return why_none_can_be_used(db, user_id, now=now) is not None
+
+
+def only_a_passkey(db) -> dict:
+    """The accounts whose only second factor is a passkey, for the Sign-in page and for telling them:
+    ``{"accounts": how many, "administrators": how many of them are administrators, "owners": [account ids]}``.
+    They hold a passkey that was not retired and no authenticator app in use. While passkeys are on these are the
+    accounts that would set a factor up again if passkeys were turned off; while they are off, the ones that do."""
+    from app.core.models import RoleEnum, SecondFactorEnrollment, User, WebAuthnCredential
+    from app.core.table_presence import has_table
+    if not has_table(db, WebAuthnCredential.__tablename__):
+        return {"accounts": 0, "administrators": 0, "owners": []}
+    holders = list(dict.fromkeys(
+        key.user_id for key in db.query(WebAuthnCredential).filter(WebAuthnCredential.retired_at.is_(None)).all()))
+    with_an_app = {row.user_id for row in db.query(SecondFactorEnrollment).filter(
+        SecondFactorEnrollment.status == "active").all()}
+    owners = [owner for owner in holders if owner not in with_an_app]
+    administrators = {user.id for user in db.query(User).filter(User.role == RoleEnum.ADMIN).all()}
+    return {"accounts": len(owners), "administrators": sum(1 for owner in owners if owner in administrators),
+            "owners": owners}
 
 
 # Run at every start. A reset of an account's second factor retires its passkeys; one made by a release that knew

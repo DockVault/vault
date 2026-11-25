@@ -73,9 +73,10 @@ def test_a_key_that_never_verified_the_person_counts_only_while_the_vault_does_n
     never.rp_id = None
     monkeypatch.setattr(wss, "algorithm_usable", lambda db, alg, now=None: (False, False))
     assert wss.why_none_can_be_used(h.db, alice.id) == "passkeys_no_longer_accepted"
-    # With passkeys turned off none is a factor, by the deployment's choice: nothing to set up again.
+    # With passkeys turned off none is a factor, by the deployment's choice, and that is what the account is told.
     _resolving(monkeypatch, registry, {wss.MODE: "off", wss.REQUIRE_UV: True})
-    assert wss.only_lapsed_passkeys(h.db, alice.id) is False and wss.why_none_can_be_used(h.db, alice.id) is None
+    assert wss.only_lapsed_passkeys(h.db, alice.id) is True
+    assert wss.why_none_can_be_used(h.db, alice.id) == "passkeys_turned_off"
 
 
 @pytest.mark.parametrize("role", ["user", "admin"])
