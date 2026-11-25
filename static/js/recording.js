@@ -1,6 +1,7 @@
 /*
- * The page /recording: what this vault records, read from GET /privacy/recording (public). For a signed-in
- * visitor (a session token in this browser), the earlier versions too, from GET /privacy/recording/history.
+ * The page /recording, titled Privacy. First the operator's own privacy policy, when one is set (GET /legal),
+ * then what this vault records, read from GET /privacy/recording (public). For a signed-in visitor (a session
+ * token in this browser), the earlier versions too, from GET /privacy/recording/history.
  * Built with createElement and textContent only; nothing on the page is inline, so it runs under the app's
  * content security policy unchanged.
  */
@@ -21,6 +22,51 @@
     }
 
     function show(id) { const n = byId(id); if (n) n.hidden = false; }
+
+    // GET /branding, once: the name above the page and the name the policy line gives.
+    let brandingOnce = null;
+    function branding() {
+        if (!brandingOnce) {
+            brandingOnce = fetch('/branding', { headers: { Accept: 'application/json' } })
+                .then((r) => (r.ok ? r.json() : null))
+                .catch(() => null);
+        }
+        return brandingOnce;
+    }
+
+    // Only a same-origin path ("/...") or an absolute http(s) address, as brand.js's safeUrl: never javascript:,
+    // data:, a protocol-relative "//host", or a backslash or control character a browser would read as one.
+    function safeUrl(u) {
+        if (typeof u !== 'string') return null;
+        const s = u.trim();
+        if (!s) return null;
+        if (/[\\\u0000-\u001F]/.test(s)) return null;
+        if (s.charAt(0) === '/' && s.charAt(1) !== '/') return s;   // same-origin path
+        if (/^https?:\/\//i.test(s)) return s;                       // absolute http(s)
+        return null;
+    }
+
+    // The operator's privacy policy, as one line under the title: "<name>'s privacy policy: <link>". With no
+    // address set, or one that is not safe to link, the line stays hidden.
+    async function loadPolicy() {
+        let url = null;
+        try {
+            const r = await fetch('/legal', { headers: { Accept: 'application/json' } });
+            if (!r.ok) return;
+            const j = await r.json();
+            url = safeUrl(j && j.privacy_policy);
+        } catch (_) { return; }
+        if (!url) return;
+        const b = await branding();
+        const name = (b && (b.company_name || b.app_name)) || '';
+        const link = el('a', null, url.replace(/^https?:\/\//i, '').replace(/\/$/, '') || url);
+        link.href = url;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        const line = byId('privacy-policy');
+        line.replaceChildren(name ? `${name}’s privacy policy: ` : 'Privacy policy: ', link);
+        line.hidden = false;
+    }
 
     function render(data) {
         byId('always').textContent = data.always;
@@ -93,10 +139,8 @@
             show('failed');
             return;
         }
-        try {
-            const b = await fetch('/branding');
-            if (b.ok) { const j = await b.json(); if (j && j.app_name) byId('brand-name').textContent = j.app_name; }
-        } catch (_) { /* the default name stays */ }
+        const j = await branding();   // with no answer, the name brand.js set (or the default) stays
+        if (j && j.app_name) byId('brand-name').textContent = j.app_name;
         const t = token();
         if (!t) return;
         try {
@@ -105,5 +149,6 @@
         } catch (_) { /* the history is for signed-in visitors only */ }
     }
 
+    loadPolicy();
     load();
 })();

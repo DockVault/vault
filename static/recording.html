@@ -3,15 +3,21 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>What this vault records</title>
+  <title>Privacy</title>
   <link rel="icon" href="/static/favicon.ico">
-  <link rel="stylesheet" href="/static/css/recording.css?v=20261108a">
+  <script src="/static/js/public-theme.js?v=20261125a"></script>
+  <link rel="stylesheet" href="/static/css/tokens.css?v=20261125a">
+  <link rel="stylesheet" href="/static/css/public-page.css?v=20261125a">
+  <link rel="stylesheet" href="/static/css/recording.css?v=20261125a">
+  <script src="/static/js/brand.js?v=20261125a"></script>
 </head>
 <body>
   <main class="wrap">
     <header class="head">
-      <p class="brand" id="brand-name">DockVault</p>
-      <h1>What this vault records</h1>
+      <p class="pp-brand"><img src="/static/assets/logo-small.png" alt="" data-brand-logo><span class="pp-name" id="brand-name" data-brand-name>DockVault</span></p>
+      <h1>Privacy</h1>
+      <p class="lead policy-line" id="privacy-policy" hidden></p>
+      <h2 class="records-h">What this vault records</h2>
       <p class="lead" id="always">Every event is recorded: who acted, what happened, when and its outcome.</p>
     </header>
 
@@ -52,7 +58,8 @@
 
     <p id="changes" class="muted"></p>
     <p class="back"><a href="/">Back to the vault</a></p>
+    <p id="powered-by" class="pp-powered">powered by <a data-powered-by-link href="https://dockvault.io" target="_blank" rel="noopener noreferrer"><span data-powered-by-name>DockVault</span></a></p>
   </main>
-  <script src="/static/js/recording.js?v=20261002a" defer></script>
+  <script src="/static/js/recording.js?v=20261125a" defer></script>
 </body>
 </html>

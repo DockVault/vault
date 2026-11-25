@@ -27,10 +27,11 @@
     show("notice");
   }
 
-  // The deployment's name above the page, and the owner's message (text only) where the page stands.
+  // The deployment's name in the header (the page kind stands under it), and the owner's message (text only)
+  // where the page stands.
   function pageIdentity(data, messageId) {
-    var brand = document.querySelector(".brand");
-    if (brand && data && data.brand) { brand.textContent = data.brand + " \u00b7 Shared note"; }
+    var brand = document.querySelector(".pp-name");
+    if (brand && data && data.brand) { brand.textContent = data.brand; }
     var m = $(messageId);
     if (m) {
       if (data && data.message) { m.textContent = data.message; m.classList.remove("hidden"); }

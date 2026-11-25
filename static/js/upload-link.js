@@ -73,7 +73,8 @@
   }
 
   function applyPageInfo(info) {
-    if (info && info.brand) { $("brand").textContent = info.brand + " · Upload files"; document.title = info.brand + " · Upload files"; }
+    // The deployment's name in the header (the page kind stands under it), and in the tab's title.
+    if (info && info.brand) { $("brand").textContent = info.brand; document.title = info.brand + " · Upload files"; }
     showOwnerMessage(info && info.message);
     if (info && info.secret_kind && info.secret_kind !== "none") { promptSecret(info.secret_kind, null); }
   }

@@ -1,0 +1,209 @@
+/* ============================================================================
+   The public pages: upload link (upload-link.html), public link
+   (public-link.html), shared note (note-link.html) and the card parts of the
+   privacy page (recording.html, whose own layout is in recording.css).
+
+   They wear the app's own theme without the app shell: the colour and font
+   tokens come from tokens.css (loaded first), light or dark from
+   public-theme.js. Colours go through the tokens only; no palette values here.
+   The look is the sign-in card's: a 2px brand rule on top, a brand header,
+   the app's fields and buttons, then the Privacy link and "powered by".
+   ============================================================================ */
+
+/* ----------------------------------------------------------------------------
+   1. Base
+   ---------------------------------------------------------------------------- */
+:root {
+    color-scheme: light;
+    /* The primary action: the deeper brand shade under light text, the lighter one under dark text. */
+    --pp-action: var(--brand-strong);
+}
+[data-theme="dark"] {
+    color-scheme: dark;
+    --pp-action: var(--brand-secondary);
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0; min-height: 100vh;
+    background: var(--page-bg); color: var(--text-primary);
+    font-family: var(--font-sans); font-size: var(--text-lg); line-height: 1.5;
+}
+h1, h2 { color: var(--text-primary); letter-spacing: -0.01em; }
+/* Links on the brand colour, readable on both grounds. */
+a { color: var(--brand-secondary); text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+a:focus-visible { outline: none; border-radius: var(--radius-sm); box-shadow: var(--focus-ring); }
+/* The page scripts show and hide with this class: it wins over any element rule below (a label, a field). */
+.hidden { display: none !important; }
+
+/* ----------------------------------------------------------------------------
+   2. The card
+   ---------------------------------------------------------------------------- */
+body.pp-card-page { display: flex; align-items: flex-start; justify-content: center; padding: 2rem 1rem; }
+.pp-card-page .wrap { width: 100%; max-width: 560px; }
+.pp-card-page .card {
+    background: var(--surface-0);
+    border: 1px solid var(--line);
+    border-top: 2px solid var(--brand-secondary);
+    border-radius: var(--radius-xl);
+    padding: 2rem 2rem 1.5rem;
+}
+.pp-card-page .card h1,
+.pp-card-page .card h2 { font-size: 1.1rem; font-weight: 600; margin: 0 0 .9rem; overflow-wrap: anywhere; }
+.pp-card-page h2:focus { outline: none; }
+
+/* ----------------------------------------------------------------------------
+   3. The brand header: logo and name, then the page kind in small capitals
+   ---------------------------------------------------------------------------- */
+.pp-head {
+    display: flex; flex-direction: column; align-items: center; gap: .55rem;
+    margin: 0 0 1.6rem; text-align: center;
+}
+.pp-brand {
+    display: flex; align-items: center; justify-content: center; gap: .6rem;
+    margin: 0; font-weight: 700; font-size: 1.3rem; line-height: 1.2; color: var(--text-primary);
+}
+.pp-brand img { height: 30px; width: auto; max-width: 180px; object-fit: contain; }
+.pp-name { overflow-wrap: anywhere; }
+.pp-kind {
+    margin: 0; font-size: var(--text-xs); font-weight: 500;
+    letter-spacing: .16em; text-transform: uppercase; color: var(--text-secondary);
+}
+
+/* ----------------------------------------------------------------------------
+   4. Fields and buttons, as in the app
+   ---------------------------------------------------------------------------- */
+.pp-card-page label:not(.drop) {
+    display: block; margin-bottom: .4rem;
+    font-size: var(--text-sm); font-weight: 500; color: var(--text-secondary);
+}
+input[type="password"], input[type="text"] {
+    width: 100%; min-height: 38px; margin: 0 0 1rem; padding: .5rem .7rem;
+    font-family: var(--font-sans); font-size: var(--text-base); color: var(--text-primary);
+    background: var(--surface-0); border: 1px solid var(--line); border-radius: var(--radius-md);
+}
+input[type="password"]:hover, input[type="text"]:hover { border-color: var(--line-strong); }
+input[type="password"]:focus, input[type="text"]:focus {
+    outline: none; border-color: var(--brand-secondary); box-shadow: var(--focus-ring);
+}
+button {
+    width: 100%; min-height: 38px; margin: 0; padding: .6rem 1rem;
+    font-family: var(--font-sans); font-size: var(--text-base); font-weight: 600; line-height: 1.2;
+    color: var(--text-inverse); background: var(--pp-action);
+    border: 1px solid transparent; border-radius: var(--radius-md); cursor: pointer;
+}
+button:hover:not(:disabled) { filter: brightness(1.06); }
+button:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+/* Quiet buttons: surface and hairline, as the app's outline buttons. */
+button.quiet, .files .remove, .row button {
+    background: transparent; color: var(--text-primary); border-color: var(--line-strong);
+}
+button.quiet:hover:not(:disabled), .files .remove:hover:not(:disabled), .row button:hover:not(:disabled) {
+    filter: none; background: var(--surface-2); border-color: var(--brand-secondary);
+}
+
+/* ----------------------------------------------------------------------------
+   5. Messages and small print
+   ---------------------------------------------------------------------------- */
+.owner-message {
+    white-space: pre-wrap; overflow-wrap: anywhere; text-align: left;
+    margin: 0 0 1rem; padding: .75rem .9rem;
+    color: var(--text-primary); font-size: var(--text-base);
+    border-left: 3px solid var(--brand-secondary); border-radius: var(--radius-lg);
+    background: color-mix(in srgb, var(--brand-secondary) 8%, transparent);
+}
+.msg { margin-top: 1rem; font-size: var(--text-sm); }
+.msg.error { color: var(--error-strong); }
+.msg.ok { color: var(--success-strong); }
+/* Small print stays on the secondary text tone: the tertiary one is under AA on the dark card. */
+.meta {
+    color: var(--text-secondary); font-size: var(--text-sm);
+    margin-top: 1.25rem; padding-top: .9rem; border-top: 1px solid var(--line);
+}
+.meta.meta-plain { margin-top: 0; padding-top: 0; border-top: 0; }
+.center { text-align: center; color: var(--text-secondary); }
+
+/* The Privacy link, then "powered by" (brand.js hides it when the deployment says so). */
+.meta.recording-link { text-align: center; margin: 1.5rem 0 0; padding-top: 0; border-top: 0; }
+.recording-link a {
+    font-size: var(--text-xs); font-weight: 600; letter-spacing: .14em; text-transform: uppercase;
+    text-decoration: none;
+}
+.recording-link a:hover { text-decoration: underline; }
+.pp-powered { margin: .6rem 0 0; text-align: center; font-size: .75rem; color: var(--text-tertiary); }
+.pp-powered a { color: inherit; text-decoration: none; }
+.pp-powered a:hover { text-decoration: underline; }
+.pp-powered [data-powered-by-name] { font-weight: 600; color: var(--text-secondary); }
+
+/* ----------------------------------------------------------------------------
+   6. Upload link: the drop zone, the chosen files, the progress bar, the receipt
+   ---------------------------------------------------------------------------- */
+/* The drop zone is the file input's label: a click opens the chooser, a drop adds the files. */
+.drop {
+    display: block; position: relative; margin-bottom: 1rem; padding: 1.4rem 1rem;
+    text-align: center; font-size: var(--text-sm); color: var(--text-secondary); cursor: pointer;
+    border: 2px dashed var(--line-strong); border-radius: var(--radius-xl); background: var(--surface-1);
+    transition: border-color .12s, background .12s;
+}
+.drop.over, .drop:hover { border-color: var(--brand-secondary); background: var(--brand-glow); }
+.drop:focus-within { outline: none; border-color: var(--brand-secondary); box-shadow: var(--focus-ring); }
+.drop strong { color: var(--text-primary); }
+.drop input[type="file"] { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+.files { list-style: none; margin: 0 0 1rem; padding: 0; }
+.files li {
+    display: flex; align-items: center; gap: .6rem; padding: .45rem 0;
+    border-bottom: 1px solid var(--line); font-size: var(--text-base);
+}
+.files li:last-child { border-bottom: 0; }
+.files .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files .size, .files .state { color: var(--text-secondary); font-size: var(--text-sm); white-space: nowrap; }
+.files .state.ok { color: var(--success-strong); }
+.files .state.error { color: var(--error-strong); }
+.files .remove { width: auto; min-height: 26px; padding: .2rem .55rem; font-size: var(--text-xs); border-radius: var(--radius-sm); }
+.bar { height: 8px; margin: 1rem 0; overflow: hidden; border-radius: var(--radius-lg); background: var(--surface-2); }
+.bar > div { height: 100%; width: 0; background: var(--brand-secondary); transition: width .15s; }
+/* The receipt: what was delivered, when, and a reference the owner can find each file by. */
+.receipt { width: 100%; border-collapse: collapse; font-size: var(--text-sm); margin: .5rem 0 1rem; }
+.receipt th, .receipt td { text-align: left; padding: .4rem .3rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.receipt th:nth-child(1) { width: 40%; }
+.receipt th {
+    color: var(--text-secondary); font-weight: 600; font-size: var(--text-xs);
+    text-transform: uppercase; letter-spacing: .08em; white-space: nowrap;
+}
+.receipt td.name { overflow-wrap: anywhere; }
+.receipt td.size, .receipt td.ref { white-space: nowrap; }
+.receipt td.ref { font-family: var(--font-mono); }
+.receipt-actions { display: flex; gap: .6rem; }
+.receipt-actions button { flex: 1 1 auto; }
+
+/* ----------------------------------------------------------------------------
+   7. Public link: the listing
+   ---------------------------------------------------------------------------- */
+.row {
+    display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+    padding: .7rem 0; border-top: 1px solid var(--line);
+}
+.row:first-child { border-top: 0; }
+.row .name { overflow-wrap: anywhere; }
+.row .sub { color: var(--text-secondary); font-size: var(--text-sm); }
+.row button { flex: 0 0 auto; width: auto; min-height: 32px; padding: .4rem .9rem; font-size: var(--text-sm); }
+
+/* ----------------------------------------------------------------------------
+   8. Shared note: the note's text
+   ---------------------------------------------------------------------------- */
+.note-body {
+    margin: 0; padding: .75rem .9rem;
+    white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55;
+    font-family: var(--font-mono); font-size: var(--text-base); color: var(--text-primary);
+    background: var(--surface-1); border: 1px solid var(--line); border-radius: var(--radius-lg);
+}
+
+/* ----------------------------------------------------------------------------
+   9. A phone's width
+   ---------------------------------------------------------------------------- */
+@media (max-width: 540px) {
+    body.pp-card-page { padding: 1rem .75rem; }
+    .pp-card-page .card { padding: 1.5rem 1.1rem 1.25rem; }
+    .receipt-actions { flex-direction: column; }
+}

@@ -296,7 +296,10 @@ def test_when_the_audit_row_cannot_be_written_it_is_not_marked_read(factory, mon
 
 def test_the_page_has_nothing_inline():
     page = (ROOT / "static" / "recording.html").read_text(encoding="utf-8")
-    assert re.findall(r"<script\b[^>]*>", page) == ['<script src="/static/js/recording.js?v=20261002a" defer>']
+    # Its own script, and the shared theme and brand scripts of the public pages: files only, none inline.
+    scripts = [re.sub(r"\?v=\d{8}[a-z]", "?v=", tag) for tag in re.findall(r"<script\b[^>]*>", page)]
+    assert scripts == ['<script src="/static/js/public-theme.js?v=">', '<script src="/static/js/brand.js?v=">',
+                       '<script src="/static/js/recording.js?v=" defer>']
     assert "<style" not in page and " style=" not in page and "javascript:" not in page
     assert re.search(r' on[a-z]+=', page) is None
     assert page.count('<link rel="stylesheet" href="/static/css/recording.css?v=') == 1
@@ -318,6 +321,10 @@ def test_the_notice_is_linked_from_sign_in_invitation_the_link_pages_and_the_acc
     menu = index[index.index('<div class="profile-menu">'):index.index("</nav>", index.index('<div class="profile-menu">'))]
     for part in (login, invite, menu):
         assert part.count('href="/recording"') == 1
+        # The page is titled Privacy, and so is every link to it.
+        assert "What this vault records" not in part
+    assert index.count('<a href="/recording" target="_blank" rel="noopener">Privacy</a>') == 2
+    assert "<span>Privacy</span>" in menu
     for name in ("public-link", "note-link", "upload-link"):
         assert (ROOT / "static" / f"{name}.html").read_text(encoding="utf-8").count('href="/recording"') == 1
     assert index.count('<script src="/static/js/notice-banner.js?v=') == 1
