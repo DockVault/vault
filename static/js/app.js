@@ -2022,12 +2022,20 @@ function _ssoStartHandOut(providerId) {
         }, start);
 }
 
+// A link, a test or a confirmation came back to a page with no session: the provider's answer is claimed only by the
+// session that started it, and nothing is linked, tested or confirmed until it is; a new sign-in cannot claim it.
+const SSO_BACK_SIGNED_OUT = 'Your session ended while you were at your organisation\'s sign-in, so nothing was '
+    + 'linked, tested or confirmed. Sign in and start again.';
+const _SSO_BACK_OF_A_SESSION = ['sso-linked', 'sso-test', 'sso-stepup'];
+
 // The page came back from a provider to the sign-in screen: a refusal is said in the server's words for its
 // reason; a sign-in's code is turned into the session (or the step that still follows) with this tab's verifier.
 async function _ssoOnSignInScreen(back) {
     if (!back || !window.Sso) return;
     if (back.kind === 'sso-error') { _showReasonNote(await Sso.reasonText(back.value)); return; }
-    if (back.kind !== 'sso') return;       // a link, a test or a confirmation belongs to a page that is signed in
+    // A link, a test or a confirmation belongs to a page that is signed in.
+    if (_SSO_BACK_OF_A_SESSION.includes(back.kind)) { _showReasonNote(SSO_BACK_SIGNED_OUT); return; }
+    if (back.kind !== 'sso') return;
     if (!back.flow || back.flow.purpose !== 'sign_in') {
         _showReasonNote('That sign-in did not come back to the tab that started it. Start again.');
         return;
@@ -2063,7 +2071,12 @@ async function _ssoOnSignInScreen(back) {
 // The page came back from a provider while signed in: a link, an administrator's test or a confirmation is claimed
 // with this tab's verifier, and the person is told what happened.
 async function _ssoResume(back) {
-    if (!back || !window.Sso || !authToken || !currentUser) return;
+    if (!back || !window.Sso) return;
+    if (!authToken || !currentUser) {
+        // The session stored for the page was refused at the load: the sign-in screen is up, with no word of why.
+        if (_SSO_BACK_OF_A_SESSION.includes(back.kind)) _showReasonNote(SSO_BACK_SIGNED_OUT);
+        return;
+    }
     const out = await Sso.resume(back);
     if (!out) return;
     if (out.kind === 'error') { showError(out.message); return; }

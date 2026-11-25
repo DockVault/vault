@@ -1,8 +1,12 @@
 """The sign-in screen's part of single sign-on (static/js/app.js with static/js/sso.js), and where its sentences point.
 
+The provider buttons stand under a heading that names them. A link to one of the app's views, opened while signed
+out, goes to the provider and comes back to that view. A link, a test or a confirmation that comes back to a page with
+no session says that nothing was done. A sign-in that finds no linked account names both ways in, and the sentences
+that send a person to Your account name a place the page has under that name.
+
 The page's own functions run in Node on the small document of tests/js/mini_dom.js, against stand-ins for the server
-(the server's side has its own tests). What is proved here: the sentences that send a person to Your account name a
-place the page has under that name.
+(the server's side has its own tests).
 """
 import json
 import re
@@ -66,6 +70,7 @@ SSO_JS = ROOT / "static" / "js" / "sso.js"
 _SHIPPED = ("_el", "_showReasonNote", "_showLoginError", "_signInOriginElsewhere", "_noteSignInOrigin", "_ssoReturnTo",
             "_initSsoSignIn", "_ssoStartHandOut", "_ssoOnSignInScreen", "_ssoResume")
 _STATE = ("_hashForSignIn", "_passwordStage")
+_CONSTANTS = ("SSO_BACK_SIGNED_OUT", "_SSO_BACK_OF_A_SESSION")
 
 
 def _function(js, name):
@@ -80,6 +85,11 @@ def _state(js, name):
     found = re.search(rf"^let {re.escape(name)} = [^;]*;", js, re.M)
     assert found, name
     return found.group(0) + "\n"
+
+
+def _constant(js, name):
+    found = re.search(rf"^const {re.escape(name)} = .*?;\n", js, re.M | re.S)
+    return found.group(0) if found else ""
 
 
 PRELUDE = r"""
@@ -141,7 +151,8 @@ def _node(scenario: str, reasons=None):
     assert node, "Node is required: the page's own code must not be skipped"
     js = APP_JS.read_text(encoding="utf-8")
     script = (PRELUDE + f"const REASONS = {json.dumps(reasons or {})};\n"
-              + "".join(_state(js, n) for n in _STATE) + "".join(_function(js, n) for n in _SHIPPED)
+              + "".join(_state(js, n) for n in _STATE) + "".join(_constant(js, n) for n in _CONSTANTS)
+              + "".join(_function(js, n) for n in _SHIPPED)
               + SSO_JS.read_text(encoding="utf-8")
               + "\n(async () => {\n" + scenario + "\n})().catch((e) => { console.error(e); process.exit(1); });\n")
     done = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=60,
@@ -265,3 +276,42 @@ def test_the_pages_list_of_views_is_the_servers():
     listed = re.search(r"const allowed = \[([^\]]*)\];", body)
     assert listed, body
     assert tuple(re.findall(r"'([^']*)'", listed.group(1))) == sso_state.RETURN_TO
+
+
+BACK_SIGNED_OUT = ("Your session ended while you were at your organisation's sign-in, so nothing was linked, tested or "
+                   "confirmed. Sign in and start again.")
+
+
+@pytest.mark.parametrize("fragment", ["#sso-linked=abc", "#sso-test=abc", "#sso-stepup=abc"])
+def test_a_link_test_or_confirmation_back_to_a_page_with_no_session_says_nothing_was_done(fragment):
+    """The provider sends the browser back with a link, a test or a confirmation the signed-in session started. The
+    page has no session any more (none stored, or the stored one was refused at the load): the code can be claimed
+    only by the session that started it, so nothing was done, and the sign-in screen says so."""
+    got = _node(r"""
+answers['GET /api/auth/sso/reasons'] = { status: 200, json: { reasons: REASONS } };
+// No session stored: the page shows the sign-in screen with what came back.
+await _ssoOnSignInScreen(arrive(FRAGMENT));
+const none = note();
+loginError.textContent = ''; loginError.style.display = 'none';
+// A session stored and refused at the load: the sign-out writes no reason, then what came back is looked at.
+authToken = null; currentUser = null;
+await _ssoResume(arrive(FRAGMENT));
+const refused = note();
+out({ none, refused, sent: sent.filter((s) => s.method === 'POST').length, toasts });
+""".replace("FRAGMENT", json.dumps(fragment)), _server_reasons())
+    assert got["none"] == {"text": BACK_SIGNED_OUT, "shown": True}, got
+    assert got["refused"] == {"text": BACK_SIGNED_OUT, "shown": True}, got
+    assert got["sent"] == 0 and got["toasts"] == []
+
+
+def test_a_sign_in_or_a_refusal_back_to_a_page_with_no_session_is_not_told_its_session_ended():
+    got = _node(r"""
+answers['GET /api/auth/sso/reasons'] = { status: 200, json: { reasons: REASONS } };
+await _ssoResume(arrive('#sso=abc'));
+await _ssoResume(arrive('#sso-error=no_account'));
+const resumed = note();
+await _ssoOnSignInScreen(arrive('#sso-error=busy'));
+out({ resumed, refused: note() });
+""", _server_reasons())
+    assert got["resumed"] == {"text": "", "shown": False}
+    assert got["refused"] == {"text": _server_reasons()["busy"], "shown": True}
