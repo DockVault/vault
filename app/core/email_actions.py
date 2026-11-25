@@ -395,13 +395,10 @@ _ACTION_META: tuple[tuple[str, str, str, str], ...] = (
      "Optional — notify a user when their account signs in.", OPTIONAL),
     ("sign_in_method_changed", "Sign-in method changed",
      "Sent to a user when a passkey is added to or removed from their own account, an authenticator app is "
-     "set up for it or turned off, or the way it signs in through a single sign-on provider changes (an identity "
-     "linked or unlinked, by the user or an administrator), or an administrator changes a single sign-on provider "
-     "the account is linked to (points it elsewhere, turns its password sign-in off or on, changes its rule for the "
-     "accounts it makes or how long it waits for a sign-in, holds the account's keys before removing it, or "
-     "removes it), or the account stops being an administrator or holding the auditor right and signs in only "
-     "through its provider again, or the vault gives an administrator's or auditor's account its password sign-in "
-     "back at start-up — says what, when, and what to do about it.",
+     "set up or turned off on it, a single sign-on provider is linked to it or unlinked (by them or an "
+     "administrator), an administrator changes how a linked provider signs it in, holds its keys before removing "
+     "that provider or removes it, or its password sign-in stops as its administrator role or auditor right ends, "
+     "or is given back at start-up while it holds one — says what, when, and what to do.",
      SYSTEM),
     ("share_created", "File / folder shared",
      "Optional — notify a recipient when something is shared with them.", OPTIONAL),

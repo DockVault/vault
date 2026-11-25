@@ -353,9 +353,10 @@ def test_the_sign_in_method_email_is_described_by_everything_it_is_sent_for():
     passkey added or removed, an authenticator app set up, and a change to how the account signs in through a
     provider. A description that names only the first hides the others from the one who edits its template."""
     described = ea.SPEC_BY_KEY["sign_in_method_changed"]["description"]
-    for sent_for in ("a passkey is added to or removed from", "an authenticator app is set up for it or turned off",
-                     "single sign-on provider", "an identity linked or unlinked",
-                     "an administrator changes a single sign-on provider", "at start-up"):
+    for sent_for in ("a passkey is added to or removed from", "an authenticator app is set up or turned off",
+                     "a single sign-on provider is linked to it or unlinked",
+                     "an administrator changes how a linked provider signs it in", "auditor right ends",
+                     "at start-up"):
         assert sent_for in described, sent_for
 
 
