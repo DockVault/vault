@@ -195,6 +195,28 @@ def test_an_account_whose_password_nobody_knows_confirms_itself_at_its_provider(
     assert h.start_reauth(p)[0] == 403
 
 
+def test_an_action_that_is_no_step_up_action_starts_nothing_at_a_provider_that_could_confirm(monkeypatch):
+    """Asked of an account that is linked to the provider, at a provider tested with auth_time, for which a known
+    action starts: everything else the start checks passes, so the refusal is the action's own. An unknown action
+    answers 404 'Unknown action.' and starts no sign-in at the provider; the unlink's confirmation is the one name
+    that is no step-up action and starts all the same."""
+    from app.services import sso_sign_in as sso
+    alice, p = _user(sso_only=True), _provider(last_test=TESTED)
+    h = Reauth(monkeypatch, [alice], [p], identities=[_identity(alice, p, subject="s-alice")])
+    h.current_user = alice
+    assert h.start_reauth(p)[0] == 200                                   # the control: a known action starts
+    started = len([k for k in h.redis.rows if k.startswith("sso:state:")])
+    assert started >= 1
+    for action in ("not.an.action", "admin.retention.writ", "sso.identity.unlinks"):
+        status, body = h.start_reauth(p, action=action)
+        assert status == 404 and body["detail"] == "Unknown action.", (action, body)
+        assert len([k for k in h.redis.rows if k.startswith("sso:state:")]) == started, action
+    assert h.start_reauth(p, action="")[0] in (404, 422)                 # no name at all: refused before or here
+    assert len([k for k in h.redis.rows if k.startswith("sso:state:")]) == started
+    assert h.start_reauth(p, action=sso.UNLINK_CONFIRMATION)[0] == 200
+    assert len([k for k in h.redis.rows if k.startswith("sso:state:")]) == started + 1
+
+
 def test_the_provider_must_be_linked_and_tested_with_auth_time(monkeypatch):
     alice, p, q = _user(sso_only=True), _provider(last_test=TESTED), _provider(name="untested", last_test={"outcome": "ok", "auth_time_present": False})
     h = Reauth(monkeypatch, [alice], [p, q], identities=[_identity(alice, q, subject="s-q")])
