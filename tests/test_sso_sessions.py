@@ -439,6 +439,62 @@ def oc_client():
     return CLIENT
 
 
+def test_a_logout_that_waits_for_an_accounts_turn_holds_up_no_other_request(monkeypatch):
+    """A provider's logout waits for the turn of each account it names, for as long as the connection waits for a
+    lock, and is never answered as busy for it (a provider rarely sends a logout twice). It waits off the
+    server's loop: a request that has nothing to do with it is answered meanwhile. On the loop, every request of
+    every person waited with it."""
+    import asyncio
+    import threading
+    alice, p = _user(), _provider()
+    h = Sessions(monkeypatch, [alice], [p], identities=[_identity(alice, p)])
+    waiting, _ = _sign_in(h, p, sid="s-1")
+    assert h.finish(waiting)[0] == 200 and len(h.active_sessions()) == 1
+    token = h.logout_token(sid="s-1")
+    at_the_turn, let_go, order = threading.Event(), threading.Event(), []
+    turn = h.S._sessions_turn
+
+    def held(db, user_id):
+        order.append("the logout is at the turn")
+        at_the_turn.set()
+        let_go.wait(10)                               # held by somebody else for a while
+        order.append("the turn is given")
+        return turn(db, user_id)
+    monkeypatch.setattr(h.S, "_sessions_turn", held)
+
+    async def request(method, path, form=None):
+        body = "&".join(f"{k}={v}" for k, v in (form or {}).items()).encode()
+        scope = {"type": "http", "http_version": "1.1", "method": method, "path": path, "raw_path": path.encode(),
+                 "query_string": b"", "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+                 "client": ("203.0.113.9", 1234), "server": ("testserver", 80), "scheme": "https"}
+        out = {}
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                out["status"] = message["status"]
+        await h.S.app(scope, receive, send)
+        return out["status"]
+
+    async def both():
+        logout = asyncio.ensure_future(request("POST", f"/auth/sso/{p.id}/backchannel-logout", {"logout_token": token}))
+        while not at_the_turn.is_set():
+            await asyncio.sleep(0.01)
+            assert not logout.done(), logout.result()
+        # The logout is waiting. Somebody else's request is answered now, not when the turn is given.
+        other = await asyncio.wait_for(request("GET", "/auth/sso/reasons"), timeout=5)
+        order.append("another request is answered")
+        assert not logout.done()
+        let_go.set()
+        return other, await asyncio.wait_for(logout, timeout=10)
+    other, logged_out = asyncio.run(both())
+    assert (other, logged_out) == (200, 200)
+    assert order == ["the logout is at the turn", "another request is answered", "the turn is given"], order
+    assert not [s for s in h.active_sessions() if s.is_active and not s.revoked]
+
+
 def test_a_logout_waits_for_a_slot_that_frees_up(monkeypatch):
     """Every slot in use, then one freed within the wait: the logout is verified, not refused."""
     import asyncio

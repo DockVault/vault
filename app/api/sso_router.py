@@ -689,6 +689,84 @@ def _owners_of(db, session_ids) -> list:
     return sorted({str(row.user_id) for row in rows})
 
 
+def _end_what_a_logout_names(db, row_id, scope, claims, client_ip):
+    """The database's part of a provider's logout, once its token is verified: the provider's row taken, what the
+    token names remembered as logged out, each named account's turn taken, the sessions ended and the commit; and
+    the route's answer. A function of its own, called in the thread pool (it waits for locks)."""
+    api = _api()
+    from app.core.models import SsoSession
+    invalid = JSONResponse(status_code=400, content={"error": "invalid_request"})
+    failed = JSONResponse(status_code=501, content={"error": "logout_failed"})
+    sid, sub = claims.get("sid"), claims.get("sub")
+    query = db.query(SsoSession).filter(SsoSession.provider_id == row_id)
+    if isinstance(sid, str) and sid:
+        query, by = query.filter(SsoSession.idp_sid == sid), "sid"
+    elif isinstance(sub, str) and sub:
+        query, by = query.filter(SsoSession.idp_sub == sub), "sub"
+    else:
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": scope, "reason": "no_identifier"})
+        return invalid
+    session_ids = []
+    try:
+        # The provider's row for this logout, first (it stands before the accounts' turns in the order of the
+        # locks, app/services/sign_in.py). A sign-in through this provider that is being written holds the row
+        # shared until it commits: the logout comes wholly after it, and ends the session it wrote, or wholly
+        # before it, and the sign-in finds the provider's session logged out. The key is left free, so a row that
+        # only refers to the provider waits for nothing.
+        if db.query(SsoProvider).filter(SsoProvider.id == row_id).with_for_update(key_share=True).first() is None:
+            db.rollback()
+            return invalid                 # removed since the token came in: its sessions went with it
+        # A sign-in held for a further step, or waiting in its handover code, carries the provider's session
+        # and the person, and would record them on a new vault session that no later logout names. What the
+        # token names (the session, else the person) is remembered as logged out now, for as long as such a
+        # sign-in can last: one begun before this moment is refused where it is written, and
+        # one it answers after is a new sign-in.
+        if by == "sid":
+            sso_state.note_logged_out(scope=scope, sid=sid)
+        else:
+            sso_state.note_logged_out(scope=scope, sub=sub)
+        # Whose sessions the token names, then, under each of those accounts' turn at its sessions, which sessions.
+        # A renewal ("Stay signed in") moves the provider's session to its new session row under the same turn, so
+        # the read made under it sees a renewal wholly done or not begun: the live session is among those ended.
+        # The person the token names takes a turn too, with or without a session yet.
+        named = [s.session_id for s in query.all()]
+        owners = set(_owners_of(db, named))
+        person = None
+        if isinstance(sub, str) and sub:
+            person = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row_id,
+                                                       ExternalIdentity.subject == sub).first()
+            if person is not None:
+                owners.add(str(person.user_id))
+        for owner in sorted(owners):
+            api._sessions_turn(db, owner)
+        session_ids = [s.session_id for s in query.all()]
+        ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout",
+                                     durable=True) if session_ids else 0
+    except Exception as exc:  # noqa: BLE001 -- nothing was applied: the token is not spent, so the provider's retry works
+        db.rollback()
+        sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
+        log.warning("sso back-channel logout not applied: %s", type(exc).__name__)
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": scope, "reason": "revocation_failed"})
+        return failed
+    try:
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        # A failed commit may still have reached the database. The token is forgotten (so the provider's retry is
+        # honoured) when a session it named is still live, or when that cannot be read: ending sessions is the safer
+        # side, though a retry naming only a subject could then also end a session opened after this logout.
+        if session_ids and _a_session_is_live(db, session_ids):
+            sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
+        log.warning("sso back-channel logout commit failed: %s", type(exc).__name__)
+        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
+               details={"provider_id": scope, "reason": "revocation_failed"})
+        return failed
+    _audit(db, "sso_backchannel_logout", ip=client_ip, details={"provider_id": scope, "by": by, "sessions": ended})
+    return JSONResponse(status_code=200, content={})
+
+
 @router.post("/auth/sso/{provider_id}/backchannel-logout")
 async def backchannel_logout(provider_id: str, request: Request, db: Session = Depends(get_db)):
     """Where the provider says a person signed out of it (OpenID Connect back-channel logout, a form with
@@ -764,8 +842,8 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
             raise _ProviderUnusable(exc.code) from exc
         return oc.verify_logout_token(provider, discovery, token, fetch=oc.fetch_json,
                                       seen_jti=lambda jti, ttl: sso_state.seen_logout_jti(jti, ttl, scope=scope))
+    from starlette.concurrency import run_in_threadpool
     try:
-        from starlette.concurrency import run_in_threadpool
         claims = await run_in_threadpool(verify)
     except _ProviderUnusable as exc:
         _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
@@ -786,74 +864,10 @@ async def backchannel_logout(provider_id: str, request: Request, db: Session = D
         return failed
     finally:
         _BACKCHANNEL_SLOTS.release()
-    sid, sub = claims.get("sid"), claims.get("sub")
-    query = db.query(SsoSession).filter(SsoSession.provider_id == row_id)
-    if isinstance(sid, str) and sid:
-        query, by = query.filter(SsoSession.idp_sid == sid), "sid"
-    elif isinstance(sub, str) and sub:
-        query, by = query.filter(SsoSession.idp_sub == sub), "sub"
-    else:
-        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": scope, "reason": "no_identifier"})
-        return invalid
-    session_ids = []
-    try:
-        # The provider's row for this logout, first (it stands before the accounts' turns in the order of the
-        # locks, app/services/sign_in.py). A sign-in through this provider that is being written holds the row
-        # shared until it commits: the logout comes wholly after it, and ends the session it wrote, or wholly
-        # before it, and the sign-in finds the provider's session logged out. The key is left free, so a row that
-        # only refers to the provider waits for nothing.
-        if db.query(SsoProvider).filter(SsoProvider.id == row_id).with_for_update(key_share=True).first() is None:
-            db.rollback()
-            return invalid                 # removed since the token came in: its sessions went with it
-        # A sign-in held for a further step, or waiting in its handover code, carries the provider's session
-        # and the person, and would record them on a new vault session that no later logout names. What the
-        # token names (the session, else the person) is remembered as logged out now, for as long as such a
-        # sign-in can last: one begun before this moment is refused where it is written, and
-        # one it answers after is a new sign-in.
-        if by == "sid":
-            sso_state.note_logged_out(scope=scope, sid=sid)
-        else:
-            sso_state.note_logged_out(scope=scope, sub=sub)
-        # Whose sessions the token names, then, under each of those accounts' turn at its sessions, which sessions.
-        # A renewal ("Stay signed in") moves the provider's session to its new session row under the same turn, so
-        # the read made under it sees a renewal wholly done or not begun: the live session is among those ended.
-        # The person the token names takes a turn too, with or without a session yet.
-        named = [s.session_id for s in query.all()]
-        owners = set(_owners_of(db, named))
-        person = None
-        if isinstance(sub, str) and sub:
-            person = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row_id,
-                                                       ExternalIdentity.subject == sub).first()
-            if person is not None:
-                owners.add(str(person.user_id))
-        for owner in sorted(owners):
-            api._sessions_turn(db, owner)
-        session_ids = [s.session_id for s in query.all()]
-        ended = api._revoke_sessions(db, session_ids=session_ids, actor_username="provider logout",
-                                     durable=True) if session_ids else 0
-    except Exception as exc:  # noqa: BLE001 -- nothing was applied: the token is not spent, so the provider's retry works
-        db.rollback()
-        sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
-        log.warning("sso back-channel logout not applied: %s", type(exc).__name__)
-        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": scope, "reason": "revocation_failed"})
-        return failed
-    try:
-        db.commit()
-    except Exception as exc:  # noqa: BLE001
-        db.rollback()
-        # A failed commit may still have reached the database. The token is forgotten (so the provider's retry is
-        # honoured) when a session it named is still live, or when that cannot be read: ending sessions is the safer
-        # side, though a retry naming only a subject could then also end a session opened after this logout.
-        if session_ids and _a_session_is_live(db, session_ids):
-            sso_state.forget_logout_jti(claims.get("jti"), scope=scope)
-        log.warning("sso back-channel logout commit failed: %s", type(exc).__name__)
-        _audit(db, "sso_backchannel_logout", ip=client_ip, status_="failure",
-               details={"provider_id": scope, "reason": "revocation_failed"})
-        return failed
-    _audit(db, "sso_backchannel_logout", ip=client_ip, details={"provider_id": scope, "by": by, "sessions": ended})
-    return JSONResponse(status_code=200, content={})
+    # What the token names is ended off the server's loop. Each account's turn, and the provider's row, are waited
+    # for as long as the connection waits for any lock: a provider rarely sends a logout twice, so this is never
+    # answered as busy for a wait. On the loop, that wait was every other request's too.
+    return await run_in_threadpool(_end_what_a_logout_names, db, row_id, scope, claims, client_ip)
 
 
 @router.post("/users/me/identities/{provider_id}/reauth")
