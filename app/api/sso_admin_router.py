@@ -98,11 +98,14 @@ def _decide(db, request_id, current_user, request: Request, *, approve: bool):
     api = _api()
     client_ip = api.get_client_ip(request)
     row = _request_or_404(db, request_id)
+    # The account's name for the records, so a search of the Activity page by it finds them; read now, as a
+    # value, so no commit below makes the row read again for it.
+    target_name = db.query(User.username).filter(User.id == row.user_id).scalar()
     refusal = sso_groups.decision_refusal if approve else sso_groups.denial_refusal
     conflict = refusal(db, row, current_user)
     if conflict is not None:
         _decision_audit(db, approve, user=current_user, ip=client_ip, status_="failure", row=row,
-                        details={"user_id": str(row.user_id), "reason": conflict.code})
+                        details={"user_id": str(row.user_id), "reason": conflict.code, "target_username": target_name})
         raise HTTPException(status_code=409, detail={"reason": conflict.code, "message": conflict.message})
     _step_up(db, current_user, request)       # may commit (a receipt is used once)
     row = _request_or_404(db, request_id, lock=True)
@@ -114,7 +117,8 @@ def _decide(db, request_id, current_user, request: Request, *, approve: bool):
         sso_groups.deny(db, row, current_user)
         outcome = {}
     _decision_audit(db, approve, user=current_user, ip=client_ip, status_="success", row=row,
-                    details={"user_id": str(row.user_id), "provider_id": str(row.provider_id)})
+                    details={"user_id": str(row.user_id), "provider_id": str(row.provider_id),
+                             "target_username": target_name})
     return {"request": _public(db, row, current_user), **outcome}
 
 
@@ -288,6 +292,7 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     if not sso_freshness.refusal_in_force(identity):
         raise HTTPException(status_code=409, detail={"reason": "changed", "message": "The identity changed meanwhile."})
     user = db.query(User).filter(User.id == identity.user_id).first()
+    target_name = user.username if user is not None else None       # for the record, read before the commit
     # Whether a provider held the account to its sign-in before the lift (its password and passkeys signed in to
     # nothing): what the notices say of them afterwards turns on it.
     held_before = sso_freshness.held_to_a_provider(db, user) if user is not None else None
@@ -323,7 +328,7 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     _audit(db, "sso_refusal_cleared", user=current_user, ip=client_ip, resource_type="user",
            resource_id=str(identity.user_id),
            details={"user_id": str(identity.user_id), "provider_id": str(identity.provider_id),
-                    "identity_id": str(identity.id)})
+                    "identity_id": str(identity.id), "target_username": target_name})
     # Lifting a refusal hands a person their keys back: the other administrators are told, as of every change to
     # the providers.
     try:
@@ -425,7 +430,7 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
                "identity_id": str(identity.id), "linked_by": identity.linked_by, "unlinked_by": "administrator",
                "sessions": ended, "held": held, "keys_paused": paused,
                "due": standing.due.isoformat() + "Z" if standing is not None and standing.due else None,
-               "restored": settled == sso_only.RESTORED}
+               "restored": settled == sso_only.RESTORED, "target_username": user.username}
     refused_by_the_provider = bool(standing is not None and standing.refused)
     db.delete(identity)
     db.commit()
@@ -437,7 +442,8 @@ def unlink_identity(identity_id: str, request: Request, current_user: User = Dep
         _audit(db, "sso_refusal_cleared", user=current_user, ip=client_ip, resource_type="user",
                resource_id=details["user_id"],
                details={"user_id": details["user_id"], "provider_id": details["provider_id"],
-                        "identity_id": details["identity_id"], "via": "unlink"})
+                        "identity_id": details["identity_id"], "via": "unlink",
+                        "target_username": details["target_username"]})
     may_set_password = settled == sso_only.RESTORED
     try:
         from app.api import sso_providers_router

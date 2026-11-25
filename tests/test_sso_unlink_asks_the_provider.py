@@ -211,9 +211,11 @@ def test_an_administrator_unlinks_an_identity_for_somebody_under_the_step_up_and
     # ended with the identity, and is recorded as a refusal lifted, by way of the unlink.
     unlinked = [a[2] for a in h.audits if a[0] == "sso_identity_unlinked"][-1]
     assert unlinked["held"] is True and unlinked["restored"] is False and unlinked["identity_id"] == str(held.id)
+    # Both name the account, so a search of the Activity page by its name finds them.
+    assert unlinked["target_username"] == "alice"
     lifted = [a[2] for a in h.audits if a[0] == "sso_refusal_cleared"]
     assert lifted == [{"user_id": str(alice.id), "provider_id": str(p.id), "identity_id": str(held.id),
-                       "via": "unlink"}]
+                       "via": "unlink", "target_username": "alice"}]
     assert told[-1][1] == "An identity was unlinked by an administrator" and "the hold ended with the identity" in told[-1][2]
     assert owners[-1][0] == "alice" and owners[-1][1].startswith("root unlinked your account from ")
     # The owner did not do it, and has nothing to remove: the advice is the one for an administrator's change.
@@ -230,7 +232,7 @@ def test_an_administrator_unlinks_an_identity_for_somebody_under_the_step_up_and
                                 "link).")
     assert owners[-1][1].endswith("Your account has no password yet: ask an administrator for a reset link.")
     unlinked = [a[2] for a in h.audits if a[0] == "sso_identity_unlinked"][-1]
-    assert unlinked["held"] is False and unlinked["restored"] is True
+    assert unlinked["held"] is False and unlinked["restored"] is True and unlinked["target_username"] == "made"
     assert len([a for a in h.audits if a[0] == "sso_refusal_cleared"]) == 1          # no refusal held this one
     assert [a[2]["linked_by"] for a in h.audits if a[0] == "sso_identity_unlinked"] == ["self", "jit"]
     assert _call(h.S, "DELETE", f"/admin/sso/identities/{held.id}")[0] == 404

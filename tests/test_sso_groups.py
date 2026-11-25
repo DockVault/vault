@@ -439,6 +439,8 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     assert body["held"][0]["you_may_decide"] is False and "less than 14 days" in body["held"][0]["refusal"]
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/approve")
     assert status == 409 and body["detail"]["reason"] == "new" and h.step_ups == [] and request.state == "held"
+    # The refusal's row names the account it is about, so a search of the Activity page by its name finds it.
+    assert ("sso_admin_approved", "failure", {"user_id": str(bob.id), "reason": "new", "target_username": "bob"}) in h.audits
     from app.core.models import AdminGrant
     h.db.rows_of(AdminGrant).clear()
     # One who changed the account's sign-in details lately may not either.
@@ -543,7 +545,8 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     assert request.state == "approved" and request.decided_by == root.id and request.decided_by_name == "root"
     assert request.decided_at is not None
     assert body["request"]["state"] == "approved" and body["username"] == "bob"
-    assert any(a[0] == "sso_admin_approved" and a[1] == "success" for a in h.audits)
+    assert ("sso_admin_approved", "success", {"user_id": str(bob.id), "provider_id": str(p.id),
+                                              "target_username": "bob"}) in h.audits
     # Decided once: a second decision is refused.
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{request.id}/deny")
     assert status == 409 and body["detail"]["reason"] == "decided"
@@ -560,7 +563,8 @@ def test_the_request_is_decided_by_another_administrator_under_the_approver_rule
     status, body, _ = _call(S, "POST", f"/admin/sso/admin-requests/{again.id}/approve")
     assert status == 200 and h.status_notices[-1] == ("carol", "root", ("external", "admin"), ["old-permission"])
     assert ([str(carol.id)], "Your administrator role was not granted") in h.notices
-    assert any(a[0] == "sso_admin_denied" and a[1] == "success" for a in h.audits)
+    assert ("sso_admin_denied", "success", {"user_id": str(carol.id), "provider_id": str(p.id),
+                                            "target_username": "carol"}) in h.audits
     # Expired: listed as expired and undecidable, but a read changes nothing and records nothing; the reading
     # administrator's address and browser are not the expiry's.
     stale = _request_for(h, p, carol, requested_at=datetime.utcnow() - timedelta(days=8), expires_at=datetime.utcnow() - timedelta(days=1))

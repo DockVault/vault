@@ -1254,7 +1254,7 @@ def test_an_administrator_clears_a_refusal_under_the_step_up_and_never_their_own
     assert told[0][2].endswith("its SSH keys, temporary credentials and devices work again. Its password and its "
                                "passkeys sign it in again.")
     assert ("sso_refusal_cleared", "success", {"user_id": str(alice.id), "provider_id": str(p.id),
-                                               "identity_id": str(identity.id)}) in h.audits
+                                               "identity_id": str(identity.id), "target_username": "alice"}) in h.audits
     status, body, _ = _call(h.S, "POST", f"/admin/sso/identities/{identity.id}/clear-refusal")
     assert status == 409 and body["detail"]["reason"] == "not_refused" and steps == ["root"]
     # A refusal the person answered since (the provider admitted a later sign-in) holds nobody: there is nothing to
