@@ -26,8 +26,9 @@ having signed in there says nothing about a person, and every linked account wou
 after an administrator's turn-off. (The keys go on pausing on their day, as above.) What held an account before
 the turn-off goes on holding it: a refusal by the provider, and days that had already run out, which the turn-off
 records as one (app/services/sso_providers.py hold_lapsed). So turning a provider off, during an incident say,
-hands nobody a password back; an administrator lifts each such account under Identities. Turned on again, the
-days count as they stand: an account that did not sign in there within them signs in through the provider.
+hands nobody a password back; an administrator lifts each such account on the provider's Identities page
+(Settings, Sign-in; app/api/sso_admin_router.py). Turned on again, the days count as they stand: an account that did
+not sign in there within them signs in through the provider.
 """
 from __future__ import annotations
 

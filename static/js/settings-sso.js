@@ -9,7 +9,9 @@
  * provider opens in a dialog with its pages: Connection (with the addresses to copy and the test sign-in), Access,
  * Second factor, Sessions. Each page is saved on its own and sends only what changed; a change asks for the
  * administrator's password (and their second factor when they have one), and what the server refuses is shown in
- * its own words. The client secret is typed, sent, and never shown again.
+ * its own words. The client secret is typed, sent, and never shown again. A fifth page, Identities, lists the
+ * accounts linked to the provider (GET /admin/sso/providers/{id}/identities) and where each stands, and lifts a
+ * refusal or a hold (POST /admin/sso/identities/{id}/clear-refusal, under the same step-up as a change).
  *
  * Uses app.js's apiRequest, openModal, closeModal, showConfirm, showToast and _el, and sso.js's Sso.startTest.
  * Builds everything with createElement and textContent.
@@ -24,9 +26,12 @@
     let page = 'connection';    // the dialog's page
     let drafts = {};            // typed and not saved, by page: {field id: value}, kept while another page is shown
     let fresh = {};             // the values the page on screen was built with
+    let identitiesFrom = 0;     // where the Identities page starts in the provider's list of accounts
+    let identityReads = 0;      // only the latest read of that list draws it
 
     const ICON_NAMES = { generic: 'Plain', microsoft: 'Microsoft', google: 'Google', okta: 'Okta', keycloak: 'Keycloak', authentik: 'Authentik' };
-    const PAGES = [['connection', 'Connection'], ['access', 'Access'], ['factor', 'Second factor'], ['sessions', 'Sessions']];
+    const PAGES = [['connection', 'Connection'], ['access', 'Access'], ['factor', 'Second factor'], ['sessions', 'Sessions'],
+        ['identities', 'Identities']];
 
     function status(provider) {
         if (provider.state === 'enabled') return ['On', 'badge-success'];
@@ -471,6 +476,129 @@
         return box;
     }
 
+    // ---------------------------------------------------------------- the provider's identities
+
+    const IDENTITIES_PAGE = 50;
+    const STATE_WORDS = { refused: ['Refused or held', 'badge-error'], lapsed: ['Days run out', 'badge-warning'],
+        linked: ['Linked', 'badge-success'] };
+    const LINKED_BY = { self: 'Linked by its owner', email: 'Linked by its verified email address',
+        invitation: 'Linked when its invitation was accepted', jit: 'Made at its first sign-in through this provider',
+        admin: 'Linked by an administrator' };
+
+    function day(iso) {
+        const d = iso ? new Date(iso) : null;
+        return d && !isNaN(d.getTime()) ? d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '';
+    }
+
+    // The accounts linked to the provider, read when the page is shown: each with where it stands, and a way to lift
+    // a refusal or a hold. What a refusal and a hold are, and how each ends, is said on the page.
+    function identitiesPage(provider) {
+        const box = _el('div');
+        const about = _el('p', 'text-secondary text-sm mb-sm', 'The accounts linked to this provider. Refused or held: '
+            + 'the provider refused the person when they last signed in there, or their days without a sign-in here had '
+            + 'run out when the provider was turned off or was to be removed. The vault keeps the date of either, not '
+            + 'which of the two it was; the account\'s SSH keys, temporary credentials and devices are paused, and a '
+            + 'sign-in the provider admits lifts it, or you lift it here. Days run out: only a sign-in through the '
+            + 'provider ends that. An account whose password and passkeys no longer sign it in is marked so below.');
+        about.id = 'sso-identities-about';
+        box.appendChild(about);
+        const list = _el('div', 'sso-identities');
+        list.id = 'sso-identities';
+        list.appendChild(_el('p', 'text-secondary text-sm', 'Reading the linked accounts…'));
+        box.appendChild(list);
+        readIdentities(provider.id, list);
+        return box;
+    }
+
+    async function readIdentities(providerId, list) {
+        const mine = ++identityReads;
+        let read;
+        try {
+            read = await apiRequest(`/admin/sso/providers/${encodeURIComponent(providerId)}/identities`
+                + `?skip=${identitiesFrom}&limit=${IDENTITIES_PAGE}`, { silent: true });
+        } catch (e) {
+            if (mine === identityReads) {
+                list.replaceChildren(_el('p', 'text-error text-sm', e.message || 'The linked accounts could not be read.'));
+            }
+            return;
+        }
+        // A later read, another provider or another page of the dialog: this answer draws nothing.
+        if (mine !== identityReads || !open || open.id !== providerId || page !== 'identities') return;
+        const rows = Array.isArray(read.identities) ? read.identities : [];
+        const total = Number(read.total) || 0;
+        const from = Number(read.skip) || 0;
+        if (!rows.length && from > 0) { identitiesFrom = 0; readIdentities(providerId, list); return; }
+        list.replaceChildren();
+        const counts = read.counts || {};
+        const summary = _el('p', 'text-sm mb-sm', total === 1 ? '1 linked account' : `${total} linked accounts`);
+        summary.id = 'sso-identities-counts';
+        if (total) summary.textContent += `: ${counts.refused || 0} refused or held, ${counts.lapsed || 0} with their days run out.`;
+        list.appendChild(summary);
+        if (!total) {
+            list.appendChild(_el('p', 'text-secondary text-sm', 'No account is linked to this provider.'));
+            return;
+        }
+        rows.forEach((identity) => list.appendChild(identityRow(providerId, identity, list)));
+        if (total > rows.length) {
+            const pager = _el('div', 'sso-identities-pager flex items-center gap-sm mt-sm');
+            const prev = _el('button', 'btn btn-secondary btn-sm', 'Previous');
+            prev.type = 'button';
+            prev.disabled = from <= 0;
+            prev.addEventListener('click', () => { identitiesFrom = Math.max(0, from - IDENTITIES_PAGE); readIdentities(providerId, list); });
+            const next = _el('button', 'btn btn-secondary btn-sm', 'Next');
+            next.type = 'button';
+            next.disabled = from + rows.length >= total;
+            next.addEventListener('click', () => { identitiesFrom = from + rows.length; readIdentities(providerId, list); });
+            pager.append(prev, _el('span', 'text-secondary text-sm', `${from + 1} to ${from + rows.length} of ${total}`), next);
+            list.appendChild(pager);
+        }
+    }
+
+    function identityRow(providerId, identity, list) {
+        const row = _el('div', 'sso-identity-row flex items-center gap-sm mb-sm');
+        row.dataset.identity = identity.id;
+        const name = identity.username || 'An account';
+        const text = _el('div', 'flex-1');
+        const title = _el('div', 'text-sm font-bold', name);
+        const [word, badge] = STATE_WORDS[identity.state] || STATE_WORDS.linked;
+        title.appendChild(_el('span', 'badge ' + badge + ' ml-sm sso-identity-state', word));
+        text.appendChild(title);
+        const bits = ['Account ' + identity.user_id,
+            (LINKED_BY[identity.linked_by] || 'Linked') + (day(identity.linked_at) ? ' on ' + day(identity.linked_at) : ''),
+            identity.last_sign_in_at ? 'last signed in through it on ' + day(identity.last_sign_in_at)
+                : 'never signed in through it'];
+        if (identity.state === 'refused' && identity.refused_at) bits.push('refused or held since ' + day(identity.refused_at));
+        if (identity.due_at) bits.push((identity.state === 'lapsed' ? 'its days ran out on ' : 'its days run out on ') + day(identity.due_at));
+        if (identity.holds_sign_in) bits.push('its password and passkeys do not sign it in now');
+        text.appendChild(_el('div', 'text-secondary text-xs', bits.join(' · ')));
+        row.appendChild(text);
+        if (identity.state === 'refused' && identity.own) {
+            row.appendChild(_el('span', 'text-secondary text-xs', 'Your own: another administrator lifts it.'));
+        } else if (identity.state === 'refused') {
+            const lift = _el('button', 'btn btn-secondary btn-sm', 'Lift refusal');
+            lift.type = 'button';
+            lift.setAttribute('aria-label', 'Lift the refusal of ' + name);
+            lift.addEventListener('click', async () => {
+                const ok = await showConfirm(`Lift the refusal or hold on ${name}? Their SSH keys, temporary credentials `
+                    + 'and devices work again, unless another rule pauses them, and they and the other administrators '
+                    + 'are told. Lift it when the refusal was a mistake the provider cannot answer.', 'Lift refusal',
+                    null, 'Lift refusal');
+                if (!ok) return;
+                lift.disabled = true;
+                try {
+                    await apiRequest(`/admin/sso/identities/${encodeURIComponent(identity.id)}/clear-refusal`,
+                        { method: 'POST', silent: true });
+                    showToast(`The refusal on ${name} was lifted.`, 'success');
+                } catch (e) { showToast(e.message || 'The refusal was not lifted.', 'error'); }
+                // Read again whatever the answer: the list says how the account stands now.
+                readIdentities(providerId, list);
+                load();
+            });
+            row.appendChild(lift);
+        }
+        return row;
+    }
+
     // ---------------------------------------------------------------- the dialog
 
     async function setState(state) {
@@ -625,7 +753,8 @@
             tabs.appendChild(tab);
         });
         body.appendChild(tabs);
-        const draws = { connection: connectionPage, access: accessPage, factor: factorPage, sessions: sessionsPage };
+        const draws = { connection: connectionPage, access: accessPage, factor: factorPage, sessions: sessionsPage,
+            identities: identitiesPage };
         const shown = draws[page](open);
         shown.id = 'sso-page-' + page;
         shown.dataset.ssoShown = page;
@@ -651,6 +780,7 @@
         catch (e) { showToast(e.message || 'The provider could not be read.', 'error'); return; }
         open = read.provider;
         page = which || 'connection';
+        identitiesFrom = 0;
         forgetDrafts();
         drawDialog({ keep: false });
         openModal('sso-provider-modal');
@@ -726,6 +856,8 @@
     // Nothing of one administrator's page is left for the next person on the tab.
     function reset() {
         loads += 1;
+        identityReads += 1;
+        identitiesFrom = 0;
         data = null;
         open = null;
         forgetDrafts();

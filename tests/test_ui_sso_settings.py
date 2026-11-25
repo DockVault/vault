@@ -364,3 +364,34 @@ def test_a_provider_is_removed_after_a_question_and_the_password(page: Page, bos
     _with_the_password(page, boss)
     expect(page.locator("#sso-provider-modal.active")).to_have_count(0, timeout=10000)
     expect(row).to_have_count(0, timeout=10000)
+
+
+def test_a_providers_identities_page_lists_the_accounts_linked_to_it_and_lifts_a_refusal(page: Page, boss,
+                                                                                       provider_name):
+    """The provider's dialog has an Identities page. A new provider has nobody linked; the list the server gives is
+    shown with where each account stands, and "Lift refusal" asks first, then sends the lift to the server (which
+    asks its step-up of an identity it holds) and says what it answered."""
+    _open(page, boss)
+    _add(page, boss, provider_name)
+    page.click("#sso-tab-identities")
+    expect(page.locator("#sso-tab-identities")).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#sso-identities-about")).to_contain_text("you lift it here")
+    expect(page.locator("#sso-identities")).to_contain_text("No account is linked to this provider.", timeout=10000)
+    # An account held by a refusal, as the server would list it; the lift itself goes to the running vault, which
+    # holds no such identity and says so before it asks for any step-up.
+    held = {"id": "00000000-0000-4000-8000-000000000001", "user_id": "00000000-0000-4000-8000-000000000002",
+            "username": "carol", "linked_by": "self", "linked_at": "2026-09-01T10:00:00Z",
+            "last_sign_in_at": "2026-10-01T10:00:00Z", "state": "refused", "refused_at": "2026-10-20T10:00:00Z",
+            "due_at": None, "holds_sign_in": True, "own": False}
+    page.route(re.compile(r".*/admin/sso/providers/[0-9a-f-]{36}/identities\?.*"), lambda route: route.fulfill(
+        status=200, json={"provider_id": "x", "identities": [held], "total": 1, "skip": 0, "limit": 50,
+                          "counts": {"refused": 1, "lapsed": 0, "linked": 0}}))
+    page.click("#sso-tab-access")
+    page.click("#sso-tab-identities")
+    row = page.locator(f'.sso-identity-row[data-identity="{held["id"]}"]')
+    expect(row.locator(".sso-identity-state")).to_have_text("Refused or held", timeout=10000)
+    row.get_by_role("button", name="Lift the refusal of carol").click()
+    expect(page.locator("#confirm-modal-message")).to_contain_text("Lift the refusal or hold on carol?", timeout=8000)
+    page.click("#confirm-modal-confirm-btn")
+    expect(page.locator("#toast-container")).to_contain_text("No such identity.", timeout=10000)
+    expect(page.locator("#stepup-modal.active")).to_have_count(0)

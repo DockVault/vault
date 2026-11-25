@@ -602,14 +602,15 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
     said += _said_of_sessions_standing(standing)
     if off and providers.sso_policy.effective(row.policy)["sso_lapse_ends_sign_in"]:
         said += (" While it is off, its days stop no password: only an account that was held before (a refusal, or "
-                 "days already run out) stays held to this provider's sign-in, until it is lifted under Identities.")
+                 "days already run out) stays held to this provider's sign-in, until it is lifted on the provider's "
+                 "Identities page (Settings, Sign-in).")
     shown = providers.public(db, row)
     if off and shown["only_way_in_accounts"]:
         said += (f" {shown['only_way_in_accounts']} account(s) linked to it have no other way to sign in: nothing "
                  "signs them in while it is off.")
     if off and held:
-        said += (f" {held} account(s) whose sign-in there had lapsed stay held: lift each under Identities when it "
-                 "should have its keys back.")
+        said += (f" {held} account(s) whose sign-in there had lapsed stay held: lift each on the provider's "
+                 "Identities page (Settings, Sign-in) when it should have its keys back.")
     due = providers.due_at_turn_on(db, row) if not off else 0
     if due:
         said += (f" {due} linked account(s) have not signed in through it within its days: their password and "

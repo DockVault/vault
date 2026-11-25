@@ -1,7 +1,8 @@
 """Single sign-on, for administrators: the held administrator requests a provider group raises
 (app/services/sso_groups.py). A sign-in never grants the administrator role; it opens a request here, and another
 administrator approves or denies it under the fixed step-up every sign-in setting is written under, judged by the
-approver rules of the credential changes with no requester. The provider pages themselves land with their item.
+approver rules of the credential changes with no requester. Also the accounts linked to a provider (its Identities
+page in Settings, Sign-in), a refusal lifted from one of them, and an identity unlinked for its owner.
 """
 from __future__ import annotations
 
@@ -10,7 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from app.api.user_management_api import require_interactive_admin
@@ -131,6 +132,94 @@ def deny_admin_request(request_id: str, request: Request, current_user: User = D
                        db: Session = Depends(get_db)):
     """Refuse the request; the account is unchanged and the person is told."""
     return _decide(db, request_id, current_user, request, approve=False)
+
+
+# --------------------------------------------------------------------------- a provider's identities
+
+IDENTITIES_PAGE = 50          # the identities listed at a time, unless the page asks for another number
+IDENTITIES_PAGE_MAX = 200
+LINKED, REFUSED, LAPSED = "linked", "refused", "lapsed"
+_STATE_ORDER = {REFUSED: 0, LAPSED: 1, LINKED: 2}
+
+
+def _provider_or_404(db, provider_id) -> SsoProvider:
+    try:
+        pid = uuid.UUID(str(provider_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Unknown provider.")
+    row = db.query(SsoProvider).filter(SsoProvider.id == pid).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Unknown provider.")
+    return row
+
+
+def _standing(identity, provider, now):
+    """Where ``identity`` stands with ``provider`` now, and its deadline (or None when the provider asks nothing):
+    ``refused`` while a refusal the provider recorded, or a hold the vault wrote in its place, is in force; ``lapsed``
+    once the provider's days without a sign-in there have run out; else ``linked``."""
+    from app.services import sso_freshness
+    found = sso_freshness.deadline_of(identity, provider)
+    if found is not None and found.refused:
+        return REFUSED, found
+    if found is not None and found.due <= now:
+        return LAPSED, found
+    return LINKED, found
+
+
+@router.get("/admin/sso/providers/{provider_id}/identities")
+def list_provider_identities(provider_id: str, skip: int = Query(0, ge=0, le=1_000_000),
+                             limit: int = Query(IDENTITIES_PAGE, ge=1, le=IDENTITIES_PAGE_MAX),
+                             state: Optional[str] = Query(None, pattern="^(linked|refused|lapsed)$"),
+                             current_user: User = Depends(require_interactive_admin), db: Session = Depends(get_db)):
+    """The accounts linked to one provider, for its Identities page: each account's username and id, how and when it
+    was linked, its last sign-in through the provider, and where it stands. ``linked``; ``refused`` while a refusal
+    holds it: one the provider recorded (its verified token left the person out), or a hold the vault wrote when the
+    provider was turned off, or was to be removed, after the person's days there had run out. Both are kept the same
+    way, as the date on the identity (``refused_at``), and both are lifted the same way, by a sign-in the provider
+    admits or by another administrator (POST /admin/sso/identities/{id}/clear-refusal). ``lapsed`` once the provider's
+    days without a sign-in there have run out (``due_at``); only a sign-in through the provider ends that.
+    ``holds_sign_in``: the account's password and passkeys do not sign it in because of this identity.
+
+    Refused first, then lapsed, then by username; ``state`` keeps one of the three. ``skip`` and ``limit`` page through
+    them; ``total`` counts them all, ``counts`` each state. Never the provider's identifier for the person, the address
+    or name it sent, or what a token claimed. A read, like the provider list: no step-up, nothing recorded."""
+    from app.core import privileged_accounts
+    from app.core.models import ExternalIdentity
+    from app.services import sso_freshness
+    row = _provider_or_404(db, provider_id)
+    now = datetime.utcnow()
+    identities = db.query(ExternalIdentity).filter(ExternalIdentity.provider_id == row.id).all()
+    names = dict(db.query(User.id, User.username).filter(
+        User.id.in_([identity.user_id for identity in identities])).all()) if identities else {}
+    stood = [(identity, *_standing(identity, row, now)) for identity in identities]
+    counts = {LINKED: 0, REFUSED: 0, LAPSED: 0}
+    for _identity, held, _found in stood:
+        counts[held] += 1
+    if state is not None:
+        stood = [entry for entry in stood if entry[1] == state]
+    stood.sort(key=lambda entry: (_STATE_ORDER[entry[1]], (names.get(entry[0].user_id) or "").lower(),
+                                  str(entry[0].user_id)))
+    page = stood[skip:skip + limit]
+    users = {u.id: u for u in db.query(User).filter(User.id.in_([e[0].user_id for e in page])).all()} if page else {}
+
+    def _t(value):
+        return value.isoformat() + "Z" if value else None
+
+    def shown(identity, held, found):
+        user = users.get(identity.user_id)
+        return {
+            "id": str(identity.id), "user_id": str(identity.user_id), "username": names.get(identity.user_id),
+            "linked_by": identity.linked_by, "linked_at": _t(identity.linked_at),
+            "last_sign_in_at": _t(getattr(identity, "last_sign_in_at", None)), "state": held,
+            "refused_at": _t(getattr(identity, "refused_at", None)) if held == REFUSED else None,
+            "due_at": _t(found.due) if found is not None and found.window_days > 0 else None,
+            "holds_sign_in": bool(found is not None and sso_freshness.closes_now(found, now) and user is not None
+                                  and privileged_accounts.kind(db, user) is None),
+            # An administrator's own refusal is lifted by another administrator.
+            "own": str(identity.user_id) == str(current_user.id),
+        }
+    return {"provider_id": str(row.id), "identities": [shown(*entry) for entry in page], "total": len(stood),
+            "skip": skip, "limit": limit, "counts": counts}
 
 
 # --------------------------------------------------------------------------- a provider's refusal, cleared

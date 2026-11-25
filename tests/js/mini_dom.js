@@ -89,6 +89,7 @@ class Element extends Node {
     focus() { this.ownerDocument.activeElement = this; }
     matches(sel) { return sel.split(',').some((part) => matchCompound(this, part.trim())); }
     closest(sel) { let n = this; while (n && n.nodeType === 1) { if (n.matches(sel)) return n; n = n.parentNode; } return null; }
+    contains(other) { let n = other; while (n) { if (n === this) return true; n = n.parentNode; } return false; }
     querySelectorAll(sel) { return select(this, sel); }
     querySelector(sel) { return select(this, sel)[0] || null; }
     getBoundingClientRect() { return { left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 }; }

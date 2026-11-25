@@ -639,9 +639,9 @@ def remove_refusal(db, row) -> Optional[Conflict]:
     if counts["refusals"]:
         n = counts["refusals"]
         return Conflict(REFUSALS_IN_FORCE, (
-            f"{n} account{'s are' if n != 1 else ' is'} held by a refusal this provider recorded. Clear "
-            f"{'each' if n != 1 else 'it'} under Identities first: removing the provider would lift "
-            f"{'them' if n != 1 else 'it'} unseen."))
+            f"{n} account{'s are' if n != 1 else ' is'} held by a refusal this provider recorded. Lift "
+            f"{'each' if n != 1 else 'it'} on this provider's Identities page first: removing the provider would "
+            f"lift {'them' if n != 1 else 'it'} unseen."))
     lapsed = (days_ran_out(db, row)
               if sso_policy.effective(getattr(row, "policy", None))["sso_lapse_ends_sign_in"] else 0)
     if lapsed:
