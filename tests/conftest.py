@@ -17,7 +17,10 @@ import base64
 import json
 import os
 import random
+import shutil
 import socket
+import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -1012,6 +1015,47 @@ def host_cannot_take_a_stack(completed):
     return any(marker in haystack for marker in HOST_CANNOT_TAKE_A_STACK)
 
 
+def _docker_output(argv, timeout):
+    """Run a docker command and return (its exit status, what it printed), or raise
+    subprocess.TimeoutExpired once it is killed.
+
+    What it prints goes to a file, never a pipe. subprocess.run reads its pipes again after it
+    kills a command that took too long, and on Windows a process the docker command started can
+    still hold them: that read then waits for it, and the timeout does not end the wait."""
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            raise
+        out.seek(0)
+        return code, out.read().decode("utf-8", "replace")
+
+
+# Whether this machine's Docker engine answers, asked once a run (see _docker_engine_answers).
+_DOCKER_ENGINE = {}
+
+
+def _docker_engine_answers(timeout=5):
+    """None when this machine has no docker command; otherwise whether its engine answered
+    `docker version` within `timeout` seconds. Asked once a run: an engine that is down is down
+    for every module that asks."""
+    if "answers" not in _DOCKER_ENGINE:
+        if shutil.which("docker") is None:
+            answers = None
+        else:
+            try:
+                answers = _docker_output(["docker", "version", "--format", "{{.Server.Version}}"],
+                                         timeout)[0] == 0
+            except FileNotFoundError:
+                answers = None
+            except subprocess.TimeoutExpired:
+                answers = False
+        _DOCKER_ENGINE["answers"] = answers
+    return _DOCKER_ENGINE["answers"]
+
+
 def configured_int_setting(name, container=None):
     """The integer the RUNNING deployment has configured for `name`, or None if unreadable.
 
@@ -1019,22 +1063,30 @@ def configured_int_setting(name, container=None):
     surface until a limit trips needs to know whether the limit it is up against is small
     enough to have tripped -- and only the deployment knows that. Unreadable is a real answer
     here: an unset variable means the app default applies, and the tests must not guess at it.
-    """
-    import subprocess
 
+    Some modules ask while they are collected, in every lane. With no docker command the
+    setting is unreadable. With a docker command whose engine does not answer, the module (or
+    the test) is skipped, saying why, instead of the collection hanging. An engine that answers
+    and a deployment that does not is a failure, as before: a stuck stack must not pass green.
+    """
+    engine = _docker_engine_answers()
+    if engine is None:
+        return None
+    if not engine:
+        pytest.skip(f"Docker does not answer on this machine, so the deployment's {name} cannot be read",
+                    allow_module_level=True)
     target = container or os.environ.get("VAULT_API_CONTAINER", "vault-api")
     try:
-        probe = subprocess.run(["docker", "exec", target, "printenv", name],
-                               capture_output=True, text=True, timeout=15)
+        code, printed = _docker_output(["docker", "exec", target, "printenv", name], timeout=15)
     except FileNotFoundError:
         return None
     except subprocess.TimeoutExpired as exc:
         # A deployment that does not answer in time is not one whose setting is unset.
         pytest.fail(f"the deployment did not say its {name} within {exc.timeout} s")
-    if probe.returncode != 0:
+    if code != 0:
         return None
     try:
-        return int(probe.stdout.strip())
+        return int(printed.strip())
     except ValueError:
         return None
 

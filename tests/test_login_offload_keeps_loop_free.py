@@ -36,13 +36,15 @@ import pytest
 
 from conftest import ApiClient, BASE_URL, configured_int_setting
 
-_LOGIN_LIMIT = configured_int_setting("RATE_LIMIT_LOGIN_ATTEMPTS")
+_OPTED_IN = os.environ.get("VAULT_LOOP_FREE_TEST") in ("1", "true", "yes")
+# Asked of the deployment only when the test is to run: collection asks it in every lane otherwise.
+_LOGIN_LIMIT = configured_int_setting("RATE_LIMIT_LOGIN_ATTEMPTS") if _OPTED_IN else None
 _N = 8  # equal to the offload slot count: a full burst that still fits the slots
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
-        os.environ.get("VAULT_LOOP_FREE_TEST") not in ("1", "true", "yes"),
+        not _OPTED_IN,
         reason="opt-in live-acceptance measurement: set VAULT_LOOP_FREE_TEST=1 to run it on a "
                "multi-core box. It is in NO CI lane - a 2-vCPU runner starves the loop and the "
                "unrelated GET crawls above the serialized wall (measured 0.78 s > 0.66 s). CI's "

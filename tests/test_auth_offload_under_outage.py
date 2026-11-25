@@ -37,14 +37,17 @@ _NEVER_VALID = "wrong-pw-xyz"  # noqa: S105 - deliberately-invalid probe value, 
 # (~2.0 s) and frozen (~3.8 s) cases measured on a paused stack.
 _ONE_STALL_CEILING = 3.0
 
+_OPTED_IN = os.environ.get("VAULT_REDIS_OUTAGE_TEST") in ("1", "true", "yes")
+
 # Guard on the login limit: this test fires logins from one IP, so a small shipped login limit (5)
 # would 429 them before they reach the broadcast. Runs on the raised-limit offload/outage stack.
-_LOGIN_LIMIT = configured_int_setting("RATE_LIMIT_LOGIN_ATTEMPTS")
+# Asked of the deployment only when the test is to run: collection asks it in every lane otherwise.
+_LOGIN_LIMIT = configured_int_setting("RATE_LIMIT_LOGIN_ATTEMPTS") if _OPTED_IN else None
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
-        os.environ.get("VAULT_REDIS_OUTAGE_TEST") not in ("1", "true", "yes"),
+        not _OPTED_IN,
         reason="opt-in: set VAULT_REDIS_OUTAGE_TEST=1 to run the cache-outage loop-freeze test "
                "(it pauses/unpauses the Redis container via docker)",
     ),
