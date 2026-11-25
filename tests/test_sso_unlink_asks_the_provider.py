@@ -495,15 +495,24 @@ def test_what_the_administrators_are_told_of_an_owners_unlink():
     assert told(policy=watches_by_refusal).endswith(closing + tail)
     assert not told(policy=nothing).endswith(closing + tail)
     # The one unlink that stays one step: the record's reader must be able to find it, three days before it is due.
-    assert told(linked_by="email", standing=standing(3)) == (
+    assert told(linked_by="email", standing=standing(3), warned_for=standing(3).due) == (
         "alice removed Contoso from the ways their account signs in. Contoso had put the identity on the account "
         "by its email address, so no fresh sign-in through Contoso was asked. A sign-in through Contoso was due by "
         "2026-11-28, and the account had been warned of it." + closing + tail)
+    # No warning on record for this deadline (the provider was off, the pass has not run since, or the warning
+    # was for an earlier deadline): the clock is all that is said.
+    for warned_for in (None, standing(-40).due):
+        assert told(linked_by="email", standing=standing(3), warned_for=warned_for).count(
+            "was due by 2026-11-28, and the warning days had begun.") == 1
+        assert "had been warned" not in told(linked_by="email", standing=standing(3), warned_for=warned_for)
     # Before the warning days, the day alone.
     assert "was due by 2026-12-15." in told(asked=True, standing=standing(20))
     assert "had been warned" not in told(asked=True, standing=standing(20))
-    assert "had been warned" in told(asked=True, standing=standing(5)) and "had been warned" not in told(
+    assert "warning days" not in told(asked=True, standing=standing(20))
+    assert "the warning days had begun" in told(asked=True, standing=standing(5)) and "warning days" not in told(
         asked=True, standing=standing(5, window=2))                # a window of two days warns one day before
+    # A warning on record is said whatever the clock says (the days were shortened since, say).
+    assert "had been warned of it." in told(asked=True, standing=standing(20), warned_for=standing(20).due)
     # A provider that only pauses keys never held the password; an account a hold does not reach neither.
     keys_only = (" From now on Contoso says nothing about this account: its SSH keys, temporary credentials and "
                  "devices no longer wait for a sign-in there.")
@@ -524,6 +533,8 @@ def test_the_owners_unlink_records_how_the_identity_was_linked_and_tells_the_adm
     with no confirmation (it was linked by an address): the administrators are told in the app and by email."""
     ada, root, alice, p = _user("ada", role="admin"), _user("root", role="admin"), _user(), _provider()
     identity = _identity(alice, p, linked_by="email", last_sign_in_at=datetime.utcnow() - timedelta(days=27))
+    # The daily pass warned her of this deadline, and wrote that on the identity.
+    identity.freshness_warned_for = identity.last_sign_in_at + timedelta(days=30)
     h = Harness(monkeypatch, [alice, ada, root], [p], identities=[identity])
     h.current_user = alice
     monkeypatch.setattr(h.S, "_active_admins", lambda db: [ada, root])

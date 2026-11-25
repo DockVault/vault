@@ -1423,11 +1423,17 @@ def owners_unlink_refusal(db, account, identity, row, *, now: Optional[datetime]
 
 
 def owners_unlink_text(username: str, label: str, *, asked: bool, linked_by, standing, policy, reached: bool,
-                       now: datetime) -> str:
+                       now: datetime, warned_for=None) -> str:
     """What the administrators are told when an owner unlinks an identity: whether the provider confirmed it, and
     if not, why none was asked; the day a sign-in there was due, when one was; and what really stops waiting for
     the provider, by the provider's own rules. ``standing``: the identity's deadline (or None); ``policy``: the
-    provider's; ``reached``: whether the provider's hold reaches this account (sso_freshness.may_be_held)."""
+    provider's; ``reached``: whether the provider's hold reaches this account (sso_freshness.may_be_held);
+    ``warned_for``: the deadline the account was warned about, as the daily pass wrote it on the identity.
+
+    "The account had been warned" is said when it was: the warning for this deadline is on record. Judged by the
+    clock alone, it was said of accounts no warning had gone to (the pass warns nobody while the provider is off,
+    no account that is turned off, and nobody before its next run): then the notice says that the warning days
+    had begun, which is what the clock shows."""
     said = f"{username} removed {label} from the ways their account signs in"
     if asked:
         said += f", after a fresh sign-in through {label}."
@@ -1438,8 +1444,10 @@ def owners_unlink_text(username: str, label: str, *, asked: bool, linked_by, sta
         said += "."
     if standing is not None and standing.due is not None and not standing.refused:
         said += f" A sign-in through {label} was due by {standing.due:%Y-%m-%d}"
-        if now >= standing.due - sso_freshness.warning_lead(standing.window_days):
+        if warned_for is not None and warned_for == standing.due:
             said += ", and the account had been warned of it"
+        elif now >= standing.due - sso_freshness.warning_lead(standing.window_days):
+            said += ", and the warning days had begun"
         said += "."
     watches = bool(policy) and (policy["sso_freshness_days"] > 0 or policy["sso_refusal_ends_access"])
     if watches and policy["sso_lapse_ends_sign_in"] and reached:
@@ -1698,7 +1706,8 @@ async def unlink_my_identity(
     told = owners_unlink_text(current_user.username, (row.label or row.name) if row is not None else
                               "an organisation provider", asked=bool(asked), linked_by=linked_by,
                               standing=standing, policy=sso.policy_of(row) if row is not None else None,
-                              reached=sso_freshness.may_be_held(db, account), now=datetime.utcnow())
+                              reached=sso_freshness.may_be_held(db, account), now=datetime.utcnow(),
+                              warned_for=getattr(identity, "freshness_warned_for", None))
     # The flag follows the providers the account is still linked to: unlinking the one that held it to no password
     # lets it hold one again (nothing is minted), in the same transaction as the unlink.
     settled = sso_only.settle(db, account, without=identity)
