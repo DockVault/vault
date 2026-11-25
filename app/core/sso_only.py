@@ -210,10 +210,17 @@ def settle(db, user, *, also=None, also_by=None, without=None, keep_session=None
     should = should_be_sso_only(db, user, also=also, also_by=also_by, without=without)
     flagged = bool(getattr(user, "sso_only", False))
     if should == flagged:
-        return None                 # nothing to change: no turn is taken (a save settles every linked account)
+        # Nothing to change, and no turn is taken here: a save or a removal settles every account linked to its
+        # provider, and takes a turn only for those it changes. What settles one account because its links
+        # change holds that account's turn before it calls this (a link:
+        # app/services/sso_sign_in.decide_in_the_accounts_turn; an unlink: its route), so its decision is made on
+        # the flag as committed. Known, and left: two saves that let two providers' people hold a password again
+        # at one moment each still see the other provider holding an account linked to both, and both leave it
+        # held. It signs in through either meanwhile, and the next settling of the account lets it go.
+        return None
     if getattr(user, "id", None) is not None:
         # A change is to be made: the account's turn at its sessions, and the decision made again in it. What
-        # unlinks an identity, and what links one, take the turn too, so the change is decided on the links, the
+        # unlinks an identity, and what links one, hold the turn too, so the change is decided on the links, the
         # flag and the role as they are, not as they were a moment before a change that is being made (decided on
         # the old ones, it left an account held to no password with no provider). Only what is read again is
         # read again: nothing else the caller set on the account is touched. The password is among it: whether

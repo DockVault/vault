@@ -683,6 +683,8 @@ def _link_by_email(db, row, answer: ProviderAnswer, policy: dict):
     user = _email_match(db, row, answer, policy)
     if user is None:
         return None
+    # The turn before the flag is read: what the link ends is told from the flag as it is committed.
+    decide_in_the_accounts_turn(db, user)
     had_password = not getattr(user, "sso_only", False)
     identity = link_identity(db, row, user, answer, linked_by=LINKED_BY_EMAIL)
     return Resolution(user, identity, linked_now=True, linked_by=LINKED_BY_EMAIL,
@@ -852,12 +854,49 @@ def link_refusal(db, row, user, answer: ProviderAnswer) -> None:
         raise Refusal(NOT_THIS_ACCOUNT, "this account already has an identity on the provider")
 
 
+# The detail of a link refused because the account's turn was held for longer than a link waits.
+ACCOUNT_BUSY = "account_busy"
+
+
+def decide_in_the_accounts_turn(db, user) -> None:
+    """Take ``user``'s turn at its sessions, and read again what a link is decided on, as it is committed: the
+    account's flag, its role and whether its password is one nobody knows.
+
+    What changes any of them takes the same turn: a provider's save that lets the account hold a password again,
+    a provider's removal, an unlink, a promotion. A link decided on what was read a moment before such a change
+    left what neither meant: an account linked to a provider whose people hold no password, with a password it
+    could set again, or an administrator's account on such a provider. In the turn, the link comes wholly after
+    the change and decides on what it left, or wholly before it, and the change then finds the link.
+
+    The provider's row is held by the caller already (the order of the locks: the row, then the turn). The routes
+    that link run on the server's one loop, so the wait is the short one of where a sign-in is written
+    (app/services/sign_in.with_a_short_wait); a turn still held refuses the link as busy, with nothing written.
+    Nothing for an account that is not written yet."""
+    if getattr(user, "id", None) is None:
+        return
+    from sqlalchemy.exc import OperationalError
+    from app.services import sign_in
+    api = _api()
+    try:
+        sign_in.with_a_short_wait(db, lambda: api._sessions_turn(db, user.id))
+    except OperationalError as waited:
+        if getattr(getattr(waited, "orig", None), "pgcode", None) != "55P03":      # lock_not_available
+            raise
+        raise Refusal(oc.TEMPORARILY_UNAVAILABLE, ACCOUNT_BUSY) from None
+    refresh = getattr(db, "refresh", None)
+    if refresh is not None and getattr(user, "_sa_instance_state", None) is not None:
+        refresh(user, attribute_names=["sso_only", "role", "password_hash", "password_nobody_knows"])
+
+
 def link_identity(db, row, user, answer: ProviderAnswer, *, linked_by: str, keep_session=None):
     """Link ``answer``'s identity to ``user``: refused when the subject already belongs to another account, or
     the account already has an identity on this provider. In the caller's transaction, and in the same one the
     provider's password rule is applied to the account (app/core/sso_only.settle): linked to a provider whose
-    people hold no password, the account holds none from this moment, however it came to be linked."""
+    people hold no password, the account holds none from this moment, however it came to be linked. All of it is
+    decided in the account's turn (:func:`decide_in_the_accounts_turn`), taken before anything of the account is
+    read."""
     from app.core.models import ExternalIdentity
+    decide_in_the_accounts_turn(db, user)
     _password_less_refusal(db, row, user)
     existing = subject_owner(db, row, answer)
     if existing is not None:

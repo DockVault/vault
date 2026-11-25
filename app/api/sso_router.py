@@ -984,8 +984,10 @@ async def finish_link(
     # The account as this transaction holds it: the link may also end its password (a provider whose people hold
     # none), and that is written with the link or not at all.
     account = db.query(User).filter(User.id == current_user.id).first() or current_user
-    had_password = not getattr(account, "sso_only", False)
     try:
+        # The account's turn before its flag is read: what the link ends is told from the flag as it is committed.
+        sso.decide_in_the_accounts_turn(db, account)
+        had_password = not getattr(account, "sso_only", False)
         # Where the link ends the account's password, the sessions the password made end with it; not this one,
         # in which the person has just proved themselves at the provider.
         from app.core.models import ActiveSession
@@ -1001,6 +1003,12 @@ async def finish_link(
         code = exc.code if isinstance(exc, sso.Refusal) else sso.ALREADY_LINKED      # a second writer got there first
         _audit(db, "sso_sign_in_refused", user=current_user, ip=client_ip, status_="failure",
                details={"provider_id": str(row.id), "purpose": sso_state.LINK, "reason": code})
+        if code == oc.TEMPORARILY_UNAVAILABLE:
+            # The account's turn was held: a change of the account was being written. Nothing was linked.
+            from app.core import sign_in_lockout
+            raise HTTPException(status_code=503, headers={"Retry-After": str(sign_in_lockout.BUSY_RETRY_SECONDS)},
+                                detail={"reason": code, "message": (
+                                    "Your account is being changed right now. Start the link again in a moment.")})
         raise HTTPException(status_code=409, detail={"reason": code, "message": sso.reason_text(code)})
     _audit(db, "sso_identity_linked", user=current_user, ip=client_ip,
            details={"provider_id": str(row.id), "purpose": sso_state.LINK, "identity_id": str(identity.id), "linked_by": "self"})

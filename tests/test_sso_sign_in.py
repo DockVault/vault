@@ -585,6 +585,30 @@ def test_a_link_needs_a_session_that_proved_the_password_and_the_factor(monkeypa
     assert h.start_link(p)[0] == 403 and _call(h.S, "GET", "/users/me/identities")[0] == 403
 
 
+def test_a_link_met_by_a_change_of_the_account_is_answered_as_busy_and_links_nothing(monkeypatch):
+    """The account's turn was held for longer than a link waits: said as busy with the wait to try again after,
+    not as a refusal of the identity."""
+    from app.services import oidc_client as oc
+    from app.services import sso_sign_in as sso
+    alice, p = _user(), _provider()
+    h = Harness(monkeypatch, [alice], [p])
+    status, out = h.start_link(p)
+    state, _ = h.state_of(out["authorization_url"])
+    status, location, _ = h.callback(p, state)
+    assert location.startswith("/#sso-linked=")
+
+    def busy(db, user):
+        raise sso.Refusal(oc.TEMPORARILY_UNAVAILABLE, sso.ACCOUNT_BUSY)
+    monkeypatch.setattr(sso, "decide_in_the_accounts_turn", busy)
+    from app.core import sign_in_lockout
+    code = parse_qs(location.split("#", 1)[1])["sso-linked"][0]
+    status, body, headers = _call(h.S, "POST", "/users/me/identities/finish", {"code": code, "verifier": "link-tab"})
+    assert status == 503 and headers.get("retry-after") == str(sign_in_lockout.BUSY_RETRY_SECONDS), (body, headers)
+    assert body["detail"] == {"reason": "temporarily_unavailable",
+                              "message": "Your account is being changed right now. Start the link again in a moment."}
+    assert len(h.identities()) == 0
+
+
 def test_an_identity_already_on_another_account_is_not_linked_twice(monkeypatch):
     alice, bob, p = _user(), _user("bob"), _provider()
     h = Harness(monkeypatch, [alice, bob], [p], identities=[_identity(bob, p)])

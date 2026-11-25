@@ -100,7 +100,7 @@ class MemoryDB:
             raise InternalError("(statement)", {}, Exception(
                 "current transaction is aborted, commands ignored until end of transaction block"))
 
-    def refresh(self, obj):
+    def refresh(self, obj, attribute_names=None):
         pass
 
     # -- evaluation ---------------------------------------------------------------------------

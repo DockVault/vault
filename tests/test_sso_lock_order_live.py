@@ -19,6 +19,13 @@ before it, and the sign-in is refused:
   session to the new session in the account's turn. The record refers to the provider; the save took the
   provider's row with its key, and then the account's turn.
 
+- a link of the account to a second provider whose people hold no password, and a save that lets the people of
+  the first hold a password again. Both are decided in the account's turn: the link that comes while the save
+  holds it waits, reads the flag the save left and holds the account to the provider it links; the save that
+  comes while the link holds it waits and finds the link. Decided outside the turn, the link changed nothing on a
+  flag the save was changing, and left the account linked to such a provider with a password it could set again.
+  A turn held for longer than a link waits refuses the link as busy, with nothing linked.
+
 - a provider's row held for longer than a sign-in waits where it is written (a save that settles many accounts):
   the sign-in is answered as busy after its own short wait, with nothing written. The routes that finish a
   sign-in are answered on the server's one loop, where the connection's five seconds would be everybody's.
@@ -91,6 +98,7 @@ def state(uid, pid):
                     ActiveSession.user_id == uid)),
                 "provider sessions": s.query(SsoSession).filter(SsoSession.provider_id == pid).count(),
                 "sso only": bool(s.get(User, uid).sso_only),
+                "links": s.query(ExternalIdentity).filter(ExternalIdentity.user_id == uid).count(),
                 "held open": s.query(PendingLogin).filter(PendingLogin.user_id == uid,
                                                           PendingLogin.consumed_at.is_(None)).count()}
 
@@ -193,6 +201,55 @@ def held_sign_in(uid):
         return row.id
 
 
+def second_provider():
+    """Another provider that is on, whose people hold no password."""
+    with SessionLocal() as s:
+        row = SsoProvider(id=uuid.uuid4(), state="enabled", kind="oidc", name="fabrikam-" + uuid.uuid4().hex[:6],
+                          label="Fabrikam", issuer="https://idp2.example/", client_id="c", client_secret_enc="e",
+                          policy={"sso_password_login": "disabled"})
+        s.add(row)
+        s.commit()
+        return row.id
+
+
+def held_to(uid, pid):
+    """The account as a provider whose people hold no password leaves it: linked, and flagged."""
+    with SessionLocal() as s:
+        s.get(SsoProvider, pid).policy = {"sso_password_login": "disabled"}
+        s.get(User, uid).sso_only = True
+        s.commit()
+
+
+def allow_passwords_again(pid, pause=0.0):
+    """The save of the provider's password rule, as its route makes it: the one unknown password hashed first,
+    the row taken, the linked accounts settled in their turns."""
+    def run():
+        ready = sso_only.a_password_nobody_knows()
+        with SessionLocal() as s:
+            row = R._row_or_404(s, pid, lock=True)
+            row.policy = {"sso_password_login": "allowed"}
+            here.stay = pause
+            changed = sso_only.apply_password_login(s, row, unknown_hash=ready)
+            s.commit()
+            return "restored" if changed["restored"] else "left as it was"
+    return run
+
+
+def link_to(uid, pid, pause=0.0):
+    """The link from Your account, as its route makes it: the provider's row read and held, then the link."""
+    def run():
+        with SessionLocal() as s:
+            row = sso_router._provider_as_it_stands(s, pid)
+            user = s.get(User, uid)
+            answer = types.SimpleNamespace(issuer="https://idp2.example/", subject="subject-q", tenant_id=None,
+                                           email=None, display_name=None)
+            here.stay = pause
+            sso_sign_in.link_identity(s, row, user, answer, linked_by="self")
+            s.commit()
+            return "linked"
+    return run
+
+
 pair, out = os.environ["PAIR"], {}
 alice = account("alice")
 contoso = provider_with(alice)
@@ -267,6 +324,28 @@ elif pair == "saved while a renewal moves the provider's session":
             s.commit()
             return len(changed["made_sso_only"])
     out = together(writer=renewal, ender=after_the_turn_is_held(save))
+elif pair == "linked while a save lets the account hold a password again":
+    fabrikam = second_provider()
+    held_to(alice, contoso)
+    # The save holds the turn for less than a link waits: the link is to wait for it, not to be sent away.
+    out = together(ender=allow_passwords_again(contoso, pause=0.2),
+                   writer=after_the_turn_is_held(link_to(alice, fabrikam)))
+elif pair == "saved while a link is decided":
+    fabrikam = second_provider()
+    held_to(alice, contoso)
+    out = together(writer=link_to(alice, fabrikam, pause=1.6),
+                   ender=after_the_turn_is_held(allow_passwords_again(contoso)))
+elif pair == "a link while the account's turn is held":
+    fabrikam = second_provider()
+
+    def hold_the_turn():
+        with SessionLocal() as s:
+            _take(s, alice)
+            in_turn.set()
+            time.sleep(2.5)
+            s.rollback()
+            return "let go"
+    out = together(holder=hold_the_turn, writer=after_the_turn_is_held(link_to(alice, fabrikam)))
 elif pair == "a row held for longer than a sign-in waits":
     def hold_the_row():
         with SessionLocal() as s:
@@ -337,3 +416,27 @@ def test_a_sign_in_waits_a_short_time_for_a_providers_row_that_is_held_and_is_an
     assert out["writer"][:3] == ["error", "HTTPException", "503"] and "busy" in out["writer"][3], out
     assert 0.3 <= out["writer seconds"] < 1.5, out           # its own short wait: not the 2.5 s, nor the connection's 5
     assert out["after"]["sessions"] == [] and out["after"]["provider sessions"] == 0, out
+
+
+def test_a_link_that_comes_while_a_save_restores_the_account_waits_and_decides_on_what_the_save_left(db_name):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "linked while a save lets the account hold a password again"})
+    assert out["ender"] == ["ok", "restored"] and out["writer"] == ["ok", "linked"], out
+    assert out["the turn was held"] is True, out
+    assert out["writer seconds"] >= 0.15, out                # the link waited for the turn the save held
+    assert out["after"]["links"] == 2 and out["after"]["sso only"] is True, out      # held by the one it linked
+
+
+def test_a_save_that_comes_while_a_link_is_decided_waits_and_finds_the_link(db_name):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "saved while a link is decided"})
+    assert out["writer"] == ["ok", "linked"] and out["ender"] == ["ok", "left as it was"], out
+    assert out["the turn was held"] is True, out
+    assert out["ender seconds"] >= 1.0, out                  # the save waited for the turn; nothing waited in a ring
+    assert out["after"]["links"] == 2 and out["after"]["sso only"] is True, out
+
+
+def test_a_link_waits_a_short_time_for_a_turn_that_is_held_and_is_refused_as_busy(db_name):
+    out = run_in(db_name, SCENARIO, env={"PAIR": "a link while the account's turn is held"})
+    assert out["holder"] == ["ok", "let go"], out
+    assert out["writer"] == ["error", "Refusal", "", "account_busy"], out
+    assert 0.3 <= out["writer seconds"] < 1.5, out           # its own short wait: not the 2.5 s, nor the connection's 5
+    assert out["after"]["links"] == 1 and out["after"]["sso only"] is False, out

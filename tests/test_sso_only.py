@@ -315,6 +315,37 @@ def test_the_provider_setting_is_refused_while_a_privileged_account_is_linked_an
     assert sso_only.apply_password_login(h.db, p) == {"made_sso_only": [], "restored": []}
 
 
+def test_a_link_from_the_profile_tells_that_the_password_stopped_from_the_flag_as_committed(monkeypatch):
+    """Restored by a save while the link waited for the account's turn, and ended again by this link: the owner
+    is told. Read before the turn, the flag said there was no password to end."""
+    privileged_accounts, sso_only = _mod()
+    from app.core import security
+    monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
+    alice = _user("alice")
+    first = _provider(name="first", label="First", policy={"sso_password_login": "disabled"})
+    second = _provider(name="second", label="Second", policy={"sso_password_login": "disabled"})
+    h = Resolving(monkeypatch, [alice], [first, second], identities=[_identity(alice, first)])
+    alice.sso_only = True
+    h.current_user = alice
+    status, out = h.start_link(second)
+    assert status == 200, out
+    state, _ = h.state_of(out["authorization_url"])
+    h.claims_override = {"sub": "s-second"}
+    status, location, _ = h.callback(second, state)
+    assert location.startswith("/#sso-linked="), location
+    turns = []
+
+    def the_save_commits_while_the_link_waits(db, user_id):
+        turns.append(str(user_id))
+        if len(turns) == 1:
+            first.policy = {"sso_password_login": "allowed"}
+            alice.sso_only = False
+    monkeypatch.setattr(h.S, "_sessions_turn", the_save_commits_while_the_link_waits)
+    status, out = h.finish_link(location)
+    assert status == 200 and out["linked"] is True and out["password_stopped"] is True, out
+    assert alice.sso_only is True and turns and turns[0] == str(alice.id)
+
+
 def test_a_provider_that_holds_its_people_to_no_password_covers_the_accounts_linked_later(monkeypatch):
     """The setting was saved, and then an account is linked: by its owner from Your account, or by its email
     address at a sign-in. Its password ends with the link, in the same transaction, so a person who leaves and
