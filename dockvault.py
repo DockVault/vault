@@ -740,8 +740,9 @@ def allowed_hosts_value(cfg):
 def passkey_address_note(name):
     """Why passkeys stay hidden when the address people open is ``name`` (the host of ALLOWED_HOSTS's first entry
     that is not a wildcard, from _allowed_hosts_name), or None: browsers make no passkey for an address reached by
-    IP, so the passkey sign-in and the passkey settings wait for a host name. Single sign-on and the emailed links
-    work either way."""
+    IP, so the passkey sign-in and the passkey settings wait for a host name. The emailed links work either way;
+    single sign-on works at an IP address only with a provider that accepts one as a redirect address, and Google
+    does not."""
     import ipaddress
     host = (name or "").strip().strip("[]")
     try:
@@ -749,8 +750,9 @@ def passkey_address_note(name):
     except ValueError:
         return None
     return ("passkeys stay hidden at this address: browsers make no passkey for an address reached by IP. Put the "
-            "vault's host name first in ALLOWED_HOSTS when you want them; single sign-on and the emailed links work "
-            "either way.")
+            "vault's host name first in ALLOWED_HOSTS when you want them. The emailed links work either way, and "
+            "single sign-on works at an IP address only with providers that accept one as a redirect address "
+            "(Google does not).")
 
 
 def _allowed_hosts_link_base(value):
@@ -5557,7 +5559,8 @@ class DockVault:
         allowed = env.get("ALLOWED_HOSTS")
         passkey_note = sign_in_address_note(allowed)
         if passkey_note:
-            print(pal.paint("  Passkeys: hidden - %s" % passkey_note, "yellow"))
+            # The note says itself what stays hidden or off (passkeys alone, or single sign-on too).
+            print(pal.paint("  Sign-in: %s" % passkey_note, "yellow"))
         elsewhere = passkeys_elsewhere_note(self._passkey_addresses(), passkey_host(allowed))
         if elsewhere:
             print(pal.paint("  Passkeys: %s" % elsewhere, "yellow"))

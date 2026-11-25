@@ -91,7 +91,8 @@ def test_the_tool_and_the_vault_judge_an_address_alike(written, reason, monkeypa
         assert note.startswith("passkeys") and "waits meanwhile, and locks nobody out" in note
         # What it turns off: passkeys alone at an address reached by IP, single sign-on too everywhere else.
         if reason == "ip":
-            assert "single sign-on and the emailed links work either way" in note
+            assert ("The emailed links work either way, and single sign-on works at an IP address only with providers "
+                    "that accept one as a redirect address (Google does not).") in note
         else:
             assert note.startswith("passkeys and single sign-on stay off"), note
         assert "ALLOWED_HOSTS" in note
@@ -106,10 +107,21 @@ def test_the_tool_and_the_vault_judge_an_address_alike(written, reason, monkeypa
 
 def test_each_reason_says_what_to_change():
     assert "both need https" in dv.sign_in_address_note("http://vault.lan:8080")
-    assert "single sign-on and the emailed links work either way" not in dv.sign_in_address_note("http://10.0.0.5:8080")
+    assert "single sign-on works at an IP address" not in dv.sign_in_address_note("http://10.0.0.5:8080")
     assert "xn-- form" in dv.sign_in_address_note("https://b\u00fccher.example")
     assert "has no address" in dv.sign_in_address_note("")
     assert "reached by IP" in dv.sign_in_address_note("https://203.0.113.9:8443")
+
+
+def test_the_note_on_an_address_reached_by_ip_says_where_single_sign_on_works():
+    """An address reached by IP keeps passkeys hidden. The emailed links work there, and single sign-on only with a
+    provider that takes an IP address as a redirect address, which Google does not."""
+    note = dv.passkey_address_note("10.0.0.5")
+    assert note.startswith("passkeys stay hidden at this address: browsers make no passkey for an address reached by IP.")
+    assert "Put the vault's host name first in ALLOWED_HOSTS when you want them." in note
+    assert note.endswith("single sign-on works at an IP address only with providers that accept one as a redirect "
+                         "address (Google does not).")
+    assert "single sign-on and the emailed links work either way" not in note
 
 
 def test_the_rule_the_vault_checks_is_the_tools_too():
@@ -134,17 +146,21 @@ def test_status_says_passkeys_are_hidden_at_an_ip(monkeypatch, tmp_path):
     monkeypatch.setattr(tool, "_run_dc", lambda *a, **k: None)
     monkeypatch.setattr(dv, "docker_available", lambda: (True, ""))
     tool._print_status("combined")
-    assert any("Passkeys: hidden" in line and "reached by IP" in line for line in printed), printed
+    # The line is about signing in, and says itself what stays hidden or off: no label says it before it.
+    assert any(line.startswith("  Sign-in: passkeys stay hidden") and "reached by IP" in line for line in printed), printed
+    assert not any("Passkeys: hidden" in line for line in printed), printed
     for written, said in (("http://vault.lan:8080", "both need https"), ("", "has no address")):
         printed.clear()
         monkeypatch.setattr(tool, "_load_env", lambda env={"ALLOWED_HOSTS": written, "SERVER_NAME": "vault"}: env)
         tool._print_status("combined")
-        assert any("Passkeys: hidden" in line and said in line and "waits meanwhile" in line for line in printed), printed
+        assert any(line.startswith("  Sign-in: passkeys and single sign-on stay off") and said in line
+                   and "waits meanwhile" in line for line in printed), printed
+        assert not any("Passkeys: hidden" in line for line in printed), printed
     for named in ({"ALLOWED_HOSTS": "vault.example.com"}, {"ALLOWED_HOSTS": "*.example.com,vault.example.com"}, {}):
         printed.clear()
         monkeypatch.setattr(tool, "_load_env", lambda env=named: env)
         tool._print_status("combined")
-        assert not any("Passkeys" in line for line in printed), (named, printed)
+        assert not any("Passkeys" in line or "Sign-in" in line for line in printed), (named, printed)
 
 
 def test_setup_says_it_once_the_address_is_known():
