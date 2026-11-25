@@ -356,3 +356,9 @@ def test_the_sign_in_method_email_is_described_by_everything_it_is_sent_for():
     for sent_for in ("a passkey is added to or removed from", "an authenticator app is set up",
                      "single sign-on provider", "an identity linked or unlinked"):
         assert sent_for in described, sent_for
+
+
+def test_the_freshness_warning_links_to_the_vault():
+    """The email asks the person to sign in through their provider by a date: it links to the vault, where they do."""
+    body = ea.DEFAULT_TEMPLATES["sso_freshness_warning"]["body_html"]
+    assert '<a href="{{vault.url}}">Open {{vault.name}}</a>' in body

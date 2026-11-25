@@ -1499,7 +1499,8 @@ def test_a_save_that_shortens_a_providers_days_says_whom_it_holds_and_tells_them
     assert out["held_by_a_refusal"] == 1                                                # dee, before and after
     (told,) = h.accounts_told
     assert told[0] == ["ben"] and told[1].startswith("Sign in through ")
-    assert "your password and passkeys do not sign you in to this vault until you have signed in through" in told[2]
+    assert ("your password and your passkeys do not sign you in to this vault until you have signed in through"
+            in told[2])
     said = h.told[-1][2]
     assert ("1 more linked account(s) have not signed in through it within its days as they are now: their password "
             "and passkeys do not sign them in until they have. They were told. 3 account(s) are held so in all.") in said
@@ -1537,6 +1538,24 @@ def test_a_save_that_turns_on_that_the_days_end_sign_in_says_whom_it_holds(monke
     del h.accounts_told[:]
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": False}})
     assert status == 200 and out["held_by_its_days"] == 0 and out["newly_held"] == 0 and h.accounts_told == []
+
+
+def test_an_account_the_days_hold_is_told_only_of_what_it_has(monkeypatch):
+    """Cy signs in only through the provider: nobody can type his password, and his passkeys never signed him in
+    by themselves. Told that his password and passkeys stopped, he read of two things he does not have. He is told
+    that his keys paused, which they did; Ben, who has both, is told of both."""
+    h, row, (ann, ben, cy) = _linked_since(monkeypatch, [1, 40, 50], policy={"sso_lapse_ends_sign_in": False})
+    cy.sso_only = True
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": True}})
+    assert status == 200 and out["newly_held"] == 2, out
+    told = {tuple(users): (title, text) for users, title, text in h.accounts_told}
+    assert sorted(told) == [("ben",), ("cy",)]
+    assert told[("ben",)][0].startswith("Sign in through ")
+    assert "your password and your passkeys do not sign you in to this vault" in told[("ben",)][1]
+    title, text = told[("cy",)]
+    assert title == "Your SSH keys, temporary credentials and devices are paused"
+    assert "password" not in text and "passkey" not in text
+    assert "your SSH keys, temporary credentials and devices are paused until you have signed in through" in text
 
 
 def test_a_provider_that_is_off_holds_nobody_by_its_days_at_a_save(monkeypatch):
@@ -1734,7 +1753,7 @@ def test_the_newly_held_are_told_what_was_changed(monkeypatch):
     assert told[0] == ["ben", "cy"] and told[2] == (
         f"An administrator changed what stops when {label} has not seen you within its days: your password and "
         f"passkeys now stop as well as your keys. Your last sign-in through {label} is older than that: your "
-        f"password and passkeys do not sign you in to this vault until you have signed in through {label} again.")
+        f"password and your passkeys do not sign you in to this vault until you have signed in through {label} again.")
     del h.accounts_told[:]
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 0}})
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 20}})
@@ -1797,7 +1816,7 @@ def test_an_account_two_saves_hold_at_once_is_told_once(monkeypatch):
     import inspect
     source = inspect.getsource(R.update_provider)
     assert 'today = f"sso_newly_held:{row.id}:{datetime.utcnow():%Y-%m-%d}"' in source
-    assert source.count("once_for=today)") == 2
+    assert source.count("once_for=today)") == 3
 
 
 def test_a_save_that_changes_the_connection_and_the_days_tells_whom_it_holds(monkeypatch):

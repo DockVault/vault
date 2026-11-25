@@ -472,25 +472,47 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
                "held_by_a_refusal": len(held_now) - len(by_days), "newly_held": len(newly_held)}
     label = row.label or row.name
     # The people the change holds from this moment had no warning of it (the warning counts five days down to the
-    # days as they were): each is told now, in the app and by email, what stopped and what brings it back.
+    # days as they were): each is told now, in the app and by email, what stopped and what brings it back. Only
+    # what the account has is named: one that signs in only through its provider has no password anybody types,
+    # and its passkeys never signed it in alone, so it is told of its keys, which pause with the days.
     # Said as what was changed: the days themselves, or what running out of them stops (with the days as they
     # were, "changed how often it must have seen you" was not true).
+    from datetime import datetime
+    from app.services import sso_freshness
+    days_were_changed = "policy.sso_freshness_days" in outcome["changed"]
     what_changed = (f"An administrator changed how often {label} must have seen you."
-                    if "policy.sso_freshness_days" in outcome["changed"] else
+                    if days_were_changed else
                     f"An administrator changed what stops when {label} has not seen you within its days: your "
                     "password and passkeys now stop as well as your keys.")
     # Once a day for a provider, whatever the saves: the accounts held before a save are read before the
     # provider's row is taken, so of two saves made at about the same time the second counts the people the
     # first has just held as its own, and told them again, in the app and by email.
-    from datetime import datetime
     today = f"sso_newly_held:{row.id}:{datetime.utcnow():%Y-%m-%d}"
-    _tell_accounts(newly_by_days, f"Sign in through {label} to keep signing in here", (
-        f"{what_changed} Your last sign-in through {label} is older than that: your password and passkeys do not "
-        f"sign you in to this vault until you have signed in through {label} again."), once_for=today)
-    _tell_accounts(newly_by_a_refusal, f"Sign in through {label} to keep signing in here", (
-        f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
-        f"sign-in through {label}: its password and passkeys do not sign it in to this vault until {label} has "
-        "admitted it again. If it does not, ask your administrator."), once_for=today)
+    stops_of = {u.id: sso_freshness.what_stops(u) for u in held_now if u.id not in held_before}
+    for stops in sorted(set(stops_of[one[0]] for one in newly_by_days)):
+        whom = [one for one in newly_by_days if stops_of[one[0]] == stops]
+        if stops:
+            _tell_accounts(whom, f"Sign in through {label} to keep signing in here", (
+                f"{what_changed} Your last sign-in through {label} is older than that: {stops} do not sign you in "
+                f"to this vault until you have signed in through {label} again."), once_for=today)
+        else:
+            # Nothing of theirs but their keys pauses: they are told of those alone, and not of a password or
+            # passkeys they do not have.
+            first = (f"{what_changed} Your last sign-in through {label} is older than that"
+                     if days_were_changed else f"Your last sign-in through {label} is older than its days allow")
+            _tell_accounts(whom, "Your SSH keys, temporary credentials and devices are paused", (
+                f"{first}: your SSH keys, temporary credentials and devices are paused until you have signed in "
+                f"through {label} again."), once_for=today)
+    for stops in sorted(set(stops_of[one[0]] for one in newly_by_a_refusal)):
+        if not stops:
+            continue        # a refusal already paused their keys; what it stops now changes nothing of theirs
+        whom = [one for one in newly_by_a_refusal if stops_of[one[0]] == stops]
+        its = {"your password and your passkeys": "its password and passkeys", "your password": "its password",
+               "your passkeys": "its passkeys"}.get(stops, stops)
+        _tell_accounts(whom, f"Sign in through {label} to keep signing in here", (
+            f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
+            f"sign-in through {label}: {its} do not sign it in to this vault until {label} has admitted it again. "
+            "If it does not, ask your administrator."), once_for=today)
     _tell_those_a_turn_off_held(db, held_ids, held_before, row.id, label)
     _tell_accounts(owners, f"{label} was pointed somewhere else", (
         f"An administrator changed where this vault finds {label}, a sign-in your account is linked to. Nobody signs "

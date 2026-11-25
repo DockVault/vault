@@ -40,11 +40,13 @@ from typing import List, Optional
 from app.core import sso_policy
 
 WARNING_DAYS = 5
-LAPSE_MESSAGE = ("Sign in through {provider} again: your SSH keys and temporary credentials are paused until you "
-                 "do.")
-# For an account the provider holds to its own sign-in from then on (:func:`held_to_a_provider`).
-LAPSE_MESSAGE_ALL = ("Sign in through {provider} again: your password, your passkeys, your SSH keys and your "
-                     "temporary credentials do not work until you do.")
+LAPSE_MESSAGE = ("Sign in through {provider} again: your SSH keys, temporary credentials and devices are paused until "
+                 "you do.")
+# For an account the provider holds to its own sign-in from then on (:func:`held_to_a_provider`); ``stops`` is what
+# of its own ways in that stops (:func:`what_stops`).
+LAPSE_MESSAGE_ALL = ("Sign in through {provider} again: {stops} do not sign you in, and your SSH keys, temporary "
+                     "credentials and devices are paused until you do.")
+ALL_THAT_STOPS = "your password and your passkeys"
 
 
 @dataclass(frozen=True)
@@ -375,10 +377,29 @@ def due_date(db, user_id) -> Optional[datetime]:
     return found[0].due if found else None
 
 
-def refusal_text(found: Deadline, *, sign_in_too: bool = False) -> str:
+def what_stops(user) -> str:
+    """What of ``user``'s own ways in a provider's hold stops, as the person is told it: "your password" where the
+    account has one somebody can type, and "your passkeys" unless the account signs in only through its provider
+    (its passkeys confirm the person after the provider's sign-in and never sign in alone). Empty when neither:
+    such an account loses its SSH keys, temporary credentials and devices alone, and is told of those alone."""
+    from app.services import sign_in
+    parts = ["your password"] if sign_in.has_a_password_it_can_type(user) else []
+    if not getattr(user, "sso_only", False):
+        parts.append("your passkeys")
+    return " and ".join(parts)
+
+
+def _capitalised(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def refusal_text(found: Deadline, *, sign_in_too: bool = False, stops: str = ALL_THAT_STOPS) -> str:
     """What a person whose deadline is missed is told; ``sign_in_too`` for one whose other ways in closed with it
-    (:func:`closes_the_other_ways_in`)."""
-    return (LAPSE_MESSAGE_ALL if sign_in_too else LAPSE_MESSAGE).format(provider=found.provider_label)
+    (:func:`closes_the_other_ways_in`), naming ``stops`` (:func:`what_stops`): with nothing to name, the keys
+    alone."""
+    if sign_in_too and stops:
+        return LAPSE_MESSAGE_ALL.format(provider=found.provider_label, stops=stops)
+    return LAPSE_MESSAGE.format(provider=found.provider_label)
 
 
 def how_to_sign_in(found: Deadline) -> str:
@@ -397,11 +418,12 @@ def how_to_sign_in(found: Deadline) -> str:
     return "Use the sign-in link your organisation gave you (sign out first if you are signed in)."
 
 
-def warning_text(found: Deadline, when: str, *, sign_in_too: bool = False) -> str:
-    """What the warning email tells the person: the provider as its button names it, the date, and how."""
+def warning_text(found: Deadline, when: str, *, sign_in_too: bool = False, stops: str = ALL_THAT_STOPS) -> str:
+    """What the warning email tells the person: the provider as its button names it, the date, what stops (``stops``
+    where the other ways in close too: :func:`what_stops`), and how."""
     name = found.provider_label
-    if sign_in_too:
-        return (f"Sign in through {name} by {when}. If you do not, your password and passkeys stop "
+    if sign_in_too and stops:
+        return (f"Sign in through {name} by {when}. If you do not, {stops} stop "
                 "signing you in then, your SSH keys, temporary credentials and devices pause, and a sign-in "
                 f"through {name} restores them. {how_to_sign_in(found)}")
     return (f"Sign in through {name} by {when}. If you do not, your SSH keys, temporary credentials "
@@ -484,10 +506,11 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
         if user is None or not user.is_active:
             continue
         due_day = found.due.strftime("%Y-%m-%d")
-        when = found.due.strftime("%d %B %Y, %H:%M UTC")
-        # Whether this deadline closes the person's password and passkeys too: said in the same words wherever
-        # the person is told.
+        when = f"{found.due.day} {found.due:%B %Y, %H:%M} UTC"      # 5 December, as the vault writes a day
+        # Whether this deadline closes the person's other ways in too, and which of them the account has: said in
+        # the same words wherever the person is told. An account with none of them is told of its keys alone.
         too = closes_the_other_ways_in(db, user, found)
+        stops = what_stops(user) if too else ""
         details = {"provider_id": found.provider_id, "identity_id": found.identity_id,
                    "expires_at": found.due.isoformat() + "Z", "ends_sign_in": too}
         name = found.provider_label         # the person knows the provider by its button
@@ -495,9 +518,9 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
         if found.due > now:
             told = api._notify_users(
                 [found.user_id], WARNED, title=f"Sign in through {name} by {when}",
-                body=((f"Your password and passkeys stop signing you in on {when}, and your SSH keys, temporary "
+                body=((f"{_capitalised(stops)} stop signing you in on {when}, and your SSH keys, temporary "
                        f"credentials and devices pause, unless you sign in through {name} before "
-                       f"then. Signing in there restores them at any time. {how}") if too else
+                       f"then. Signing in there restores them at any time. {how}") if stops else
                       (f"Your SSH keys, temporary credentials and devices pause on {when} unless you sign in through "
                        f"{name} before then. Signing in restores them at any time. {how}")),
                 target=NOTICE_TARGET, dedup_prefix=f"{WARNED}:{found.identity_id}:{due_day}")
@@ -506,14 +529,15 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
             _audit(db, WARNED, user=user, details=details)
             if told and user.email:
                 api._fire_action_email(db, "sso_freshness_warning", email=user.email, username=user.username,
-                                       action_context={"change": warning_text(found, when, sign_in_too=too),
+                                       action_context={"change": warning_text(found, when, sign_in_too=too,
+                                                                              stops=stops),
                                                        "when": when})
         else:
             api._notify_users(
                 [found.user_id], EXPIRED,
-                title=(f"Sign in through {name}: nothing else signs you in now" if too
-                       else "Your SSH keys and temporary credentials are paused"),
-                body=refusal_text(found, sign_in_too=too) + " " + how, target=NOTICE_TARGET,
+                title=(f"Sign in through {name}: nothing else signs you in now" if stops
+                       else "Your SSH keys, temporary credentials and devices are paused"),
+                body=refusal_text(found, sign_in_too=too, stops=stops) + " " + how, target=NOTICE_TARGET,
                 dedup_prefix=f"{EXPIRED}:{found.identity_id}:{due_day}")
             paused.append(user.username)
             held += 1 if too else 0

@@ -32,7 +32,8 @@ def _an_address_single_sign_on_can_use(monkeypatch):
 
 
 def _user(name="alice", **extra):
-    fields = dict(id=uuid.uuid4(), username=name, email=f"{name}@example.test", is_active=True)
+    """An account with a password of its own, unless the test says otherwise."""
+    fields = dict(id=uuid.uuid4(), username=name, email=f"{name}@example.test", is_active=True, password_hash="x")
     fields.update(extra)
     return types.SimpleNamespace(**fields)
 
@@ -208,7 +209,8 @@ def test_the_sweep_warns_five_days_before_once_and_tells_once_when_keys_pause(to
     # How: the button, and to sign out first, since only a sign-in through the provider counts.
     how = " Use the “contoso” button on the sign-in page (sign out first if you are signed in)."
     assert told.emails[0][2]["change"].endswith(how) and told.notices[0][3].endswith(how)
-    assert (str(carol.id), F.EXPIRED, "Your SSH keys and temporary credentials are paused") == told.notices[1][:3]
+    assert told.notices[1][:3] == (str(carol.id), F.EXPIRED, "Your SSH keys, temporary credentials and devices are "
+                                                             "paused")
     assert told.notices[1][3].startswith("Sign in through contoso again")
     assert told.notices[1][3] == F.refusal_text(F.deadlines(db, carol.id)[0]) + how
     wave = told.notices[2]
@@ -319,6 +321,46 @@ def test_the_warning_says_how_to_sign_in_through_the_provider(told, monkeypatch)
     monkeypatch.setattr(sso_sign_in, "address_refusal", lambda: "Single sign-on needs the vault's public address.")
     said = F.how_to_sign_in(found)
     assert "button" not in said and "link" not in said and "administrator" in said
+
+
+def test_the_warning_names_only_what_the_account_has_and_the_day_as_it_is_written(told):
+    """Alice has a password of her own. Sam signs in only through the provider: nobody can type his password, and
+    his passkeys confirm him after the provider's sign-in and never sign him in by themselves. Told that "your
+    password and passkeys stop signing you in", Sam read of two things he does not have. Each is told what stops
+    for them, the day without a leading zero, and the pause names the devices with the keys."""
+    alice, sam = _user(), _user("sam", sso_only=True)
+    p = _provider(30)
+    due = datetime(2026, 12, 5, 9, 30)
+    db = _db([alice, sam], [p], [_identity(alice, p, signed_in=due - 30 * DAY),
+                                 _identity(sam, p, signed_in=due - 30 * DAY)])
+    assert F.what_stops(alice) == "your password and your passkeys" and F.what_stops(sam) == ""
+    assert F.sweep(db, due - 3 * DAY) == {"warned": 2, "lapsed": 0}
+    warned = {n[0]: n for n in told.notices}
+    emails = {e[1]: e[2] for e in told.emails}
+    assert warned[str(alice.id)][2] == "Sign in through contoso by 5 December 2026, 09:30 UTC"
+    assert emails["alice@example.test"]["when"] == "5 December 2026, 09:30 UTC"
+    assert "your password and your passkeys stop signing you in then" in emails["alice@example.test"]["change"]
+    assert warned[str(alice.id)][3].startswith("Your password and your passkeys stop signing you in on 5 December")
+    for said in (emails["sam@example.test"]["change"], warned[str(sam.id)][3]):
+        assert "password" not in said and "passkey" not in said and "devices" in said, said
+    # The pause: devices with the keys, and what stops for each.
+    del told.notices[:]
+    assert F.sweep(db, due + DAY) == {"warned": 0, "lapsed": 2}
+    paused = {n[0]: n for n in told.notices}
+    assert paused[str(alice.id)][2] == "Sign in through contoso: nothing else signs you in now"
+    assert paused[str(sam.id)][2] == "Your SSH keys, temporary credentials and devices are paused"
+    assert "your password and your passkeys do not sign you in" in paused[str(alice.id)][3]
+    for who in (alice, sam):
+        assert "devices" in paused[str(who.id)][3]
+    assert "password" not in paused[str(sam.id)][3] and "passkey" not in paused[str(sam.id)][3]
+    found = F.deadlines(db, sam.id)[0]
+    assert F.refusal_text(found) == ("Sign in through contoso again: your SSH keys, temporary credentials and devices "
+                                     "are paused until you do.")
+    # The email itself: a link to the vault, and the date once, in the sentence.
+    from app.core import email_actions
+    body = email_actions.DEFAULT_TEMPLATES["sso_freshness_warning"]["body_html"]
+    assert '<p>{{action.change}}</p><p><a href="{{vault.url}}">Open {{vault.name}}</a></p><hr>' in body
+    assert "By:" not in body
 
 
 def test_the_sweep_sends_no_email_to_an_account_without_an_address(told):

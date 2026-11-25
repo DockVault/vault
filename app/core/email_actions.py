@@ -272,7 +272,7 @@ DEFAULT_TEMPLATES: dict[str, dict] = {
             "<h2>Sign in through your organisation</h2>"
             "<p>Hi {{user.username}},</p>"
             "<p>{{action.change}}</p>"
-            "<p>By: {{action.when}}</p>"
+            "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
             "<hr>"
             "<p><small>Sent by {{vault.name}}.</small></p>"
         ),

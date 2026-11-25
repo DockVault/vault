@@ -315,7 +315,7 @@ def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
     hers.refused_at = datetime.utcnow() - timedelta(days=2)
     hers.last_sign_in_at = datetime.utcnow() - timedelta(days=1)
     assert F.another_way_in(db, refused) == (
-        "You can sign in through Fabrikam instead: Use the “Staff sign-in” button on the sign-in page.")
+        "You can sign in through Staff sign-in instead: Use the “Staff sign-in” button on the sign-in page.")
     hers.last_sign_in_at = datetime.utcnow()
     adatum.state, hers.refused_at = "enabled", None
     # Where the provider that holds the account can be reached, it is the one named, and no other.
@@ -501,12 +501,13 @@ def test_the_warning_and_the_notices_say_that_the_password_stops_too_where_it_do
     assert F.sweep(db, NOW) == {"warned": 1, "lapsed": 1}
     due = (NOW + 3 * DAY).strftime("%d %B %Y, %H:%M UTC")
     warning, paused, wave = told.notices
-    assert warning[3].startswith(f"Your password and passkeys stop signing you in on {due}, and your SSH keys")
+    assert warning[3].startswith(f"Your password and your passkeys stop signing you in on {due}, and your SSH keys")
     assert told.emails[0][2]["change"] == F.warning_text(F.deadlines(db, alice.id)[0], due, sign_in_too=True)
-    assert "your password and passkeys stop signing you in then" in told.emails[0][2]["change"]
+    assert "your password and your passkeys stop signing you in then" in told.emails[0][2]["change"]
     assert paused[2] == "Sign in through contoso: nothing else signs you in now"
     how = F.how_to_sign_in(F.deadlines(db, carol.id)[0])
-    assert paused[3] == F.LAPSE_MESSAGE_ALL.format(provider="contoso") + " " + how and "your password" in paused[3]
+    assert paused[3] == F.LAPSE_MESSAGE_ALL.format(provider="contoso", stops=F.ALL_THAT_STOPS) + " " + how
+    assert "your password" in paused[3]
     assert "For 1 of them the password and passkeys no longer sign in either" in wave[3]
     assert [details["ends_sign_in"] for _, _, details in told.audits] == [True, True]
     # The two texts differ, so a person is never told the wrong one.
