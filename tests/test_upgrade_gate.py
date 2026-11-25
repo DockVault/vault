@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+import _release_conditions_0_36 as rc
 from conftest import skip_if_container_absent
 
 pytestmark = pytest.mark.unit
@@ -305,6 +306,98 @@ def test_a_downgrade_over_two_upgrades_one_of_them_one_way_says_so_and_is_refuse
     assert "steps        : 2 adjacent release(s) back, taking back the upgrade 0.1.0 -> 0.3.0" in out, out
     assert "reversible   : no" in out and "reversible   : yes" not in out, out
     assert "is a downgrade this deployment cannot take" in out, out
+
+
+# --- going back: the conditions that speak of it -----------------------------------------------
+
+def _matrix_with_0_36():
+    """This checkout's matrix with 0.36.0 declared as its release commit declares it."""
+    return rc.with_the_release(json.loads((ROOT / "docs" / "upgrade-matrix.json").read_text(encoding="utf-8")))
+
+
+_GOING_BACK_0_36 = [cid for cid in rc.CONDITIONS if cid in rc.ON_UPGRADED]
+_NOT_GOING_BACK_0_36 = [cid for cid in rc.CONDITIONS if cid not in rc.ON_UPGRADED]
+
+
+def test_going_back_from_0_36_0_carries_the_conditions_that_speak_of_going_back():
+    """0.36.0 writes no data marker, so on the way back to 0.35.2 nothing stops the older release from
+    starting: the edge's conditions about going back are all the operator is told. The others are the
+    upgrade's, and stay on the way up."""
+    matrix = _matrix_with_0_36()
+    down = dv.plan_downgrade_path(matrix, "0.36.0", "0.35.2")
+    assert down["known"]
+    assert [c["id"] for c in down["conditions"]] == _GOING_BACK_0_36
+    up = dv.plan_upgrade_path(matrix, "0.35.2", "0.36.0")
+    assert [c["id"] for c in up["conditions"]] == list(rc.CONDITIONS)
+
+
+def test_going_back_from_0_36_0_prints_each_of_them_with_its_query(tmp_path, capsys):
+    matrix = _matrix_with_0_36()
+    tool = _deployment(tmp_path, version="0.36.0", matrix=matrix)
+    tool._describe_hop(dv.plan_downgrade_path(matrix, "0.36.0", "0.35.2"), "the test matrix", "0.36.0",
+                       "v0.35.2", down=True)
+    out = capsys.readouterr().out
+    for cid in _GOING_BACK_0_36:
+        assert "note         : " + rc.SUMMARY[cid] in out, cid
+        assert "check with: " + rc.DETECT[cid] in out, cid
+    for cid in _NOT_GOING_BACK_0_36:
+        assert rc.SUMMARY[cid] not in out, cid
+        assert cid not in rc.DETECT or rc.DETECT[cid] not in out, cid
+
+
+@pytest.mark.parametrize("current, target", [("0.34.0", "0.33.6"), ("0.34.5", "0.33.10")])
+def test_going_back_to_0_33_carries_the_note_on_the_retention_the_panel_set(current, target):
+    """Of 0.34.0's conditions only this one speaks of going back without a record in the data to hold it:
+    the others about going back are held by the records an older release refuses to start on."""
+    matrix = json.loads((ROOT / "docs" / "upgrade-matrix.json").read_text(encoding="utf-8"))
+    plan = dv.plan_downgrade_path(matrix, current, target)
+    assert [c["id"] for c in plan["conditions"]] == ["panel-retention-not-read"]
+    assert plan["conditions"][0]["detect"]
+
+
+def _going_back_from_0_36(tmp_path, monkeypatch, offered):
+    """0.36.0 running, going back to 0.35.2: `offered` is whether the running version could be asked what in its data
+    stops the older one, and it names nothing."""
+    tool = _deployment(tmp_path, version="0.36.0", matrix=_matrix_with_0_36())
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(dv, "fetch_main_lifecycle_matrix", lambda *a, **k: None)
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.36.0", "the running container"))
+    monkeypatch.setattr(tool, "_downgrade_blockers", lambda target: (offered, []))
+    _update(tool, tag="v0.35.2", dry_run=True)
+
+
+_ONLY_YOU = ("Nothing in this deployment's data stops v0.35.2 from starting, so only you can stop what the notes "
+             "above describe: run each \"check with\" query on this deployment first.")
+
+
+def test_going_back_from_0_36_0_says_that_only_the_operator_can_stop_what_the_notes_describe(
+        tmp_path, monkeypatch, capsys):
+    _going_back_from_0_36(tmp_path, monkeypatch, offered=True)
+    out = capsys.readouterr().out
+    for cid in _GOING_BACK_0_36:
+        assert rc.SUMMARY[cid] in out and rc.DETECT[cid] in out, cid
+    assert _ONLY_YOU in out, out
+    last_note = max(out.index(rc.SUMMARY[cid]) for cid in _GOING_BACK_0_36)
+    assert last_note < out.index(_ONLY_YOU) < out.index("--dry-run: nothing was changed.")
+
+
+def test_whether_anything_stops_the_older_release_is_not_claimed_when_it_could_not_be_asked(
+        tmp_path, monkeypatch, capsys):
+    _going_back_from_0_36(tmp_path, monkeypatch, offered=None)
+    out = capsys.readouterr().out
+    assert "Could not ask the running deployment whether v0.35.2 can read its data" in out, out
+    assert "Nothing in this deployment's data stops" not in out, out
+
+
+def test_a_downgrade_with_no_notes_says_nothing_of_them(tmp_path, monkeypatch, capsys):
+    tool = _deployment(tmp_path, version="0.2.0", matrix=_matrix(backup=False, reversible=True))
+    _stub(monkeypatch, tool, backups=[])
+    monkeypatch.setattr(tool, "_running_version", lambda *a, **k: ("0.2.0", "the running container"))
+    monkeypatch.setattr(tool, "_downgrade_blockers", lambda target: (True, []))
+    _update(tool, tag="v0.1.0", dry_run=True)
+    out = capsys.readouterr().out
+    assert "--dry-run: nothing was changed." in out, out
+    assert "Nothing in this deployment's data stops" not in out, out
 
 
 def test_a_one_way_hop_is_summarised_as_needing_the_backup_it_takes(tmp_path, monkeypatch, capsys):

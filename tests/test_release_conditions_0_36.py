@@ -293,6 +293,12 @@ def test_every_condition_is_listed_once_and_each_set_is_drawn_from_them():
     assert all(rc.SUMMARY[cid].startswith("Coming back to 0.36") for cid in set(rc.DETECT) - rc.ON_UPGRADED)
 
 
+def test_the_conditions_shown_on_the_way_back_are_the_ones_checked_on_the_upgraded_database():
+    """dockvault.py shows, on the way back from 0.36.0, the edge's conditions whose text begins "Going back"
+    (plan_downgrade_path); those must be exactly the ones whose queries run on the upgraded database."""
+    assert {cid for cid in rc.CONDITIONS if rc.SUMMARY[cid].startswith("Going back")} == rc.ON_UPGRADED
+
+
 def test_the_ids_texts_and_keys_are_ones_the_matrix_takes():
     um = _matrix_script()
     for cid in rc.CONDITIONS:

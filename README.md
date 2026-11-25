@@ -586,7 +586,10 @@ backup when one is required, and, run interactively, asks you to type an acknowl
 that cannot be rolled back. `--dry-run` reports the plan and changes nothing. An upgrade it cannot find a
 description for is treated as the riskiest case rather than assumed safe. A downgrade is described by the
 upgrade it takes back: along upgrades the matrix marks reversible it says so, and it is refused across one
-it marks irreversible; it always takes a backup first, as there are no down-migrations.
+it marks irreversible; it always takes a backup first, as there are no down-migrations. Of the conditions
+on those upgrades, it shows the ones whose summary begins "Going back", each with its query. When the
+running version says that nothing in its data stops the older one from starting, it also says that only
+you can stop what those conditions describe.
 
 The version a change starts from is asked of the running container. With nothing running it is a guess,
 and the tool says so: the highest of the stopped container's own version, the release `DOCKVAULT_IMAGE`

@@ -3664,8 +3664,9 @@ def plan_downgrade_path(matrix, current, target):
     The matrix declares each upgrade between adjacent releases, and on each one whether it can be taken
     back (`reversible`). So a downgrade is described by the upgrade route from `target` up to `current`:
     reversible when every edge on it is, never across a blocked one (an upgrade that must not be taken has
-    no reverse). It is one recreate, so it has no legs, and the conditions on the way up are the upgrade's,
-    not carried. Whether it needs a backup is the downgrade's own rule (backup_reason): the backup flags on
+    no reverse). It is one recreate, so it has no legs. The conditions on the way up that speak of going
+    back (their summary begins "Going back") are carried, in the order of the edges; the others are the
+    upgrade's. Whether it needs a backup is the downgrade's own rule (backup_reason): the backup flags on
     the way up are about the upgrade. Unknown, as before, when that route is not in the matrix, or when this
     is not a downgrade."""
     unknown = {"steps": [], "legs": [], "requires_backup": True, "irreversible": True,
@@ -3689,7 +3690,8 @@ def plan_downgrade_path(matrix, current, target):
         "requires_backup": False,
         "irreversible": any(not e.get("reversible", True) or e.get("kind") == "blocked" for e in route),
         "blocked": None,
-        "conditions": [],
+        "conditions": [c for e in route for c in (e.get("conditions") or [])
+                       if isinstance(c, dict) and str(c.get("summary", "")).lower().startswith("going back")],
         "known": True,
         "downgrade": True,
     }
@@ -9120,6 +9122,13 @@ class DockVault:
                         "in a way %s cannot read, %s starts anyway and may delete or change what %s "
                         "keeps." % (tag, tag, FIRST_NEWER_DATA_CHECK, current, tag, tag, current),
                         "yellow"))
+            elif plan["conditions"]:
+                # The running version answered, and nothing it wrote stops the older one: the notes about
+                # going back (plan_downgrade_path) are then the only thing between the operator and them.
+                print(pal.paint(
+                    "  Nothing in this deployment's data stops %s from starting, so only you can stop what the "
+                    "notes above describe: run each \"check with\" query on this deployment first." % tag,
+                    "yellow"))
         elif down:
             # Going back from a guessed origin (nothing running to ask): nobody can say what the data holds that the
             # older version cannot read, so neither question above can be put. An older image from
