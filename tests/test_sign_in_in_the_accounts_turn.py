@@ -591,3 +591,27 @@ def test_the_order_of_the_locks_names_the_rows_of_an_auditor_right_after_the_tur
     table = text[text.index("# The order of the locks."):text.index("# Any of them may be skipped")]
     assert table.index("3. the account's turn at its sessions") < table.index("4. the account's row") \
         < table.index("5. a row of credential_changes or of auditor_grants")
+
+
+def test_an_account_that_loses_its_standing_has_its_row_locked_before_the_rows_of_its_standing():
+    """The order of the locks puts the account's row before a row of its requests or of its auditor right. Where
+    an account is locked, turned off, demoted or deleted, those rows are locked first by what withdraws and
+    suspends them, and the account's row was written only after: the row is taken first now, with its key free."""
+    import inspect
+    from app.api import api_server as api
+    source = inspect.getsource(api._account_lost_standing)
+    steps = ("db.query(User.id).filter(User.id == user.id).with_for_update(key_share=True).first()",
+             "_withdraw_requests_of(db, user, actor=actor, because=because)",
+             "auditor_rights.after_lost_standing(db, user, actor=actor, because=because)")
+    assert all(step in source for step in steps), [step for step in steps if step not in source]
+    order = [source.index(step) for step in steps]
+    assert order == sorted(order), order
+    # As the recorder of the order reads it: the turn, the row, a row of the auditor right, the row again.
+    from _lock_order_recorder import ACCOUNT_ROW, CHANGE_ROW, SESSIONS_TURN, Held
+    held = Held()
+    for kind, key in ((SESSIONS_TURN, "a"), (ACCOUNT_ROW, "a"), (CHANGE_ROW, "*"), (ACCOUNT_ROW, "a")):
+        assert held.take(kind, key) == [], (kind, key)
+    late = Held()
+    for kind, key in ((SESSIONS_TURN, "a"), (CHANGE_ROW, "*")):
+        assert late.take(kind, key) == []
+    assert late.take(ACCOUNT_ROW, "a") != [], "the row taken only after a row of the auditor right is out of order"

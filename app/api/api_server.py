@@ -7243,6 +7243,13 @@ def _account_lost_standing(db, user, *, actor, because) -> _LostStanding:
     proposed are withdrawn (app/core/auditor_rights.py, after_lost_standing; told after the commit).
     Returns what _announce_lost_standing tells after the commit."""
     from app.core import auditor_rights
+    # The account's own row first, then the rows that go with its standing (the order of the locks,
+    # app/services/sign_in.py). Every route that calls this holds the account's turn and writes the row in the
+    # same transaction (a lock, a deactivation, a demotion, a deletion): taken here, the row comes before the
+    # rows of its requests and of its auditor right on each of them, as where a change to its sign-in details
+    # is made. Its key is left free, so the rows that name the account are written without waiting for it.
+    if user is not None and getattr(user, "id", None) is not None:
+        db.query(User.id).filter(User.id == user.id).with_for_update(key_share=True).first()
     withdrawn = _withdraw_requests_of(db, user, actor=actor, because=because)
     keys = _report_keys_added_by(db, user, actor=actor, because=because)
     auditor_rights.after_lost_standing(db, user, actor=actor, because=because)
