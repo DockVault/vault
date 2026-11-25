@@ -204,6 +204,24 @@ def _sessions_standing(db, provider_id) -> Optional[int]:
         return None
 
 
+SESSIONS_STANDING = "sessions_standing"
+
+
+def _sessions_refusal(db, row) -> Optional[providers.Conflict]:
+    """Why ``row`` may not be removed for the sessions that came through it, or None. A turn-off ends them; where
+    that failed, its answer and its notice say how many still stand and that turning the provider off again ends
+    them. Removed meanwhile, the provider took with it what names those sessions: they went on working until they
+    ran out, turning it off again answered that there is no such provider, and nothing said which accounts to
+    sign out. The removal waits until none stands, and when they cannot be counted."""
+    standing = _sessions_standing(db, row.id)
+    if standing == 0:
+        return None
+    many = "Sessions" if standing is None else f"{standing} session(s)"
+    return providers.Conflict(SESSIONS_STANDING, (
+        f"{many} that came through this provider still stand. Turn it off again to end its sessions first: "
+        "removed now, nothing would name them any more."))
+
+
 def _said_of_sessions_standing(standing: Optional[int]) -> str:
     """The sentence of the administrators' notice for sessions that still stand after a turn-off, or ""."""
     if standing == 0:
@@ -546,11 +564,14 @@ def set_provider_state(provider_id: str, body: ProviderState, request: Request,
 def remove_provider(provider_id: str, request: Request, current_user: User = Depends(require_interactive_admin),
                     db: Session = Depends(get_db)):
     """Remove a provider with its links, its group mappings and its held requests. Refused while it is on, while an
-    account still signs in only through a provider and is linked to it, and while a refusal it recorded is in force."""
+    account still signs in only through a provider and is linked to it, while a refusal it recorded is in force,
+    and while a session that came through it still stands (409 ``sessions_standing``: turned off again, it ends
+    them)."""
     api = _api()
     _refuse_locked()
     row = _row_or_404(db, provider_id)
-    refusal = providers.remove_refusal(db, row)            # reads only: nothing is changed before the step-up
+    # Reads only: nothing is changed before the step-up.
+    refusal = providers.remove_refusal(db, row) or _sessions_refusal(db, row)
     if refusal is not None:
         raise _refused(refusal)
     _step_up(db, current_user, request)        # may commit (a receipt is used once)
@@ -559,7 +580,7 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
     # Made before the row is taken, as at a save: the linked accounts are settled while it is held.
     unknown_hash = sso_only.a_password_nobody_knows()
     row = _row_or_404(db, provider_id, lock=True)
-    refusal = providers.remove_refusal(db, row)
+    refusal = providers.remove_refusal(db, row) or _sessions_refusal(db, row)
     if refusal is not None:
         db.rollback()
         raise _refused(refusal)

@@ -1661,3 +1661,39 @@ def test_a_save_that_makes_a_missed_sign_in_end_the_password_counts_whom_a_refus
     del h.accounts_told[:]
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 31}})
     assert status == 200 and out["newly_held"] == 0 and out["held_by_a_refusal"] == 1 and h.accounts_told == []
+
+
+def test_a_provider_is_not_removed_while_sessions_that_came_through_it_still_stand(monkeypatch):
+    """Contoso was turned off, and two of its sessions could not be ended: the notice said to turn it off again
+    to end them. Another administrator removed it first. The removal took what names those sessions with it: they
+    went on working until they ran out, turning it off again answered 404, and nothing said whom to sign out. The
+    removal is refused, before anything is asked or changed, until none stands."""
+    row = _provider(state="disabled", created_at=None, updated_at=None)
+    h = Admin(monkeypatch, [row])
+    sessions = _sessions_through(h, row, standing=1, ended=1, others=2, idle=1)
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and out["detail"] == {"reason": "sessions_standing", "message": (
+        "2 session(s) that came through this provider still stand. Turn it off again to end its sessions first: "
+        "removed now, nothing would name them any more.")}, out
+    assert h.order == [] and h.rows() == [row] and h.audits == []          # no step-up asked, nothing written
+    # They cannot be counted: not taken for none.
+    real = h.R._sessions_standing
+    monkeypatch.setattr(h.R, "_sessions_standing", lambda db, provider_id: None)
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and out["detail"]["message"].startswith("Sessions that came through this provider still stand.")
+    monkeypatch.setattr(h.R, "_sessions_standing", real)
+    # Ended meanwhile, after the step-up was given: read again in the row, and refused there too.
+    for session in sessions:
+        session.revoked = True
+    seen = []
+
+    def standing_again(db, provider_id):
+        seen.append(1)
+        return 0 if len(seen) == 1 else 3
+    monkeypatch.setattr(h.R, "_sessions_standing", standing_again)
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 409 and out["detail"]["reason"] == "sessions_standing" and h.order == ["step_up"] and h.rows() == [row]
+    # None stands: removed.
+    monkeypatch.setattr(h.R, "_sessions_standing", real)
+    status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
+    assert status == 200 and out == {"removed": True} and h.rows() == []
