@@ -100,7 +100,7 @@ NO_STORED_BYTES = {
     ("app/api/api_server.py", "upload_chunk"): (["hash_path.write_text"], RESUME_HINT),
     ("app/core/case_export.py", "ExportStream._pieces"): (["zipfile.ZipFile", "archive.open"], IN_MEMORY),
     ("app/api/api_server.py", "update_settings"): (["_api_rate_limit_policy_cache.replace"], NOT_A_FILE),
-    ("app/services/oidc_client.py", "fetch_json"): (["(opener or _opener).open"], NOT_A_FILE),   # a URL opener
+    ("app/services/oidc_client.py", "fetch_json"): (["opener.open"], NOT_A_FILE),   # a URL opener
     ("app/core/sso_state.py", "_Guarded.__getattr__.guarded"): (["call"], NOT_A_FILE),   # a Redis command, by name
     ("app/core/audit_head_record.py", "_file_lock"): (["os.open"], LOCK),
     ("app/core/second_factor.py", "otpauth_qr_svg"): (["qr.make_image(image_factory=SvgPathImage).save"],
