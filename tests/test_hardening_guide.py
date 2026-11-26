@@ -91,7 +91,11 @@ def test_the_guide_and_the_readme_say_how_sftp_agrees_its_keys():
     for text in (guide, readme):
         assert "SFTP_KEX_POLICY" in text
     assert kex_policy.HYBRID in readme and "`SFTP_KEX_POLICY=pq-required` refuses clients that do not" in readme
-    assert kex_policy.PREFERRED == "pq-preferred" and "`SFTP_KEX_POLICY=pq-preferred`, the default" in guide
+    assert kex_policy.POLICIES == ("default", "pq-required") and not hasattr(kex_policy, "PREFERRED")
+    assert ("`SFTP_KEX_POLICY` takes two values. `default` (also what you get with no value) agrees the hybrid "
+            "ML-KEM exchange with every client that lists it first; the client's order decides") in guide
+    assert "`pq-required` refuses clients without it." in guide
+    assert "pq-preferred" not in guide and "pq-preferred" not in readme
     assert "kex.agreed.classical" in guide
     assert "in the one-container shape the whole vault stops with it" in guide
 

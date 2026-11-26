@@ -878,8 +878,9 @@ The [hardening guide](docs/guides/hardening.md#sign-in-passkeys-and-single-sign-
   the key in the browser, so the server never sees plaintext.
 - **Transport:** run it behind TLS — a reverse proxy, or the included HTTPS deployment
   script. SFTP uses SSH host keys, and agrees its session keys with the hybrid post-quantum exchange
-  `mlkem768x25519-sha256` (ML-KEM-768 with X25519) whenever the client offers it;
-  `SFTP_KEX_POLICY=pq-required` refuses clients that do not (see `.env.example`).
+  `mlkem768x25519-sha256` (ML-KEM-768 with X25519) whenever the client lists it first (the client's order
+  decides, and OpenSSH 9.9 and later list it first). That is `SFTP_KEX_POLICY=default`;
+  `SFTP_KEX_POLICY=pq-required` refuses clients that do not offer it (see `.env.example`).
 - **Container hardening:** runs as a non-root user on a read-only root filesystem with no
   new privileges; login throttling and account lockout are built in.
 - **Secrets:** all keys and passwords come from `.env`. Use fresh encryption/JWT keys per deployment.

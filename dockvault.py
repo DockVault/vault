@@ -1040,13 +1040,13 @@ def allowed_hosts_port_note(allowed_hosts, web_host_port):
 
 
 # The key exchange an SFTP connection uses, as the vault takes SFTP_KEX_POLICY (app/core/config.py,
-# app/sftp/kex_policy.py): each policy with what status says of it and the colour it is said in.
-SFTP_KEX_POLICIES = {
-    "pq-preferred": ("pq-preferred - the hybrid post-quantum exchange with every client that offers it; others still "
-                     "connect with a classical one.", "grey"),
+# app/sftp/kex_policy.py): each policy with what status says of it and the colour it is said in. Its keys are the
+# two values of SFTP_KEX_POLICIES below.
+SFTP_KEX_STATUS_WORDS = {
+    "default": ("default - the hybrid post-quantum exchange with every client that lists it first (the client's "
+                "order decides); other clients connect with a classical one.", "grey"),
     "pq-required": ("pq-required - only the hybrid post-quantum exchange (mlkem768x25519-sha256): a client without it "
                     "(OpenSSH before 9.9, many older SFTP programs) cannot connect.", "yellow"),
-    "default": ("default - the SSH library's own order (today the same as pq-preferred).", "grey"),
 }
 
 
@@ -1054,18 +1054,18 @@ def sftp_kex_status_line(env, profiles):
     """What status says about SFTP_KEX_POLICY, as (text, colour), or None. A value the vault does not take (an empty
     one among them) is refused when any part of the vault starts, the web side too, so it is said wherever SFTP
     runs or not. Otherwise the policy in force is said where SFTP runs (RUN_SFTP, or the split layout): unset is
-    pq-preferred. Pure: ``env`` is the parsed .env."""
+    default. Pure: ``env`` is the parsed .env."""
     env = env or {}
     if "SFTP_KEX_POLICY" in env:
         raw = str(env.get("SFTP_KEX_POLICY") or "").strip()
-        if raw.lower() not in SFTP_KEX_POLICIES:
-            return ("SFTP_KEX_POLICY=%s in .env is not pq-preferred, pq-required or default: the vault refuses to "
+        if raw.lower() not in SFTP_KEX_STATUS_WORDS:
+            return ("SFTP_KEX_POLICY=%s in .env is not default or pq-required: the vault refuses to "
                     "start with it." % raw, "red")
     sftp_runs = (str(env.get("RUN_SFTP") or "").strip().lower() in ("1", "true", "yes", "on")
                  or profiles == "split")
     if not sftp_runs:
         return None
-    return SFTP_KEX_POLICIES[str(env.get("SFTP_KEX_POLICY") or "pq-preferred").strip().lower()]
+    return SFTP_KEX_STATUS_WORDS[str(env.get("SFTP_KEX_POLICY") or "default").strip().lower()]
 
 
 def build_env_lines(cfg):
@@ -6144,8 +6144,8 @@ class DockVault:
                                        pal, "").strip() or None
                 sftp_public_port = _port_or(ask("Port SFTP clients connect to", pal, str(sftp_port)),
                                             sftp_port)
-            # How SFTP agrees the keys that encrypt a connection (SFTP_KEX_POLICY): the default, pq-preferred,
-            # is written nowhere.
+            # How SFTP agrees the keys that encrypt a connection (SFTP_KEX_POLICY): default or pq-required. The
+            # default is written nowhere: an absent value is the default.
             kex_policy = a("sftp_kex_policy")
             if (enable_sftp or split) and kex_policy is None and confirm(
                     "Refuse SFTP clients that cannot use the post-quantum key exchange (OpenSSH before 9.9 and "
@@ -6228,7 +6228,7 @@ class DockVault:
             "web_public_address": web_public,
             "sftp_public_host": sftp_public_host,
             "sftp_public_port": sftp_public_port,
-            # build_env_lines writes it only when SFTP runs and it is not the default (pq-preferred).
+            # build_env_lines writes it only when SFTP runs and it is pq-required (absent is the default).
             "sftp_kex_policy": kex_policy,
             # SFTP staging tmpfs size — install-time only (a deploy-time infra knob, not a live
             # limit, so it is not in the Limits menu). --sftp-staging-tmpfs-mb or hand-edit .env.
@@ -10642,11 +10642,11 @@ def build_parser():
                          "false (streaming, the default, never stages); then it also caps the SFTP upload "
                          "size and counts toward the SFTP container's memory limit")
     sp.add_argument("--enable-sftp", dest="enable_sftp", action="store_true", help="also serve SFTP")
-    sp.add_argument("--sftp-kex-policy", dest="sftp_kex_policy", choices=("pq-preferred", "pq-required", "default"),
-                    help="how SFTP agrees the keys that encrypt a connection: pq-preferred (the default) uses the "
-                         "hybrid post-quantum exchange with clients that offer it; pq-required refuses clients "
-                         "without it (OpenSSH before 9.9, many older SFTP programs); default takes the SSH "
-                         "library's own order")
+    sp.add_argument("--sftp-kex-policy", dest="sftp_kex_policy", choices=SFTP_KEX_POLICIES,
+                    help="how SFTP agrees the keys that encrypt a connection: default agrees the hybrid "
+                         "post-quantum exchange with every client that lists it first (the client's order "
+                         "decides), and others connect with a classical one; pq-required refuses clients "
+                         "without it (OpenSSH before 9.9, many older SFTP programs)")
     sp.add_argument("--split", dest="split", action="store_true", help="two containers (vault-api + vault-sftp)")
     sp.add_argument("--image-source", dest="image_source", choices=("release", "build"),
                     help="release = pull the published GHCR image | build = build this checkout. "

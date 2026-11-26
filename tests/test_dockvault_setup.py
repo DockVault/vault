@@ -374,9 +374,8 @@ def _first_setup_config(monkeypatch, argv):
 def test_setup_takes_the_sftp_key_exchange_policy_and_writes_it_only_when_it_is_not_the_default(monkeypatch):
     required = _lines(_first_setup_config(monkeypatch, ["--enable-sftp", "--sftp-kex-policy", "pq-required"]))
     assert "SFTP_KEX_POLICY=pq-required" in required, required
-    classical = _lines(_first_setup_config(monkeypatch, ["--enable-sftp", "--sftp-kex-policy", "default"]))
-    assert "SFTP_KEX_POLICY=default" in classical
-    for argv in (["--enable-sftp"], ["--enable-sftp", "--sftp-kex-policy", "pq-preferred"]):
+    # The default is written nowhere: an absent value is the default.
+    for argv in (["--enable-sftp"], ["--enable-sftp", "--sftp-kex-policy", "default"]):
         lines = _lines(_first_setup_config(monkeypatch, argv))
         assert not [line for line in lines if line.startswith("SFTP_KEX_POLICY")], (argv, lines)
 
@@ -385,14 +384,27 @@ def test_the_example_file_says_how_setup_sets_the_key_exchange_policy():
     before = _example().split("\nSFTP_KEX_POLICY=")[0]
     said = " ".join(" ".join(line.lstrip("#").strip() for line in before.splitlines()[-12:]).split())
     assert ("A first python dockvault.py setup that turns SFTP on asks whether to refuse clients without the hybrid "
-            "exchange, or takes --sftp-kex-policy, and writes this line only for pq-required or default.") in said
+            "exchange, or takes --sftp-kex-policy, and writes this line only for pq-required.") in said
 
 
-def test_a_misspelt_key_exchange_policy_is_refused_by_the_command_line(capsys):
+@pytest.mark.parametrize("value", ["pq-requried", "pq-preferred", "Default"])
+def test_the_command_line_takes_only_the_two_key_exchange_policies(capsys, value):
+    """The vault takes default and pq-required, and refuses anything else at its start."""
     with pytest.raises(SystemExit) as refused:
-        dv.build_parser().parse_args(["setup", "--sftp-kex-policy", "pq-requried"])
+        dv.build_parser().parse_args(["setup", "--sftp-kex-policy", value])
     assert refused.value.code == 2
-    assert "pq-preferred" in capsys.readouterr().err
+    offered = capsys.readouterr().err.split("choose from")[-1]
+    assert "default" in offered and "pq-required" in offered and "pq-preferred" not in offered, offered
+
+
+def test_the_command_line_offers_the_two_policies_and_says_what_each_does():
+    assert dv.SFTP_KEX_POLICIES == ("default", "pq-required")
+    for value in dv.SFTP_KEX_POLICIES:
+        args = dv.build_parser().parse_args(["setup", "--sftp-kex-policy", value])
+        assert args.sftp_kex_policy == value
+    source = (ROOT / "dockvault.py").read_text(encoding="utf-8")
+    assert 'choices=SFTP_KEX_POLICIES,' in source
+    assert "pq-preferred" not in source and "PREFERRED" not in source
 
 
 def test_an_interactive_setup_asks_whether_to_refuse_clients_without_the_post_quantum_exchange(monkeypatch):

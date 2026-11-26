@@ -27,9 +27,11 @@ Treat `.env` and the backups as the most sensitive things you hold.
   sign-in limits see real addresses.
 - **Publish only what is used:** the web port, and the SFTP port only if SFTP is used. Keep PostgreSQL and Redis on
   the internal network; set `REDIS_PASSWORD` and `ALLOWED_HOSTS`.
-- **Post-quantum SFTP.** `SFTP_KEX_POLICY=pq-preferred`, the default, agrees the hybrid ML-KEM exchange with every
-  client that offers it (OpenSSH 9.9 and later). Before you set `pq-required`, look in the log of the container
-  that runs SFTP for `kex.agreed.classical` lines: each one is a client that would then be refused. Under
+- **Post-quantum SFTP.** `SFTP_KEX_POLICY` takes two values. `default` (also what you get with no value) agrees
+  the hybrid ML-KEM exchange with every client that lists it first; the client's order decides (OpenSSH 9.9 and
+  later list it first). `pq-required` refuses clients without it. Before you set `pq-required`, look in the log
+  of the container that runs SFTP for `kex.agreed.classical` lines: each one is a client that would then be
+  refused. Under
   `pq-required` a server that cannot offer the hybrid exchange does not start SFTP, and in the one-container shape
   the whole vault stops with it.
 - **Require a second factor for administrators.** Every compliance step asks for the password and an
