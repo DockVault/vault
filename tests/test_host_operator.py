@@ -260,18 +260,15 @@ def test_the_host_tool_reads_the_settings_an_administrator_saved_before_it_acts(
 
 
 def test_the_host_tool_refuses_in_words_when_the_saved_settings_cannot_be_read(tmp_path, monkeypatch, capsys):
-    """The settings could not be read (the table out of reach). The read raises nothing and leaves the copy
-    empty: gone on, the tool would have acted on the defaults, which is what it did before. It refuses, and
-    says why; nothing of the action runs."""
+    """The settings could not be read while the database answers (the table out of reach). The read raises
+    nothing and leaves the copy empty: gone on, the tool would have acted on the defaults, which is what it did
+    before. It refuses, and says why; nothing of the action runs."""
     import json
     import sys
     import types
-    from app.core import database, host_operator
+    from app.core import host_operator
     registry = _settings_database(tmp_path, monkeypatch)
-
-    def out_of_reach():
-        raise RuntimeError("the database at db.example.internal is out of reach")
-    monkeypatch.setattr(database, "SessionLocal", out_of_reach)
+    monkeypatch.setattr(registry, "refresh", lambda factory=None: False)     # read nothing, raised nothing
     with pytest.raises(host_operator._Answer) as refused:
         host_operator.load_the_stored_settings()
     assert refused.value.code == 2 and refused.value.obj == {"ok": False, "error": host_operator.SETTINGS_NOT_READ}
@@ -290,6 +287,43 @@ def test_the_host_tool_refuses_in_words_when_the_saved_settings_cannot_be_read(t
     assert [json.loads(line) for line in out.splitlines() if line.strip()] == [
         {"ok": False, "error": host_operator.SETTINGS_NOT_READ}]
     assert "db.example.internal" not in out
+
+
+def test_a_database_out_of_reach_is_answered_stopped_with_its_traceback(tmp_path, monkeypatch, capsys):
+    """The database does not answer at all. The settings' read raises nothing, so the tool asks the database once
+    more itself: that raises, and the tool answers as it always did when something stopped it: the one line, exit
+    status 1, and the traceback on standard error. It is not told as settings that could not be read."""
+    import json
+    import sys
+    import types
+    from sqlalchemy.exc import OperationalError
+    from app.core import database, host_operator
+    _settings_database(tmp_path, monkeypatch)
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, *a, **kw):
+            raise OperationalError("SELECT 1", {}, RuntimeError("could not connect to db.example.internal"))
+
+        def query(self, *a, **kw):
+            raise OperationalError("SELECT", {}, RuntimeError("could not connect to db.example.internal"))
+
+        def close(self):
+            pass
+    monkeypatch.setattr(database, "SessionLocal", Session)
+    monkeypatch.setitem(sys.modules, "app.api.api_server", types.ModuleType("app.api.api_server"))
+    monkeypatch.setattr(host_operator, "_wait_for_background_work", lambda started_before: None)
+    code = host_operator.run(["lookup", "--username", "alice"])
+    out, err = capsys.readouterr()
+    assert code == 1
+    assert [json.loads(line) for line in out.splitlines() if line.strip()] == [
+        {"ok": False, "error": "The account tool stopped before it could answer."}]
+    assert "Traceback" in err and "db.example.internal" in err
 
 
 def test_the_host_tool_loads_the_settings_before_the_action_and_once(tmp_path, monkeypatch, capsys):

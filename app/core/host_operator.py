@@ -383,6 +383,11 @@ def load_the_stored_settings() -> None:
     from app.core import settings_registry as registry
     registry.refresh(database.SessionLocal)
     if registry.stamp() is None:
+        # The read raises nothing. A database out of reach raises here, and is answered "stopped", with its
+        # traceback, as it always was; one that answers while the settings could not be read is refused in words.
+        from sqlalchemy import text
+        with database.SessionLocal() as db:
+            db.execute(text("SELECT 1"))
         _refuse(SETTINGS_NOT_READ)
 
 

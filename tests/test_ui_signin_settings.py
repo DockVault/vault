@@ -201,7 +201,7 @@ def test_the_page_says_under_two_rows_what_the_counts_mean(page: Page, admin_cre
                     "accounts_with_only_a_passkey", "administrators_with_only_a_passkey"):
             body[key] = 0
     _with_the_answer_changed(page, none)
-    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    page.locator('#sidebar .sidebar-settings-item[data-tab="signin"]').click()
     expect(page.locator(VERIFY + " .signin-setting-note")).to_have_count(0, timeout=10000)
     expect(page.locator("#signin-passkey-settings .signin-setting-note")).to_have_count(0)
     page.unroute_all(behavior="ignoreErrors")
@@ -264,11 +264,11 @@ def test_the_page_says_when_direct_attestation_has_no_trust_anchors(page: Page, 
         _value(body, "webauthn_attestation", "direct")
         body["trust_anchors"] = 1
     _with_the_answer_changed(page, one_anchor)
-    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    page.locator('#sidebar .sidebar-settings-item[data-tab="signin"]').click()
     expect(alert).to_be_hidden(timeout=10000)
     page.unroute_all(behavior="ignoreErrors")
     # The server's own answer: attestation is not direct.
-    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    page.locator('#sidebar .sidebar-settings-item[data-tab="signin"]').click()
     expect(page.locator(ATTESTATION + " select")).to_have_value("none", timeout=10000)
     expect(alert).to_be_hidden()
 
@@ -290,7 +290,7 @@ def test_required_for_roles_with_no_role_chosen_says_nobody_is_required(page: Pa
         _value(body, "webauthn_mode", "required_for_roles")
         _value(body, "webauthn_required_roles", ["user"])
     _with_the_answer_changed(page, a_role)
-    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    page.locator('#sidebar .sidebar-settings-item[data-tab="signin"]').click()
     expect(page.locator(MODE + " .signin-roles-note")).to_have_count(0, timeout=10000)
     page.unroute_all(behavior="ignoreErrors")
 
@@ -311,6 +311,6 @@ def test_the_page_lists_the_accounts_the_requirement_was_lifted_for_as_text(page
     expect(box).to_contain_text("bob (Administrators)")
     page.unroute_all(behavior="ignoreErrors")
     # The server's own answer: nobody's requirement was lifted on this stack.
-    page.locator('#settings-section .tab-btn[data-tab="signin"]').click()
+    page.locator('#sidebar .sidebar-settings-item[data-tab="signin"]').click()
     expect(page.locator('#signin-passkey-settings [data-setting="webauthn_mode"]')).to_be_visible(timeout=10000)
     expect(box).to_be_hidden(timeout=10000)

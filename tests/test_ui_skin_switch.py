@@ -383,7 +383,7 @@ def test_console_nav_sections_still_work(page: Page, fresh_admin):
     assert _skin_state(page)["ui"] == "v2"
 
     labels = page.eval_on_selector_all(
-        ".nav-group-label", "els => els.map(e => e.textContent)"
+        "#sidebar > .sidebar-nav:not(.sidebar-settings-nav) .nav-group-label", "els => els.map(e => e.textContent)"
     )
     assert labels == ["Overview", "Storage", "Access", "System"]
 
