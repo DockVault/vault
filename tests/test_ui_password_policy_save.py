@@ -35,9 +35,14 @@ SAVE_BTN = "#save-all-settings-btn"
 
 
 def _open_settings(page, admin):
-    # The sections' list is hidden while Settings is open (the settings menu takes its place): clicked through the
-    # page, as a second visit from inside Settings would be.
-    page.evaluate("() => document.querySelector('.sidebar-item[data-section=\"settings\"]').click()")
+    # After a reload the page may come back on Settings by itself, and then the sections' list is hidden (the
+    # settings menu takes its place). Wait until the page has settled either way, then open Settings if it is not.
+    page.wait_for_function(
+        "() => { const seen = (el) => !!el && el.getClientRects().length > 0;"
+        " return seen(document.querySelector('#settings-section'))"
+        " || seen(document.querySelector('.sidebar-item[data-section=\"settings\"]')); }", timeout=15000)
+    if not page.locator("#settings-section").is_visible():
+        page.click('.sidebar-item[data-section="settings"]')
     expect(page.locator("#settings-section")).to_be_visible()
     sentinel = str(admin.get("/settings").json().get("password_min_length") or 8)
     page.wait_for_function(
