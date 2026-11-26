@@ -24,7 +24,7 @@ pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parent.parent
 APP_JS = ROOT / "static" / "js" / "app.js"
 _SHIPPED = ("parseServerTime", "formatServerTime", "_el", "loadSsoAdminRequests", "_ssoAdminDecidedText",
-            "renderSsoAdminRequests", "decideSsoAdminRequest")
+            "renderSsoAdminRequests", "decideSsoAdminRequest", "serverSaid")
 
 
 def _function(js, name):
@@ -241,7 +241,7 @@ button('Deny bob').click();
 await tick(); await tick(); await tick();
 const denied = { confirm: confirms[0], toasts: toasts.slice() };
 toasts.length = 0;
-answers[PATH + '/r-1/approve'] = new Error('The request changed meanwhile; look again.');
+answers[PATH + '/r-1/approve'] = Object.assign(new Error('The request changed meanwhile; look again.'), { status: 409 });
 button('Approve bob').click();
 await tick(); await tick(); await tick();
 out({ denied, refused: toasts, posts: asked.filter((a) => a.method === 'POST').map((a) => a.path),

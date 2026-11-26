@@ -7684,7 +7684,8 @@ async function decideSsoAdminRequest(req, approve, btn) {
             showSuccess(name + ' was not made an administrator; they are told.');
         }
     } catch (e) {
-        showError(serverSaid(e, 'The request could not be decided.'));
+        // A refusal apiRequest has already shown is not shown again.
+        if (!(e && e.shown)) showError(serverSaid(e, 'The request could not be decided.'));
     } finally {
         if (btn) btn.disabled = false;
         loadUsers();          // reads the card again too
@@ -8408,7 +8409,7 @@ async function removeUserPasskey(userId, key, btn) {
         if (r && r.held) showHeldChange(r);
         else showSuccess('Passkey removed. ' + name + ' was signed out everywhere.');
     } catch (e) {
-        showError(serverSaid(e, 'Could not remove the passkey.'));
+        if (!(e && e.shown)) showError(serverSaid(e, 'Could not remove the passkey.'));
     } finally {
         if (btn) btn.disabled = false;
     }
