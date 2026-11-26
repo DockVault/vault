@@ -308,6 +308,40 @@ out({ results, claims: asked.filter((a) => /finish$/.test(a.path)).length });
     assert got["claims"] == 1                          # only the last one reached the server
 
 
+def test_a_busy_claim_says_the_servers_sentence_and_is_not_sent_again():
+    """/users/me/identities/finish, /users/me/identities/reauth/finish and a provider's /test/finish answer 503
+    {reason: 'busy'} with no Retry-After once their one-time code is spent: the page says the server's sentence and
+    sends nothing again, because the same code cannot work twice. A provider's return the vault was too busy for comes
+    back as #sso-error=busy, said in the words of the server's list of reasons."""
+    got = _node(r"""
+const BUSY = 'The vault is busy with this right now. Start it again in a moment.';
+const busy = () => Object.assign(new Error(BUSY), { status: 503, reason: 'busy' });
+const results = [];
+answers['/users/me/identities/p-1/start'] = { authorization_url: 'https://idp.example.org/a' };
+answers['/admin/sso/providers/p-1/test/start'] = { authorization_url: 'https://idp.example.org/a' };
+answers['/users/me/identities/p-1/reauth'] = { authorization_url: 'https://idp.example.org/a' };
+answers['/users/me/identities/finish'] = busy();
+answers['/admin/sso/providers/p-1/test/finish'] = busy();
+answers['/users/me/identities/reauth/finish'] = busy();
+await window.Sso.startLink('p-1');
+results.push(await window.Sso.resume(arrive('#sso-linked=c1')));
+await window.Sso.startTest('p-1');
+results.push(await window.Sso.resume(arrive('#sso-test=c2')));
+await window.Sso.startConfirm('p-1', 'vault.delete', 'step-up', 'Contoso');
+results.push(await window.Sso.resume(arrive('#sso-stepup=c3')));
+await new Promise((resolve) => setTimeout(resolve, 50));
+fetched['/api/auth/sso/reasons'] = { ok: true, json: { reasons: { busy: 'Signing in is busy right now. Try again in a moment.' } } };
+results.push(await window.Sso.resume(arrive('#sso-error=busy')));
+out({ results, claims: asked.filter((a) => /finish$/.test(a.path)).map((a) => a.path) });
+""")
+    said = {"kind": "error", "message": "The vault is busy with this right now. Start it again in a moment."}
+    assert got["results"] == [said, said, said,
+                              {"kind": "error", "message": "Signing in is busy right now. Try again in a moment."}]
+    # Each claim was sent once: nothing tries again on its own.
+    assert got["claims"] == ["/users/me/identities/finish", "/admin/sso/providers/p-1/test/finish",
+                             "/users/me/identities/reauth/finish"]
+
+
 def test_a_start_that_fails_for_a_signed_in_person_leaves_no_proof_behind():
     got = _node(r"""
 const said = [];

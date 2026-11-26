@@ -7624,19 +7624,23 @@ function renderSsoAdminRequests(data) {
             + ' · expires ' + formatServerTime(req.expires_at)));
         row.appendChild(text);
         const actions = _el('div', 'credential-request-actions');
+        // Approve and Deny are answered apart: a request that can no longer be approved may still be denied.
         if (req.you_may_decide) {
             const approve = _el('button', 'btn btn-sm btn-primary', 'Approve');
             approve.type = 'button';
             approve.setAttribute('aria-label', 'Approve ' + name);
             approve.addEventListener('click', () => decideSsoAdminRequest(req, true, approve));
+            actions.appendChild(approve);
+        } else if (req.refusal) {
+            // Why this administrator may not approve it (their own account, a change they made, too new...).
+            actions.appendChild(_el('span', 'credential-request-waiting', req.refusal));
+        }
+        if (req.you_may_deny) {
             const deny = _el('button', 'btn btn-sm btn-secondary', 'Deny');
             deny.type = 'button';
             deny.setAttribute('aria-label', 'Deny ' + name);
             deny.addEventListener('click', () => decideSsoAdminRequest(req, false, deny));
-            actions.append(approve, deny);
-        } else if (req.refusal) {
-            // Why this administrator may not decide it (their own account, a change they made, too new...).
-            actions.appendChild(_el('span', 'credential-request-waiting', req.refusal));
+            actions.appendChild(deny);
         }
         row.appendChild(actions);
         list.appendChild(row);
@@ -8460,7 +8464,8 @@ function _passkeyWhen(iso) {
 
 // What a passkey's row says of the key beyond its name and dates, as {text, cls}, or null when there is nothing to
 // say. The server says of every key it lists whether it is a factor now (usable), why not (not_usable_because, the
-// reasons of webauthn_settings.why_a_key_is_no_factor, or passkeys turned off) and, while a removed signature
+// reasons of webauthn_settings.why_a_key_is_no_factor, passkeys turned off, or key_too_short for an RSA key under
+// 2048 bits) and, while a removed signature
 // algorithm runs out its days, the day it stops being accepted (accepted_until). ``owner``: the words for the key's
 // owner (Your account), else for an administrator (the Users page). ``when`` writes a date; Your account's way by
 // default. A key that never checked the person counts again once it does at a use, and a switch turned back on
@@ -8491,6 +8496,11 @@ function _passkeyStateText(key, owner, when) {
                 + 'or remove it and add another.'
                 : 'Not usable: it has never checked the person with a PIN, fingerprint or face, and this vault asks '
                 + 'for that.';
+            break;
+        case 'key_too_short':
+            // An RSA key under 2048 bits.
+            text = owner ? 'This passkey\'s key is too short to trust.'
+                : 'Not usable: this passkey\'s key is too short to trust.';
             break;
         default:
             return null;
@@ -11305,11 +11315,11 @@ function refreshAccountsPolicyUI() {
     setDisabled('setting-invite-ttl-hours', !inviteOn);
     dim('accounts-invite-card', inviteOn);
 
-    const signupOn = on('setting-signup-enabled');
-    setDisabled('setting-signup-domain-mode', !signupOn);
-    dim('accounts-signup-card', signupOn);
+    // The email domain gate is not only for self-signup: accepting an invitation is held to it, and so is a single
+    // sign-on provider with "Also hold people to the sign-up domain list" ticked. It stays editable with self-signup
+    // off.
     const modeEl = document.getElementById('setting-signup-domain-mode');
-    const domainsActive = signupOn && modeEl && modeEl.value !== 'off';
+    const domainsActive = !!(modeEl && modeEl.value !== 'off');
     setDisabled('setting-signup-domain-input', !domainsActive);
     setDisabled('setting-signup-domain-add', !domainsActive);
 
@@ -11399,9 +11409,9 @@ function updateAccountsSummary() {
         : 'People sign in with their username.');
     parts.push(on('setting-invite-enabled') ? 'Admins can invite people by link.' : 'Invitations are off.');
     parts.push(on('setting-signup-enabled') ? 'Anyone can sign themselves up.' : 'Self-signup is off.');
-    if (on('setting-signup-enabled') && val('setting-signup-domain-mode') !== 'off') {
+    if (val('setting-signup-domain-mode') !== 'off') {
         const verb = val('setting-signup-domain-mode') === 'allowlist' ? 'restricted to' : 'blocked for';
-        parts.push(`Signup email is ${verb} ${accountsDomains.length} listed domain(s).`);
+        parts.push(`Signing up and accepting an invitation are ${verb} ${accountsDomains.length} listed email domain(s).`);
     }
     if (on('setting-email-change-verification')) {
         parts.push('Changing one’s own email requires a code sent to the new address.');

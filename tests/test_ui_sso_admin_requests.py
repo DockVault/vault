@@ -2,8 +2,8 @@
 
 A sign-in through a provider that maps a group to the administrator role raises a request that waits for an
 administrator's approval; the administrators' notice sends them to the Users page. The card lists the waiting
-requests: one this administrator may decide has Approve and Deny, one they may not shows why in place of the
-buttons. Approve asks first, then sends the approval, and a reset link the promotion took back a password for is
+requests: Approve shows where this administrator may approve one and Deny where they may deny it, and one they may
+not approve shows why in place of Approve. Approve asks first, then sends the approval, and a reset link the promotion took back a password for is
 shown once to copy, as after any promotion.
 
 The requests are the browser's own answers here (page.route): no provider is configured on the test deployment,
@@ -22,10 +22,11 @@ PHONE = {"width": 375, "height": 812}
 HELD = [
     {"id": "11111111-1111-4111-8111-111111111111", "username": "bob-sso", "provider": "Contoso",
      "provider_group": "vault-admins", "requested_at": "2026-06-14T09:00:00Z", "expires_at": "2026-06-21T09:00:00Z",
-     "state": "held", "decided_by": None, "decided_at": None, "you_may_decide": True, "refusal": None},
+     "state": "held", "decided_by": None, "decided_at": None, "you_may_decide": True, "you_may_deny": True,
+     "refusal": None},
     {"id": "22222222-2222-4222-8222-222222222222", "username": "carol-sso", "provider": "Contoso",
      "provider_group": "vault-admins", "requested_at": "2026-06-13T09:00:00Z", "expires_at": "2026-06-20T09:00:00Z",
-     "state": "held", "decided_by": None, "decided_at": None, "you_may_decide": False,
+     "state": "held", "decided_by": None, "decided_at": None, "you_may_decide": False, "you_may_deny": False,
      "refusal": "You made or approved a change to this account's sign-in details in the last 14 days."},
 ]
 

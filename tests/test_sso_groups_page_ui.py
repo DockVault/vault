@@ -222,13 +222,14 @@ out({ roles: options('sso-group-role'), help: byId('sso-group-role').closest('.f
     ("", "external", {"provider_group": "Interns", "role": "external"}),
     ("d-fin", "user", {"provider_group": "Interns", "department_id": "d-fin", "role": "user"}),
 ])
-def test_add_sends_the_mapping_trimmed_without_empty_fields_and_reads_the_list_again(department, role, body):
+def test_add_sends_the_mapping_without_empty_fields_and_reads_the_list_again(department, role, body):
     got = _node(r"""
 answers[MAPS] = () => (asked[asked.length - 1].method === 'POST'
-    ? { mapping: { id: 'm-4', provider_group: 'Interns', department: null, role: null, does_nothing: null } }
+    ? { mapping: { id: 'm-4', provider_group: 'Interns', department: null, role: null, does_nothing: null },
+        may_leave: [] }
     : LISTING());
 await openGroups();
-byId('sso-group-name').value = '  Interns ';
+byId('sso-group-name').value = 'Interns';
 byId('sso-group-department').value = %s;
 byId('sso-group-role').value = %s;
 byId('sso-group-add').click();
@@ -298,7 +299,7 @@ const firstToasts = toasts.slice();
 button('m-2', 'Change').click();
 await tick();
 row('m-2').querySelector('.sso-group-edit-department').value = 'd-staff-2';
-row('m-2').querySelector('.sso-group-edit-name').value = ' Finance EU ';
+row('m-2').querySelector('.sso-group-edit-name').value = ' Finance EU';
 answers[MAPS + '/m-2'] = () => ({ mapping: MAPPINGS[1], changed: [] });
 row('m-2').querySelectorAll('button').find((b) => b.textContent === 'Save').click();
 await settle();
@@ -311,9 +312,99 @@ out({ shown, untouched, first, firstToasts, second: sent('PATCH').slice(1), toas
     assert got["firstToasts"] == [["The mapping of the group Finance was changed. It applies from each person's next "
                                    "sign-in through this provider.", "success"]]
     assert got["second"] == [["/admin/sso/providers/p-1/group-mappings/m-2",
-                              {"provider_group": "Finance EU", "department_id": "d-staff-2"}]]
+                              {"provider_group": " Finance EU", "department_id": "d-staff-2"}]]   # as typed
     assert got["toasts"] == [["Nothing was changed.", "info"]]
     assert got["reads"] == 3
+
+
+def test_add_sends_the_group_as_typed_spaces_included():
+    """The server keeps a mapping's group letter for letter and matches it so (app/services/sso_group_mappings.py,
+    _group): a group the provider sends with a space around it is mapped with that space. Trimmed here, it never
+    matched."""
+    got = _node(r"""
+answers[MAPS] = () => (asked[asked.length - 1].method === 'POST'
+    ? { mapping: { id: 'm-4', provider_group: ' Interns ', department: null, role: 'user', does_nothing: null },
+        may_leave: [] }
+    : LISTING());
+await openGroups();
+byId('sso-group-name').value = ' Interns ';
+byId('sso-group-role').value = 'user';
+byId('sso-group-add').click();
+await settle();
+out({ posts: sent('POST') });
+""")
+    assert got["posts"] == [["/admin/sso/providers/p-1/group-mappings", {"provider_group": " Interns ", "role": "user"}]]
+
+
+def test_the_page_does_not_trim_a_mappings_group_but_trims_the_required_groups():
+    """The server trims each required group (app/core/sso_policy.py, _saved_list) and keeps a mapping's group as
+    given: the page does the same."""
+    js = PAGE.read_text(encoding="utf-8")
+    assert "provider_group: form.name.value.trim()" not in js
+    assert "const body = { provider_group: form.name.value };" in js
+    assert "const now = { provider_group: form.name.value, department_id:" in js
+    assert "const groupLines = (value) => String(value || '').split(/\\n+/).map((s) => s.trim()).filter(Boolean);" in js
+
+
+WRITTEN = r"""
+answers[MAPS] = () => (asked[asked.length - 1].method === 'GET' ? LISTING() : ANSWER);
+answers[MAPS + '/m-3'] = () => ANSWER;
+await openGroups();
+"""
+
+
+@pytest.mark.parametrize("answer, said", [
+    ({"may_leave": [{"department": {"id": "d-fin", "name": "Finance"}, "accounts": 3}]},
+     " 3 linked accounts in Finance may leave it at their next sign-in."),
+    ({"may_leave": [{"department": {"id": "d-fin", "name": "Finance"}, "accounts": 1},
+                    {"department": {"id": "d-staff", "name": "Staff"}, "accounts": 2}]},
+     " One linked account in Finance may leave it at its next sign-in. 2 linked accounts in Staff may leave it at their"
+     " next sign-in."),
+    ({"may_leave": [], "requests_ended": 0, "administrators_kept": 0}, ""),
+])
+def test_an_added_mapping_says_who_may_leave_a_department(answer, said):
+    got = _node(WRITTEN.replace("await openGroups();", "const ANSWER = Object.assign({ mapping: { id: 'm-4', "
+                                "provider_group: 'Interns', department: { id: 'd-fin', name: 'Finance' }, role: null, "
+                                "does_nothing: null } }, %s);\nawait openGroups();" % json.dumps(answer)) + r"""
+byId('sso-group-name').value = 'Interns';
+byId('sso-group-department').value = 'd-fin';
+byId('sso-group-add').click();
+await settle();
+out(toasts);
+""")
+    assert got == [["The group Interns is mapped. It applies from each person's next sign-in through this provider."
+                    + said, "success"]]
+
+
+@pytest.mark.parametrize("answer, said", [
+    ({"may_leave": [{"department": {"id": "d-fin", "name": "Finance"}, "accounts": 3}], "requests_ended": 1,
+      "administrators_kept": 2},
+     " 3 linked accounts in Finance may leave it at their next sign-in. One open administrator request was ended. 2 "
+     "administrators approved through this group keep the role: take it away on the Users page if they should not "
+     "keep it."),
+    ({"may_leave": [], "requests_ended": 4, "administrators_kept": 1},
+     " 4 open administrator requests were ended. One administrator approved through this group keeps the role: take "
+     "it away on the Users page if they should not keep it."),
+    ({"may_leave": [], "requests_ended": 0, "administrators_kept": 0}, ""),
+])
+def test_a_changed_or_removed_mapping_says_who_may_leave_the_requests_ended_and_the_administrators_kept(answer, said):
+    got = _node(WRITTEN.replace("await openGroups();", "const ANSWER = Object.assign({ mapping: MAPPINGS[2], "
+                                "changed: ['role'], removed: true }, %s);\nawait openGroups();" % json.dumps(answer))
+                + r"""
+button('m-3', 'Change').click();
+await tick();
+row('m-3').querySelector('.sso-group-edit-role').value = 'user';
+row('m-3').querySelectorAll('button').find((b) => b.textContent === 'Save').click();
+await settle();
+const changed = toasts.slice();
+toasts.length = 0;
+button('m-3', 'Remove').click();
+await settle();
+out({ changed, removed: toasts });
+""")
+    assert got["changed"] == [["The mapping of the group Vault Admins was changed. It applies from each person's next "
+                               "sign-in through this provider." + said, "success"]]
+    assert got["removed"] == [["The mapping of the group Vault Admins was removed." + said, "success"]]
 
 
 def test_change_keeps_the_administrator_role_of_a_mapping_that_has_it_and_cancel_puts_the_row_back():

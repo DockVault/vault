@@ -137,7 +137,7 @@ out({ rows: rows(), ending: day('2026-07-01T09:00:00Z') });
 def test_the_words_for_each_reason_are_the_owners_or_the_administrators_and_an_unknown_one_says_nothing():
     got = account_node(r"""
 const reasons = ['passkeys_turned_off', 'passkeys_at_another_address', 'passkeys_no_longer_accepted',
-                 'passkeys_without_verification', 'something_new'];
+                 'passkeys_without_verification', 'something_new', 'key_too_short'];
 const said = {};
 for (const owner of [true, false]) {
     said[owner ? 'owner' : 'administrator'] = reasons.map((why) =>
@@ -156,6 +156,11 @@ out(said);
         "Not usable: its signature algorithm (RS256) is no longer accepted here.",
         "Not usable: it has never checked the person with a PIN, fingerprint or face, and this vault asks for that."]
     assert owner[4] is None and admin[4] is None
+    # An RSA key under 2048 bits.
+    assert owner[5] == {"text": "This passkey's key is too short to trust.",
+                        "cls": "text-warning text-xs passkey-not-usable"}
+    assert admin[5] == {"text": "Not usable: this passkey's key is too short to trust.",
+                        "cls": "text-warning text-xs passkey-not-usable"}
     assert got["usable"] == [None, None]
 
 

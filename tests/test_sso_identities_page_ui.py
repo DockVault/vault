@@ -648,6 +648,27 @@ def test_a_removal_refused_for_another_reason_says_it_and_reads_the_list_again()
     assert landed["listedAgain"] == 1 and landed["readAgain"] == 0
 
 
+def test_a_removal_refused_for_sessions_that_still_stand_says_the_servers_sentence_and_offers_turn_off_again():
+    """DELETE answers 409 sessions_standing before it asks for any step-up: the page says the server's sentence,
+    asks for nothing else, and the keyboard goes to "Turn off again", which ends those sessions."""
+    said = ("2 session(s) that came through this provider still stand. Turn it off again to end its sessions first: "
+            "removed now, nothing would name them any more.")
+    got = _node(REMOVE % ("0", json.dumps(said), json.dumps("sessions_standing")))
+    landed = got["landed"]
+    assert landed["deletes"] == ["/admin/sso/providers/p-1"]       # one request: no step-up, no second try
+    assert got["toasts"] == [[said, "error"]]
+    assert landed["page"] == "sso-tab-connection" and landed["note"] is None
+    assert landed["listedAgain"] == 1 and landed["readAgain"] == 0
+
+
+def test_the_removal_offers_turn_off_again_after_a_sessions_standing_refusal():
+    js = PAGE.read_text(encoding="utf-8")
+    removal = js[js.index("    async function remove() {"):js.index("    // The values of a page's fields")]
+    assert "if (e.reason === 'sessions_standing') {" in removal
+    assert "drawDialog({ focus: 'sso-end-sessions' });" in removal
+    assert removal.index("e.reason === 'sessions_standing'") < removal.index("TO_IDENTITIES.includes(e.reason)")
+
+
 @pytest.mark.parametrize("mappings, said", [
     (3, "Remove contoso? Its 3 link(s) to accounts are removed with it, and its 3 group mapping(s); the accounts "
         "stay."),
@@ -847,21 +868,33 @@ out(await save('sso-issuer', 'https://elsewhere.example.test', { provider: Objec
 
 
 def test_a_save_of_the_days_says_whom_they_hold_now():
-    """A save of the provider's days, or of what they end, answers how many linked accounts it holds from now on and
-    how many its days hold in all: the administrator is told both, as the other administrators are."""
+    """A save of the provider's days, or of what they end, answers how many linked accounts it holds from now on
+    (newly_held, by its days or by a refusal), how many its days hold (held_by_its_days) and how many a refusal or a
+    hold on record holds (held_by_a_refusal): the administrator is told each, as the other administrators are."""
     got = _node(SAVE + r"""
 byId('sso-tab-sessions').click();
 await tick();
 const more = await save('sso-freshness', '30', { changed: ['policy.sso_freshness_days'], held_by_its_days: 3,
-                                                 newly_held: 2 });
+                                                 held_by_a_refusal: 1, newly_held: 2 });
 const none = await save('sso-freshness', '60', { changed: ['policy.sso_freshness_days'], held_by_its_days: 3,
-                                                 newly_held: 0 });
-out({ more, none });
+                                                 held_by_a_refusal: 0, newly_held: 0 });
+const refused = await save('sso-freshness', '90', { changed: ['policy.sso_freshness_days'], held_by_its_days: 0,
+                                                    held_by_a_refusal: 1, newly_held: 1 });
+const nobody = await save('sso-freshness', '120', { changed: ['policy.sso_freshness_days'], held_by_its_days: 0,
+                                                    held_by_a_refusal: 0, newly_held: 0 });
+out({ more, none, refused, nobody });
 """)
-    assert got["more"] == ["Saved. 2 more linked account(s) have not signed in through it within its days as they are "
-                           "now: their password and passkeys do not sign them in until they have. They were told. 3 "
-                           "account(s) are held so in all.", "success"]
-    assert got["none"] == ["Saved. 3 linked account(s) are held to a sign-in through it by its days.", "success"]
+    assert got["more"] == ["Saved. 2 more linked account(s) are held to a sign-in through it now: their password and "
+                           "passkeys do not sign them in until a sign-in through it admits them. They were told. 3 "
+                           "linked account(s) are held because they have not signed in through it within its days. 1 "
+                           "linked account(s) are held by a refusal or a hold: see the Identities page.", "success"]
+    assert got["none"] == ["Saved. 3 linked account(s) are held because they have not signed in through it within its "
+                           "days.", "success"]
+    assert got["refused"] == ["Saved. 1 more linked account(s) are held to a sign-in through it now: their password "
+                              "and passkeys do not sign them in until a sign-in through it admits them. They were "
+                              "told. 1 linked account(s) are held by a refusal or a hold: see the Identities page.",
+                              "success"]
+    assert got["nobody"] == ["Saved.", "success"]
 
 
 def test_a_save_that_lets_accounts_hold_a_password_again_says_how_they_get_one_on_this_vault():

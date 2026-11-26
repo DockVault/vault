@@ -55,7 +55,8 @@
 
     const lines = (value) => String(value || '').split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
     // Required groups are one on each line: a group's name may hold a comma (a distinguished name has several), and
-    // a group is matched letter for letter (sso_policy.restriction), so it is never cut at one.
+    // a group is matched letter for letter (sso_policy.restriction), so it is never cut at one. Each line is trimmed:
+    // the server trims each entry of this list too (unlike a mapping's group, which is kept as typed).
     const groupLines = (value) => String(value || '').split(/\n+/).map((s) => s.trim()).filter(Boolean);
     const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
     // The deployment's lock, as the last read of the list says.
@@ -298,14 +299,8 @@
                 if (out.owners_told) {
                     told += ` The ${out.owners_told} account(s) linked to it were told it was pointed somewhere else.`;
                 }
-                // Whom the provider's days hold now that they changed (the other administrators are told the same).
-                if (out.newly_held) {
-                    told += ` ${out.newly_held} more linked account(s) have not signed in through it within its days `
-                        + 'as they are now: their password and passkeys do not sign them in until they have. They were '
-                        + `told. ${out.held_by_its_days} account(s) are held so in all.`;
-                } else if (out.held_by_its_days) {
-                    told += ` ${out.held_by_its_days} linked account(s) are held to a sign-in through it by its days.`;
-                }
+                // Whom the provider holds now that its days changed (the other administrators are told the same).
+                told += heldSaid(out);
                 showToast(told, out.turned_off && standsIn(out) ? 'warning' : 'success');
                 delete drafts[page];                       // this page was saved; the others keep what was typed
                 drawDialog({ keep: false, focus: 'sso-save' });
@@ -318,6 +313,22 @@
             }
         });
         return bar;
+    }
+
+    // Whom a save of the provider's days holds to a sign-in through it, as PATCH answers it: held_by_its_days (they
+    // have not signed in through it within its days) and held_by_a_refusal (a refusal or a hold on record).
+    // newly_held counts both, held from this save on. Empty when nobody is held.
+    function heldSaid(out) {
+        const byDays = Number(out.held_by_its_days) || 0;
+        const byRefusal = Number(out.held_by_a_refusal) || 0;
+        let said = '';
+        if (out.newly_held) {
+            said += ` ${out.newly_held} more linked account(s) are held to a sign-in through it now: their password and `
+                + 'passkeys do not sign them in until a sign-in through it admits them. They were told.';
+        }
+        if (byDays) said += ` ${byDays} linked account(s) are held because they have not signed in through it within its days.`;
+        if (byRefusal) said += ` ${byRefusal} linked account(s) are held by a refusal or a hold: see the Identities page.`;
+        return said;
     }
 
     // What a page of the dialog holds, as the fields to send: only those that differ from the provider as read.
@@ -1029,6 +1040,34 @@
         }
     }
 
+    // What a mapping's write did besides the mapping, as POST, PATCH and DELETE answer it: the linked accounts a
+    // sign-in may now take out of a department (may_leave), the open administrator requests it ended
+    // (requests_ended), and the administrators approved through the group who keep the role (administrators_kept).
+    // Nothing is said for none.
+    function mappingAfterSaid(out) {
+        if (!out) return '';
+        let said = '';
+        (Array.isArray(out.may_leave) ? out.may_leave : []).forEach((one) => {
+            const n = Number(one && one.accounts) || 0;
+            const name = one && one.department && one.department.name;
+            if (!n || !name) return;
+            said += n === 1 ? ` One linked account in ${name} may leave it at its next sign-in.`
+                : ` ${n} linked accounts in ${name} may leave it at their next sign-in.`;
+        });
+        const ended = Number(out.requests_ended) || 0;
+        if (ended) {
+            said += ended === 1 ? ' One open administrator request was ended.'
+                : ` ${ended} open administrator requests were ended.`;
+        }
+        const kept = Number(out.administrators_kept) || 0;
+        if (kept) {
+            said += (kept === 1 ? ' One administrator approved through this group keeps the role'
+                : ` ${kept} administrators approved through this group keep the role`)
+                + ': take it away on the Users page if they should not keep it.';
+        }
+        return said;
+    }
+
     // After a write the server accepted: say so, read the list again, and the card's counts.
     function mappingWritten(ctx, said, kind) {
         showToast(said, kind || 'success');
@@ -1099,9 +1138,10 @@
             if (!ok) return;
             remove.disabled = true;
             try {
-                await apiRequest(`${mappingsPath(ctx.providerId)}/${encodeURIComponent(mapping.id)}`,
+                const out = await apiRequest(`${mappingsPath(ctx.providerId)}/${encodeURIComponent(mapping.id)}`,
                     { method: 'DELETE', silent: true });
-                mappingWritten(ctx, `The mapping of the group ${mapping.provider_group} was removed.`);
+                mappingWritten(ctx, `The mapping of the group ${mapping.provider_group} was removed.`
+                    + mappingAfterSaid(out));
             } catch (e) {
                 showToast(e.message || 'The mapping was not removed.', 'error');
                 // Read again whatever the answer: the list says how the mappings stand now.
@@ -1142,7 +1182,8 @@
             if (ctx.locked) return;
             const before = { provider_group: mapping.provider_group,
                 department_id: mapping.department ? mapping.department.id : null, role: mapping.role || null };
-            const now = { provider_group: form.name.value.trim(), department_id: form.department.value || null,
+            // The group is sent as typed: the server keeps and matches it letter for letter, spaces included.
+            const now = { provider_group: form.name.value, department_id: form.department.value || null,
                 role: form.role.value || null };
             const body = changed(now, before);
             if (!Object.keys(body).length) { mappingSaying(form, said, 'Nothing was changed.'); return; }
@@ -1154,7 +1195,7 @@
                 const name = (out && out.mapping && out.mapping.provider_group) || now.provider_group;
                 if (out && Array.isArray(out.changed) && !out.changed.length) mappingWritten(ctx, 'Nothing was changed.', 'info');
                 else mappingWritten(ctx, `The mapping of the group ${name} was changed. It applies from each person's `
-                    + 'next sign-in through this provider.');
+                    + 'next sign-in through this provider.' + mappingAfterSaid(out));
             } catch (e) {
                 save.disabled = false;
                 mappingRefused(e, form, said, 'The mapping was not changed.');
@@ -1194,7 +1235,8 @@
         if (full && !ctx.locked) said.textContent = `A provider holds at most ${limit} group mappings. Remove one first.`;
         add.addEventListener('click', async () => {
             if (ctx.locked || full) return;
-            const body = { provider_group: form.name.value.trim() };
+            // As typed: the server keeps and matches the group letter for letter, spaces included.
+            const body = { provider_group: form.name.value };
             if (form.department.value) body.department_id = form.department.value;
             if (form.role.value) body.role = form.role.value;
             add.disabled = true;
@@ -1204,7 +1246,7 @@
                 const name = (out && out.mapping && out.mapping.provider_group) || body.provider_group;
                 said.textContent = '';
                 mappingWritten(ctx, `The group ${name} is mapped. It applies from each person's next sign-in through `
-                    + 'this provider.');
+                    + 'this provider.' + mappingAfterSaid(out));
             } catch (e) {
                 add.disabled = false;
                 mappingRefused(e, form, said, 'The mapping was not added.');
@@ -1345,6 +1387,16 @@
         } catch (e) {
             // Whatever the refusal, the list is read again: one that came after the step-up may have held accounts.
             load();
+            // Sessions that came through it still stand: the server says so before it asks for any step-up, and
+            // "Turn off again" ends them. The keyboard goes to that button.
+            if (e.reason === 'sessions_standing') {
+                showToast(e.message || 'Sessions that came through this provider still stand.', 'error');
+                if (open && open.id === asked) {
+                    if (!stands(asked)) standing[asked] = null;   // how many is in the server's sentence
+                    drawDialog({ focus: 'sso-end-sessions' });
+                }
+                return;
+            }
             if (!TO_IDENTITIES.includes(e.reason)) {
                 showToast(e.message || 'The provider was not removed.', 'error');
                 return;

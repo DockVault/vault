@@ -83,14 +83,15 @@ function provider(name, policy, state) {
 """
 
 
-def _node(scenario):
+def _node(scenario, names=("collectAccountsPolicy", "_confirmSignUpListChange", "brandShowNameValue", "saveAllSettings"),
+          report=None):
     node = shutil.which("node")
     assert node, "Node is required: the page's own code must not be skipped"
-    helpers = "\n".join(_function(n) for n in ("collectAccountsPolicy", "_confirmSignUpListChange",
-                                                 "saveAllSettings"))
-    script = (PRELUDE + helpers + "\n(async () => {\n" + scenario
-              + "\nout({ asked, confirms, toasts,"
-              + " sent: sent.map((s) => [s.signup_email_domain_mode, s.signup_email_domains]) });"
+    helpers = "\n".join(_function(n) for n in names)
+    if report is None:
+        report = ("out({ asked, confirms, toasts,"
+                  " sent: sent.map((s) => [s.signup_email_domain_mode, s.signup_email_domains]) });")
+    script = (PRELUDE + helpers + "\n(async () => {\n" + scenario + "\n" + report
               + "\n})().catch((e) => { print('FAILED ' + e.stack); process.exit(1); });\n")
     done = subprocess.run([node, "-"], input=script, capture_output=True, text=True, encoding="utf-8", timeout=60,
                           cwd=str(ROOT), env=dict(os.environ, TZ="UTC"))
@@ -238,6 +239,41 @@ await saveAllSettings();
 """)
     assert len(got["confirms"]) == 1
     assert got["sent"] == [["off", []], ["off", []]]
+
+
+def test_the_domain_gate_stays_editable_with_self_signup_off():
+    """Accepting an invitation is held to the gate, and so is a provider with the tick: turning self-signup off leaves
+    the gate, and its domain list while the gate is on, usable, and the summary still names the gate."""
+    got = _node(r"""
+globalThis.accountsPublicAddress = true;
+globalThis.renderLoginIdentifierWarning = () => {};
+const el = (id) => document.getElementById(id);
+const read = () => ({ mode: !!el('setting-signup-domain-mode').disabled,
+                      input: !!el('setting-signup-domain-input').disabled,
+                      add: !!el('setting-signup-domain-add').disabled,
+                      summary: el('accounts-policy-summary').textContent });
+el('setting-signup-enabled').checked = false;
+el('setting-signup-domain-mode').value = 'off';
+accountsDomains = [];
+refreshAccountsPolicyUI();
+const off = read();
+el('setting-signup-domain-mode').value = 'allowlist';
+accountsDomains = ['example.com'];
+refreshAccountsPolicyUI();
+const allow = read();
+el('setting-signup-domain-mode').value = 'denylist';
+refreshAccountsPolicyUI();
+const deny = read();
+""", names=("refreshAccountsPolicyUI", "updateAccountsSummary"),
+        report="out({ off, allow, deny });")
+    assert (got["off"]["mode"], got["off"]["input"], got["off"]["add"]) == (False, True, True)
+    assert (got["allow"]["mode"], got["allow"]["input"], got["allow"]["add"]) == (False, False, False)
+    assert (got["deny"]["mode"], got["deny"]["input"], got["deny"]["add"]) == (False, False, False)
+    assert "Self-signup is off." in got["allow"]["summary"]
+    assert ("Signing up and accepting an invitation are restricted to 1 listed email domain(s)."
+            in got["allow"]["summary"])
+    assert "Signing up and accepting an invitation are blocked for 1 listed email domain(s)." in got["deny"]["summary"]
+    assert "listed email domain" not in got["off"]["summary"]
 
 
 def test_the_domain_lists_help_says_a_provider_can_be_held_to_it():

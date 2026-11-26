@@ -80,8 +80,10 @@ def test_sub_controls_follow_their_master_switches(page: Page, admin_creds):
     # so this tests the follow-the-master behavior independent of the shipped default.
     page.set_checked("#setting-invite-enabled", False)
     expect(ttl).to_be_disabled()
+    # The email domain gate also holds invitations and single sign-on providers to it, so it stays editable
+    # with self-signup off.
     page.set_checked("#setting-signup-enabled", False)
-    expect(mode).to_be_disabled()
+    expect(mode).to_be_enabled()
     # turning the masters on enables them
     page.set_checked("#setting-invite-enabled", True)
     expect(ttl).to_be_enabled()
@@ -110,6 +112,85 @@ def test_domain_chip_add_and_remove(page: Page, admin_creds):
     # remove it
     chip.locator(".chip-remove").click()
     expect(page.locator("#setting-signup-domains-list .chip")).to_have_count(0)
+
+
+def test_domain_gate_stays_editable_with_self_signup_off(page: Page, admin_creds):
+    """Accepting an invitation is held to the gate too, so turning self-signup off leaves it usable."""
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_accounts_tab(page)
+    expect(page.locator("#setting-invite-enabled")).to_be_checked()     # the settings load has landed
+    page.set_checked("#setting-signup-enabled", False)
+    mode = page.locator("#setting-signup-domain-mode")
+    expect(mode).to_be_visible()
+    expect(mode).to_be_enabled()
+    page.select_option("#setting-signup-domain-mode", "allowlist")
+    inp = page.locator("#setting-signup-domain-input")
+    expect(inp).to_be_visible()
+    expect(inp).to_be_enabled()
+
+
+# One enabled provider that makes accounts at a first sign-in, holds people to the sign-up list and has no tenant,
+# domain or required group of its own: the allow-list is all that says who may sign in through it.
+RELYING_PROVIDER = {
+    "id": "p-contoso", "name": "Contoso", "label": "Sign in with Contoso", "state": "enabled",
+    "policy": {"sso_use_signup_domains": True, "sso_account_creation": "jit", "sso_link_by_email": False,
+               "sso_allowed_tenants": [], "sso_allowed_domains": [], "sso_required_groups": []},
+}
+
+
+def _answer_providers(page: Page, providers):
+    def handle(route):
+        if route.request.method == "GET":
+            route.fulfill(status=200, json={"providers": providers, "presets": []})
+        else:
+            route.continue_()
+    page.route("**/admin/sso/providers", handle)
+
+
+def _settings_puts(page: Page):
+    puts = []
+    page.on("request", lambda r: puts.append(r.url)
+            if r.method == "PUT" and r.url.split("?")[0].endswith("/settings") else None)
+    return puts
+
+
+def test_turning_the_allow_list_off_asks_when_a_provider_relies_on_it(page: Page, admin_creds, admin,
+                                                                      restore_settings):
+    admin.put("/settings", json={"signup_email_domain_mode": "allowlist", "signup_email_domains": ["example.com"]})
+    _answer_providers(page, [RELYING_PROVIDER])
+    puts = _settings_puts(page)
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_accounts_tab(page)
+    expect(page.locator("#setting-signup-domain-mode")).to_have_value("allowlist")
+    page.select_option("#setting-signup-domain-mode", "off")
+    page.click("#save-all-settings-btn")
+    modal = page.locator("#confirm-modal")
+    expect(modal).to_be_visible(timeout=8000)
+    expect(page.locator("#confirm-modal-title")).to_have_text("Single sign-on depends on the sign-up list")
+    expect(page.locator("#confirm-modal-message")).to_contain_text("“Contoso”")
+    expect(page.locator("#confirm-modal-message")).to_contain_text("makes accounts at a first sign-in")
+    page.click("#confirm-modal-cancel-btn")
+    expect(modal).to_be_hidden()
+    page.wait_for_timeout(800)
+    assert puts == [], f"a Cancel must send no PUT /settings: {puts}"
+    assert admin.get("/settings").json().get("signup_email_domain_mode") == "allowlist"
+
+
+def test_turning_the_allow_list_off_saves_without_asking_when_no_provider_relies_on_it(
+        page: Page, admin_creds, admin, restore_settings):
+    admin.put("/settings", json={"signup_email_domain_mode": "allowlist", "signup_email_domains": ["example.com"]})
+    unticked = dict(RELYING_PROVIDER, policy=dict(RELYING_PROVIDER["policy"], sso_use_signup_domains=False))
+    _answer_providers(page, [unticked])
+    puts = _settings_puts(page)
+    _login(page, admin_creds["username"], admin_creds["password"])
+    _open_accounts_tab(page)
+    expect(page.locator("#setting-signup-domain-mode")).to_have_value("allowlist")
+    page.select_option("#setting-signup-domain-mode", "off")
+    with page.expect_request(lambda r: r.method == "PUT" and r.url.split("?")[0].endswith("/settings"),
+                             timeout=8000):
+        page.click("#save-all-settings-btn")
+    expect(page.locator("#confirm-modal")).to_be_hidden()
+    assert len(puts) == 1
 
 
 def test_email_change_toggle_disabled_without_smtp(page: Page, admin_creds, admin, restore_settings):

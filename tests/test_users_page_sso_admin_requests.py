@@ -2,8 +2,9 @@
 
 A provider that maps a group to the administrator role does not grant it at a sign-in: the sign-in raises a request
 that waits seven days for an administrator's approval, and the administrators' notice sends them to the Users page.
-The page shows the waiting requests, with Approve and Deny for an administrator who may decide one and the reason
-in their place for one who may not, and the decided ones (the last fifty) folded away. An approval that took back a
+The page shows the waiting requests, with Approve where the administrator may approve one, Deny where they may deny
+it (a request that can no longer be approved may still be denied), and the reason in place of Approve for one they may
+not approve, and the decided ones (the last fifty) folded away. An approval that took back a
 password someone else had set hands its reset link over as a promotion does. Nothing shows when there is nothing.
 
 Driven in Node against the page's own functions, on the small document of tests/js/mini_dom.js.
@@ -67,11 +68,16 @@ const PATH = '/admin/sso/admin-requests';
 const HELD = [
     { id: 'r-1', username: 'bob', provider: 'Contoso', provider_group: 'vault-admins', requested_at: '2026-06-14T09:00:00Z',
       expires_at: '2026-06-21T09:00:00Z', state: 'held', decided_by: null, decided_at: null, you_may_decide: true,
-      refusal: null },
+      you_may_deny: true, refusal: null },
     { id: 'r-2', username: 'carol', provider: 'Contoso', provider_group: 'vault-admins',
       requested_at: '2026-06-13T09:00:00Z', expires_at: '2026-06-20T09:00:00Z', state: 'held', decided_by: null,
-      decided_at: null, you_may_decide: false,
+      decided_at: null, you_may_decide: false, you_may_deny: false,
       refusal: "You made or approved a change to this account's sign-in details in the last 14 days." }];
+// One that can no longer be approved (its mapping was removed) and may still be denied.
+const GONE = { id: 'r-5', username: 'gus', provider: 'Contoso', provider_group: 'vault-admins',
+    requested_at: '2026-06-14T10:00:00Z', expires_at: '2026-06-21T10:00:00Z', state: 'held', decided_by: null,
+    decided_at: null, you_may_decide: false, you_may_deny: true,
+    refusal: 'The group is no longer mapped to the administrator role.' };
 const DECIDED = [
     { id: 'r-3', username: 'dan', provider: 'Contoso', provider_group: 'vault-admins', requested_at: '2026-06-01T09:00:00Z',
       expires_at: '2026-06-08T09:00:00Z', state: 'approved', decided_by: 'erin', decided_at: '2026-06-02T09:00:00Z',
@@ -117,7 +123,7 @@ out({ shown: block.style.display || '', held: rows(list), decided: rows(decidedL
     assert bob == {"id": "r-1", "text": ["bob signed in through Contoso in the group vault-admins, which is mapped to "
                                          "the administrator role.", f"Requested {t[0]} · expires {t[1]}"],
                    "actions": [["button", "Approve", "Approve bob"], ["button", "Deny", "Deny bob"]]}
-    # One this administrator may not decide: the reason in place of the buttons.
+    # One this administrator may neither approve nor deny: the reason in place of the buttons.
     assert carol == {"id": "r-2", "text": ["carol signed in through Contoso in the group vault-admins, which is "
                                            "mapped to the administrator role.", f"Requested {t[2]} · expires {t[3]}"],
                      "actions": [["span", "You made or approved a change to this account's sign-in details in the "
@@ -127,6 +133,34 @@ out({ shown: block.style.display || '', held: rows(list), decided: rows(decidedL
     assert fay["text"] == ["fay, through Contoso (group vault-admins)",
                            f"Expired {t[5]}: nobody decided within 7 days."]
     assert dan["actions"] == [] and fay["actions"] == []
+
+
+def test_a_request_that_can_no_longer_be_approved_may_still_be_denied():
+    """Approve follows you_may_decide and Deny follows you_may_deny: the server answers them apart."""
+    got = _node(r"""
+answers[PATH] = { held: [GONE], decided: [] };
+answers[PATH + '/r-5/deny'] = { request: Object.assign({}, GONE, { state: 'denied' }) };
+await loadSsoAdminRequests();
+const shown = rows(list);
+button('Deny gus').click();
+await tick(); await tick(); await tick();
+out({ shown, approve: !!button('Approve gus'), posts: asked.filter((a) => a.method === 'POST').map((a) => a.path),
+      toasts });
+""")
+    (gus,) = got["shown"]
+    assert gus["id"] == "r-5"
+    assert gus["actions"] == [["span", "The group is no longer mapped to the administrator role.", None],
+                              ["button", "Deny", "Deny gus"]]
+    assert got["approve"] is False
+    assert got["posts"] == ["/admin/sso/admin-requests/r-5/deny"]
+    assert got["toasts"] == [["success", "gus was not made an administrator; they are told."]]
+
+
+def test_the_page_shows_approve_and_deny_by_their_own_answers():
+    js = APP_JS.read_text(encoding="utf-8")
+    render = _function(js, "renderSsoAdminRequests")
+    assert "if (req.you_may_decide) {" in render and "if (req.you_may_deny) {" in render
+    assert render.index("'Approve'") < render.index("if (req.you_may_deny) {") < render.index("'Deny'")
 
 
 def test_nothing_shows_when_nothing_was_asked_or_the_list_cannot_be_read():
