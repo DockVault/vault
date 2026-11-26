@@ -250,7 +250,27 @@ def out():
         yield run_in(name, SCENARIO)
 
 
-THROUGH = "Sign in through Contoso: your account has not signed in there within the time your organisation allows"
+def _not_available(provider):
+    """What a door says while the vault's address cannot carry single sign-on (ALLOWED_HOSTS empty, or not https):
+    no sign-in through any provider starts then, so the provider is not available, whatever held the account."""
+    return (f"Your account signs in only through {provider} until it has signed in there again, and {provider} is "
+            "not available on this vault right now.")
+
+
+# The provider is named as its button names it, without the button's "Sign in with": "Sign in with Contoso" is
+# said as Contoso. Either sentence, as the stack's address can carry single sign-on or not.
+THROUGH = ("Sign in through Contoso: your account has not signed in there within the time your organisation allows",
+           _not_available("Contoso"))
+HELD = ("Your account is held to a sign-in through Contoso: ", _not_available("Contoso"))
+
+
+def _held_by_its_days(detail, provider):
+    """Whether ``detail`` is what the form and a passkey by itself say of an account whose days at ``provider`` (a
+    provider of the test's own, with no button on the sign-in page) have run out: the provider and the link to use,
+    or, where the stack's address cannot carry single sign-on, that the provider is not available here."""
+    if detail.startswith(f"Sign in through {provider}: "):
+        return detail.endswith("Use the sign-in link your organisation gave you.")
+    return detail.startswith(_not_available(provider)) and detail.endswith("Ask your administrator.")
 
 
 def test_a_held_account_is_refused_at_every_door_that_goes_through_no_provider(out):
@@ -281,7 +301,7 @@ def test_a_provider_that_only_pauses_the_keys_leaves_every_other_way_in(out):
 def test_a_refusal_holds_at_once_and_says_so(out):
     refused = out["refused"]
     assert refused["web"][:2] == ["refused", "SignInThroughProviderError"]
-    assert refused["web"][3].startswith("Your account is held to a sign-in through Contoso")
+    assert refused["web"][3].startswith(HELD), refused["web"]
     assert refused["passkey"][:3] == ["refused", "ProviderOnly", 403]
 
 
@@ -370,8 +390,7 @@ def test_the_form_and_sftp_refuse_a_held_account_and_its_open_connections_go_no_
         # The days run out.
         _signed_in_there(pid, 40)
         r = _form(name, password)
-        assert r.status_code == 403 and r.json()["detail"].startswith(f"Sign in through {provider}: "), r.text
-        assert r.json()["detail"].endswith("Use the sign-in link your organisation gave you.")
+        assert r.status_code == 403 and _held_by_its_days(r.json()["detail"], provider), r.text
         wrong = _form(name, "not-the-password-1!")
         assert wrong.status_code == 401 and wrong.json()["detail"] == "Invalid username or password"
         with pytest.raises(_REFUSED):
@@ -420,7 +439,7 @@ def test_a_passkey_by_itself_is_refused_for_a_held_account_and_signs_in_where_th
                                      json={"challenge_id": body["challenge_id"], "credential": credential}, timeout=15)
 
         r = by_itself(1)
-        assert r.status_code == 403 and r.json()["detail"].startswith(f"Sign in through {provider}: "), r.text
+        assert r.status_code == 403 and _held_by_its_days(r.json()["detail"], provider), r.text
         _policy(pid, sso_lapse_ends_sign_in=False)
         r = by_itself(2)
         assert r.status_code == 200 and r.json()["user"]["username"] == client.username, r.text

@@ -58,7 +58,8 @@ def test_the_owners_unlink_is_confirmed_by_a_fresh_sign_in_through_the_provider(
     assert out["detail"]["reason"] == "provider_confirmation_required"
     assert out["detail"]["action"] == sso.UNLINK_CONFIRMATION == "sso.identity.unlink"
     assert out["detail"]["provider"] == {"id": str(p.id), "label": p.label}
-    assert out["detail"]["message"] == f"Sign in through {p.label} once more to confirm it is you, then unlink it."
+    # The button's text is "Sign in with Contoso"; the sentence names the provider without the button's phrase.
+    assert out["detail"]["message"] == "Sign in through Contoso once more to confirm it is you, then unlink it."
     assert h.identities() == [identity]
     # The password an account has is never stood in for by its provider: a step-up's confirmation is still
     # refused to this account, and only the unlink's own may be started.

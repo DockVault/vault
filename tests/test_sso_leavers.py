@@ -189,7 +189,7 @@ def test_turning_a_provider_off_hands_nobody_a_password_back():
     assert getattr(j, "refused_at", None) is None
     p.state = "disabled"
     assert F.held_to_a_provider(db, lapsed).refused and F.held_to_a_provider(db, refused_one).refused
-    assert F.way_in_text(db, F.held_to_a_provider(db, lapsed)) == NOT_AVAILABLE.format("Sign in with Contoso")
+    assert F.way_in_text(db, F.held_to_a_provider(db, lapsed)) == NOT_AVAILABLE.format("Contoso")
     assert F.held_to_a_provider(db, fresh_one) is None
     # Sixty days off: the account that was inside its days is still not held, though its keys have paused.
     later = datetime.utcnow() + timedelta(days=60)
@@ -212,8 +212,8 @@ def test_the_provider_that_holds_the_account_is_the_one_it_is_told_about():
     assert F.lapsed(db, alice.id).provider_id == str(p.id)
     held = F.held_to_a_provider(db, alice)
     assert held.provider_id == str(q.id) and held.provider_name == "Fabrikam"
-    assert held.provider_label == "Sign in with Fabrikam"
-    assert F.way_in_text(db, held).startswith("Sign in through Sign in with Fabrikam: ")
+    assert held.provider_label == "Sign in with Fabrikam" and held.provider_spoken == "Fabrikam"
+    assert F.way_in_text(db, held).startswith("Sign in through Fabrikam: ")
     # Of two that hold the account, the one whose days ran out first is named.
     r = _provider(name="Northwind", label="Sign in with Northwind")
     k = _identity(alice, r, subject="subject-3", last_sign_in_at=datetime.utcnow() - timedelta(days=31))
@@ -231,7 +231,7 @@ def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
     alice, p, i, db = _world()
     held = F.held_to_a_provider(db, alice)
     assert F.way_in_text(db, held) == (
-        "Sign in through Sign in with Contoso: your account has not signed in there within the time your "
+        "Sign in through Contoso: your account has not signed in there within the time your "
         "organisation allows, so its password and passkeys do not sign it in until it does. Use the “Sign in with "
         "Contoso” button on the sign-in page.")
     p.show_on_sign_in = False
@@ -257,7 +257,7 @@ def test_what_the_person_is_told_names_the_provider_and_how_to_reach_it():
     p.state = "draft"                                    # nor one that is not finished
     assert F.way_in_text(db, refused) == gone
     db.tables[SsoProvider].clear()                       # no row to read: the name the deadline carries
-    assert F.way_in_text(db, held) == NOT_AVAILABLE.format(held.provider_label)
+    assert F.way_in_text(db, held) == NOT_AVAILABLE.format(held.provider_spoken)
 
 
 def test_the_person_is_told_of_another_provider_of_theirs_that_lets_them_in():
@@ -649,9 +649,9 @@ def test_a_held_account_is_not_linked_by_its_verified_email_at_another_provider(
     # The owner is told what works: the holding provider first, in the words its own doors use, and only then the
     # link. Not "link it under Your account", which is refused for a held account, as its password is.
     (ids, title, body), = [n for n in h.notice_bodies if n[1].endswith("with your address was kept out")]
-    assert ids == [str(bob.id)] and title == "A sign-in through Sign in with Fabrikam with your address was kept out"
+    assert ids == [str(bob.id)] and title == "A sign-in through Fabrikam with your address was kept out"
     assert F.way_in_text(h.db, F.held_to_a_provider(h.db, bob)) in body
-    assert "Once your account has signed in there, you can link Sign in with Fabrikam under Your account." in body
+    assert "Once your account has signed in there, you can link Fabrikam under Your account." in body
     assert "If that was you, link it there" not in body
     # The administrators are told: a person who can no longer sign in through one provider and tries another.
     (ids, title, body), = [n for n in h.notice_bodies if "tried to reach bob's account" in n[1]]
@@ -1127,8 +1127,8 @@ def test_a_held_account_with_no_password_to_type_is_not_told_it_can_link_under_y
         location, _ = _sign_in(h, other, sub="bob-at-fabrikam", email="bob@example.test")
         assert location == "/#sso-error=held_to_a_provider", location
         (ids, title, body), = [n for n in h.notice_bodies if n[1].endswith("with your address was kept out")]
-        said = "Once your account has signed in there, you can link Sign in with Fabrikam under Your account."
+        said = "Once your account has signed in there, you can link Fabrikam under Your account."
         assert (said in body) is types_one, body
-        assert body.endswith("If it was not you, your address at Sign in with Fabrikam may be in someone else's "
+        assert body.endswith("If it was not you, your address at Fabrikam may be in someone else's "
                              "hands: tell an administrator.")
         assert "  " not in body

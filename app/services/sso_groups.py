@@ -390,6 +390,12 @@ def may_leave(db, row, department_ids) -> list:
 
 # --------------------------------------------------------------------------- after the commit
 
+def _spoken(row) -> str:
+    """The provider as the person's sentences name it (app/services/sso_freshness.py, spoken_label)."""
+    from app.services import sso_freshness
+    return sso_freshness.spoken_label(row)
+
+
 def tell(db, row, user, applied: Applied, *, client_ip) -> None:
     """The audit rows and notices for what :func:`apply` did. Best effort, like every notice."""
     api = _api()
@@ -457,8 +463,9 @@ def tell(db, row, user, applied: Applied, *, client_ip) -> None:
                                     f"{REQUEST_DAYS} days, on the Users page."),
                               target="#users", dedup_prefix=f"sso_admin_request:{applied.request.id}")
             api._notify_users([str(user.id)], "sso_admin_request", title="Your administrator role waits for approval",
-                              body=(f"Your organisation's sign-in through {label} puts you in a group mapped to the "
-                                    "administrator role. An administrator must approve before the role is granted."),
+                              body=(f"Your organisation's sign-in through {_spoken(row) or label} puts you in a group "
+                                    "mapped to the administrator role. An administrator must approve before the role "
+                                    "is granted."),
                               target="#profile", dedup_prefix=f"sso_admin_request_own:{applied.request.id}")
         except Exception as exc:  # noqa: BLE001
             log.info("sso admin-request notice skipped: %s", type(exc).__name__)

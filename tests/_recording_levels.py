@@ -43,6 +43,49 @@ def levels_restored():
              "DELETE FROM data_requirements WHERE key = 'recording-levels'; END IF; END $$")
 
 
+ACTION = "admin.audit_privacy.write"
+
+
+def save(admin, password, levels):
+    """Save ``levels`` as the panel does: a password step-up for the action, then the PUT with its receipt.
+    Returns the answer's JSON.
+
+    A step-up is limited to ten an account in five minutes, and a run of tests that all confirm as the one
+    administrator reaches that (the limit answers 429, with no receipt). Then the save is made by a short-lived
+    second administrator confirming with its own password: the same rule, proven the same way
+    (_sf_helpers.put_settings_with_password does the same for the settings)."""
+    r = admin.post("/auth/second-factor/step-up", json={"action": ACTION, "method": "password", "code": password})
+    if r.status_code == 429:
+        return _save_as_a_second_administrator(admin, levels)
+    assert r.status_code == 200, r.text
+    saved = admin.put("/settings/recording", json={"levels": levels}, headers={"X-Second-Factor": r.json()["receipt"]})
+    assert saved.status_code == 200, saved.text
+    return saved.json()
+
+
+def _save_as_a_second_administrator(admin, levels):
+    from conftest import ApiClient
+
+    other = admin.create_user(role="admin")
+    done = False
+    try:
+        second = ApiClient()
+        second.login(other["_username"], other["_password"])
+        r = second.post("/auth/second-factor/step-up",
+                        json={"action": ACTION, "method": "password", "code": other["_password"]})
+        assert r.status_code == 200, r.text
+        saved = second.put("/settings/recording", json={"levels": levels},
+                           headers={"X-Second-Factor": r.json()["receipt"]})
+        assert saved.status_code == 200, saved.text
+        done = True
+        return saved.json()
+    finally:
+        gone = admin.delete_user(other["id"])
+        # Checked only when nothing else went wrong, so the first failure is the one reported.
+        if done:
+            assert gone.status_code in (200, 204), f"the second administrator was not removed: {gone.text}"
+
+
 def mark_all_read(version=None):
     version = version if version is not None else latest()[0]
     psql(f"UPDATE users SET privacy_seen_version = {int(version)}")

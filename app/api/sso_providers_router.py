@@ -510,7 +510,8 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     outcome = {**outcome, "turned_off": bool(turned_off), "sessions_ended": ended, "sessions_not_ended": standing,
                "held": held, "owners_told": len(owners), "held_by_its_days": len(by_days),
                "held_by_a_refusal": len(held_now) - len(by_days), "newly_held": len(newly_held)}
-    label = row.label or row.name
+    from app.services import sso_freshness
+    label = sso_freshness.spoken_label(row) or row.name        # as the people told below know it
     # The people the change holds from this moment had no warning of it (the warning counts five days down to the
     # days as they were): each is told now, in the app and by email, what stopped and what brings it back. Only
     # what the account has is named: one that signs in only through its provider has no password anybody types,
@@ -518,7 +519,6 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
     # Said as what was changed: the days themselves, or what running out of them stops (with the days as they
     # were, "changed how often it must have seen you" was not true).
     from datetime import datetime
-    from app.services import sso_freshness
     days_were_changed = "policy.sso_freshness_days" in outcome["changed"]
     what_changed = (f"An administrator changed how often {label} must have seen you."
                     if days_were_changed else
@@ -754,7 +754,8 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
         with_no_password = [(u.id, u.username, u.email) for u in told_of_it
                             if not _sign_in.has_a_password_it_can_type(u)]
         turned_off = held - len(told_of_it)
-        name, shown = row.name, row.label or row.name
+        from app.services.sso_freshness import spoken_label
+        name, shown = row.name, spoken_label(row) or row.name
         db.commit()
         _tell_administrators(current_user.username, "Accounts were held before a provider's removal", (
             f"{current_user.username} began to remove the single sign-on provider {name}. {held} account(s) had not "
@@ -769,7 +770,8 @@ def remove_provider(provider_id: str, request: Request, current_user: User = Dep
         _tell_accounts(with_no_password, "Your keys stay paused on this vault", paused)
         raise _refused(providers.held_by_the_removal(held))
     gone = {"provider_id": str(row.id), "name": row.name, "identities": providers.public(db, row)["identities"]}
-    label = row.label or row.name
+    from app.services.sso_freshness import spoken_label
+    label = spoken_label(row) or row.name                     # for the people who lose it
     # Each account linked to it loses a way to sign in, and its flag follows the providers it is still linked to
     # (one held to no password by this provider alone may hold a password again; nothing is minted).
     kept, may_set, to_ask = [], [], []
@@ -854,7 +856,8 @@ def _tell_of_requests_ended(ended: list, row) -> str:
     notice for them ("" for none). Best effort."""
     if not ended:
         return ""
-    label = row.label or row.name
+    from app.services.sso_freshness import spoken_label
+    label = spoken_label(row) or row.name
     try:
         api = _api()
         for request_id, account_id in ended:

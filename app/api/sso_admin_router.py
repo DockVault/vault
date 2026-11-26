@@ -304,7 +304,7 @@ def clear_identity_refusal(identity_id: str, request: Request, current_user: Use
     counts_for_a_removal = sso_freshness.lift_the_hold(identity, provider)
     label = ((provider.name or provider.label) if provider is not None else None) or "an identity provider"
     # The person knows the provider by its button; the name is the administrators'.
-    person_label = ((provider.label or provider.name) if provider is not None else None) or "an identity provider"
+    person_label = sso_freshness.spoken_label(provider) or "an identity provider"
     # What the lifting gives back, said as it is: the provider's days may have run out under the hold, another
     # provider of the account may hold it still, and a provider that is turned off signs nobody in.
     to_the_person = sso_freshness.after_a_hold_is_lifted(db, user, identity, provider, whose="your",

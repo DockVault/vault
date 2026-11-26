@@ -273,6 +273,55 @@ def test_the_person_reads_the_providers_button_text_and_the_administrators_its_n
     # A provider with no button text of its own: its button shows its name, and so does every sentence.
     p.label = None
     assert F.deadlines(db, alice.id)[0].provider_label == "entra-prod"
+    assert F.deadlines(db, alice.id)[0].provider_spoken == "entra-prod"
+
+
+@pytest.mark.parametrize("label, spoken", [
+    ("Sign in with Contoso", "Contoso"),
+    ("sign in with Contoso", "Contoso"),
+    ("SIGN IN WITH Contoso", "Contoso"),
+    ("Log in with Contoso", "Contoso"),
+    ("Login with Contoso", "Contoso"),
+    ("Continue with Contoso", "Contoso"),
+    ("Sign in through Contoso", "Contoso"),
+    ("  Sign in  with   Contoso SSO ", "Contoso SSO"),
+    ("Contoso", "Contoso"),                              # not such a phrase: whole
+    ("Staff sign-in", "Staff sign-in"),
+    ("Sign in", "Sign in"),
+    ("Sign in with", "Sign in with"),                    # the phrase alone: whole
+    ("Sign in with ", "Sign in with"),
+    ("Signing in with Contoso", "Signing in with Contoso"),
+    ("Contoso: sign in with it", "Contoso: sign in with it"),   # only a leading phrase is taken off
+])
+def test_the_person_reads_a_provider_without_its_buttons_phrase(label, spoken):
+    assert F.without_button_phrase(label) == spoken
+    assert F.spoken_label(types.SimpleNamespace(label=label, name="entra-prod")) == spoken
+
+
+def test_a_provider_is_spoken_of_by_its_name_when_it_has_no_label_and_its_button_is_quoted_whole():
+    """With no label the button shows the name, and the sentences say the name as it is. Where a sentence points
+    at the button, it quotes the label whole: that is what the person sees on the page."""
+    assert F.spoken_label(types.SimpleNamespace(label=None, name="entra-prod")) == "entra-prod"
+    assert F.spoken_label(types.SimpleNamespace(label="  ", name="Sign in with Contoso")) == "Sign in with Contoso"
+    assert F.spoken_label(types.SimpleNamespace(label=None, name=None)) == ""
+    assert F.spoken_label(None) == ""
+    alice = _user()
+    p = types.SimpleNamespace(id=uuid.uuid4(), name="entra-prod", label="Sign in with Contoso", state="enabled",
+                              show_on_sign_in=True, policy={"sso_freshness_days": 30})
+    i = types.SimpleNamespace(id=uuid.uuid4(), user_id=alice.id, provider_id=p.id, last_sign_in_at=NOW - 40 * DAY,
+                              linked_at=NOW - 90 * DAY, refused_at=None)
+    found = F.deadline_of(i, p)
+    assert (found.provider_name, found.provider_label, found.provider_spoken) == (
+        "entra-prod", "Sign in with Contoso", "Contoso")
+    assert F.refusal_text(found).startswith("Sign in through Contoso again: ")
+    assert F.how_to_sign_in(found) == ("Use the “Sign in with Contoso” button on the sign-in page (sign out first if "
+                                       "you are signed in).")
+    assert F.warning_text(found, "5 December 2026, 12:00 UTC").startswith("Sign in through Contoso by 5 December")
+    assert "Sign in through Sign in with" not in F.warning_text(found, "5 December 2026, 12:00 UTC")
+    # A deadline made without the field takes it from its label.
+    bare = F.Deadline(identity_id="i", user_id="u", provider_id="p", provider_name="entra-prod", due=NOW,
+                      refused=False, provider_label="Continue with Fabrikam")
+    assert bare.provider_spoken == "Fabrikam"
 
 
 def test_a_vault_address_single_sign_on_cannot_use_sends_nobody_to_a_button(monkeypatch):

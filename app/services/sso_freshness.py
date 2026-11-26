@@ -33,6 +33,7 @@ not sign in there within them signs in through the provider.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -49,6 +50,30 @@ LAPSE_MESSAGE_ALL = ("Sign in through {provider} again: {stops} {do} not sign yo
                      "credentials and devices are paused until you do.")
 ALL_THAT_STOPS = "your password and your passkeys"
 
+# A button label that is a phrase around the provider's name ("Sign in with Contoso"): in running text the person
+# reads the name alone ("sign in through Contoso"), not "sign in through Sign in with Contoso".
+_BUTTON_PHRASE = re.compile(r"^\s*(?:sign\s+in\s+with|log\s+in\s+with|login\s+with|continue\s+with|sign\s+in\s+through)"
+                            r"\s+(?=\S)", re.IGNORECASE)
+
+
+def without_button_phrase(label: str) -> str:
+    """``label`` with a leading button phrase taken off ("Sign in with ", "Log in with ", "Login with ", "Continue
+    with ", "Sign in through ", in any case): "Sign in with Contoso" gives "Contoso". A label that is not such a
+    phrase, or is the phrase alone, stays whole."""
+    text = (label or "").strip()
+    found = _BUTTON_PHRASE.match(text)
+    return text[found.end():].strip() if found else text
+
+
+def spoken_label(provider) -> str:
+    """How the person's sentences name ``provider`` in running text: its button label with a leading button phrase
+    taken off (:func:`without_button_phrase`), else its name; empty when it has neither. A sentence that points at
+    the button itself quotes the whole label (:func:`_button_name`)."""
+    label = (getattr(provider, "label", None) or "").strip()
+    if label:
+        return without_button_phrase(label)
+    return (getattr(provider, "name", None) or "").strip()
+
 
 @dataclass(frozen=True)
 class Deadline:
@@ -63,14 +88,19 @@ class Deadline:
     ends_sign_in: bool = False  # missed, it also closes the account's ways in that go through no provider
     provider_on: bool = True    # the provider is turned on here (its days close the other ways in only then)
     keys_only_hold: bool = False  # the hold on record is the vault's own, written while the days only paused keys
-    # What the sign-in page's button says (its label, else the name): the person knows the provider by it, so every
-    # sentence for the person names it so. The name is the administrators', and the person may never see it.
+    # What the sign-in page's button says (its label, else the name): the person knows the provider by it. Quoted
+    # whole where a sentence points at the button; the name is the administrators', and the person may never see it.
     provider_label: str = ""
     on_sign_in_page: bool = True  # the sign-in page shows its button (else the organisation hands out a link)
+    # The provider as the person's sentences name it in running text (:func:`spoken_label`): "Contoso" for a
+    # button that says "Sign in with Contoso".
+    provider_spoken: str = ""
 
     def __post_init__(self):
         if not self.provider_label:
             object.__setattr__(self, "provider_label", self.provider_name)
+        if not self.provider_spoken:
+            object.__setattr__(self, "provider_spoken", without_button_phrase(self.provider_label))
 
 
 def warning_lead(window_days: int) -> timedelta:
@@ -120,7 +150,8 @@ def deadline_of(identity, provider) -> Optional[Deadline]:
                     provider_on=getattr(provider, "state", None) == "enabled",
                     keys_only_hold=bool(refused and keys_only is not None and keys_only == refused_at),
                     provider_label=label or name or "your identity provider",
-                    on_sign_in_page=bool(getattr(provider, "show_on_sign_in", True)))
+                    on_sign_in_page=bool(getattr(provider, "show_on_sign_in", True)),
+                    provider_spoken=spoken_label(provider) or "your identity provider")
 
 
 def deadlines(db, user_id) -> List[Deadline]:
@@ -274,7 +305,7 @@ def another_way_in(db, found: Deadline) -> Optional[str]:
                                        # the account or is off: it is left out by one of the two)
         other = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
         if other is not None and getattr(other, "state", None) == "enabled":
-            name = _button_name(other)
+            name = spoken_label(other)
             if name:
                 others.append((name.lower(), name, other))
     if not others:
@@ -292,14 +323,14 @@ def way_in_text(db, found: Deadline) -> str:
     available then, as when it is off."""
     from app.core.models import SsoProvider
     from app.services import sso_sign_in
-    name = found.provider_label
+    name = found.provider_spoken
     row = None
     try:
         row = db.query(SsoProvider).filter(SsoProvider.id == uuid.UUID(found.provider_id)).first()
     except ValueError:
         row = None
     if row is not None:
-        name = _button_name(row) or name              # as the button says it now
+        name = spoken_label(row) or name              # as the button says it now
     if row is None or getattr(row, "state", None) != "enabled" or sso_sign_in.address_refusal():
         other = another_way_in(db, found)
         return (f"Your account signs in only through {name} until it has signed in there again, and {name} is not "
@@ -373,7 +404,7 @@ def after_a_hold_is_lifted(db, user, identity, provider, *, whose: str, now: Opt
     you = "you" if person else "it"
 
     def named(found: Deadline) -> str:
-        return found.provider_label if person else found.provider_name
+        return found.provider_spoken if person else found.provider_name
 
     # What of the account's own ways in a hold stops, named as the account has them (:func:`what_stops`).
     stops = what_stops(db, user) if user is not None else ""
@@ -451,9 +482,9 @@ def refusal_text(found: Deadline, *, sign_in_too: bool = False, stops: str = ALL
     (:func:`closes_the_other_ways_in`), naming ``stops`` (:func:`what_stops`): with nothing to name, the keys
     alone."""
     if sign_in_too and stops:
-        return LAPSE_MESSAGE_ALL.format(provider=found.provider_label, stops=stops,
+        return LAPSE_MESSAGE_ALL.format(provider=found.provider_spoken, stops=stops,
                                         do="does" if names_one(stops) else "do")
-    return LAPSE_MESSAGE.format(provider=found.provider_label)
+    return LAPSE_MESSAGE.format(provider=found.provider_spoken)
 
 
 def how_to_sign_in(found: Deadline) -> str:
@@ -464,7 +495,7 @@ def how_to_sign_in(found: Deadline) -> str:
     address cannot carry single sign-on no provider can be reached here: the administrator then."""
     from app.services import sso_sign_in
     if sso_sign_in.address_refusal():
-        return (f"This vault's sign-in page cannot offer {found.provider_label} right now: ask your "
+        return (f"This vault's sign-in page cannot offer {found.provider_spoken} right now: ask your "
                 "administrator.")
     if found.on_sign_in_page:
         return (f"Use the “{found.provider_label}” button on the sign-in page (sign out first if you are signed "
@@ -475,7 +506,7 @@ def how_to_sign_in(found: Deadline) -> str:
 def warning_text(found: Deadline, when: str, *, sign_in_too: bool = False, stops: str = ALL_THAT_STOPS) -> str:
     """What the warning email tells the person: the provider as its button names it, the date, what stops (``stops``
     where the other ways in close too: :func:`what_stops`), and how."""
-    name = found.provider_label
+    name = found.provider_spoken
     if sign_in_too and stops:
         return (f"Sign in through {name} by {when}. If you do not, {stops} {'stops' if names_one(stops) else 'stop'} "
                 "signing you in then, your SSH keys, temporary credentials and devices pause, and a sign-in "
@@ -570,7 +601,7 @@ def sweep(db, now: Optional[datetime] = None) -> dict:
         stops = what_stops(db, user) if too else ""
         details = {"provider_id": found.provider_id, "identity_id": found.identity_id,
                    "expires_at": found.due.isoformat() + "Z", "ends_sign_in": too}
-        name = found.provider_label         # the person knows the provider by its button
+        name = found.provider_spoken        # the person knows the provider by its button
         how = how_to_sign_in(found)
         if found.due > now:
             told = api._notify_users(
@@ -679,7 +710,7 @@ def end_access_on_refusal(db, row, answer, *, client_ip: Optional[str] = None,
         pass
     # The person, too: their keys stopped on another device with no word of why. Named as its button names it.
     try:
-        named = _button_name(row) or "your identity provider"
+        named = spoken_label(row) or "your identity provider"
         found = deadline_of(identity, row)
         stops = what_stops(db, user) if found is not None and closes_the_other_ways_in(db, user, found) else ""
         api._notify_users([str(user.id)], ENDED, title=f"{named} no longer admits your account here",

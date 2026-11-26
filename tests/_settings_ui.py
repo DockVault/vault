@@ -17,13 +17,21 @@ def is_phone(page: Page) -> bool:
 
 
 def open_drawer(page: Page) -> None:
-    """On a phone, open the sidebar drawer (a wide screen's rail is always there)."""
+    """On a phone, open the sidebar drawer (a wide screen's rail is always there), and wait for it to slide in.
+    The button says it is open at once, while the drawer is still off-screen: it slides in over .2s (mobile.css),
+    and a box measured before then is the closed drawer's, left of the screen."""
     if not is_phone(page):
         return
     toggle = page.locator("#mobile-nav-toggle")
     if toggle.get_attribute("aria-expanded") != "true":
         toggle.click()
     expect(toggle).to_have_attribute("aria-expanded", "true")
+    page.wait_for_function("""() => {
+        const drawer = document.getElementById('sidebar');
+        return getComputedStyle(drawer).visibility === 'visible'
+            && !drawer.getAnimations().some((a) => a.playState === 'running')
+            && drawer.getBoundingClientRect().left >= -0.5;
+    }""")
 
 
 def close_drawer(page: Page) -> None:

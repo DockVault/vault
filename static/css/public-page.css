@@ -147,7 +147,10 @@ button.quiet:hover:not(:disabled), .files .remove:hover:not(:disabled), .row but
     transition: border-color .12s, background .12s;
 }
 .drop.over, .drop:hover { border-color: var(--brand-secondary); background: var(--brand-glow); }
-.drop:focus-within { outline: none; border-color: var(--brand-secondary); box-shadow: var(--focus-ring); }
+.drop:focus-within { border-color: var(--brand-secondary); box-shadow: var(--focus-ring); }
+/* The file input inside is invisible, so the keyboard's focus shows on the zone: a solid outline in the link
+   colour, which reads on the light ground and the dark one. */
+.drop:has(input[type="file"]:focus-visible) { outline: 3px solid var(--brand-secondary); outline-offset: 2px; }
 .drop strong { color: var(--text-primary); }
 .drop input[type="file"] { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
 .files { list-style: none; margin: 0 0 1rem; padding: 0; }

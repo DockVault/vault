@@ -1608,8 +1608,7 @@ def renewal_refusal(db, user, provider_id, *, methods=(), subject: Optional[str]
         return unlinked
     provider = db.query(SsoProvider).filter(SsoProvider.id == row_id).first()
     # Named as its button names it: the person knows the provider by that, not by the administrators' name.
-    name = ((getattr(provider, "label", None) or "").strip() or (getattr(provider, "name", None) or "").strip()
-            or "your identity provider")
+    name = sso_freshness.spoken_label(provider) or "your identity provider"
     if provider is None or getattr(provider, "state", None) != "enabled":
         return f"Signing in through {name} is turned off. Sign in again another way, or ask an administrator."
     found = sso_freshness.deadline_of(identity, provider)

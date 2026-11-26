@@ -6,22 +6,17 @@ transaction, and the upgrade condition's detect query finds the same; setting th
 import pytest
 
 from _account_change_helpers import psql
-from _recording_levels import levels_restored  # noqa: F401 -- a fixture
+from _recording_levels import levels_restored, save  # noqa: F401 -- a fixture
 
 pytestmark = pytest.mark.integration
 
-ACTION = "admin.audit_privacy.write"
 DETECT = ("SELECT count(*) FROM audit_privacy_policies WHERE version = (SELECT max(version) FROM "
           "audit_privacy_policies) AND (signin_names <> 'full' OR emails <> 'full' OR ip <> 'full' OR "
           "user_agent <> 'full')")
 
 
 def _save(admin, password, levels):
-    receipt = admin.post("/auth/second-factor/step-up",
-                         json={"action": ACTION, "method": "password", "code": password}).json()["receipt"]
-    r = admin.put("/settings/recording", json={"levels": levels}, headers={"X-Second-Factor": receipt})
-    assert r.status_code == 200, r.text
-    return r.json()["version"]
+    return save(admin, password, levels)["version"]
 
 
 def _marker():

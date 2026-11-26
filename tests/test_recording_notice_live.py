@@ -9,19 +9,13 @@ import requests
 
 from conftest import BASE_URL
 from _account_change_helpers import psql
-from _recording_levels import latest, levels_restored, wait_for  # noqa: F401 -- a fixture
+from _recording_levels import latest, levels_restored, save, wait_for  # noqa: F401 -- a fixture
 
 pytestmark = pytest.mark.integration
 
-ACTION = "admin.audit_privacy.write"
-
 
 def _save(admin, password, levels):
-    receipt = admin.post("/auth/second-factor/step-up",
-                         json={"action": ACTION, "method": "password", "code": password}).json()["receipt"]
-    r = admin.put("/settings/recording", json={"levels": levels}, headers={"X-Second-Factor": receipt})
-    assert r.status_code == 200, r.text
-    return r.json()
+    return save(admin, password, levels)
 
 
 def test_the_notice_and_its_page_need_no_sign_in_and_show_no_earlier_version():

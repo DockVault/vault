@@ -875,7 +875,8 @@ def test_a_held_enrollment_registers_no_passkey_once_its_provider_no_longer_stan
     status, body = _call_h(h.S, "POST", options_path, {}, headers)
     assert status == refused_with, body
     if through is None:
-        assert "through Sign in with Contoso" in body["detail"], body          # its button's text
+        # Named without its button's "Sign in with", and its button quoted whole.
+        assert "through Contoso" in body["detail"] and "“Sign in with Contoso”" in body["detail"], body
     else:
         assert body["detail"] == "This sign-in cannot be completed; start again.", body
     status, body = _call_h(h.S, "POST", verify_path, {"challenge_id": "ab" * 16, "credential": {}}, headers)

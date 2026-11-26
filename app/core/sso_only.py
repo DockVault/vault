@@ -513,12 +513,13 @@ def another_way_in(db, user, *, without) -> bool:
 def _providers_to_name(db, user, *, at_this_address: bool = True) -> tuple:
     """(the names to tell the person, the button labels on the sign-in page) of the enabled providers ``user`` is
     linked to, each once, in the order found. A provider is named to the person as its button names it (its label,
-    else its name): the person knows it by that, and the name is the administrators'. None while the vault's address
-    cannot carry single sign-on: the sign-in page shows no provider's button then, and no sign-in through one
-    starts, so naming one would send the person where nothing answers. ``at_this_address`` False asks only
-    whether an enabled provider vouches for the account, whatever the address."""
+    else its name): the person knows it by that, and the name is the administrators'. Named without the button's
+    leading phrase (app/services/sso_freshness.py, spoken_label), and quoted whole as the button. None while the
+    vault's address cannot carry single sign-on: the sign-in page shows no provider's button then, and no sign-in
+    through one starts, so naming one would send the person where nothing answers. ``at_this_address`` False asks
+    only whether an enabled provider vouches for the account, whatever the address."""
     from app.core.models import ExternalIdentity, SsoProvider
-    from app.services import sso_sign_in
+    from app.services import sso_freshness, sso_sign_in
     if at_this_address and sso_sign_in.address_refusal():
         return [], []
     names, buttons = [], []
@@ -528,8 +529,9 @@ def _providers_to_name(db, user, *, at_this_address: bool = True) -> tuple:
             continue
         name = (getattr(row, "name", None) or "").strip()
         label = (getattr(row, "label", None) or "").strip() or name       # the button shows the name when no label
-        if label and label not in names:
-            names.append(label)
+        spoken = sso_freshness.spoken_label(row)
+        if spoken and spoken not in names:
+            names.append(spoken)
         if getattr(row, "show_on_sign_in", True):
             if label and label not in buttons:
                 buttons.append(label)
@@ -558,12 +560,13 @@ def passkey_note(db, user) -> Optional[str]:
     if not getattr(user, "sso_only", False):
         return None
     from app.core.models import ExternalIdentity, SsoProvider
+    from app.services import sso_freshness
     names = []
     for identity in db.query(ExternalIdentity).filter(ExternalIdentity.user_id == user.id).all():
         row = db.query(SsoProvider).filter(SsoProvider.id == identity.provider_id).first()
         if row is None or getattr(row, "state", None) != "enabled":
             continue
-        name = (getattr(row, "label", None) or "").strip() or (getattr(row, "name", None) or "").strip()
+        name = sso_freshness.spoken_label(row)
         if name and name not in names:
             names.append(name)
     through = " or ".join(names) if names else "its own sign-in"

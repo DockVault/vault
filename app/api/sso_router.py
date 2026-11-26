@@ -1068,6 +1068,8 @@ def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
     api = _api()
     user = found.user
     label = (row.label or row.name) if row is not None else "single sign-on"
+    # The person reads the provider as its button names it, without the button's "Sign in with".
+    spoken = (sso_freshness.spoken_label(row) if row is not None else "") or label
     if found.invitation is not None:
         inv = found.invitation
         _audit(db, "account_invitation_accepted", user=user, ip=client_ip, resource_type="account_invitation",
@@ -1100,10 +1102,10 @@ def _record_resolution(db, row, found, *, client_ip, details: dict) -> None:
                     "made_sso_only": bool(found.password_stopped)})
     if found.linked_by == sso.LINKED_BY_EMAIL:
         _tell_owner(db, user, row, "A sign-in method was added",
-                    f"Single sign-on with {label} was linked to your account by a sign-in with your verified email address."
-                    + (PASSWORD_STOPPED.format(label=label) if found.password_stopped else ""),
+                    f"Single sign-on with {spoken} was linked to your account by a sign-in with your verified email address."
+                    + (PASSWORD_STOPPED.format(label=spoken) if found.password_stopped else ""),
                     # Not made from the account: a sign-in at the provider with the person's address made it.
-                    advice=(f"If you did not sign in through {label} just now, tell an administrator at once: your "
+                    advice=(f"If you did not sign in through {spoken} just now, tell an administrator at once: your "
                             "address there may be in someone else's hands."))
         # A link nobody at the vault asked for: the administrators are told of each, as of an account made at a
         # first sign-in.
@@ -1234,7 +1236,7 @@ async def finish_link(
     _audit(db, "sso_identity_linked", user=current_user, ip=client_ip,
            details={"provider_id": str(row.id), "purpose": sso_state.LINK, "identity_id": str(identity.id),
                     "linked_by": "self", "made_sso_only": bool(password_stopped)})
-    label = row.label or row.name
+    label = sso_freshness.spoken_label(row) or row.name
     who = sso.identity_shown(identity)
     _tell_owner(db, current_user, row, "A sign-in method was added to your account",
                 f"You linked your account to {label}{' as ' + who if who else ''}: it can now sign in through it."
@@ -1344,13 +1346,14 @@ def _tell_of_a_held_account_kept_out(db, row, user, label: str, key: str) -> Non
     # "You can link it under Your account" is said to an account that can: a link is started with the account's
     # password, so one that has none it can type (it signs in only through its provider) never could.
     from app.services import sign_in as _sign_in
-    can_link = (f" Once your account has signed in there, you can link {label} under Your account."
+    spoken = sso_freshness.spoken_label(row) or label
+    can_link = (f" Once your account has signed in there, you can link {spoken} under Your account."
                 if _sign_in.has_a_password_it_can_type(user) else "")
     api._notify_users([str(user.id)], "account_changed",
-                      title=f"A sign-in through {label} with your address was kept out",
-                      body=(f"Someone signed in through {label} with your email address. Nobody was signed in to your "
+                      title=f"A sign-in through {spoken} with your address was kept out",
+                      body=(f"Someone signed in through {spoken} with your email address. Nobody was signed in to your "
                             f"account and nothing was linked. {first}{can_link} If it was not you, your address at "
-                            f"{label} may be in someone else's hands: tell an administrator."),
+                            f"{spoken} may be in someone else's hands: tell an administrator."),
                       target="#profile", dedup_prefix=key, once=True)
     # (The held account is never one of them: an administrator is not held.)
     admins = [str(a.id) for a in db.query(User).filter(User.role == RoleEnum.ADMIN).all() if a.is_active]
@@ -1388,6 +1391,7 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
         return
     api = _api()
     label = (getattr(row, "label", None) or getattr(row, "name", None) or "a provider").strip()
+    spoken = sso_freshness.spoken_label(row) or label     # what the owner's sentences call it
     key = f"sso_kept_out:{row.id}:{datetime.utcnow():%Y-%m-%d}"
     try:
         detail = getattr(refusal, "detail", "") or ""
@@ -1404,19 +1408,19 @@ def _tell_of_a_sign_in_kept_out(db, row, refusal) -> None:
             from app.core import privileged_accounts
             whom = ("another administrator" if detail.endswith(":" + privileged_accounts.ADMINISTRATOR)
                     else "an administrator")
-            body = (f"Someone signed in through {label} with your email address. Nobody was signed in to your account "
+            body = (f"Someone signed in through {spoken} with your email address. Nobody was signed in to your account "
                     "and nothing was linked: an administrator's or auditor's account is linked to a provider only "
                     "from Your account, after its password and, where it has one, its second factor."
-                    + (f" {label} signs its people in without a local password, and an administrator's or auditor's "
-                       f"account keeps one, so your account cannot be linked to {label}." if sso_only.password_less(row) else
-                       f" If that was you, link {label} there.")
-                    + f" If it was not, your address at {label} may be in someone else's hands: tell {whom}.")
+                    + (f" {spoken} signs its people in without a local password, and an administrator's or auditor's "
+                       f"account keeps one, so your account cannot be linked to {spoken}." if sso_only.password_less(row) else
+                       f" If that was you, link {spoken} there.")
+                    + f" If it was not, your address at {spoken} may be in someone else's hands: tell {whom}.")
         else:
-            body = (f"Someone signed in through {label} with your email address. Nobody was signed in to your "
-                    f"account and nothing was linked: your account is linked to {label} only by you, under Your "
-                    f"account. If that was you, link it there. If it was not, your address at {label} may be in "
+            body = (f"Someone signed in through {spoken} with your email address. Nobody was signed in to your "
+                    f"account and nothing was linked: your account is linked to {spoken} only by you, under Your "
+                    f"account. If that was you, link it there. If it was not, your address at {spoken} may be in "
                     "someone else's hands: tell an administrator.")
-        api._notify_users([str(user.id)], "account_changed", title=f"A sign-in through {label} with your address was kept out",
+        api._notify_users([str(user.id)], "account_changed", title=f"A sign-in through {spoken} with your address was kept out",
                           body=body, target="#profile", dedup_prefix=key, once=True)
         if detail == sso.ADDRESS_ON_AN_UNCONFIRMED_ACCOUNT:
             # A first sign-in that made no account: its verified address is written on an account that never
@@ -1489,8 +1493,8 @@ def owners_unlink_refusal(db, account, identity, row, *, now: Optional[datetime]
     if row is not None and linked_by in sso_only.MADE_THROUGH_THE_PROVIDER \
             and sso_only.holds_to_no_password(row, account, linked_by):
         return (UNLINK_MADE_HERE, (
-            f"Your account was made at its first sign-in through {row.label or row.name}, which stays its way in: "
-            "it is not unlinked here. Ask an administrator."))
+            f"Your account was made at its first sign-in through {sso_freshness.spoken_label(row) or row.name}, which "
+            "stays its way in: it is not unlinked here. Ask an administrator."))
     standing = sso_freshness.deadline_of(identity, row)
     if standing is not None and (standing.refused or standing.due <= now):
         return (UNLINK_LAPSED, _what_unblocks_an_unlink(standing, now))
@@ -1507,7 +1511,7 @@ def _what_unblocks_an_unlink(standing, now: datetime) -> str:
     - It is on, and a hold is on record: a sign-in it admits lifts the hold and gives new days. An
       administrator's lift helps only while the days have not run out as well; where they have, it is not named.
     - It is on and the days have run out: a sign-in through it."""
-    name = standing.provider_label
+    name = standing.provider_spoken
     if not standing.provider_on:
         return (f"{name} is turned off on this vault, so you cannot sign in through it, and it is not unlinked "
                 "here. Ask an administrator to unlink it for you.")
@@ -1888,6 +1892,7 @@ async def unlink_my_identity(
     asked = sso.unlink_asks_the_provider(db, account, identity, row)
     if asked:
         label = row.label or row.name
+        spoken = sso_freshness.spoken_label(row) or label
         try:
             staged = sso_state.take_reauth(api._current_session_hash(request), sso.UNLINK_CONFIRMATION)
         except sso_state.Unavailable:
@@ -1897,10 +1902,10 @@ async def unlink_my_identity(
                 raise HTTPException(status_code=403, detail={
                     "reason": "provider_confirmation_required", "action": sso.UNLINK_CONFIRMATION,
                     "provider": {"id": str(row.id), "label": label},
-                    "message": f"Sign in through {label} once more to confirm it is you, then unlink it."})
+                    "message": f"Sign in through {spoken} once more to confirm it is you, then unlink it."})
             raise HTTPException(status_code=409, detail={
                 "reason": "provider_cannot_confirm", "provider": {"id": str(row.id), "label": label},
-                "message": f"{label} cannot confirm you right now, so it is not unlinked here. Ask an administrator."})
+                "message": f"{spoken} cannot confirm you right now, so it is not unlinked here. Ask an administrator."})
     provider_id = str(identity.provider_id)
     # Kept for the record and the notice, before the identity goes: how it was linked, and what its provider
     # still asked of the account (a deadline that was running).
@@ -1952,7 +1957,8 @@ async def unlink_my_identity(
     except Exception as exc:  # noqa: BLE001 -- the unlink stands without its notice
         log.info("sso unlink notice to administrators skipped: %s", type(exc).__name__)
     _tell_owner(db, current_user, row, "A sign-in method was removed from your account",
-                f"You unlinked your account from {label}: it can no longer sign in through it."
+                f"You unlinked your account from {(sso_freshness.spoken_label(row) if row is not None else '') or label}: "
+                "it can no longer sign in through it."
                 + (" Your account may hold a password again and has none yet: "
                    + _how_to_set_a_password(db, current_user) if may_set_password else ""),
                 removed=True)

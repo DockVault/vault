@@ -9,6 +9,8 @@ import pytest
 
 from test_sso_sign_in import BASE, DB, Harness, _call, _h, _identity, _provider, _user
 
+from app.services.sso_freshness import spoken_label
+
 pytestmark = pytest.mark.unit
 
 ISSUER_2 = "https://login.example.org/tenant/v2.0"
@@ -209,7 +211,7 @@ def test_the_setting_for_accounts_made_at_a_first_sign_in_tells_them_in_its_own_
     password_origin.mark_nobody_knows(made)
     h = Admin(monkeypatch, [row], users=[made, linked],
               identities=[_identity(made, row, linked_by="jit"), _identity(linked, row, subject="s-2")])
-    label = row.label or row.name
+    label = spoken_label(row) or row.name
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_jit_password": True}})
     assert status == 200 and out["restored"] == ["made"] and out["made_sso_only"] == [] and made.sso_only is False, out
     assert out["changed"] == ["policy.sso_jit_password"]
@@ -241,7 +243,7 @@ def test_turning_password_sign_in_off_names_the_accounts_and_says_so_to_the_admi
     assert h.audit("sso_provider_updated")[0][2]["made_sso_only"] == 2
     assert h.told[0][2].endswith("2 linked account(s) now sign in only through it.")
     # A change another person made to how an account signs in is told to its owner.
-    label = row.label or row.name
+    label = spoken_label(row) or row.name
     assert h.accounts_told == [(["alice", "bob"], "Your password no longer works on this vault", (
         f"An administrator turned password sign-in off for {label}. Your account now signs in only through {label}: "
         "its password and its SFTP password sign-in no longer work."))]
@@ -310,7 +312,7 @@ def test_a_provider_is_removed_with_its_links_only_when_nothing_depends_on_it(mo
     assert status == 200 and out == {"removed": True} and h.rows() == [] and h.order == ["step_up"]
     # Each account that was linked is told it lost a way to sign in.
     assert h.accounts_told == [(["alice"], "A sign-in method was removed from your account", (
-        f"An administrator removed {row.label or row.name} from this vault: your account can no longer sign in through it."))]
+        f"An administrator removed {spoken_label(row) or row.name} from this vault: your account can no longer sign in through it."))]
     assert h.audit("sso_provider_deleted") == [("sso_provider_deleted", "success", {
         "provider_id": str(row.id), "name": row.name, "identities": 1})]
     assert h.told == [("root", "A single sign-on provider was removed",
@@ -345,7 +347,7 @@ def test_a_removal_tells_an_account_left_with_no_way_in_how_to_get_a_password(mo
                           _identity(gina, other, refused_at=datetime.utcnow(), last_sign_in_at=None)])
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
     assert status == 200 and out == {"removed": True}, out
-    removed = f"An administrator removed {row.label or row.name} from this vault: your account can no longer sign in through it."
+    removed = f"An administrator removed {spoken_label(row) or row.name} from this vault: your account can no longer sign in through it."
     told = {tuple(names): text for names, _title, text in h.accounts_told}
     assert told[("alice", "erin")] == removed
     assert told[("dana", "gina")] == f"{removed} {router.set_a_password(h.db)}"
@@ -392,8 +394,8 @@ def test_a_removal_first_holds_the_people_whose_days_ran_out_while_the_provider_
     assert recorded < h.db.log.index(("commit",))
     assert h.told[0][1] == "Accounts were held before a provider's removal" and "1 account(s)" in h.told[0][2]
     assert h.accounts_told == [(["alice"], "Your keys stay paused on this vault", (
-        f"You have not signed in through {row.label or row.name} within the time your organisation allows, and "
-        f"{row.label or row.name} is being removed from this vault. Your SSH keys, temporary credentials and devices "
+        f"You have not signed in through {spoken_label(row) or row.name} within the time your organisation allows, and "
+        f"{spoken_label(row) or row.name} is being removed from this vault. Your SSH keys, temporary credentials and devices "
         "stay paused until an administrator lifts that. Your password signs you in as before."))]
     # Tried again while she is held: the recorded refusal stands in the way, and nothing is held or told twice.
     status, out = h.call("DELETE", f"/admin/sso/providers/{row.id}")
@@ -882,8 +884,9 @@ def test_the_people_linked_to_a_provider_are_told_when_it_is_pointed_somewhere_e
     status, out = h.call("PATCH", path, change)
     assert status == 200 and out["owners_told"] == 2, out
     (names, title, text), = h.accounts_told
-    assert names == ["alice", "bob"] and title == "Sign in with Contoso was pointed somewhere else"
-    assert "changed where this vault finds Sign in with Contoso" in text and "tested it again" in text
+    # Named as the people know it: its button "Sign in with Contoso", without the button's phrase.
+    assert names == ["alice", "bob"] and title == "Contoso was pointed somewhere else"
+    assert "changed where this vault finds Contoso" in text and "tested it again" in text
     assert "stop and tell an administrator" in text
     said = h.told[-1][2]
     assert "pointed somewhere else" in said and "The 2 account(s) linked to it were told." in said
@@ -1077,7 +1080,7 @@ def test_an_account_is_told_of_the_password_rule_as_its_provider_stands(monkeypa
     h = Admin(monkeypatch, [row], users=[alice], identities=[_identity(alice, row)])
     from app.core import security
     monkeypatch.setattr(security, "hash_password", lambda secret: "argon2:" + secret)
-    label = row.label or row.name
+    label = spoken_label(row) or row.name
     while_off = f" {label} is turned off at the moment: ask an administrator."
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_password_login": "disabled"}})
     assert status == 200 and out["made_sso_only"] == ["alice"], out
@@ -1692,7 +1695,7 @@ def test_a_save_that_makes_a_missed_sign_in_end_the_password_counts_whom_a_refus
     assert status == 200, out
     assert (out["newly_held"], out["held_by_a_refusal"], out["held_by_its_days"]) == (1, 1, 0), out
     assert [u.username for u in providers.held_through(h.db, row)] == ["cy"] and providers.held_by_its_days(h.db, row) == []
-    label = row.label or row.name
+    label = spoken_label(row) or row.name
     assert h.accounts_told == [(["cy"], f"Sign in through {label} to keep signing in here", (
         f"An administrator changed what a refusal or hold on record for {label} stops. Your account is held to a "
         f"sign-in through {label}: its password does not sign it in to this vault until {label} admits it. If it "
@@ -1725,7 +1728,7 @@ def test_an_account_the_vault_itself_held_is_not_told_that_the_provider_refused_
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": True}})
     assert status == 200, out
     assert [u.username for u in providers.held_by_the_vaults_own_hold(h.db, row)] == ["cy"]
-    label = row.label or row.name
+    label = spoken_label(row) or row.name
     told = [entry for entry in h.accounts_told if entry[0] == ["cy"]]
     assert told == [(["cy"], f"Sign in through {label} to keep signing in here", (
         f"An administrator changed what stops when {label} has not seen you within its days. Your days there had "
@@ -1777,7 +1780,7 @@ def test_the_newly_held_are_told_what_was_changed(monkeypatch):
     how often had changed. They are told what did. A change of the days themselves is said as that."""
     h, row, (ann, ben, cy) = _linked_since(monkeypatch, [1, 40, 50], policy={"sso_freshness_days": 30,
                                                                            "sso_lapse_ends_sign_in": False})
-    label = row.label or row.name
+    label = spoken_label(row) or row.name
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": True}})
     assert status == 200 and out["newly_held"] == 2, out
     (told,) = h.accounts_told
@@ -1860,7 +1863,7 @@ def test_a_save_that_changes_the_connection_and_the_days_tells_whom_it_holds(mon
                                                                            "sso_lapse_ends_sign_in": False})
     monkeypatch.setattr(h.R, "_end_sessions_of", lambda db, provider_id, **record: 0)
     monkeypatch.setattr(h.R, "_sessions_standing", lambda db, provider_id: 0)
-    label = row.label or row.name
+    label = spoken_label(row) or row.name
     asked_about, real = [], h.R._tell_those_a_turn_off_held
     monkeypatch.setattr(h.R, "_tell_those_a_turn_off_held", lambda db, ids, before, provider_id, shown: (
         asked_about.append(provider_id), real(db, ids, before, provider_id, shown))[1])

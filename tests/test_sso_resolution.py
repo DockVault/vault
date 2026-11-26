@@ -248,7 +248,7 @@ def test_a_first_sign_in_makes_no_second_account_for_an_address_that_has_one(mon
         if holder == "an administrator" and not links:
             expected = "address_has_an_account"          # the creation's own refusal: the link was not asked
         assert any(a[0] == "sso_sign_in_refused" and a[2].get("refused_because") == expected for a in h.audits), h.audits
-        assert ([str(bob.id)], "A sign-in through Sign in with Contoso with your address was kept out") in h.notices
+        assert ([str(bob.id)], "A sign-in through Contoso with your address was kept out") in h.notices
     else:
         assert location == f"/#sso-error={outcome}", location
 
@@ -372,7 +372,7 @@ def test_a_link_asks_the_provider_for_a_fresh_sign_in_and_says_who_was_linked(mo
     assert status == 200 and body["identity"]["email"] == "alice@corp.example", body
     assert body["identity"]["display_name"] == "Alice Example"
     said = [text for ids, title, text in h.notice_bodies if ids == [str(alice.id)]]
-    assert said and said[-1].startswith("You linked your account to Sign in with Contoso as alice@corp.example: ")
+    assert said and said[-1].startswith("You linked your account to Contoso as alice@corp.example: ")
     status, listed, _ = _call(h.S, "GET", "/users/me/identities")
     assert status == 200 and [(i["email"], i["display_name"]) for i in listed["identities"]] == [
         ("alice@corp.example", "Alice Example")]
@@ -810,7 +810,7 @@ def test_a_verified_email_links_an_existing_account_when_the_provider_allows_it_
     # Nobody at the vault made this link: a sign-in at the provider with the person's address did. If it was not
     # them, the address there is in other hands, and only an administrator can act on that.
     (said,) = [body for ids, title, body in h.notice_bodies if title == "A sign-in method was added"]
-    assert said.endswith(f"If you did not sign in through {p.label} just now, tell an administrator at once: your "
+    assert said.endswith("If you did not sign in through Contoso just now, tell an administrator at once: your "
                          f"address there may be in someone else's hands.")
     assert any(e[0] == "sign_in_method_changed" and e[1] == "bob@example.test" for e in h.emails), h.emails
     status, body = h.finish(location)
@@ -842,7 +842,7 @@ def test_a_privileged_account_is_never_linked_by_its_verified_email(monkeypatch,
     assert "link your organisation's sign-in under Your account" in sso.reason_text("link_from_your_account")
     assert h.identities() == [] and h.codes() == [] and h.emails == []
     # The owner is told that it was tried (and nobody else here: there is no other administrator).
-    assert h.notices == [([str(bob.id)], "A sign-in through Sign in with Contoso with your address was kept out")]
+    assert h.notices == [([str(bob.id)], "A sign-in through Contoso with your address was kept out")]
     assert any(a[0] == "sso_sign_in_refused" and a[2].get("reason") == "link_from_your_account"
                and a[2].get("refused_because") == f"privileged_account:{kind}" for a in h.audits), h.audits
     # An ended grant is no standing: the account links.
@@ -1182,7 +1182,7 @@ def test_the_owner_is_told_when_a_sign_in_with_their_address_was_kept_out(monkey
     assert location == "/#sso-error=link_from_profile"
     (ids, ntype, title, body, target, dedup, once), = told
     assert (ids, ntype, target, dedup, once) == ([str(bob.id)], "account_changed", "#profile", key, True)
-    assert title == "A sign-in through Sign in with Contoso with your address was kept out"
+    assert title == "A sign-in through Contoso with your address was kept out"
     assert "Nobody was signed in" in body and "under Your account" in body and "tell an administrator" in body
     # A privileged account: its owner, and the other administrators who are active.
     del told[:]
@@ -1217,16 +1217,16 @@ def test_an_administrator_kept_out_is_told_how_its_account_is_linked_or_that_it_
     location, _ = _sign_in(h, p, sub="s-root", email="root@example.test")
     assert location == "/#sso-error=link_from_your_account", location
     (body,) = [t[3] for t in told if t[0] == [str(root.id)]]
-    assert body.startswith("Someone signed in through Sign in with Contoso with your email address. Nobody was "
+    assert body.startswith("Someone signed in through Contoso with your email address. Nobody was "
                            "signed in to your account and nothing was linked: an administrator's or auditor's account "
                            "is linked to a provider only from Your account")
-    assert body.endswith("your address at Sign in with Contoso may be in someone else's hands: tell another "
+    assert body.endswith("your address at Contoso may be in someone else's hands: tell another "
                          "administrator.")
     if passwords == "kept":
-        assert "If that was you, link Sign in with Contoso there." in body
+        assert "If that was you, link Contoso there." in body
     else:
-        assert "link it there" not in body and "link Sign in with Contoso there" not in body
-        assert "so your account cannot be linked to Sign in with Contoso" in body
+        assert "link it there" not in body and "link Contoso there" not in body
+        assert "so your account cannot be linked to Contoso" in body
 
 
 def test_a_turned_off_account_whose_identity_is_linked_is_not_told_to_link_it(monkeypatch):
