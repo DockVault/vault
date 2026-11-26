@@ -46,10 +46,18 @@ def test_the_table_starts_at_policy_one_and_only_grows():
                  "WHERE version = 1")
     assert first.split("|") == [POLICY_ONE[k] for k in KEYS] + ["initial", "server configuration"]
     for sql in ("UPDATE audit_privacy_policies SET ip = 'none' WHERE version = 1",
+                "UPDATE audit_privacy_policies SET ip = 'none', created_by = NULL WHERE version = 1",
+                "UPDATE audit_privacy_policies SET created_by = (SELECT id FROM users LIMIT 1) WHERE version = 1 "
+                "AND created_by IS DISTINCT FROM (SELECT id FROM users LIMIT 1)",
                 "DELETE FROM audit_privacy_policies WHERE version = 1",
                 "TRUNCATE audit_privacy_policies"):
         failed, err = _psql_fails(sql)
+        if "created_by = (SELECT" in sql and not failed and not err:
+            continue                       # no other account to point at, or it already points there: nothing ran
         assert failed and "only grows" in err, (sql, err)
+    # Who set a version is the one thing that may go: the account deleted clears it, the person erased renames it.
+    assert not _psql_fails("UPDATE audit_privacy_policies SET created_by = NULL, created_by_name = created_by_name "
+                           "WHERE version = 1")[0]
     assert psql("SELECT ip FROM audit_privacy_policies WHERE version = 1") == "full"
     assert psql("SELECT count(*) FROM audit_logs WHERE action = 'audit_privacy_changed' AND resource_id = '1'") == "1"
 

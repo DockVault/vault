@@ -1327,6 +1327,14 @@ def test_the_policies_table_only_grows():
     assert "BEFORE UPDATE OR DELETE ON audit_privacy_policies" in ddl
     assert "BEFORE TRUNCATE ON audit_privacy_policies" in ddl
     assert "RAISE EXCEPTION" in ddl
+    # Who set a version may be cleared (the account deleted) or replaced (the person erased); nothing else of a
+    # version changes, and its author is never pointed at another account.
+    assert ("(to_jsonb(NEW) - 'created_by' - 'created_by_name') = (to_jsonb(OLD) - 'created_by' - 'created_by_name')"
+            in ddl)
+    assert "(NEW.created_by IS NULL OR NEW.created_by = OLD.created_by) THEN RETURN NEW" in ddl
+    assert ddl.index("THEN RETURN NEW") < ddl.index("RAISE EXCEPTION")
+    assert AuditPrivacyPolicy.__table__.c.created_by.foreign_keys and all(
+        fk.ondelete == "SET NULL" for fk in AuditPrivacyPolicy.__table__.c.created_by.foreign_keys)
     source = inspect.getsource(api_server._run_lightweight_migrations)
     assert source.count("*AUDIT_PRIVACY_POLICIES_DDL") == 1
     columns = AuditPrivacyPolicy.__table__.c

@@ -29419,9 +29419,18 @@ SSH_KEY_MAKER_FROM_AUDIT = (
 )
 
 
+# The recording levels' versions only grow: a version is never changed or deleted. Who set one is the exception.
+# Deleting that account sets created_by to NULL (its foreign key), and erasing the person replaces
+# created_by_name; refused as a change of the version, the account could not be deleted at all (an error, and the
+# account stayed), nor erased. An update that leaves every other column as it was, and clears created_by rather
+# than pointing it elsewhere, goes through; anything else is refused as before.
 AUDIT_PRIVACY_POLICIES_DDL = (
     "CREATE OR REPLACE FUNCTION dv_audit_privacy_policies_only_grow() RETURNS trigger LANGUAGE plpgsql AS $dv$ "
-    "BEGIN RAISE EXCEPTION 'audit_privacy_policies only grows: a change of the recording levels adds a version'; "
+    "BEGIN "
+    "IF TG_OP = 'UPDATE' "
+    "AND (to_jsonb(NEW) - 'created_by' - 'created_by_name') = (to_jsonb(OLD) - 'created_by' - 'created_by_name') "
+    "AND (NEW.created_by IS NULL OR NEW.created_by = OLD.created_by) THEN RETURN NEW; END IF; "
+    "RAISE EXCEPTION 'audit_privacy_policies only grows: a change of the recording levels adds a version'; "
     "END $dv$",
     "CREATE OR REPLACE TRIGGER trg_audit_privacy_policies_only_grow BEFORE UPDATE OR DELETE ON audit_privacy_policies "
     "FOR EACH ROW EXECUTE FUNCTION dv_audit_privacy_policies_only_grow()",
