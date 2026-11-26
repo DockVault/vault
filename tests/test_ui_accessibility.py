@@ -62,6 +62,18 @@ def _findings(page: Page, where: str, root: str = None) -> list:
     return out
 
 
+def _said(problems: list) -> str:
+    """Each finding whole, one line per element, so a failure names what to fix: the page, the rule, the
+    element's selector and axe's summary (for a contrast rule, the colours and the ratio)."""
+    lines = []
+    for v in problems:
+        lines.append(f"{v['where']}: {v['id']} ({v['impact']}), {v.get('count', 0)} element(s)")
+        for n in v.get("nodes", []):
+            summary = " ".join(str(n.get("summary") or "").split())
+            lines.append(f"  {n.get('target')}: {summary}")
+    return "\n".join(lines)
+
+
 @pytest.fixture
 def an_admin(admin):
     a = admin.create_user(role="admin")
@@ -82,7 +94,8 @@ def test_the_sign_in_screen_has_no_serious_finding(page: Page, skin):
     page.evaluate("ui => localStorage.setItem('ui', ui)", skin)
     page.goto("/")
     expect(page.locator("#login-screen")).to_be_visible(timeout=15000)
-    assert _findings(page, "sign-in") == []
+    found = _findings(page, "sign-in")
+    assert found == [], _said(found)
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])
@@ -102,7 +115,7 @@ def test_every_main_screen_has_no_serious_finding(page: Page, an_admin, skin):
     page.wait_for_timeout(500)
     problems += _findings(page, "vault")
     assert len(visited) >= 8, visited
-    assert problems == [], problems
+    assert problems == [], _said(problems)
 
 
 @pytest.mark.parametrize("skin", ["v1", "v2"])
@@ -124,4 +137,4 @@ def test_every_settings_page_has_no_serious_finding(page: Page, an_admin, skin):
         visited.append(tab)
         problems += _findings(page, f"settings:{tab}", "#settings-section")
     assert len(visited) >= 10, visited
-    assert problems == [], problems
+    assert problems == [], _said(problems)
