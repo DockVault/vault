@@ -715,8 +715,9 @@ COVERAGE: Dict[str, str] = {
     "compliance_case_vaults": IDS_ONLY, "compliance_case_counters": NO_PERSON,
     "held_files": HELD, "held_folders": HELD, "held_name_history": HELD,
     # Outside the database (the data inventory's other sections).
-    "cache": "entries expire on their own within a day (a lock on a name that is no account: 30 days), and those "
-             "about names typed at sign-in hold only a keyed stand-in",
+    "cache": "entries about a person expire on their own within a day (a lock on a name that is no account: 30 "
+             "days), and those about names typed at sign-in hold only a keyed stand-in; the one entry with no "
+             "expiry holds no person",
     "logs": "container output and the log-access file are outside the database: what was logged stays until "
             "rotated away",
     "email": "email already sent cannot be called back",

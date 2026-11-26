@@ -104,6 +104,38 @@ def test_the_cache_table_names_every_key_an_anonymous_link_keeps():
     assert not missing, f"keys the links keep in Redis that the Cache table does not name: {missing}"
 
 
+def test_the_cache_table_names_every_key_single_sign_on_keeps():
+    # Found from the code that writes them (app/core/sso_state.py, app/core/sign_in_codes.py): a new prefix fails
+    # here until the table says what it holds and for how long.
+    from app.core import sign_in_codes, sso_state
+    keys = _cache_keys()
+    prefixes = [value for name, value in vars(sso_state).items()
+                if name.endswith("_PREFIX") and isinstance(value, str)] + [sign_in_codes.KEY_PREFIX]
+    assert "sso:state:" in prefixes and "sso:handover:" in prefixes and "sso:logged-out:" in prefixes
+    missing = [p for p in prefixes if f"`{p}<" not in keys]
+    assert not missing, f"single sign-on keys in Redis that the Cache table does not name: {missing}"
+    assert f"`{sso_state.LOGGED_OUT_REACH_KEY}`" in keys
+
+
+def test_the_cache_rows_of_single_sign_on_give_the_lifetimes_the_code_sets():
+    from app.core import sign_in_codes, sso_state
+    text = _text()
+    rows = {line.split("|")[1].strip(): line.split("|")[3].strip() for line in text.splitlines()
+            if line.startswith("| `sso:") or line.startswith("| `signin:code:")}
+    assert sso_state.STATE_TTL_SECONDS == 600 and rows["`sso:state:<state>`"].startswith("10 minutes")
+    assert sso_state.HANDOVER_TTL_SECONDS == 60 and rows["`sso:handover:<code hash>`"].startswith("60 seconds")
+    assert sign_in_codes.CODE_TTL_SECONDS == 60 and rows["`signin:code:<code hash>`"].startswith("60 seconds")
+    assert sso_state.LOGGED_OUT_TTL_SECONDS == 1200 and rows["`sso:logged-out:<hash>`"] == "20 minutes."
+    assert rows["`sso:logged-out-since`"].startswith("No expiry.")
+    # The one-time sign-in code of an invitation holds the provider's answer, its groups among it.
+    code_row = next(line for line in text.splitlines() if line.startswith("| `signin:code:"))
+    assert "\nGROUPS_KEPT = 1000\n" in (ROOT / "app" / "services" / "sso_sign_in.py").read_text(encoding="utf-8")
+    assert "subject, issuer, tenant, email, display name and up to 1000 groups" in code_row
+    # Every key expires but the one mark, which holds no person: both the store list and the section say so.
+    assert "Every key below expires on its own but one:\n`sso:logged-out-since`" in text
+    assert "`sso:logged-out-since`, a single time that holds nothing about a person, has no expiry" in text
+
+
 def test_the_grant_row_says_what_a_grant_holds_and_for_how_long():
     # What the code stores (link id, address, mint time) and for how long (_PUBLINK_GRANT_TTL) is pinned
     # in tests/test_public_link_grant.py; this holds the row to the same three parts and the same time.
