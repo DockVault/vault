@@ -52,11 +52,21 @@ def _made_here(db, role, *, own_password=False, policy=None):
     return provider, jay
 
 
+class _Told(list):
+    """What each account was told, and beside it (``advice``) the advice each telling was given."""
+    def __init__(self):
+        super().__init__()
+        self.advice = []
+
+
 def _told(monkeypatch):
     from app.api import sso_providers_router
-    told = []
-    monkeypatch.setattr(sso_providers_router, "_tell_accounts",
-                        lambda users, title, change: told.append((list(users), title, change)))
+    told = _Told()
+
+    def tell(users, title, change, advice=None):
+        told.append((list(users), title, change))
+        told.advice.append(advice)
+    monkeypatch.setattr(sso_providers_router, "_tell_accounts", tell)
     return told
 
 
@@ -244,6 +254,10 @@ def test_an_auditor_grant_that_is_no_longer_open_has_the_rule_settled_once_it_is
     assert told == [([(jay.id, "jay", "jay@example.com")], "Your account signs in only through Contoso", (
         "Your account no longer holds the auditor right. It signs in only through Contoso from now on: its "
         "password and its SFTP password sign-in no longer work."))]
+    # The right also ends with nobody's doing (it expired, or its proposal lapsed): the advice says what to do, and
+    # not that an administrator made a change.
+    assert told.advice == [sso_only.AUDITOR_RIGHT_ADVICE]
+    assert "did not expect" not in sso_only.AUDITOR_RIGHT_ADVICE
 
 
 def test_an_administrator_whose_auditor_grant_ends_keeps_its_password(db, world, monkeypatch, settled_after):

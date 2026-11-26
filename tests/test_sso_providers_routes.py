@@ -1694,9 +1694,9 @@ def test_a_save_that_makes_a_missed_sign_in_end_the_password_counts_whom_a_refus
     assert [u.username for u in providers.held_through(h.db, row)] == ["cy"] and providers.held_by_its_days(h.db, row) == []
     label = row.label or row.name
     assert h.accounts_told == [(["cy"], f"Sign in through {label} to keep signing in here", (
-        f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
-        f"sign-in through {label}: its password does not sign it in to this vault until {label} has "
-        "admitted it again. If it does not, ask your administrator."))]
+        f"An administrator changed what a refusal or hold on record for {label} stops. Your account is held to a "
+        f"sign-in through {label}: its password does not sign it in to this vault until {label} admits it. If it "
+        "does not, ask your administrator."))]
     count = [a for a in h.audit("sso_provider_updated") if a[2].get("reason") == "held_by_its_days"]
     assert count[0][2] == {"provider_id": str(row.id), "name": row.name, "changed": [], "reason": "held_by_its_days",
                            "held_by_its_days": 0, "held_by_a_refusal": 1, "newly_held": 1}
@@ -1707,6 +1707,32 @@ def test_a_save_that_makes_a_missed_sign_in_end_the_password_counts_whom_a_refus
     del h.accounts_told[:]
     status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_freshness_days": 31}})
     assert status == 200 and out["newly_held"] == 0 and out["held_by_a_refusal"] == 1 and h.accounts_told == []
+
+
+def test_an_account_the_vault_itself_held_is_not_told_that_the_provider_refused_it(monkeypatch):
+    """Contoso only pauses keys. It was turned off while Cy's days had run out, so the vault held Cy's account to it
+    (a hold of its own, marked keys-only), and it was turned on again. An administrator now makes a missed sign-in
+    end the password too: Cy is held. Contoso never refused Cy, and he is told who wrote the hold."""
+    from datetime import datetime, timedelta
+    h, row, (ann, ben, cy) = _linked_since(monkeypatch, [1, 2, 3], policy={"sso_freshness_days": 30,
+                                                                         "sso_lapse_ends_sign_in": False})
+    from app.core.models import ExternalIdentity
+    link = next(i for i in h.db.rows_of(ExternalIdentity) if i.user_id == cy.id)
+    link.last_sign_in_at = datetime.utcnow() - timedelta(days=40)
+    link.refused_at = link.keys_only_hold_at = datetime.utcnow() - timedelta(days=2)
+    from app.services import sso_providers as providers
+    assert providers.held_through(h.db, row) == []
+    status, out = h.call("PATCH", f"/admin/sso/providers/{row.id}", {"policy": {"sso_lapse_ends_sign_in": True}})
+    assert status == 200, out
+    assert [u.username for u in providers.held_by_the_vaults_own_hold(h.db, row)] == ["cy"]
+    label = row.label or row.name
+    told = [entry for entry in h.accounts_told if entry[0] == ["cy"]]
+    assert told == [(["cy"], f"Sign in through {label} to keep signing in here", (
+        f"An administrator changed what stops when {label} has not seen you within its days. Your days there had "
+        f"run out when {label} was turned off or was to be removed, and this vault held your account to a sign-in "
+        f"through {label} then: its password does not sign it in to this vault until you have signed in through "
+        f"{label} again. If you cannot, ask your administrator."))], h.accounts_told
+    assert "did not admit" not in told[0][2] and "has not admitted" not in told[0][2]
 
 
 def test_a_provider_is_not_removed_while_sessions_that_came_through_it_still_stand(monkeypatch):

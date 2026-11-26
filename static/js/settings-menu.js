@@ -177,7 +177,12 @@
         const root = section();
         if (!root || !S.nav) return;
         const on = root.classList.contains('active');
-        if (on === S.on) return;
+        if (on === S.on) {
+            // Settings opened again while it was open: a section click cleared every rail item's mark, these
+            // too, so the open page is marked again.
+            if (on) render();
+            return;
+        }
         S.on = on;
         const moveFocus = focusInRail() && !PHONE.matches;
         const sidebar = rail();

@@ -544,17 +544,31 @@ def update_provider(provider_id: str, body: Dict[str, Any], request: Request,
             _tell_accounts(whom, "Your SSH keys, temporary credentials and devices are paused", (
                 f"{first}: your SSH keys, temporary credentials and devices are paused until you have signed in "
                 f"through {label} again."), once_for=today)
-    for stops in sorted(set(stops_of[one[0]] for one in newly_by_a_refusal)):
-        if not stops:
-            continue        # a refusal already paused their keys; what it stops now changes nothing of theirs
-        whom = [one for one in newly_by_a_refusal if stops_of[one[0]] == stops]
-        its = {"your password and your passkeys": "its password and passkeys", "your password": "its password",
-               "your passkeys": "its passkeys"}.get(stops, stops)
-        _tell_accounts(whom, f"Sign in through {label} to keep signing in here", (
-            f"An administrator changed what a sign-in that {label} did not admit stops. Your account is held to a "
-            f"sign-in through {label}: {its} {'does' if sso_freshness.names_one(stops) else 'do'} not sign it in "
-            f"to this vault until {label} has admitted it again. "
-            "If it does not, ask your administrator."), once_for=today)
+    # A hold on record is the provider's refusal, or the vault's own hold, written when the days had run out as the
+    # provider was turned off or was to be removed (keys_only_hold on the deadline). Each is told who wrote it.
+    try:
+        vaults_own = ({user.id for user in providers.held_by_the_vaults_own_hold(db, row)}
+                      if newly_by_a_refusal else set())
+    except Exception as exc:  # noqa: BLE001 -- told in the words that fit both
+        log.warning("whose hold it is was not read: %s", type(exc).__name__)
+        vaults_own = set()
+    own_of = {one[0]: one[0] in vaults_own for one in newly_by_a_refusal}
+    for stops, own in sorted(set((stops_of[one[0]], own_of[one[0]]) for one in newly_by_a_refusal
+                                 if stops_of[one[0]])):
+        # A refusal or hold already paused their keys; what it stops now changes nothing for one with no other way in.
+        whom = [one for one in newly_by_a_refusal if stops_of[one[0]] == stops and own_of[one[0]] == own]
+        its = stops.replace("your ", "its ")
+        verb = "does" if sso_freshness.names_one(stops) else "do"
+        if own:
+            said = (f"An administrator changed what stops when {label} has not seen you within its days. Your days "
+                    f"there had run out when {label} was turned off or was to be removed, and this vault held your "
+                    f"account to a sign-in through {label} then: {its} {verb} not sign it in to this vault until you "
+                    f"have signed in through {label} again. If you cannot, ask your administrator.")
+        else:
+            said = (f"An administrator changed what a refusal or hold on record for {label} stops. Your account is "
+                    f"held to a sign-in through {label}: {its} {verb} not sign it in to this vault until {label} "
+                    "admits it. If it does not, ask your administrator.")
+        _tell_accounts(whom, f"Sign in through {label} to keep signing in here", said, once_for=today)
     _tell_those_a_turn_off_held(db, held_ids, held_before, row.id, label)
     _tell_accounts(owners, f"{label} was pointed somewhere else", (
         f"An administrator changed where this vault finds {label}, a sign-in your account is linked to. Nobody signs "

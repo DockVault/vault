@@ -857,8 +857,11 @@ one.
   `https://<address>/auth/sso/<provider id>/callback`, the back-channel logout address and the sign-out return
   address. A provider is turned on only after a **Test sign-in** passed with its settings as they are now.
 - **Who gets in.** By default only people who were invited or are already linked sign in through a provider.
-  Making accounts at a first sign-in, or linking an existing account by its verified email, needs the provider to
-  say who may sign in: a tenant, a domain, required groups, or the sign-up domain list when it is an allow-list.
+  Making accounts at a first sign-in, or linking an existing account by its email, needs the provider to say who
+  may sign in: a tenant, a domain, required groups, or the sign-up domain list when it is an allow-list. A link by
+  email needs an address the provider verified and that the vault itself confirmed for the account (an
+  administrator or an invitation set it, or the person typed the code sent there). An account from before 0.36.0
+  counts as confirmed only when it was made from an invitation that carried the address it still holds.
 - **People who leave** (all on by default). A provider's back-channel logout ends the sessions it names. When the
   provider refuses a person it knows, their access here ends. After 30 days without a sign-in through the
   provider, the person's SSH keys, temporary credentials and devices pause, and their password, a passkey by itself

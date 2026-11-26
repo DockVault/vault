@@ -393,6 +393,45 @@ def test_seed_leaves_a_sign_in_alert_an_administrator_edited_as_it_is():
     assert existing["login_alert"].body_html == edited
 
 
+_SIGN_IN_METHOD_BEFORE = (
+    "<h2>A change to how you sign in</h2>"
+    "<p>Hi {{user.username}},</p>"
+    "<p>{{action.change}}</p>"
+    "<p>When: {{action.when}}</p>"
+    "<p>If this was you, no action is needed. If it was not, open your profile, remove what you do not "
+    "recognize, change your password and tell your administrators.</p>"
+    "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
+    "<hr>"
+    "<p><small>Sent by {{vault.name}}.</small></p>"
+)
+
+
+@pytest.mark.parametrize("stored", ["as written", "sanitized"])
+def test_seed_brings_a_sign_in_method_email_nobody_edited_to_the_current_default(stored):
+    """The earlier default followed the change's own advice with a fixed paragraph that told every account to
+    change a password, one that has none among them. A row still at that default was never edited: the boot gives
+    it the current one, whose advice comes with the change alone."""
+    body = _SIGN_IN_METHOD_BEFORE if stored == "as written" else es.sanitize_email_html(_SIGN_IN_METHOD_BEFORE)
+    existing = {k: _FakeTemplate(default_key=k) for k in ea.DEFAULT_TEMPLATES}
+    existing["sign_in_method_changed"] = _FakeTemplate(default_key="sign_in_method_changed", body_html=body)
+    sess = _FakeSession(existing_templates=existing, actions=_all_actions_unbound())
+    assert ea.seed_default_templates(sess) == 0
+    healed = existing["sign_in_method_changed"].body_html
+    assert healed == es.sanitize_email_html(ea.DEFAULT_TEMPLATES["sign_in_method_changed"]["body_html"])
+    assert "change your password" not in healed.lower() and "{{action.change}}" in healed
+    ea.seed_default_templates(sess)
+    assert existing["sign_in_method_changed"].body_html == healed
+
+
+def test_seed_leaves_a_sign_in_method_email_an_administrator_edited_as_it_is():
+    edited = es.sanitize_email_html(_SIGN_IN_METHOD_BEFORE.replace("tell your administrators", "call the help desk"))
+    existing = {k: _FakeTemplate(default_key=k) for k in ea.DEFAULT_TEMPLATES}
+    existing["sign_in_method_changed"] = _FakeTemplate(default_key="sign_in_method_changed", body_html=edited)
+    sess = _FakeSession(existing_templates=existing, actions=_all_actions_unbound())
+    ea.seed_default_templates(sess)
+    assert existing["sign_in_method_changed"].body_html == edited
+
+
 def test_the_sign_in_method_email_is_described_by_everything_it_is_sent_for():
     """The administrator who reads the list of emails sees what this one tells a user of: it is sent for a
     passkey added or removed, an authenticator app set up, and a change to how the account signs in through a

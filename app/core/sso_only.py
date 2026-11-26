@@ -441,10 +441,16 @@ def _settle_after_a_grant_ended(user_ids) -> None:
                                                 type(exc).__name__)
 
 
+# What an account whose auditor right ended is told to do: the right also ends on its own, when its days run out or
+# it lapses, and then no administrator changed anything.
+AUDITOR_RIGHT_ADVICE = "If you still need the auditor right, ask an administrator to grant it again."
+
+
 def _tell_held_again(notices) -> None:
     from app.api import sso_providers_router
     for user_id, username, email, title, change in notices:
-        sso_providers_router._tell_accounts([(user_id, username, email)], title, change)
+        advice = AUDITOR_RIGHT_ADVICE if change.startswith(f"Your account {HELD_THE_AUDITOR_RIGHT}.") else None
+        sso_providers_router._tell_accounts([(user_id, username, email)], title, change, advice=advice)
 
 
 after_commit.handler(_GRANT_ENDED, _settle_after_a_grant_ended)

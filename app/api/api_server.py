@@ -29029,7 +29029,8 @@ def _seed_admin_user(db=None):
               "account's, or ADMIN_USERNAME is a name kept for the server's own records)")
         return "error"
     except Exception as e:
-        print(f"⚠ Admin bootstrap skipped: {e}")
+        # By its kind only: a database error's text can carry the row it refused ("Key (username)=(...)").
+        print(f"⚠ Admin bootstrap skipped: {type(e).__name__}")
         return "error"
 
 
@@ -30083,8 +30084,9 @@ END $$;""",
                 # Own try/except so a failure here cannot abort anything else; every statement in
                 # the loop above already committed independently.
                 db.rollback()
-                print(f"⚠ users.email case-insensitive index skipped: {e}")
-                recorder.record(email_index_step, SchemaStep.OUTCOME_FAILED, str(e))
+                # By its kind only: a duplicate key's text names the address ("Key (lower(email::text))=(...)").
+                print(f"⚠ users.email case-insensitive index skipped: {type(e).__name__}")
+                recorder.record(email_index_step, SchemaStep.OUTCOME_FAILED, type(e).__name__)
 
             # The legal hold's kept tables and triggers (app/core/kept_tables.py). Last, after every
             # statement that adds a column to files or folders: the kept tables gain the same columns and

@@ -360,6 +360,12 @@ async def delete_profile(profile_id: uuid.UUID, request: Request,
     if p is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
     _step_up(db, admin, request)
+    # The step-up may commit: read the row again, under a lock, as update_profile does. Another administrator may
+    # have deleted it meanwhile.
+    p = (db.query(EmailProfile).filter(EmailProfile.id == profile_id)
+         .populate_existing().with_for_update().first())
+    if p is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found.")
     name = p.name
     was_default = p.is_default
     db.delete(p)  # templates referencing it have profile_id set to NULL (FK ondelete=SET NULL)

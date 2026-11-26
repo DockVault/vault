@@ -96,6 +96,40 @@ def test_a_fresh_volume_set_keeps_the_passkey_settings_the_old_env_gave():
     assert not [line for line in plain if line.startswith("WEBAUTHN_")], plain
 
 
+def test_each_passkey_line_of_the_example_file_uncommented_keeps_its_value_in_a_fresh_volume_set():
+    """An operator uncomments a line of the example file. The vault reads it as docker compose does, and a fresh
+    volume set made from that .env must carry the same value, or the new set's vault refuses to start."""
+    lines = [line for line in _example().splitlines()
+             if re.match(r"# WEBAUTHN_[A-Z_]+=", line) and not line.startswith("# WEBAUTHN_ATTESTATION_ROOTS=")]
+    assert sorted(line[2:].split("=", 1)[0] for line in lines) == sorted(PASSKEY_ENV)
+    # Each note stands on its own line, above its setting, never after a value.
+    assert not [line for line in lines if "#" in line[1:]], lines
+    text = "\n".join(line[2:] for line in lines) + "\n"
+    env = dv.parse_env(text)
+    assert env == dv.compose_env_values(text, PASSKEY_ENV, environ={})
+    assert env == {"WEBAUTHN_MODE": "optional", "WEBAUTHN_REQUIRED_ROLES": "", "WEBAUTHN_ENROLLMENT_GRACE_DAYS": "14",
+                   "WEBAUTHN_SIGN_IN": "user,external", "WEBAUTHN_REQUIRE_UV": "true",
+                   "WEBAUTHN_ALLOWED_ALGS": "ES256,RS256,EdDSA", "WEBAUTHN_DEVICE_BOUND_ROLES": ""}
+    written = "\n".join(_lines(dv.new_set_config(env, "prefix-1", "dep-1"))) + "\n"
+    assert dv.compose_env_values(written, PASSKEY_ENV, environ={}) == env
+
+
+def test_a_note_after_a_value_is_dropped_as_docker_compose_drops_it():
+    """An .env written from the earlier example file can carry a note after a value. parse_env reads it as docker
+    compose does: an unquoted value ends before " #"."""
+    text = ("A=optional                    # off, optional or required_for_roles\n"
+            "B=                  # with required_for_roles\n"
+            "C='x # y'\n"
+            "D=x#y\n"
+            "E=\"two words\"\n")
+    parsed = dv.parse_env(text)
+    assert parsed == dv.compose_env_values(text, list("ABCDE"), environ={})
+    assert parsed["A"] == "optional" and parsed["C"] == "x # y" and parsed["D"] == "x#y"
+    # A fresh volume set made from such a .env carries the value alone.
+    old = dv.parse_env("WEBAUTHN_SIGN_IN=user,external            # roles a passkey signs in alone\n")
+    assert "WEBAUTHN_SIGN_IN=user,external" in _lines(dv.new_set_config(old, "prefix-1", "dep-1"))
+
+
 # --------------------------------------------------------------------------- the certificate authorities of a provider
 
 def test_the_example_file_says_where_a_providers_private_authority_goes_and_that_a_proxy_is_honoured():
@@ -251,6 +285,68 @@ def test_setup_refuses_an_attestation_roots_file_it_cannot_use_and_changes_nothi
     assert not (root / "certs" / name).exists()
 
 
+def test_setup_copies_a_providers_certificate_authorities_into_certs_and_names_them_in_env(tmp_path, monkeypatch,
+                                                                                           capsys):
+    bundle = tmp_path / "corp-ca.pem"
+    bundle.write_bytes(PEM)
+    owned = []
+    _quiet_certificate_step(monkeypatch, owned)
+    root = tmp_path / "deployment"
+    root.mkdir()
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    # A fresh install: the line is in the .env setup writes, and the container's user is given the file.
+    tool.setup(_setup_args(server_name="vault.example.com", sso_ca_bundle=str(bundle)))
+    assert (root / "certs" / "corp-ca.pem").read_bytes() == PEM
+    assert dv.parse_env((root / ".env").read_text(encoding="utf-8"))["SSO_CA_BUNDLE"] == "/app/certs/corp-ca.pem"
+    assert owned and "corp-ca.pem" in owned[-1], owned
+    assert "Copied %s to certs/corp-ca.pem." % bundle in capsys.readouterr().out
+    # A re-run with both flags: each setting is written, and nothing else changes.
+    roots = tmp_path / "roots.pem"
+    roots.write_bytes(PEM + PEM)
+    before = dv.parse_env((root / ".env").read_text(encoding="utf-8"))
+    tool.setup(_setup_args(sso_ca_bundle=str(bundle), webauthn_attestation_roots=str(roots)))
+    after = dv.parse_env((root / ".env").read_text(encoding="utf-8"))
+    assert after["SSO_CA_BUNDLE"] == "/app/certs/corp-ca.pem"
+    assert after["WEBAUTHN_ATTESTATION_ROOTS"] == "/app/certs/roots.pem"
+    assert {k: v for k, v in after.items() if k != "WEBAUTHN_ATTESTATION_ROOTS"} == before
+    # The flag is offered, and the example file names it beside the line.
+    assert dv.build_parser().parse_args(["setup", "--sso-ca-bundle", "x.pem"]).sso_ca_bundle == "x.pem"
+    assert ("# python dockvault.py setup --sso-ca-bundle <file> copies a file into certs/ and writes this line."
+            in _example())
+
+
+def test_setup_refuses_a_file_whose_name_another_file_in_certs_has_and_changes_nothing(tmp_path, monkeypatch, capsys):
+    _quiet_certificate_step(monkeypatch)
+    root = tmp_path / "deployment"
+    root.mkdir()
+    _reusable_env(root, sso_ca_bundle="/app/certs/ca.pem")
+    (root / "certs").mkdir()
+    (root / "certs" / "ca.pem").write_bytes(PEM)
+    other = tmp_path / "given" / "ca.pem"
+    other.parent.mkdir()
+    other.write_bytes(PEM + PEM)
+    env_before = (root / ".env").read_text(encoding="utf-8")
+    tool = dv.DockVault(dv.Palette(False), root=str(root))
+    # The file SSO_CA_BUNDLE names is not overwritten by attestation roots of the same name.
+    with pytest.raises(SystemExit):
+        tool.setup(_setup_args(webauthn_attestation_roots=str(other)))
+    assert "certs/ca.pem already exists with other contents" in capsys.readouterr().out
+    assert (root / "certs" / "ca.pem").read_bytes() == PEM
+    assert (root / ".env").read_text(encoding="utf-8") == env_before
+    # Two flags that name one file name: refused before either is copied.
+    first, second = tmp_path / "a" / "same.pem", tmp_path / "b" / "same.pem"
+    for path, body in ((first, PEM), (second, PEM + PEM)):
+        path.parent.mkdir()
+        path.write_bytes(body)
+    with pytest.raises(SystemExit):
+        tool.setup(_setup_args(webauthn_attestation_roots=str(first), sso_ca_bundle=str(second)))
+    assert "has the name of the file --webauthn-attestation-roots copies" in capsys.readouterr().out
+    assert not (root / "certs" / "same.pem").exists()
+    # A new copy of the file .env already names for the same setting replaces it.
+    tool.setup(_setup_args(sso_ca_bundle=str(other)))
+    assert (root / "certs" / "ca.pem").read_bytes() == PEM + PEM
+
+
 def test_the_readability_probe_names_each_file_it_is_given(monkeypatch):
     seen = {}
 
@@ -378,6 +474,18 @@ def test_setup_takes_the_sftp_key_exchange_policy_and_writes_it_only_when_it_is_
     for argv in (["--enable-sftp"], ["--enable-sftp", "--sftp-kex-policy", "default"]):
         lines = _lines(_first_setup_config(monkeypatch, argv))
         assert not [line for line in lines if line.startswith("SFTP_KEX_POLICY")], (argv, lines)
+
+
+def test_setup_says_when_it_drops_the_key_exchange_policy_because_sftp_is_off(monkeypatch, capsys):
+    lines = _lines(_first_setup_config(monkeypatch, ["--sftp-kex-policy", "pq-required"]))
+    assert not [line for line in lines if line.startswith("SFTP_KEX_POLICY")], lines
+    assert ("Note: --sftp-kex-policy pq-required is not written: SFTP is off. Add --enable-sftp or --split to run "
+            "it.") in capsys.readouterr().out
+    # With SFTP on, or the default, nothing is said.
+    for argv in (["--enable-sftp", "--sftp-kex-policy", "pq-required"], ["--split", "--sftp-kex-policy", "pq-required"],
+                 ["--sftp-kex-policy", "default"]):
+        _first_setup_config(monkeypatch, argv)
+        assert "is not written: SFTP is off" not in capsys.readouterr().out, argv
 
 
 def test_the_example_file_says_how_setup_sets_the_key_exchange_policy():

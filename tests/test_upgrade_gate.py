@@ -343,6 +343,26 @@ def test_going_back_from_0_36_0_prints_each_of_them_with_its_query(tmp_path, cap
     for cid in _NOT_GOING_BACK_0_36:
         assert rc.SUMMARY[cid] not in out, cid
         assert cid not in rc.DETECT or rc.DETECT[cid] not in out, cid
+    # This .env sets no passkey requirement: nothing is said of it.
+    assert "this .env :" not in out
+
+
+def test_going_back_from_0_36_0_says_the_passkey_requirement_this_env_sets(tmp_path, capsys):
+    """The query of role-must-hold-a-passkey reads the values saved on the settings page. A requirement set in .env
+    is read here, below that query."""
+    matrix = _matrix_with_0_36()
+    tool = _deployment(tmp_path, version="0.36.0", matrix=matrix)
+    with open(tmp_path / ".env", "a", encoding="utf-8", newline="") as handle:
+        handle.write("WEBAUTHN_MODE=required_for_roles\nWEBAUTHN_REQUIRED_ROLES=admin\n")
+    tool._describe_hop(dv.plan_downgrade_path(matrix, "0.36.0", "0.35.2"), "the test matrix", "0.36.0",
+                       "v0.35.2", down=True)
+    out = capsys.readouterr().out
+    said = ("this .env : WEBAUTHN_MODE=required_for_roles and WEBAUTHN_REQUIRED_ROLES=admin in .env: the roles admin "
+            "must hold a passkey, unless values saved on the settings page (which the query reads) replace them.")
+    assert said in out, out
+    detect = out.index("check with: " + rc.DETECT["role-must-hold-a-passkey"])
+    assert detect < out.index(said) < out.index(rc.SUMMARY["held-address-confirmations"]), out
+    assert out.count("this .env :") == 1, out
 
 
 @pytest.mark.parametrize("current, target", [("0.34.0", "0.33.6"), ("0.34.5", "0.33.10")])

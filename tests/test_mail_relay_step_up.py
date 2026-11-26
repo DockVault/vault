@@ -226,6 +226,22 @@ def test_deleting_a_profile_needs_the_step_up(db, admin):
     assert _profiles(db) == []
 
 
+def test_a_profile_another_administrator_deleted_during_the_step_up_is_not_found(db, admin, monkeypatch):
+    """The step-up may commit, and the row read before it may be gone after it: the answer is a 404, not a 500."""
+    p = _profile(db)
+    profile_id = p.id
+
+    def step_up(session, who, request):
+        session.query(studio.EmailProfile).filter(studio.EmailProfile.id == profile_id).delete(
+            synchronize_session=False)
+        session.commit()
+    monkeypatch.setattr(studio, "_step_up", step_up)
+    with pytest.raises(HTTPException) as gone:
+        run_coroutine(studio.delete_profile(profile_id=profile_id, request=_request(), admin=admin, db=db))
+    assert gone.value.status_code == 404
+    assert _profiles(db) == []
+
+
 @pytest.mark.parametrize("stored", [True, False], ids=["stored-profile", "unsaved-profile"])
 def test_a_profile_test_send_needs_the_step_up(db, admin, sent, stored):
     fields = ({"profile_id": _profile(db).id} if stored else

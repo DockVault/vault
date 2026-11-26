@@ -223,7 +223,14 @@ def test_the_second_factors_the_query_counts_are_the_ones_an_earlier_release_ign
         encoding="utf-8")
 
 
-def test_the_passkey_requirement_the_query_reads_lives_only_in_the_settings_store():
+def _dockvault():
+    spec = importlib.util.spec_from_file_location("dockvault_conditions_0_36", ROOT / "dockvault.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_passkey_requirement_is_read_from_the_settings_store_by_the_query_and_from_env_by_the_host_tool():
     from app.core import settings_registry as registry
     from app.core import webauthn_settings as ws
     sql = rc.DETECT["role-must-hold-a-passkey"]
@@ -231,11 +238,50 @@ def test_the_passkey_requirement_the_query_reads_lives_only_in_the_settings_stor
                                                                    "required_for_roles")
     assert f"m.key = '{ws.MODE}' AND m.value #>> '{{}}' = '{ws.REQUIRED_FOR_ROLES}'" in sql
     assert f"r.key = '{ws.REQUIRED_ROLES}'" in sql
-    for key in (ws.MODE, ws.REQUIRED_ROLES):
-        assert registry.spec_for(key).env is None, key      # no deployment value: the stored row is all there is
     assert registry.spec_for(ws.REQUIRED_ROLES).kind == "list"
     assert "db.query(ManagedSetting).all()" in (ROOT / "app" / "core" / "settings_registry.py").read_text(
         encoding="utf-8")
+    # Both also take a deployment value from .env, which SQL cannot read: the text says the host tool reads it.
+    names = {key: registry.spec_for(key).env.upper() for key in (ws.MODE, ws.REQUIRED_ROLES)}
+    assert names == {ws.MODE: "WEBAUTHN_MODE", ws.REQUIRED_ROLES: "WEBAUTHN_REQUIRED_ROLES"}
+    assert ("The query reads the values saved on the settings page; dockvault.py reads WEBAUTHN_MODE and "
+            "WEBAUTHN_REQUIRED_ROLES in .env, which apply where none is saved.") in rc.SUMMARY["role-must-hold-a-passkey"]
+    # Each resolves on its own: a valid saved value wins over .env, unless SETTINGS_LOCKED_KEYS locks the setting.
+    mode, roles = registry.spec_for(ws.MODE), registry.spec_for(ws.REQUIRED_ROLES)
+
+    def deployment(locked=""):
+        return SimpleNamespace(webauthn_mode="required_for_roles", webauthn_required_roles="admin",
+                               settings_locked_keys=locked)
+    assert registry._resolve(mode, {}, deployment())[0] == "required_for_roles"
+    assert registry._resolve(roles, {}, deployment())[0] == ["admin"]
+    assert registry._resolve(mode, {ws.MODE: ("optional",)}, deployment())[0] == "optional"
+    assert registry._resolve(mode, {ws.MODE: (None,)}, deployment())[0] == "required_for_roles"   # cleared
+    assert registry._resolve(mode, {ws.MODE: ("optional",)}, deployment("webauthn"))[0] == "required_for_roles"
+    # The host tool reads the two lines where it shows this condition, by the same rule.
+    dv = _dockvault()
+    assert dv.PASSKEY_REQUIREMENT_CONDITION == "role-must-hold-a-passkey" and dv.PASSKEY_ROLES == ws.ROLES
+    both = {"WEBAUTHN_MODE": "required_for_roles", "WEBAUTHN_REQUIRED_ROLES": "admin, user"}
+    said = dv.condition_env_note(rc.condition("role-must-hold-a-passkey"), both)
+    assert said == ("WEBAUTHN_MODE=required_for_roles and WEBAUTHN_REQUIRED_ROLES=admin,user in .env: the roles "
+                    "admin, user must hold a passkey, unless values saved on the settings page (which the query "
+                    "reads) replace them."), said
+    held = dv.condition_env_note(rc.condition("role-must-hold-a-passkey"), dict(both, SETTINGS_LOCKED_KEYS="webauthn"))
+    assert held.endswith("which SETTINGS_LOCKED_KEYS holds: the roles admin, user must hold a passkey, whatever the "
+                         "query finds."), held
+    # A lock on one of the two is not a hold on the requirement.
+    assert "unless values saved" in dv.condition_env_note(rc.condition("role-must-hold-a-passkey"),
+                                                          dict(both, SETTINGS_LOCKED_KEYS="webauthn_mode"))
+    # One line alone makes a requirement with a saved value that the query does not find.
+    assert "though the query, which reads the saved mode, finds nothing" in dv.condition_env_note(
+        rc.condition("role-must-hold-a-passkey"), {"WEBAUTHN_MODE": "required_for_roles"})
+    assert "though the query, which reads the saved roles, finds nothing" in dv.condition_env_note(
+        rc.condition("role-must-hold-a-passkey"), {"WEBAUTHN_REQUIRED_ROLES": "admin"})
+    # Nothing to add: no line, a mode that asks nothing, or a value the vault refuses to start with.
+    for env in ({}, {"WEBAUTHN_MODE": "optional"}, {"WEBAUTHN_MODE": "off", "WEBAUTHN_REQUIRED_ROLES": ""},
+                {"WEBAUTHN_REQUIRED_ROLES": "auditor"}):
+        assert dv.condition_env_note(rc.condition("role-must-hold-a-passkey"), env) is None, env
+    # Other conditions get no note.
+    assert dv.condition_env_note(rc.condition("held-address-confirmations"), both) is None
 
 
 def test_the_passkey_text_states_the_defaults():

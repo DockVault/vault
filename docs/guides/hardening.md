@@ -86,8 +86,9 @@ sign-on needs an `https` address, and an IP address serves it where the provider
   turned on keep signing in, and no longer prove a compliance step-up.
 - **Restrict every provider** to your organisation on its Access page: **Tenants** (Microsoft Entra ID),
   **Domains** (Google Workspace), **Required groups**, or the sign-up domain list when it is an allow-list. A
-  provider makes accounts at a first sign-in, or links an existing account by its verified email, only when it
-  says who may sign in. An Entra issuer already names your tenant, so a tenant there keeps nobody out: require a
+  provider makes accounts at a first sign-in, or links an existing account by its email, only when it says who
+  may sign in. A link by email also needs an address the vault itself confirmed for the account, not only one the
+  provider verified. An Entra issuer already names your tenant, so a tenant there keeps nobody out: require a
   group, and in Entra let only assigned people use the app.
 - **Keep the leaver rules on** (the provider's Sessions page, all on by default): back-channel logout; a refusal
   by the provider ends access here; the days a person may go without signing in through the provider (30; 0 turns

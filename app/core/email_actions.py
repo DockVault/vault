@@ -576,6 +576,19 @@ EARLIER_DEFAULT_BODIES = {
         "<hr>"
         "<p><small>Sent by {{vault.name}}.</small></p>",
     ),
+    # An earlier default told every change to change a password and to remove what the person did not recognize, an
+    # account with no password among them. The advice now comes with the change ({{action.change}}).
+    "sign_in_method_changed": (
+        "<h2>A change to how you sign in</h2>"
+        "<p>Hi {{user.username}},</p>"
+        "<p>{{action.change}}</p>"
+        "<p>When: {{action.when}}</p>"
+        "<p>If this was you, no action is needed. If it was not, open your profile, remove what you do not "
+        "recognize, change your password and tell your administrators.</p>"
+        "<p><a href=\"{{vault.url}}\">Open {{vault.name}}</a></p>"
+        "<hr>"
+        "<p><small>Sent by {{vault.name}}.</small></p>",
+    ),
 }
 
 

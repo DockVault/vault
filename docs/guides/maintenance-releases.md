@@ -2,7 +2,7 @@
 
 Which release lines are supported, and until when, is set by [SECURITY.md](../../.github/SECURITY.md):
 from 0.36.0 on, the newest line, and for 30 days after a minor release ships, the line before it.
-This guide says what that means for an install, and how the maintainers release a fix on a line that
+Those 30 days are for the upgrade: the line before gets no more fixes in them. This guide says what that means for an install, and how the maintainers release a fix on a line that
 is no longer the newest, where SECURITY.md promises one, as they did for the 0.33 and 0.34 lines.
 
 ## Release lines

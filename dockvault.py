@@ -539,7 +539,8 @@ def gen_hex(nbytes):
 def parse_env(text):
     """Parse a KEY=VALUE .env into a dict. First occurrence of a key wins; a single surrounding
     matching quote pair is stripped; tolerant of CRLF + whitespace around the key/'=', and of a byte
-    order mark at the start (without_bom). Pure — mirrors the setup scripts' read_env so a re-run reads
+    order mark at the start (without_bom). An unquoted value ends before " #" (a space, then #), as docker
+    compose reads it: what follows is a comment. Pure — mirrors the setup scripts' read_env so a re-run reads
     its own output back correctly."""
     out = {}
     for raw in without_bom(text).splitlines():
@@ -551,6 +552,8 @@ def parse_env(text):
         val = val.strip().rstrip("\r")
         if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
             val = val[1:-1]
+        elif val[:1] not in ("'", '"') and " #" in val:
+            val = val[:val.index(" #")].rstrip()
         if key and key not in out:
             out[key] = val
     return out
@@ -1581,6 +1584,11 @@ CERTS_FILE_SETTINGS = (
     ("SSO_CA_BUNDLE", "Single sign-on",
      "Until the server can read it, no single sign-on provider can be reached."),
 )
+# The setup flags that copy such a file into certs/ and name it in .env: (flag, its argument's name, the setting).
+CERTS_FILE_FLAGS = (
+    ("--webauthn-attestation-roots", "webauthn_attestation_roots", "WEBAUTHN_ATTESTATION_ROOTS"),
+    ("--sso-ca-bundle", "sso_ca_bundle", "SSO_CA_BUNDLE"),
+)
 
 
 def certs_file_name(value):
@@ -2470,9 +2478,12 @@ SFTP_KEX_POLICIES = ("default", "pq-required")
 
 def sftp_kex_policy_problem(value):
     """Why ``value`` (SFTP_KEX_POLICY as a .env has it) is no policy the vault takes, in the vault's own words, or
-    None. Left out or empty is the default."""
-    text = str(value or "").strip().lower()
-    if not text or text in SFTP_KEX_POLICIES:
+    None. Left out (None) is the default. An empty value is refused at the vault's start, as status says, so it is
+    no policy here either."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in SFTP_KEX_POLICIES:
         return None
     return "SFTP_KEX_POLICY must be one of default, pq-required (the .env has %r)" % (str(value).strip(),)
 
@@ -3764,6 +3775,55 @@ def attestation_roots_note(locked):
                       "on until the lock names neither *, the group webauthn nor webauthn_attestation.")
     return False, ("The file alone turns nothing on: an administrator chooses Direct for Attestation (an advanced "
                    "setting) in Settings -> Sign-in methods.")
+
+
+# The upgrade matrix's condition on the passkey a role must hold. Its query reads the values saved on the settings
+# page (managed_settings); WEBAUTHN_MODE and WEBAUTHN_REQUIRED_ROLES in .env apply where none is saved, or where
+# SETTINGS_LOCKED_KEYS locks the setting (app/core/settings_registry.py), and only this tool can read them.
+PASSKEY_REQUIREMENT_CONDITION = "role-must-hold-a-passkey"
+PASSKEY_ROLES = ("user", "external", "admin")
+
+
+def env_passkey_roles(env):
+    """The roles WEBAUTHN_REQUIRED_ROLES in ``env`` (the parsed .env) names, as a tuple: comma-separated, as the
+    vault reads a list. Empty when it names none, or names something that is no role (the vault then refuses to
+    start). Pure."""
+    roles = [part.strip() for part in str((env or {}).get("WEBAUTHN_REQUIRED_ROLES") or "").split(",") if part.strip()]
+    return tuple(roles) if all(role in PASSKEY_ROLES for role in roles) else ()
+
+
+def passkey_requirement_env_note(env):
+    """What .env (``env``, parsed) adds to the condition role-must-hold-a-passkey, as a sentence, or None when it adds
+    nothing. Each of the two settings resolves on its own: a value saved on the settings page wins over .env's,
+    unless SETTINGS_LOCKED_KEYS locks the setting. Pure."""
+    env = env or {}
+    mode = str(env.get("WEBAUTHN_MODE") or "").strip()
+    roles = env_passkey_roles(env)
+    tokens = settings_locked_tokens(env.get("SETTINGS_LOCKED_KEYS"))
+    held = all(tokens & {"*", "webauthn", key} for key in ("webauthn_mode", "webauthn_required_roles"))
+    if mode == "required_for_roles" and roles:
+        shown = "WEBAUTHN_MODE=required_for_roles and WEBAUTHN_REQUIRED_ROLES=%s in .env" % ",".join(roles)
+        if held:
+            return ("%s, which SETTINGS_LOCKED_KEYS holds: the roles %s must hold a passkey, whatever the query finds."
+                    % (shown, ", ".join(roles)))
+        return ("%s: the roles %s must hold a passkey, unless values saved on the settings page (which the query "
+                "reads) replace them." % (shown, ", ".join(roles)))
+    if mode == "required_for_roles":
+        return ("WEBAUTHN_MODE=required_for_roles in .env: where roles are saved on the settings page and no other "
+                "mode is, those roles must hold a passkey, though the query, which reads the saved mode, finds "
+                "nothing.")
+    if roles:
+        return ("WEBAUTHN_REQUIRED_ROLES=%s in .env: where the settings page saved the mode required_for_roles and no "
+                "roles, these roles must hold a passkey, though the query, which reads the saved roles, finds "
+                "nothing." % ",".join(roles))
+    return None
+
+
+def condition_env_note(condition, env):
+    """What .env adds to an upgrade-matrix condition whose query cannot read it, or None. Pure."""
+    if isinstance(condition, dict) and condition.get("id") == PASSKEY_REQUIREMENT_CONDITION:
+        return passkey_requirement_env_note(env)
+    return None
 
 
 # Where Docker puts compose networks by default (its default address pools), for when the deployment's
@@ -5816,9 +5876,9 @@ class DockVault:
 
         env_path = self._env_path()
         existing = parse_env(open(env_path, encoding="utf-8").read()) if os.path.exists(env_path) else {}
-        # A file of attestation roots given on the command line is checked and copied into certs/ before .env is
-        # written or changed: a file setup cannot use stops it with nothing changed.
-        attestation_roots = self._take_attestation_roots(args, existing.get("SETTINGS_LOCKED_KEYS"))
+        # The files given on the command line for certs/ (attestation roots, a provider's certificate authorities) are
+        # checked and copied before .env is written or changed: a file setup cannot use stops it with nothing changed.
+        certs_flags = self._take_certs_files(args, existing)
         reusing = False
         summary = {}
         tracker.show()
@@ -5847,9 +5907,9 @@ class DockVault:
             # bootstrapped deployment the seed is marker-guarded, so this is inert and the value is
             # dropped again after a healthy boot. Not passed -> the existing .env is left untouched.
             existing = self._apply_cli_admin_overrides(env_path, existing, args)
-            if attestation_roots:
-                self._set_env_key(env_path, "WEBAUTHN_ATTESTATION_ROOTS", attestation_roots)
-                print(pal.paint("  Set WEBAUTHN_ATTESTATION_ROOTS=%s in .env." % attestation_roots, "green"))
+            for key, path in certs_flags.items():
+                self._set_env_key(env_path, key, path)
+                print(pal.paint("  Set %s=%s in .env." % (key, path), "green"))
             summary = {"server_name": existing.get("SERVER_NAME") or _allowed_hosts_name(existing.get("ALLOWED_HOSTS")) or "",
                        "admin_username": existing.get("ADMIN_USERNAME") or "admin",
                        "compose_profiles": migrated,
@@ -5858,8 +5918,8 @@ class DockVault:
                        "sftp_host_port": _port_or(existing.get("SFTP_HOST_PORT"), 2322)}
         else:
             cfg = self._collect_setup_config(args)
-            if attestation_roots:
-                cfg["webauthn_attestation_roots"] = attestation_roots
+            for key, path in certs_flags.items():
+                cfg[key.lower()] = path
             tracker.advance(); tracker.show()          # -> Write .env
             if write_env(env_path, build_env_lines(cfg)):
                 print(pal.paint("  Wrote .env (restricted to your user).", "green"))
@@ -5987,7 +6047,9 @@ class DockVault:
         # A re-run starts the vault at the address .env gives now, which an operator may have changed by hand: what it
         # turns off, and the passkeys it leaves unusable, are said while the running container can still be asked.
         if reusing:
-            self._say_sign_in_address(env_now.get("ALLOWED_HOSTS"), interactive)
+            self._say_sign_in_address(env_now.get("ALLOWED_HOSTS"), interactive,
+                                      kept="What setup already changed in .env and certs/ stays, and applies at the "
+                                           "next start.")
         # Port preflight: warn (don't block) if the chosen web port is held by something ELSE.
         # A re-run over a running deployment finds its OWN container on the port - the one compose
         # is about to recreate - and warning there is just noise the operator has to second-guess.
@@ -6164,6 +6226,10 @@ class DockVault:
             sftp_public_port = a("sftp_public_port")
             kex_policy = a("sftp_kex_policy")
             update_check, log_pull = bool(a("update_check")), bool(a("enable_log_pull"))
+        # The policy is written only where SFTP runs: one given without SFTP is said, not dropped unseen.
+        if str(kex_policy or "").strip().lower() == "pq-required" and not (enable_sftp or split):
+            print(pal.paint("  Note: --sftp-kex-policy pq-required is not written: SFTP is off. Add --enable-sftp or "
+                            "--split to run it.", "yellow"))
         # What the audit log may record of personal data at most (RECORDING_PRESETS).
         preset, lock_levels = a("recording_preset"), bool(a("lock_recording_levels"))
         if interactive and not preset:
@@ -6282,47 +6348,74 @@ class DockVault:
             self._fail("unknown --cert-mode %r (one of %s)" % (mode, ", ".join(CERT_MODES)))
         return (mode or "selfsigned", email, cpath, kpath)
 
-    def _take_attestation_roots(self, args, locked=None):
-        """The file --webauthn-attestation-roots names, checked and copied into certs/ (mode 644; setup then hands it
-        to the container's user with the TLS pair): the path the container reads it at (/app/certs/<its name>), for
-        WEBAUTHN_ATTESTATION_ROOTS. None when the flag is not given. A file that is not there, holds no PEM
-        certificate, has the name of the TLS pair's certificate or key, or a name a .env line cannot carry plainly,
-        stops setup before anything is written. ``locked`` is the .env's SETTINGS_LOCKED_KEYS, for what it says after
-        the copy (attestation_roots_note)."""
-        source = getattr(args, "webauthn_attestation_roots", None) if args else None
-        if not source:
-            return None
-        source = os.path.expanduser(str(source))
-        flag = "--webauthn-attestation-roots"
-        if not os.path.isfile(source):
-            self._fail("%s: %s is not a file." % (flag, source))
-        name = os.path.basename(source)
-        if name in ("cert.pem", "key.pem"):
-            self._fail("%s: %s has the name of the TLS pair's certificate or key in certs/; copy it under another "
-                       "name first." % (flag, source))
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
-            self._fail("%s: the file's name %r has more than letters, digits, dots, hyphens and underscores; copy it "
-                       "under such a name first." % (flag, name))
-        try:
-            with open(source, "rb") as handle:
-                body = handle.read()
-        except OSError as exc:
-            self._fail("%s: %s cannot be read (%s)." % (flag, source, type(exc).__name__))
-        if b"-----BEGIN CERTIFICATE-----" not in body:
-            self._fail("%s: %s holds no PEM certificate." % (flag, source))
+    def _take_certs_files(self, args, existing=None):
+        """The files setup's flags name for the server to read from certs/ (CERTS_FILE_FLAGS), each checked and copied
+        into certs/ (mode 644; setup then hands them to the container's user with the TLS pair), as {.env setting: the
+        path the container reads it at (/app/certs/<its name>)}. Empty when no such flag is given. ``existing`` is the
+        .env before setup changes it.
+
+        Every file is checked before any is copied, so a file setup cannot use stops it with nothing changed: one
+        that is not there, holds no PEM certificate, has the name of the TLS pair's certificate or key, or a name a
+        .env line cannot carry plainly. So does a name two flags share, and a file already in certs/ under that name
+        with other contents, unless it is the one .env names for the same setting (a new copy of it replaces it)."""
+        existing = existing or {}
         cert_dir = self._certs_dir()
-        target = os.path.join(cert_dir, name)
-        try:
-            os.makedirs(cert_dir, exist_ok=True)
-            if os.path.abspath(source) != os.path.abspath(target):
-                shutil.copyfile(source, target)
-            os.chmod(target, 0o644)
-        except OSError as exc:
-            self._fail("%s: could not copy %s into certs/ (%s). Copy it there yourself and set "
-                       "WEBAUTHN_ATTESTATION_ROOTS=/app/certs/%s in .env." % (flag, source, type(exc).__name__, name))
-        held, note = attestation_roots_note(locked)
-        print(self.pal.paint("  Copied %s to certs/%s. %s" % (source, name, note), "yellow" if held else "green"))
-        return "/app/certs/" + name
+        taken = []                          # (flag, setting, source, name)
+        for flag, attr, key in CERTS_FILE_FLAGS:
+            source = getattr(args, attr, None) if args else None
+            if not source:
+                continue
+            source = os.path.expanduser(str(source))
+            if not os.path.isfile(source):
+                self._fail("%s: %s is not a file." % (flag, source))
+            name = os.path.basename(source)
+            if name in ("cert.pem", "key.pem"):
+                self._fail("%s: %s has the name of the TLS pair's certificate or key in certs/; copy it under another "
+                           "name first." % (flag, source))
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+                self._fail("%s: the file's name %r has more than letters, digits, dots, hyphens and underscores; copy "
+                           "it under such a name first." % (flag, name))
+            try:
+                with open(source, "rb") as handle:
+                    body = handle.read()
+            except OSError as exc:
+                self._fail("%s: %s cannot be read (%s)." % (flag, source, type(exc).__name__))
+            if b"-----BEGIN CERTIFICATE-----" not in body:
+                self._fail("%s: %s holds no PEM certificate." % (flag, source))
+            for other_flag, _key, _source, other in taken:
+                if other == name:
+                    self._fail("%s: %s has the name of the file %s copies; copy one of them under another name first."
+                               % (flag, source, other_flag))
+            target = os.path.join(cert_dir, name)
+            if os.path.isfile(target) and os.path.abspath(source) != os.path.abspath(target) \
+                    and certs_file_name(existing.get(key)) != name:
+                try:
+                    with open(target, "rb") as handle:
+                        same = handle.read() == body
+                except OSError:
+                    same = False
+                if not same:
+                    self._fail("%s: certs/%s already exists with other contents; copy %s under another name first."
+                               % (flag, name, source))
+            taken.append((flag, key, source, name))
+        out = {}
+        for flag, key, source, name in taken:
+            target = os.path.join(cert_dir, name)
+            try:
+                os.makedirs(cert_dir, exist_ok=True)
+                if os.path.abspath(source) != os.path.abspath(target):
+                    shutil.copyfile(source, target)
+                os.chmod(target, 0o644)
+            except OSError as exc:
+                self._fail("%s: could not copy %s into certs/ (%s). Copy it there yourself and set %s=/app/certs/%s in "
+                           ".env." % (flag, source, type(exc).__name__, key, name))
+            if key == "WEBAUTHN_ATTESTATION_ROOTS":
+                held, note = attestation_roots_note(existing.get("SETTINGS_LOCKED_KEYS"))
+                print(self.pal.paint("  Copied %s to certs/%s. %s" % (source, name, note), "yellow" if held else "green"))
+            else:
+                print(self.pal.paint("  Copied %s to certs/%s." % (source, name), "green"))
+            out[key] = "/app/certs/" + name
+        return out
 
     @staticmethod
     def _certs_files_named(env, cert_dir):
@@ -8818,11 +8911,16 @@ class DockVault:
         print("    reversible   : %s" % ("no" if plan["irreversible"] else "yes"))
         why = backup_reason(plan, down)
         print("    backup       : %s" % (("required (%s)" % why) if why else "not required"))
+        env = self._load_env() if plan["conditions"] else {}
         for condition in plan["conditions"]:
             print(pal.paint("    note         : %s" % clean_matrix_text(condition.get("summary", "")),
                             "yellow"))
             if condition.get("detect"):
                 print("                   check with: %s" % clean_matrix_text(condition["detect"]))
+            # A setting the query cannot read, read here from .env.
+            from_env = condition_env_note(condition, env)
+            if from_env:
+                print(pal.paint("                   this .env : %s" % from_env, "yellow"))
 
     def _require_backup(self, args, interactive, reason):
         """Take a backup, or accept an operator's word that one exists. False = do not proceed.
@@ -9555,12 +9653,13 @@ class DockVault:
         self._recreate_stack(build=False)
         print(pal.paint("  Applied.\n", "green"))
 
-    def _say_sign_in_address(self, allowed_hosts, interactive):
+    def _say_sign_in_address(self, allowed_hosts, interactive, kept=""):
         """What setup's re-run and restart say before the vault is recreated at the address ``allowed_hosts`` gives
         (ALLOWED_HOSTS in .env now): what that address turns off (sign_in_address_note), and the passkeys in use that
         were made at another one (passkeys_elsewhere_note), which the running deployment, still the one before the
         change, is asked about. When ``interactive`` and an account would be left with no second factor at the new
-        address while passkeys are on, the operator confirms first: No stops the command, with nothing taken down."""
+        address while passkeys are on, the operator confirms first: No stops the command, with nothing taken down.
+        ``kept`` is a sentence on what the command already wrote, said when it stops."""
         pal = self.pal
         note = sign_in_address_note(allowed_hosts)
         if note:
@@ -9580,7 +9679,7 @@ class DockVault:
             if not confirm("Start the vault at this address anyway? Those passkeys cannot be used until the address "
                            "goes back.", pal, default=False):
                 print(pal.paint("  The deployment was not restarted. Change ALLOWED_HOSTS back in .env, or run this "
-                                "again to go on.", "yellow"))
+                                "again to go on.%s" % ((" " + kept) if kept else ""), "yellow"))
                 raise SystemExit(1)
 
     def _passkey_addresses(self):
@@ -10696,6 +10795,10 @@ def build_parser():
                     help="a PEM file of authenticator vendors' attestation root certificates, for direct passkey "
                          "attestation (turned on in Settings -> Sign-in methods): copied into certs/ and named in "
                          "WEBAUTHN_ATTESTATION_ROOTS; on a re-run too")
+    sp.add_argument("--sso-ca-bundle", dest="sso_ca_bundle",
+                    help="a PEM file of the certificate authorities that issued the certificate of a single sign-on "
+                         "provider inside your network (a Keycloak or ADFS on your own authority): copied into certs/ "
+                         "and named in SSO_CA_BUNDLE; on a re-run too")
     sp.add_argument("--update-check", dest="update_check", action="store_true", help="enable the opt-in update check")
     sp.add_argument("--enable-log-pull", dest="enable_log_pull", action="store_true", help="enable the log-pull endpoint")
     sp.add_argument("--non-interactive", dest="non_interactive", action="store_true", help="use flags/defaults, never prompt")

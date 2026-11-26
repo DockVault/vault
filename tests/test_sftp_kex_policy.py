@@ -292,9 +292,10 @@ def test_the_setup_tool_refuses_a_new_set_while_the_policy_is_no_policy(capsys):
     what the vault itself says."""
     tool = _tool()
     assert tool.SFTP_KEX_POLICIES == ("default", "pq-required")
-    for fine in (None, "", "default", " PQ-Required ", "Default"):
+    for fine in (None, "default", " PQ-Required ", "Default"):
         assert tool.sftp_kex_policy_problem(fine) is None, fine
-    for wrong in ("pq_required", "required", "pq-preferred", "yes"):
+    # An empty line is not left out: the vault refuses it at its start, and status says so in red.
+    for wrong in ("pq_required", "required", "pq-preferred", "yes", ""):
         assert tool.sftp_kex_policy_problem(wrong) == (
             "SFTP_KEX_POLICY must be one of default, pq-required (the .env has %r)" % wrong)
 

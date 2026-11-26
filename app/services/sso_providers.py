@@ -355,6 +355,13 @@ def held_by_its_days(db, row, *, now=None) -> list:
     return [user for user, standing in _held(db, row, now) if not standing.refused]
 
 
+def held_by_the_vaults_own_hold(db, row, *, now=None) -> list:
+    """The accounts ``row`` holds by a hold the vault wrote itself (:func:`hold_lapsed`, marked keys_only_hold):
+    their days had run out when the provider was turned off or was to be removed, while those days only paused
+    keys. The provider refused none of them."""
+    return [user for user, standing in _held(db, row, now) if standing.refused and standing.keys_only_hold]
+
+
 def held_through(db, row, *, now=None) -> list:
     """Every account that can sign in and that ``row`` holds to a provider's sign-in right now, whatever holds
     it: its days (:func:`held_by_its_days`), or a refusal or hold on record. What a save that changes what the

@@ -31,7 +31,7 @@ APP_JS = ROOT / "static" / "js" / "app.js"
 _SHIPPED = ("_el", "parseServerTime", "formatDayMonth", "_changedBy", "pendingApproval", "confirmCredentialChange",
             "_passkeysShownFor", "loadUserPasskeys", "renderUserPasskeys", "_passkeyWhen", "_passkeyStateText",
             "_zkKeyHoldSays", "removeUserPasskey", "_passkeysCounted", "_passkeysHeld",
-            "renderUserDetail")
+            "renderUserDetail", "serverSaid")
 
 
 def _function(js, name):
@@ -244,14 +244,14 @@ out({ confirm: confirms[0], toasts, on });
 def test_a_refused_removal_is_said_and_the_list_is_read_again():
     got = _node(r"""
 answers['/users/u-carol/passkeys'] = KEYS;
-answers['/users/u-carol/passkeys/k-1'] = new Error('That passkey was not found.');
+answers['/users/u-carol/passkeys/k-1'] = Object.assign(new Error('That passkey was not found.'), { status: 404 });
 await loadUserPasskeys('u-carol');
 host.querySelector('.user-passkey-remove-btn').click();
 await tick(); await tick(); await tick();
 out({ toasts, reloads: reloads.length, disabled: host.querySelector('.user-passkey-remove-btn').disabled });
 """)
-    assert got == {"toasts": [["error", "Could not remove the passkey: That passkey was not found."]], "reloads": 1,
-                   "disabled": False}
+    # The server's sentence, said once (serverSaid): a sentence apiRequest has shown already is not said again.
+    assert got == {"toasts": [["error", "That passkey was not found."]], "reloads": 1, "disabled": False}
 
 
 def test_a_key_that_signs_nobody_in_says_why_and_one_whose_algorithm_runs_out_says_until_when():

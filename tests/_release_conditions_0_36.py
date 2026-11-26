@@ -47,8 +47,10 @@ DETECT = {
         "(e.refused_at IS NOT NULL AND (e.last_sign_in_at IS NULL OR e.refused_at >= e.last_sign_in_at)) OR "
         "(COALESCE((p.policy->>'sso_freshness_days')::int, 30) > 0 AND COALESCE(e.last_sign_in_at, e.linked_at) + "
         "make_interval(days => COALESCE((p.policy->>'sso_freshness_days')::int, 30)) <= (now() AT TIME ZONE 'utc'))"),
-    # The passkey mode and the roles that must hold one, which only the settings store (managed_settings, a json
-    # column) holds: neither has a deployment value (app/core/webauthn_settings.py).
+    # The passkey mode and the roles that must hold one, as saved on the settings page (managed_settings, a json
+    # column). Each also takes a deployment value from .env (WEBAUTHN_MODE, WEBAUTHN_REQUIRED_ROLES;
+    # app/core/webauthn_settings.py), which applies where none is saved, or where SETTINGS_LOCKED_KEYS locks it. SQL
+    # cannot read .env: dockvault.py reads it where it shows this condition (condition_env_note).
     "role-must-hold-a-passkey": (
         "SELECT 1 FROM managed_settings m WHERE m.key = 'webauthn_mode' AND m.value #>> '{}' = 'required_for_roles' "
         "AND EXISTS (SELECT 1 FROM managed_settings r WHERE r.key = 'webauthn_required_roles' AND CASE WHEN "
@@ -94,7 +96,9 @@ SUMMARY = {
         "sign-in there have run out: their password, SSH keys, temporary credentials and devices work again, and "
         "their sessions are renewed without asking the provider. Disable those accounts first."),
     "role-must-hold-a-passkey": (
-        "Going back: an earlier release does not ask for the passkey a role must hold."),
+        "Going back: an earlier release does not ask for the passkey a role must hold. The query reads the values "
+        "saved on the settings page; dockvault.py reads WEBAUTHN_MODE and WEBAUTHN_REQUIRED_ROLES in .env, which "
+        "apply where none is saved."),
     "held-address-confirmations": (
         "Going back: first deny or withdraw the held confirmations of an address. An earlier release applies one as "
         "a change of address, writing the address it names over the one the account holds by then."),

@@ -87,3 +87,19 @@ def test_the_lifespan_scrubs_the_password_right_after_seeding_the_admin():
     assert seed_pos < scrub_pos, "the scrub must run after the admin is seeded"
     assert "_admin_bootstrap_status = _seed_admin_user()" in body, \
         "the bootstrap status must be captured and passed to the scrub"
+
+
+def test_the_boot_steps_that_can_meet_a_duplicate_key_print_its_kind_and_not_its_text():
+    """A database error's text carries the row it refused: "Key (username)=(...)" when two workers seed the admin at
+    once, "Key (lower(email::text))=(...)" when an account is made while the address index is built. Container output
+    keeps neither: the line says the kind of error only, and so does the record of the schema step."""
+    src = (Path(__file__).resolve().parent.parent / "app" / "api" / "api_server.py").read_text(encoding="utf-8")
+    seed = src[src.index("def _seed_admin_user("):]
+    seed = seed[:seed.index("\ndef ", 1)]
+    assert 'print(f"⚠ Admin bootstrap skipped: {type(e).__name__}")' in seed
+    assert "{e}" not in seed
+    index = src[src.index('print(f"⚠ users.email case-insensitive index skipped'):]
+    index = index[:index.index("\n\n")]
+    assert 'print(f"⚠ users.email case-insensitive index skipped: {type(e).__name__}")' in index
+    assert "recorder.record(email_index_step, SchemaStep.OUTCOME_FAILED, type(e).__name__)" in index
+    assert "str(e)" not in index and "{e}" not in index
