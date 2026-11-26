@@ -466,7 +466,7 @@ def test_a_removal_goes_through_once_an_administrator_has_lifted_the_holds_it_ma
     assert lapsed.refused_at is None and lapsed.hold_lifted_for == last + timedelta(days=7)
     assert lapsed.last_sign_in_at == last                       # the lift gives no sign-in
     # The administrators are told that the keys stay paused until a sign-in there, and what ends that wait.
-    assert h.told[-1][1] == "A single sign-on refusal was lifted" and h.told[-1][2].endswith(
+    assert h.told[-1][1] == "A single sign-on refusal or hold was lifted" and h.told[-1][2].endswith(
         f"A removal of {row.name} no longer waits for this account: once {row.name} is removed, its keys wait for "
         "a sign-in there no more.")
     assert f"stay paused until a sign-in through {row.name}, which is turned off" in h.told[-1][2]

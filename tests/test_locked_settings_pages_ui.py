@@ -91,6 +91,8 @@ const matches = dom.Element.prototype.matches;
 dom.Element.prototype.matches = function (sel) { return matches.call(this, plain(sel)); };
 dom.Element.prototype.after = function (node) { this.parentNode.insertBefore(node, this.nextSibling()); };
 global.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+// The page listens for the Advanced switch turned in another tab; no other tab here.
+if (typeof window.addEventListener !== 'function') window.addEventListener = () => {};
 const section = document.createElement('div');
 section.id = 'settings-section'; section.className = 'active';
 document.body.appendChild(section);
@@ -133,7 +135,7 @@ out({ sso: sso.className, mode: mode.className, algs: algs.className,
       summary: fold.querySelector('summary').textContent, hidden: fold.hidden,
       listed: fold.querySelectorAll('.settings-provider-item').map((item) => [item.dataset.foldKey,
           item.querySelector('strong').textContent, item.querySelector('.settings-provider-value').textContent]),
-      toggle: bar.querySelector('.settings-advanced-toggle').textContent,
+      toggle: bar.querySelectorAll('.settings-advanced-toggle').length,
       allAdvanced: !bar.querySelector('.settings-level-note').hidden });
 """)
     # The single sign-on card stays in its place; the other locked setting leaves for the list.
@@ -142,8 +144,9 @@ out({ sso: sso.className, mode: mode.className, algs: algs.className,
     assert got["hidden"] is False and got["summary"] == "Set by your provider (2)"
     assert got["listed"] == [["sso", "Single sign-on providers", "The providers are kept as they are."],
                              ["webauthn_mode", "Passkeys", "off"]]
-    # Neither locked one is counted: the page's one counted setting is advanced, and the page says so.
-    assert got["toggle"] == "Show advanced settings (1)" and got["allAdvanced"] is True
+    # Neither locked one is counted: the page's one counted setting is advanced, and the page says so (the one
+    # Advanced switch, in the settings menu, shows it; the page has no button of its own).
+    assert got["toggle"] == 0 and got["allAdvanced"] is True
 
 
 def test_the_sign_in_pages_single_sign_on_card_is_marked_as_showing_its_own_lock():
