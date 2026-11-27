@@ -432,6 +432,110 @@ def test_release_scans_before_auth_and_attests_one_push_bound_registry_digest():
     assert not (_ROOT / ".github" / "scripts" / "release_push_digest.py").exists()
 
 
+# The reviewed texts of the five OpenSSL statements (security/vex.openvex.json) and of their paragraph
+# in docs/supply-chain-controls.md, word for word.
+_OPENSSL_USERS = (
+    "In this image the system OpenSSL, Alpine's libssl3 and libcrypto3 3.5.9-r1, is linked by "
+    "Python's _ssl module (TLS over TCP), Python's _hashlib module (digests, HMAC, PBKDF2 "
+    "and scrypt, no ciphers), busybox's ssl_client (TLS over TCP), apk-tools (TLS over TCP "
+    "and signature checks), ca-certificates' c_rehash (certificate hashing), and the legacy "
+    "provider and engines OpenSSL loads on request. None of them imports a QUIC, DANE, CMS or "
+    "PKCS#7 function, and the image has no openssl command."
+)
+_OPENSSL_END = (
+    "The statement is bound to libssl3 and libcrypto3 3.5.9-r1 and ends when the image moves "
+    "to an OpenSSL with the fix (3.5.10, scheduled for 1 December 2026). Verified for source "
+    "revision __SOURCE_REVISION__."
+)
+_OPENSSL_REASON = {
+    "quic": (
+        "Python's ssl module has no QUIC support, and dnspython's DNS over QUIC needs aioquic, "
+        "which the image does not install and which implements QUIC itself, not with OpenSSL."
+    ),
+    "crl": (
+        "Python's standard library has no CMS or PKCS#7 interface, and the application never "
+        "turns on CRL checking in Python's ssl module."
+    ),
+    "dane": (
+        "Python's ssl module has no DANE support, and the application looks up no TLSA records."
+    ),
+    "pem": (
+        "Python's _ssl module does not import these functions, and the one program in the image "
+        "that does, ca-certificates' c_rehash, is never run: the package's trigger runs "
+        "update-ca-certificates, which uses no OpenSSL and does not run it, and neither the "
+        "application nor its entrypoint runs c_rehash."
+    ),
+}
+_OPENSSL_WHAT = {
+    "CVE-2026-107494": ("quic", (
+        "CVE-2026-107494 is a flaw in OpenSSL's QUIC implementation, rated Low by OpenSSL: the "
+        "QUIC stack queues a RETIRE_CONNECTION_ID frame for every retransmitted NEW_CONNECTION_ID "
+        "frame, so a malicious QUIC peer can make it queue frames without limit until memory runs "
+        "out. It is reached only by an application that runs a QUIC connection with OpenSSL."
+    )),
+    "CVE-2026-124709": ("quic", (
+        "CVE-2026-124709 is a flaw in OpenSSL's QUIC server, rated Low by OpenSSL: a server that "
+        "rejects a stream the peer opened keeps that stream's state for the life of the "
+        "connection when the peer resets the stream first, so a client can make its memory grow "
+        "without bound. It is reached only by an application that runs a QUIC server with "
+        "OpenSSL."
+    )),
+    "CVE-2026-121482": ("crl", (
+        "CVE-2026-121482 is a flaw in OpenSSL's CRL checking, rated Low by OpenSSL: verifying a "
+        "crafted CMS or PKCS#7 SignedData message with CRL checking turned on rebuilds the CRL "
+        "distribution point names for every CRL, so the time it takes grows with the square of "
+        "the message's size. It is reached only by an application that verifies such a message "
+        "with CRL checking turned on, which OpenSSL leaves off by default."
+    )),
+    "CVE-2026-84786": ("dane", (
+        "CVE-2026-84786 is a NULL pointer dereference in OpenSSL's DANE support, rated Low by "
+        "OpenSSL: a TLS client that turns on DANE and accepts TLSA records that mix PKIX-TA(0) or "
+        "PKIX-EE(1) with DANE-TA(2) can crash when a server presents a trusted authority's "
+        "certificate as its own. It is reached only by an application that turns on DANE for a "
+        "TLS connection with OpenSSL."
+    )),
+    "CVE-2026-107493": ("pem", (
+        "CVE-2026-107493 is a use-after-free in OpenSSL's PEM_X509_INFO_read_bio_ex() and the "
+        "functions built on it, rated Low by OpenSSL: when reading into a stack the caller passes "
+        "fails, OpenSSL frees the stack's entries but leaves them in it. It is reached only by an "
+        "application that passes its own stack instead of NULL; OpenSSL's own callers, including "
+        "the code TLS uses to load CA certificates, pass NULL."
+    )),
+}
+_OPENSSL_IMPACT = {
+    name: " ".join((what, _OPENSSL_USERS, _OPENSSL_REASON[kind], _OPENSSL_END))
+    for name, (kind, what) in _OPENSSL_WHAT.items()
+}
+_OPENSSL_PARAGRAPH = (
+    "Five more come from OpenSSL's advisories of 17 and 24 November 2026, which rate all five "
+    "Low: `CVE-2026-107494` and `CVE-2026-124709` in its QUIC implementation, `CVE-2026-121482` "
+    "in CRL checking during CMS and PKCS#7 verification, `CVE-2026-84786` in its DANE support, "
+    "and `CVE-2026-107493` in `PEM_X509_INFO_read_bio_ex()` when a caller passes its own stack. "
+    "The fixed release, OpenSSL 3.5.10, is scheduled for 1 December 2026; when they were "
+    "reviewed, on 27 November 2026, Alpine 3.24 served 3.5.9-r1, which does not fix them. In "
+    "this image the system OpenSSL is linked by Python's `_ssl` module (TLS over TCP), "
+    "Python's `_hashlib` module (digests, HMAC, PBKDF2 and scrypt, no ciphers), busybox's "
+    "`ssl_client` (TLS over TCP), apk-tools (TLS over TCP and signature checks), "
+    "ca-certificates' `c_rehash` (certificate hashing), and the legacy provider and engines "
+    "OpenSSL loads on request. None of them imports a QUIC, DANE, CMS or PKCS#7 function, and "
+    "the image has no `openssl` command. Python's `ssl` module has no QUIC or DANE support; "
+    "dnspython's DNS over QUIC needs `aioquic`, which the image does not install and which "
+    "implements QUIC itself, not with OpenSSL; the application looks up no TLSA records and "
+    "never turns on CRL checking; and Python's standard library has no CMS or PKCS#7 "
+    "interface. OpenSSL's own callers of `PEM_X509_INFO_read_bio_ex()`, including the code TLS "
+    "uses to load CA certificates, pass no stack; `_ssl` does not import it, and `c_rehash`, "
+    "the one program in the image that does, is never run: the package's trigger runs "
+    "`update-ca-certificates`, which uses no OpenSSL and does not run it, and neither the "
+    "application nor its entrypoint runs `c_rehash`. Each statement binds the "
+    "`pkg:apk/alpine/libssl3@3.5.9-r1` and `pkg:apk/alpine/libcrypto3@3.5.9-r1` subcomponents: "
+    "the build's `apk upgrade` installs a patched package as soon as Alpine 3.24 serves one, "
+    "the pins stop matching, the image scan says so, and the five statements are removed. The "
+    "five are published from 0.36.0; the images of 0.33.10, 0.34.5 and 0.35.2 carry 3.5.9-r1 "
+    "without them."
+)
+_OPENSSL_CVES = tuple(_OPENSSL_WHAT)
+
+
 def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     assert "only-fixed" not in _RELEASE
     assert "severity-cutoff: high" in _RELEASE
@@ -440,12 +544,12 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
     vex = json.loads(
         (_ROOT / "security" / "vex.openvex.json").read_text(encoding="utf-8")
     )
-    # One reviewed exception. An exception is a deliberate, reviewed addition: its statement, its
+    # Six reviewed exceptions. An exception is a deliberate, reviewed addition: its statement, its
     # entry here and its paragraph in the evidence document, together. Any OTHER statement fails here.
     python_cve = "CVE-2026-119170"
     by_name = {s["vulnerability"]["name"]: s for s in vex["statements"]}
-    assert set(by_name) == {python_cve}
-    assert len(vex["statements"]) == 1
+    assert set(by_name) == {python_cve, *_OPENSSL_CVES}
+    assert len(vex["statements"]) == 6
     assert vex["@id"].endswith("/__SOURCE_REVISION__")
 
     # CVE-2026-119170 is a regression in Python 3.14.10's hashlib FIPS enforcement, reached only
@@ -472,12 +576,40 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
                  "_hashlib.get_fips_mode() returns 0", "bound to Python 3.14.10"):
         assert fact in python["impact_statement"], fact
 
+    # The five findings of OpenSSL's advisories of 17 and 24 November 2026, all rated Low by OpenSSL,
+    # are in QUIC, CRL checking of CMS and PKCS#7 messages, DANE and PEM_X509_INFO_read_bio_ex() with a
+    # caller's stack; nothing that links the system OpenSSL in the image reaches any of them. Bound to
+    # the exact Alpine packages, so the build's apk upgrade to a patched OpenSSL ends the exceptions
+    # (check_vex_sbom.py fails the scan on the stale pins). Each statement is pinned whole: a fact that
+    # changes is a statement reviewed again.
+    openssl_subs = [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"},
+                    {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+    for name in _OPENSSL_CVES:
+        statement = by_name[name]
+        assert statement["status"] == "not_affected", name
+        assert statement["justification"] == "vulnerable_code_not_in_execute_path", name
+        assert statement["products"] == [
+            {
+                "@id": (
+                    "pkg:oci/vault@__IMAGE_DIGEST__"
+                    "?repository_url=ghcr.io/dockvault/vault"
+                ),
+                "subcomponents": openssl_subs,
+            },
+            {"@id": "__IMAGE_REFERENCE__", "subcomponents": openssl_subs},
+        ], name
+        assert statement["timestamp"] == "__GENERATED_AT__", name
+        assert statement["impact_statement"] == _OPENSSL_IMPACT[name], name
+
     evidence = (_ROOT / "docs" / "supply-chain-controls.md").read_text(encoding="utf-8")
     assert "There is no blanket `only-fixed` bypass" in evidence
     assert "fails for every unexcepted vulnerability" in evidence
     assert "It holds no statements now." not in evidence
     flat = " ".join(evidence.split())
-    assert "It holds one statement now, for `CVE-2026-119170` in Python 3.14.10" in flat
+    assert ("It holds six statements now: one for `CVE-2026-119170` in Python 3.14.10, and five for "
+            "OpenSSL's advisories of 17 and 24 November 2026 in Alpine's `libssl3` and `libcrypto3` "
+            "3.5.9-r1") in flat
+    assert _OPENSSL_PARAGRAPH in flat
     # The five OpenSSL statements of 0.35.1 ended when the build's apk upgrade moved to the patched package;
     # the document keeps the record of every statement that was removed.
     assert ("and the five findings of OpenSSL's advisory of 10 November 2026 (`CVE-2026-88822`, "
@@ -486,7 +618,7 @@ def test_scanner_exceptions_are_code_backed_narrow_and_documented():
             "replaces with the patched 3.5.9-r1.") in flat
     assert "vulnerable_code_not_in_execute_path" in flat
     assert "`pkg:generic/python@3.14.10` subcomponent" in flat
-    assert "While the template holds the statement below, a release attaches its VEX." in flat
+    assert "While the template holds the statements below, a release attaches its VEX." in flat
     assert ("The GitHub Release publishes the rendered VEX beside the SBOMs only when the template "
             "holds at least one statement.") in flat
     assert "OpenVEX requires a document to hold at least one" in flat
@@ -558,12 +690,13 @@ def test_the_committed_vex_renders_bound_to_the_scanned_image(tmp_path):
         source_revision=revision,
         generated_at="2026-10-16T00:00:00Z",
     )
-    assert [s["vulnerability"]["name"] for s in document["statements"]] == ["CVE-2026-119170"]
-    (statement,) = document["statements"]
-    assert {p["@id"] for p in statement["products"]} == {
-        f"pkg:oci/vault@{digest}?repository_url=ghcr.io/dockvault/vault", reference}
-    assert revision in statement["impact_statement"]
-    assert statement["timestamp"] == "2026-10-16T00:00:00Z"
+    assert [s["vulnerability"]["name"] for s in document["statements"]] == [
+        "CVE-2026-119170", *_OPENSSL_CVES]
+    for statement in document["statements"]:
+        assert {p["@id"] for p in statement["products"]} == {
+            f"pkg:oci/vault@{digest}?repository_url=ghcr.io/dockvault/vault", reference}
+        assert revision in statement["impact_statement"]
+        assert statement["timestamp"] == "2026-10-16T00:00:00Z"
     assert document["@id"] == f"https://github.com/DockVault/vault/security/vex/{revision}"
     assert document["timestamp"] == "2026-10-16T00:00:00Z"
     assert "__" not in output.read_text(encoding="utf-8")
@@ -618,10 +751,12 @@ def test_a_release_publishes_the_committed_vex(tmp_path):
     )
     written = json.loads(output.read_text(encoding="utf-8"))
     assert written == document
-    assert [s["vulnerability"]["name"] for s in written["statements"]] == ["CVE-2026-119170"]
-    assert {p["@id"] for p in written["statements"][0]["products"]} == {
-        f"pkg:oci/vault@{digest}?repository_url=ghcr.io/dockvault/vault",
-        "ghcr.io/dockvault/vault:v0.33.4"}
+    assert [s["vulnerability"]["name"] for s in written["statements"]] == [
+        "CVE-2026-119170", *_OPENSSL_CVES]
+    for statement in written["statements"]:
+        assert {p["@id"] for p in statement["products"]} == {
+            f"pkg:oci/vault@{digest}?repository_url=ghcr.io/dockvault/vault",
+            "ghcr.io/dockvault/vault:v0.33.4"}
 
 
 def test_a_release_publishes_the_vex_when_it_holds_a_statement(tmp_path):

@@ -21,6 +21,91 @@
       "justification": "vulnerable_code_not_in_execute_path",
       "impact_statement": "CVE-2026-119170 is a regression in Python 3.14.10 in how the hashlib module enforces the algorithms OpenSSL allows in FIPS mode; it affects only a Python whose OpenSSL runs in FIPS mode. OpenSSL in the DockVault image cannot run in FIPS mode: the image ships no FIPS provider (/usr/lib/ossl-modules holds only legacy.so), its /etc/ssl/openssl.cnf enables none, neither the image nor its Compose files set OPENSSL_CONF or OPENSSL_MODULES, and nothing in the application enables FIPS mode, so _hashlib.get_fips_mode() returns 0 and the code with the flaw never runs. The statement is bound to Python 3.14.10 and ends when the base image moves to a Python release without the flaw. Verified for source revision __SOURCE_REVISION__.",
       "timestamp": "__GENERATED_AT__"
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-107494"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "CVE-2026-107494 is a flaw in OpenSSL's QUIC implementation, rated Low by OpenSSL: the QUIC stack queues a RETIRE_CONNECTION_ID frame for every retransmitted NEW_CONNECTION_ID frame, so a malicious QUIC peer can make it queue frames without limit until memory runs out. It is reached only by an application that runs a QUIC connection with OpenSSL. In this image the system OpenSSL, Alpine's libssl3 and libcrypto3 3.5.9-r1, is linked by Python's _ssl module (TLS over TCP), Python's _hashlib module (digests, HMAC, PBKDF2 and scrypt, no ciphers), busybox's ssl_client (TLS over TCP), apk-tools (TLS over TCP and signature checks), ca-certificates' c_rehash (certificate hashing), and the legacy provider and engines OpenSSL loads on request. None of them imports a QUIC, DANE, CMS or PKCS#7 function, and the image has no openssl command. Python's ssl module has no QUIC support, and dnspython's DNS over QUIC needs aioquic, which the image does not install and which implements QUIC itself, not with OpenSSL. The statement is bound to libssl3 and libcrypto3 3.5.9-r1 and ends when the image moves to an OpenSSL with the fix (3.5.10, scheduled for 1 December 2026). Verified for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-124709"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "CVE-2026-124709 is a flaw in OpenSSL's QUIC server, rated Low by OpenSSL: a server that rejects a stream the peer opened keeps that stream's state for the life of the connection when the peer resets the stream first, so a client can make its memory grow without bound. It is reached only by an application that runs a QUIC server with OpenSSL. In this image the system OpenSSL, Alpine's libssl3 and libcrypto3 3.5.9-r1, is linked by Python's _ssl module (TLS over TCP), Python's _hashlib module (digests, HMAC, PBKDF2 and scrypt, no ciphers), busybox's ssl_client (TLS over TCP), apk-tools (TLS over TCP and signature checks), ca-certificates' c_rehash (certificate hashing), and the legacy provider and engines OpenSSL loads on request. None of them imports a QUIC, DANE, CMS or PKCS#7 function, and the image has no openssl command. Python's ssl module has no QUIC support, and dnspython's DNS over QUIC needs aioquic, which the image does not install and which implements QUIC itself, not with OpenSSL. The statement is bound to libssl3 and libcrypto3 3.5.9-r1 and ends when the image moves to an OpenSSL with the fix (3.5.10, scheduled for 1 December 2026). Verified for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-121482"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "CVE-2026-121482 is a flaw in OpenSSL's CRL checking, rated Low by OpenSSL: verifying a crafted CMS or PKCS#7 SignedData message with CRL checking turned on rebuilds the CRL distribution point names for every CRL, so the time it takes grows with the square of the message's size. It is reached only by an application that verifies such a message with CRL checking turned on, which OpenSSL leaves off by default. In this image the system OpenSSL, Alpine's libssl3 and libcrypto3 3.5.9-r1, is linked by Python's _ssl module (TLS over TCP), Python's _hashlib module (digests, HMAC, PBKDF2 and scrypt, no ciphers), busybox's ssl_client (TLS over TCP), apk-tools (TLS over TCP and signature checks), ca-certificates' c_rehash (certificate hashing), and the legacy provider and engines OpenSSL loads on request. None of them imports a QUIC, DANE, CMS or PKCS#7 function, and the image has no openssl command. Python's standard library has no CMS or PKCS#7 interface, and the application never turns on CRL checking in Python's ssl module. The statement is bound to libssl3 and libcrypto3 3.5.9-r1 and ends when the image moves to an OpenSSL with the fix (3.5.10, scheduled for 1 December 2026). Verified for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-84786"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "CVE-2026-84786 is a NULL pointer dereference in OpenSSL's DANE support, rated Low by OpenSSL: a TLS client that turns on DANE and accepts TLSA records that mix PKIX-TA(0) or PKIX-EE(1) with DANE-TA(2) can crash when a server presents a trusted authority's certificate as its own. It is reached only by an application that turns on DANE for a TLS connection with OpenSSL. In this image the system OpenSSL, Alpine's libssl3 and libcrypto3 3.5.9-r1, is linked by Python's _ssl module (TLS over TCP), Python's _hashlib module (digests, HMAC, PBKDF2 and scrypt, no ciphers), busybox's ssl_client (TLS over TCP), apk-tools (TLS over TCP and signature checks), ca-certificates' c_rehash (certificate hashing), and the legacy provider and engines OpenSSL loads on request. None of them imports a QUIC, DANE, CMS or PKCS#7 function, and the image has no openssl command. Python's ssl module has no DANE support, and the application looks up no TLSA records. The statement is bound to libssl3 and libcrypto3 3.5.9-r1 and ends when the image moves to an OpenSSL with the fix (3.5.10, scheduled for 1 December 2026). Verified for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
+    },
+    {
+      "vulnerability": {"name": "CVE-2026-107493"},
+      "products": [
+        {
+          "@id": "pkg:oci/vault@__IMAGE_DIGEST__?repository_url=ghcr.io/dockvault/vault",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        },
+        {
+          "@id": "__IMAGE_REFERENCE__",
+          "subcomponents": [{"@id": "pkg:apk/alpine/libssl3@3.5.9-r1"}, {"@id": "pkg:apk/alpine/libcrypto3@3.5.9-r1"}]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "CVE-2026-107493 is a use-after-free in OpenSSL's PEM_X509_INFO_read_bio_ex() and the functions built on it, rated Low by OpenSSL: when reading into a stack the caller passes fails, OpenSSL frees the stack's entries but leaves them in it. It is reached only by an application that passes its own stack instead of NULL; OpenSSL's own callers, including the code TLS uses to load CA certificates, pass NULL. In this image the system OpenSSL, Alpine's libssl3 and libcrypto3 3.5.9-r1, is linked by Python's _ssl module (TLS over TCP), Python's _hashlib module (digests, HMAC, PBKDF2 and scrypt, no ciphers), busybox's ssl_client (TLS over TCP), apk-tools (TLS over TCP and signature checks), ca-certificates' c_rehash (certificate hashing), and the legacy provider and engines OpenSSL loads on request. None of them imports a QUIC, DANE, CMS or PKCS#7 function, and the image has no openssl command. Python's _ssl module does not import these functions, and the one program in the image that does, ca-certificates' c_rehash, is never run: the package's trigger runs update-ca-certificates, which uses no OpenSSL and does not run it, and neither the application nor its entrypoint runs c_rehash. The statement is bound to libssl3 and libcrypto3 3.5.9-r1 and ends when the image moves to an OpenSSL with the fix (3.5.10, scheduled for 1 December 2026). Verified for source revision __SOURCE_REVISION__.",
+      "timestamp": "__GENERATED_AT__"
     }
   ]
 }
