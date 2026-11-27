@@ -491,7 +491,10 @@ def test_a_sign_in_answer_the_decoder_cannot_read_is_refused_not_a_server_error(
     elif spoil == "extensions cut off":
         credential["response"]["authenticatorData"] = websafe_encode(head + b"\xa1\x19")
     else:
-        credential["response"]["clientDataJSON"] = websafe_encode(b"[" * 100000)
+        # How deep the JSON decoder gets before its stack runs out depends on the platform's stack and build:
+        # about 6,000 brackets on Alpine, 17,000 on Windows, and past 100,000 on a Linux runner, where 100,000
+        # parsed to the end and was refused as an unfinished document instead. Ten million is past every stack.
+        credential["response"]["clientDataJSON"] = websafe_encode(b"[" * 10_000_000)
     with pytest.raises(ws.Refused) as refused:
         ws.verify_authentication(rp, policy, challenge=challenge, credential=credential, key=key,
                                  allow_ids=[key.credential_id])
