@@ -75,7 +75,7 @@ services:
     logging: *logging
 
   vault-redis:
-    image: redis:8-alpine@sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241
+    image: redis:8-alpine@sha256:5af80107c1eeecb484a2269b80a26d12bfa6521787da4663bd9f19f60a163483
     container_name: vault-redis
     environment:
       # Optional Redis auth. Empty (the default) => no password (unchanged behaviour). Set
