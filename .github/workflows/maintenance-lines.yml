@@ -117,7 +117,7 @@ jobs:
           echo "IMAGE=ghcr.io/dockvault/vault:${tag}-amd64" >> "$GITHUB_ENV"
 
       - name: Scan with the release policy
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: anchore/scan-action@11983a512817154c80a9db660c1a184be7513ed6 # v7.4.3
         with:
           image: ${{ env.IMAGE }}
           grype-version: v0.112.0
