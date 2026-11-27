@@ -223,3 +223,55 @@ updates:
       line-0.34-github-actions:
         patterns:
           - "*"
+
+  - package-ecosystem: "pip"
+    target-branch: "release/0.35"
+    directories:
+      - "/"
+      - "/tests"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      line-0.35-pip:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+
+  - package-ecosystem: "docker"
+    target-branch: "release/0.35"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+
+  - package-ecosystem: "docker-compose"
+    target-branch: "release/0.35"
+    directory: "/deploy"
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+
+  - package-ecosystem: "github-actions"
+    target-branch: "release/0.35"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      line-0.35-github-actions:
+        patterns:
+          - "*"

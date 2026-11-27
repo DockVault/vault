@@ -7,12 +7,15 @@
   },
   "lines": {
     "0.33": {
-      "security_fixes_until": "2027-05-09"
+      "security_fixes_until": "2026-12-27"
     },
     "0.34": {
-      "security_fixes_until": "2027-05-17"
+      "security_fixes_until": "2026-12-27"
     },
     "0.35": {
+      "security_fixes_until": "2026-12-27"
+    },
+    "0.36": {
       "security_fixes_until": null
     }
   },
@@ -4826,7 +4829,7 @@
     },
     "0.35.0": {
       "released": "2026-11-17",
-      "notes": "The first release of the 0.35 line: the web app made ready for everyday work in an organisation. It publishes no new advisory and carries the fix of the one published with 0.34.4. Releases before 0.33 are end-of-life from this release; 0.34.x receives security fixes until 2027-05-17 and 0.33.x until 2027-05-09 (.github/SECURITY.md). Upgrade from 0.34.4 (an older release goes through it on the way): update the checkout before python dockvault.py update, reload browser tabs opened before the upgrade, and with SFTP in its own container update both together. dockvault.py no longer names an end-of-life release as the newest of your line. New: one chip per person and sortable, searchable tables with a density switch; a More menu on each file, folder selection with Copy and Cut, and Find in this folder; a dashboard with quick actions, a Needs-attention lane and, for administrators, a Get-started list; Settings pages listed at the left; dialogs and toasts named for assistive technology, and contrast fixes. Previews are served inline under a sandboxing Content-Security-Policy, and a share recipient's previews are counted apart from downloads (recorded as share_previewed). A share tag has a new switch that lets view-only recipients view files in the browser, with no Download button (the browser receives the file, so they can keep a copy): on for tags made from this release on and for a new install's tags, off for every tag and share that existed before the upgrade, whose view-only recipients keep seeing names and sizes only. A share the dialog showed as view-only is never made downloadable when an administrator changes its tag while the dialog is open: it is made view-only, or refused with the reason if the tag no longer allows view-only (before, it could be made downloadable). Makers can extend shares and links (administrators, someone else's, through the API), and makers are reminded two days before something expires. Upload links take several files, give the uploader a receipt and tell the owner; an owner can add a message to an upload, file or note link. The two new emails are off until an administrator turns them on. Stay signed in: a minute before a session ends the web app offers to renew it, up to 24 hours after the sign-in by default (Settings, Security, Show advanced settings). Personal data it stores is listed in docs/data-inventory.md. A live-update connection refused because its account (or temporary credential) already holds ten closes with code 4429, and the tab tries again a minute later. Schema: a new table and new columns, added at the first start; going back to 0.34.4 needs no restore. The release page on GitHub has the full notes.",
+      "notes": "The first release of the 0.35 line: the web app made ready for everyday work in an organisation. It publishes no new advisory and carries the fix of the one published with 0.34.4. Releases before 0.33 are end-of-life from this release; .github/SECURITY.md says until when 0.34.x and 0.33.x are supported. Upgrade from 0.34.4 (an older release goes through it on the way): update the checkout before python dockvault.py update, reload browser tabs opened before the upgrade, and with SFTP in its own container update both together. dockvault.py no longer names an end-of-life release as the newest of your line. New: one chip per person and sortable, searchable tables with a density switch; a More menu on each file, folder selection with Copy and Cut, and Find in this folder; a dashboard with quick actions, a Needs-attention lane and, for administrators, a Get-started list; Settings pages listed at the left; dialogs and toasts named for assistive technology, and contrast fixes. Previews are served inline under a sandboxing Content-Security-Policy, and a share recipient's previews are counted apart from downloads (recorded as share_previewed). A share tag has a new switch that lets view-only recipients view files in the browser, with no Download button (the browser receives the file, so they can keep a copy): on for tags made from this release on and for a new install's tags, off for every tag and share that existed before the upgrade, whose view-only recipients keep seeing names and sizes only. A share the dialog showed as view-only is never made downloadable when an administrator changes its tag while the dialog is open: it is made view-only, or refused with the reason if the tag no longer allows view-only (before, it could be made downloadable). Makers can extend shares and links (administrators, someone else's, through the API), and makers are reminded two days before something expires. Upload links take several files, give the uploader a receipt and tell the owner; an owner can add a message to an upload, file or note link. The two new emails are off until an administrator turns them on. Stay signed in: a minute before a session ends the web app offers to renew it, up to 24 hours after the sign-in by default (Settings, Security, Show advanced settings). Personal data it stores is listed in docs/data-inventory.md. A live-update connection refused because its account (or temporary credential) already holds ten closes with code 4429, and the tab tries again a minute later. Schema: a new table and new columns, added at the first start; going back to 0.34.4 needs no restore. The release page on GitHub has the full notes.",
       "support": {
         "eol": false,
         "secure": true
@@ -4859,6 +4862,14 @@
     "0.35.2": {
       "released": "2026-11-20",
       "notes": "A maintenance release of the 0.35 line, rebuilt on Alpine's patched OpenSSL (libssl3 and libcrypto3 3.5.9-r1), which fixes the five findings of OpenSSL's advisory of 10 November 2026 (CVE-2026-88822, CVE-2026-88823, CVE-2026-95691, CVE-2026-95692 and CVE-2026-107496, all rated Low by OpenSSL); the vault reaches none of them. It publishes no advisory. 0.35.1's VEX file listed them as not affecting the image; those statements named the system OpenSSL 3.5.9-r0, which the image no longer carries, so they are gone. The application is the one of 0.35.1, and going back to 0.35.1 needs no restore.",
+      "support": {
+        "eol": false,
+        "secure": true
+      }
+    },
+    "0.36.0": {
+      "released": "2026-11-27",
+      "notes": "The first release of the 0.36 line: passkeys, and single sign-on through OpenID Connect providers. It publishes no advisory. From this release only the newest line gets security fixes; 0.35.x, 0.34.x and 0.33.x are supported until 2026-12-27, time to upgrade only (.github/SECURITY.md). Upgrade from 0.35.2 (an older release goes through it): update the checkout before python dockvault.py update, and reload browser tabs opened before the upgrade. Passkeys are on as an option: anyone may add one under Your account, and for the roles user and external a passkey that verifies the person signs in by itself; an administrator always types the password too. A passkey works only at the first ALLOWED_HOSTS entry, which must be an https host name. Administrators add identity providers (Microsoft Entra ID, Google Workspace, Okta, Keycloak, Authentik or another OpenID Connect provider) under Settings, Sign-in methods, and turn each on after a test sign-in. Neither opens a zero-knowledge vault: its passphrase stays. Schema: new tables and nullable or defaulted columns, added at the first start. Going back to 0.35.2 needs no restore; the upgrade conditions say what to do first. The release page on GitHub has the full notes.",
       "support": {
         "eol": false,
         "secure": true
@@ -5594,6 +5605,59 @@
           "id": "emailed-links-need-allowed-hosts",
           "summary": "From 0.35.1 every emailed link (password reset, invitations, notices) is built on the first entry of ALLOWED_HOSTS in .env, never on a request's Host header. With ALLOWED_HOSTS empty, no reset or invitation email is sent until it is set. Set it to the address people open the vault by: a bare name means https://name; write another port or plain http as the full address (https://vault.example.com:8443). An entry with no readable host now stops the start and names the entry. dockvault.py setup writes it; an install made by setup on a web port other than 443 should check it. The Host check of every release before 0.35.1 compares each entry, as written, with the host name a request gives, so a full address matches no request there: before going back to one, add the bare name of each full address as another entry.",
           "detect": "SELECT value->>'password_reset_enabled' AS self_service_reset_enabled FROM system_settings WHERE key = 'global'"
+        }
+      ]
+    },
+    {
+      "from": "0.35.2",
+      "to": "0.36.0",
+      "kind": "direct",
+      "reversible": true,
+      "requires_backup": false,
+      "conditions": [
+        {
+          "id": "passkeys-on-by-default",
+          "summary": "From 0.36.0 passkeys are on as an option (Settings, Sign-in methods): anyone may add one under Your account, and for the roles user and external a passkey that verifies the person signs in by itself; an administrator always types the password too. A passkey works only at the address it was made at, the first ALLOWED_HOSTS entry, which must be an https host name; otherwise passkeys stay hidden, and dockvault.py status says why. Single sign-on stays off until an administrator adds a provider. A sign-in waiting for its second step during the upgrade starts again."
+        },
+        {
+          "id": "provider-only-accounts",
+          "summary": "Going back: an earlier release holds no account to its provider. An account that signs in only through one (the first column) can then sign in with any password it is given: a reset link it asks for where self-service reset is on (the second column), a person the provider no longer admits included, or an administrator's link or password. First disable the accounts of people who left, or turn self-service reset off, and sign these accounts out: an earlier release renews their sessions without asking the provider.",
+          "detect": "SELECT * FROM (SELECT (SELECT count(*) FROM users WHERE sso_only) AS provider_only, COALESCE((SELECT value->>'password_reset_enabled' FROM system_settings WHERE key = 'global'), 'false') AS self_service_reset) t WHERE provider_only > 0"
+        },
+        {
+          "id": "passwords-nobody-knows",
+          "summary": "Going back: an account whose password nobody knows, such as one made through a provider or given password sign-in back, needs a reset link on an earlier release before a password works.",
+          "detect": "SELECT count(*) FROM users WHERE NOT COALESCE(sso_only, false) AND password_nobody_knows = encode(sha256(convert_to(password_hash, 'UTF8')), 'hex')"
+        },
+        {
+          "id": "second-factors-an-earlier-release-does-not-know",
+          "summary": "Going back: an earlier release counts neither a passkey nor a provider's trusted second factor. An account without an authenticator app then signs in with its password alone, and where a second factor is required, whoever knows the password sets one up: have each add an authenticator app first.",
+          "detect": "SELECT count(*) FROM users u WHERE NOT EXISTS (SELECT 1 FROM second_factor_enrollments s WHERE s.user_id = u.id AND s.status = 'active') AND (EXISTS (SELECT 1 FROM webauthn_credentials w WHERE w.user_id = u.id AND w.retired_at IS NULL) OR EXISTS (SELECT 1 FROM external_identities e JOIN sso_providers p ON p.id = e.provider_id WHERE e.user_id = u.id AND p.state = 'enabled' AND p.policy->>'sso_trust_idp_mfa' = 'true'))"
+        },
+        {
+          "id": "people-a-provider-no-longer-admits",
+          "summary": "Going back: an earlier release does not hold back people a provider refused, or whose days without a sign-in there have run out: their password, SSH keys, temporary credentials and devices work again, and their sessions are renewed without asking the provider. Disable those accounts first.",
+          "detect": "SELECT count(*) FROM external_identities e JOIN sso_providers p ON p.id = e.provider_id WHERE (e.refused_at IS NOT NULL AND (e.last_sign_in_at IS NULL OR e.refused_at >= e.last_sign_in_at)) OR (COALESCE((p.policy->>'sso_freshness_days')::int, 30) > 0 AND COALESCE(e.last_sign_in_at, e.linked_at) + make_interval(days => COALESCE((p.policy->>'sso_freshness_days')::int, 30)) <= (now() AT TIME ZONE 'utc'))"
+        },
+        {
+          "id": "role-must-hold-a-passkey",
+          "summary": "Going back: an earlier release does not ask for the passkey a role must hold. The query reads the values saved on the settings page; dockvault.py reads WEBAUTHN_MODE and WEBAUTHN_REQUIRED_ROLES in .env, which apply where none is saved.",
+          "detect": "SELECT 1 FROM managed_settings m WHERE m.key = 'webauthn_mode' AND m.value #>> '{}' = 'required_for_roles' AND EXISTS (SELECT 1 FROM managed_settings r WHERE r.key = 'webauthn_required_roles' AND CASE WHEN json_typeof(r.value) = 'array' THEN json_array_length(r.value) ELSE 0 END > 0)"
+        },
+        {
+          "id": "held-address-confirmations",
+          "summary": "Going back: first deny or withdraw the held confirmations of an address. An earlier release applies one as a change of address, writing the address it names over the one the account holds by then.",
+          "detect": "SELECT count(*) FROM credential_changes WHERE status = 'held' AND payload->>'confirm' = 'true'"
+        },
+        {
+          "id": "back-on-0-36-after-an-earlier-release",
+          "summary": "Coming back to 0.36 after a time on an earlier release: passkeys and provider links made before are back as they were. A second-factor reset made there by another administrator or the server's operator retires, at the first start, the passkeys made before it, for at least 14 days after the reset; an older reset only while the account has not answered it, and only where the account had an authenticator app. Nothing else done there (a password reset, a sign-out everywhere, a factor an account turned off itself) ended a link or a passkey: for each account acted on there for a security reason, remove its passkeys and unlink its identities. The days there count: linked people who did not sign in through their provider within its window may be held to it until they do, and a role's time to set a passkey up may have run out.",
+          "detect": "SELECT 1 FROM pg_class WHERE relname IN ('webauthn_credentials', 'external_identities') AND relkind = 'r' LIMIT 1"
+        },
+        {
+          "id": "privileged-accounts-keep-a-password",
+          "summary": "Coming back to 0.36: an account that signs in only through a provider and was made an administrator, or given the auditor right, on the earlier release gets its password sign-in back at the first start. It keeps the password it has, it and the administrators are told, and where it has none it sets one with a reset link. Nothing to do.",
+          "detect": "SELECT timestamp, resource_id FROM audit_logs WHERE action = 'sso_password_sign_in_restored'"
         }
       ]
     }
