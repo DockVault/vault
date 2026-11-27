@@ -171,7 +171,7 @@ def test_a_passkey_is_registered_only_by_its_own_account(monkeypatch):
     """No route registers a passkey for someone else, and the options always name the caller's own account as the
     key's user: an administrator adds nothing to another account's keys."""
     root = _user("root", role="admin")
-    h = RouteHarness(monkeypatch, root) if False else Harness(monkeypatch, root)
+    h = Harness(monkeypatch, root)
     other = uuid.uuid4()
     for path in (f"/users/{other}/passkeys/register/options", f"/users/{other}/passkeys/register/verify"):
         status, body = _call(h.S, "POST", path, {"current_password": "pw"})
